@@ -1,0 +1,244 @@
+//// ---------------- ENUMS ---------------- ////
+
+Enum TransactionTypeEnum {
+  TOP_UP
+  CHARGE_DEDUCT
+}
+
+Enum ChargerStatusEnum {
+  // Add your ChargerStatusEnum values here
+  // e.g., AVAILABLE, CHARGING, UNAVAILABLE, FAULTED
+  AVAILABLE
+  PREPARING
+  CHARGING
+  SUSPENDED_EVSE
+  SUSPENDED_EV
+  FINISHING
+  RESERVED
+  UNAVAILABLE
+  FAULTED
+}
+
+Enum TransactionStatusEnum {
+  // Add your TransactionStatusEnum values here
+  // e.g., STARTED, COMPLETED, FAILED
+  STARTED
+  PENDING_START
+  RUNNING
+  PENDING_STOP
+  STOPPED
+  COMPLETED
+  CANCELLED
+  FAILED
+}
+
+Enum MessageDirectionEnum {
+  // Add your MessageDirectionEnum values here
+  // e.g., INBOUND, OUTBOUND
+  INBOUND
+  OUTBOUND
+}
+
+
+//// ---------------- TABLES ---------------- ////
+
+// --- Base Model (Fields will be included in each table) ---
+// Table BaseModel {
+//   id int [pk, increment]
+//   created_at datetime [default: `now()`]
+//   updated_at datetime [default: `now()`]
+// }
+
+// --- User ---
+Table User {
+  id int [pk, increment]
+  created_at datetime [default: `now()`]
+  updated_at datetime [default: `now()`]
+  email varchar(255)
+  phone_number varchar(255) [unique]
+  password_hash varchar(255)
+  full_name varchar(255)
+  is_active boolean [default: true]
+}
+
+// --- Admin User ---
+Table AdminUser {
+  id int [pk, increment]
+  created_at datetime [default: `now()`]
+  updated_at datetime [default: `now()`]
+  email varchar(255)
+  phone_number varchar(255) [unique]
+  password_hash varchar(255)
+  full_name varchar(255)
+  is_active boolean [default: true]
+}
+
+// --- Wallet ---
+Table Wallet {
+  id int [pk, increment]
+  created_at datetime [default: `now()`]
+  updated_at datetime [default: `now()`]
+  user_id int [unique] // Foreign key for OneToOneField
+  balance decimal(10,2)
+}
+
+// --- Wallet Transaction ---
+Table WalletTransaction {
+  // WalletTransaction does not inherit BaseModel, so no id, created_at, updated_at by default
+  // Assuming you might want an ID for it:
+  id int [pk, increment]
+  wallet_id int
+  amount decimal(10,2)
+  type TransactionTypeEnum // Or varchar if you prefer not to use DBML enum type
+  description text [null]
+  charging_transaction_id int [null]
+  payment_metadata json
+  // Assuming created_at might be useful
+  created_at datetime [default: `now()`]
+}
+
+// --- Payment Gateway ---
+Table PaymentGateway {
+  id int [pk, increment]
+  created_at datetime [default: `now()`]
+  updated_at datetime [default: `now()`]
+  name varchar(100)
+  api_key varchar(255) [null] // Should be encrypted in application logic
+  webhook_secret varchar(255) [null]
+  status boolean [default: true]
+  config json [null]
+  default_currency varchar(3) [default: "INR"]
+}
+
+// --- Vehicle Profile ---
+Table VehicleProfile {
+  id int [pk, increment]
+  created_at datetime [default: `now()`]
+  updated_at datetime [default: `now()`]
+  user_id int
+  make varchar(100)
+  model varchar(100)
+  year int
+}
+
+// --- Valid Vehicle Profile ---
+Table ValidVehicleProfile {
+  id int [pk, increment]
+  created_at datetime [default: `now()`]
+  updated_at datetime [default: `now()`]
+  make varchar(100)
+  model varchar(100)
+  year int
+}
+
+// --- Charging Station ---
+Table ChargingStation {
+  id int [pk, increment]
+  created_at datetime [default: `now()`]
+  updated_at datetime [default: `now()`]
+  name varchar(255)
+  latitude float
+  longitude float
+  address text
+}
+
+// --- Charger ---
+Table Charger {
+  id int [pk, increment]
+  created_at datetime [default: `now()`]
+  updated_at datetime [default: `now()`]
+  charge_point_string_id varchar(255) [unique]
+  station_id int
+  name varchar(255)
+  model varchar(100)
+  vendor varchar(100)
+  serial_number varchar(100) [unique]
+  firmware_version varchar(100)
+  iccid varchar(100) [null]
+  imsi varchar(100) [null]
+  meter_type varchar(100) [null]
+  meter_serial_number varchar(100) [null]
+  latest_status ChargerStatusEnum // Or varchar
+  last_heart_beat_time datetime
+  connector_type varchar(255)
+  max_power_kw float
+}
+
+// --- Tariff ---
+Table Tariff {
+  id int [pk, increment]
+  created_at datetime [default: `now()`]
+  updated_at datetime [default: `now()`]
+  charger_id int [null]
+  rate_per_kwh decimal(5,2)
+  is_global boolean [default: false]
+}
+
+// --- Transaction ---
+Table Transaction {
+  id int [pk, increment]
+  created_at datetime [default: `now()`] // start_time is auto_now_add, but base model has created_at
+  updated_at datetime [default: `now()`]
+  user_id int
+  charger_id int
+  vehicle_id int
+  start_meter_kwh float
+  end_meter_kwh float [null]
+  energy_consumed_kwh float [null]
+  start_time datetime [default: `now()`] // Tortoise auto_now_add
+  end_time datetime [null]
+  stop_reason text [null]
+  transaction_status TransactionStatusEnum // Or varchar
+}
+
+// --- MeterValue ---
+Table MeterValue {
+  id int [pk, increment]
+  created_at datetime [default: `now()`]
+  updated_at datetime [default: `now()`]
+  transaction_id int
+  reading_kwh float
+  timestamp datetime
+  current float [null]
+  voltage float [null]
+  power_kw float [null]
+}
+
+// --- Log ---
+Table Log {
+  id int [pk, increment]
+  created_at datetime [default: `now()`] // timestamp is auto_now_add, but base model has created_at
+  updated_at datetime [default: `now()`]
+  charge_point_id varchar(100)
+  message_type varchar(100)
+  direction varchar(10) // Consider MessageDirectionEnum if you make it. Tortoise model uses CharField.
+  payload json
+  timestamp datetime [default: `now()`] // Tortoise auto_now_add
+}
+
+
+//// ---------------- RELATIONSHIPS ---------------- ////
+
+Ref: Wallet.user_id > User.id // One-to-One
+Ref: WalletTransaction.wallet_id > Wallet.id // Many-to-One
+Ref: WalletTransaction.charging_transaction_id > Transaction.id // Many-to-One (or One-to-One if a wallet transaction is for only one charging transaction)
+
+Ref: VehicleProfile.user_id > User.id // Many-to-One
+
+Ref: Charger.station_id > ChargingStation.id // Many-to-One
+Ref: Tariff.charger_id > Charger.id // Many-to-One
+
+Ref: Transaction.user_id > User.id // Many-to-One
+Ref: Transaction.charger_id > Charger.id // Many-to-One
+Ref: Transaction.vehicle_id > VehicleProfile.id // Many-to-One
+
+Ref: MeterValue.transaction_id > Transaction.id // Many-to-One
+
+// Note: ReverseRelations are implicitly defined by the ForeignKeys and OneToOneFields.
+// User.wallet: Wallet.user_id > User.id
+// User.vehicles: VehicleProfile.user_id > User.id
+// ChargingStation.chargers: Charger.station_id > ChargingStation.id
+// Charger.tariffs: Tariff.charger_id > Charger.id
+// Transaction.meter_values: MeterValue.transaction_id > Transaction.id
+// Wallet.transactions: WalletTransaction.wallet_id > Wallet.id
+// Transaction.wallet_transactions: WalletTransaction.charging_transaction_id > Transaction.id
