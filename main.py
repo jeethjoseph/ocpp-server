@@ -128,7 +128,7 @@ async def send_ocpp_request(charge_point_id: str, action: str, payload: Dict = N
     try:
         # Example: only RemoteStartTransaction is implemented here
         if action == "RemoteStartTransaction":
-            req = call.RemoteStartTransactionPayload(**(payload or {}))
+            req = call.RemoteStartTransaction(**(payload or {}))
             response = await cp.call(req)
             logger.info(f"Sent {action} request to {charge_point_id}")
             return True, response
