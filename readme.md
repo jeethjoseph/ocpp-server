@@ -12,3 +12,28 @@ Best practice is to install and run in python virtual environment
 ### Deployment
 
 Current deployment is in render.
+
+### File structure
+
+ocpp-server/
+│
+├── main.py # FastAPI app entrypoint (routes, startup)
+├── models.py # SQLAlchemy ORM models
+├── database.py # DB engine, session, and dependency
+├── schemas.py # Pydantic models (request/response)
+├── crud.py # CRUD operations for DB
+├── websocket.py # OCPP WebSocket logic
+├── utils.py # Utility functions (e.g., logging)
+├── alembic/ # Alembic migrations folder (created by alembic init)
+├── requirements.txt
+├── schema.dbml
+└── readme.md
+
+### Alembic
+
+1. Generate schema `alembic revision --autogenerate -m "fixed log schema removed connector id"`
+2. Push schema `alembic upgrade head`
+
+### Docs
+
+1. https://docs.sqlalchemy.org/en/20/orm/session_basics.html

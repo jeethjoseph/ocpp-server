@@ -5,3 +5,4 @@ __pycache__/
 .venv
 test.html
 .idea/*
+alembic.ini
