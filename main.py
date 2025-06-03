@@ -49,9 +49,7 @@ class ChargePoint(OcppChargePoint):
     @on('StatusNotification')
     async def on_status_notification(self, connector_id, status, error_code=None, info=None, **kwargs):
         logger.info(f"StatusNotification from {self.id}: connector_id={connector_id}, status={status}, error_code={error_code}, info={info}")
-        return call_result.StatusNotification(
-            status="Accepted"
-        )
+        return call_result.StatusNotification()
 
 # Adapter to make FastAPI's WebSocket compatible with python-ocpp
 class FastAPIWebSocketAdapter:
