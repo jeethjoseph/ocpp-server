@@ -43,7 +43,7 @@ class ChargePoint(OcppChargePoint):
     @on('Heartbeat')
     async def on_heartbeat(self, **kwargs):
         logger.info(f"Heartbeat from {self.id}")
-        return call_result.HeartbeatPayload(
+        return call_result.Heartbeat(
             current_time=datetime.datetime.utcnow().isoformat() + "Z"
         )
 
