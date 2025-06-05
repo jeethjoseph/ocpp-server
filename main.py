@@ -124,9 +124,14 @@ async def send_ocpp_request(charge_point_id: str, action: str, payload: Dict = N
         return False, f"ChargePoint instance for {charge_point_id} not found"
 
     try:
-        # Example: only RemoteStartTransaction is implemented here
+                # Example: only RemoteStartTransaction is implemented here
         if action == "RemoteStartTransaction":
             req = call.RemoteStartTransaction(**(payload or {}))
+            response = await cp.call(req)
+            logger.info(f"Sent {action} request to {charge_point_id}")
+            return True, response
+        elif action == "ChangeAvailability":
+            req = call.ChangeAvailability(**(payload or {}))
             response = await cp.call(req)
             logger.info(f"Sent {action} request to {charge_point_id}")
             return True, response
