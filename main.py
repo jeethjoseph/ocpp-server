@@ -176,10 +176,13 @@ async def send_ocpp_command(command: OCPPCommand):
     )
     
     if success:
+        # Extract correlation_id from the OCPP response message (index 1 if result is a list)
+        correlation_id = result[1]
+       
         return OCPPResponse(
             success=True,
-            message="Command sent successfully",
-            correlation_id=result
+            message=result,
+            correlation_id=correlation_id
         )
     else:
         raise HTTPException(status_code=400, detail=result)
