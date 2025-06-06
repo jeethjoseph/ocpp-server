@@ -45,7 +45,7 @@ async def validate_and_connect_charger(charge_point_id: str, db: Session, connec
     
     # Check if already connected
     if charge_point_id in connected_charge_points:
-        return False, f"Charger {charge_point_id} already connected"
+        return False, f"Charger {charge_point_id} is already connected"
     
     return True, "Valid charger"
 

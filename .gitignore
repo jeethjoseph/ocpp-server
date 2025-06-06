@@ -6,3 +6,4 @@ __pycache__/
 test.html
 .idea/*
 alembic.ini
+.vscode/*
