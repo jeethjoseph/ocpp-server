@@ -1,19 +1,25 @@
 import os
 import datetime
 from typing import Dict, List
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends
-from fastapi.responses import JSONResponse
-from sqlalchemy.orm import Session
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 
-from database import get_db
+from database import  init_db, close_db
 from schemas import OCPPCommand, OCPPResponse, MessageLogResponse, ChargePointStatus
-from crud import log_message, get_logs, get_logs_by_charge_point
+from crud import (
+    log_message, 
+    get_logs, 
+    get_logs_by_charge_point, 
+    validate_and_connect_charger,
+    update_charger_status
+)
+from models import OCPPLog
 
 from ocpp.v16 import ChargePoint as OcppChargePoint
 from ocpp.v16 import call, call_result
 from ocpp.routing import on
 
 import logging
+import json
 
 
 # Configure logging
@@ -34,6 +40,9 @@ class ChargePoint(OcppChargePoint):
     @on('BootNotification')
     async def on_boot_notification(self, charge_point_vendor, charge_point_model, **kwargs):
         logger.info(f"BootNotification from {self.id}: vendor={charge_point_vendor}, model={charge_point_model}")
+        # Update charger status in database
+        await update_charger_status(self.id, "AVAILABLE")
+        
         return call_result.BootNotification(
             current_time=datetime.datetime.utcnow().isoformat() + "Z",
             interval=300,
@@ -43,12 +52,19 @@ class ChargePoint(OcppChargePoint):
     @on('Heartbeat')
     async def on_heartbeat(self, **kwargs):
         logger.info(f"Heartbeat from {self.id}")
+        # Update last heartbeat time
+        await update_charger_status(self.id, "AVAILABLE")
+        
         return call_result.Heartbeat(
             current_time=datetime.datetime.utcnow().isoformat() + "Z"
         )
+    
     @on('StatusNotification')
     async def on_status_notification(self, connector_id, status, error_code=None, info=None, **kwargs):
         logger.info(f"StatusNotification from {self.id}: connector_id={connector_id}, status={status}, error_code={error_code}, info={info}")
+        # Update charger status in database
+        await update_charger_status(self.id, status)
+        
         return call_result.StatusNotification()
 
 # Adapter to make FastAPI's WebSocket compatible with python-ocpp
@@ -64,23 +80,21 @@ class FastAPIWebSocketAdapter:
 
 # Logging adapter to persist all OCPP messages to DB
 class LoggingWebSocketAdapter(FastAPIWebSocketAdapter):
-    def __init__(self, websocket: WebSocket, charge_point_id: str, db: Session):
+    def __init__(self, websocket: WebSocket, charge_point_id: str):
         super().__init__(websocket)
         self.charge_point_id = charge_point_id
-        self.db = db
 
     async def recv(self):
         msg = await super().recv()
         correlation_id = None
         try:
-            import json
             parsed = json.loads(msg)
             if isinstance(parsed, list) and len(parsed) > 1:
                 correlation_id = str(parsed[1])
         except Exception:
             logger.error(f"Failed to parse OCPP message in the logging adapter: {msg}", exc_info=True)
-        log_message(
-            db=self.db,
+        
+        await log_message(
             charger_id=self.charge_point_id,
             direction="IN",
             message_type="OCPP",
@@ -94,14 +108,13 @@ class LoggingWebSocketAdapter(FastAPIWebSocketAdapter):
     async def send(self, data):
         correlation_id = None
         try:
-            import json
             parsed = json.loads(data)
             if isinstance(parsed, list) and len(parsed) > 1:
                 correlation_id = str(parsed[1])
         except Exception:
             logger.error(f"Failed to parse OCPP message in the logging adapter: {data}", exc_info=True)
-        log_message(
-            db=self.db,
+        
+        await log_message(
             charger_id=self.charge_point_id,
             direction="OUT",
             message_type="OCPP",
@@ -112,8 +125,8 @@ class LoggingWebSocketAdapter(FastAPIWebSocketAdapter):
         logger.info(f"[OCPP][OUT] {data}")
         await super().send(data)
 
-# Function to send OCPP requests from central system to charge point. In this particualar use case we use the API to send a message
-async def send_ocpp_request(charge_point_id: str, action: str, payload: Dict = None, db: Session = Depends(get_db)):
+# Function to send OCPP requests from central system to charge point
+async def send_ocpp_request(charge_point_id: str, action: str, payload: Dict = None):
     if charge_point_id not in connected_charge_points:
         logger.warning(f"Charge point {charge_point_id} not connected")
         return False, f"Charge point {charge_point_id} not connected"
@@ -124,7 +137,7 @@ async def send_ocpp_request(charge_point_id: str, action: str, payload: Dict = N
         return False, f"ChargePoint instance for {charge_point_id} not found"
 
     try:
-                # Example: only RemoteStartTransaction is implemented here
+        # Example: only RemoteStartTransaction is implemented here
         if action == "RemoteStartTransaction":
             req = call.RemoteStartTransaction(**(payload or {}))
             response = await cp.call(req)
@@ -152,7 +165,6 @@ def read_root():
 def read_api_root():
     return {"Hello": "World"}
 
-
 # OCPP Management Endpoints
 @app.get("/api/charge-points", response_model=List[ChargePointStatus])
 def get_connected_charge_points():
@@ -177,7 +189,7 @@ async def send_ocpp_command(command: OCPPCommand):
     
     if success:
         # Extract correlation_id from the OCPP response message (index 1 if result is a list)
-        correlation_id = result[1]
+        correlation_id = result[1] if isinstance(result, list) and len(result) > 1 else None
        
         return OCPPResponse(
             success=True,
@@ -188,17 +200,13 @@ async def send_ocpp_command(command: OCPPCommand):
         raise HTTPException(status_code=400, detail=result)
 
 @app.get("/api/ocpp/logs/{charge_point_id}")
-def get_charge_point_logs(
-    charge_point_id: str, 
-    limit: int = 100,
-    db: Session = Depends(get_db)
-):
+async def get_charge_point_logs(charge_point_id: str, limit: int = 100):
     """Get OCPP message logs for a specific charge point"""
-    logs = get_logs_by_charge_point(db, charge_point_id, limit)
+    logs = await get_logs_by_charge_point(charge_point_id, limit)
     return [
         MessageLogResponse(
             id=str(log.id),
-            charger_id=log.charger_id,
+            charger_id=log.charge_point_id,
             direction=log.direction,
             message_type=log.message_type,
             payload=log.payload,
@@ -209,16 +217,13 @@ def get_charge_point_logs(
     ]
 
 @app.get("/api/ocpp/logs")
-def get_all_logs(
-    limit: int = 100,
-    db: Session = Depends(get_db)
-):
+async def get_all_logs(limit: int = 100):
     """Get all OCPP message logs"""
-    logs = get_logs(db, limit)
+    logs = await get_logs(limit)
     return [
         MessageLogResponse(
             id=str(log.id),
-            charger_id=log.charger_id,
+            charger_id=log.charge_point_id,
             direction=log.direction,
             message_type=log.message_type,
             payload=log.payload,
@@ -231,12 +236,19 @@ def get_all_logs(
 # ============ WEBSOCKET ENDPOINTS (OCPP) ============
 
 @app.websocket("/ocpp/{charge_point_id}")
-async def ocpp_websocket_endpoint(websocket: WebSocket, charge_point_id: str, db: Session = Depends(get_db)):
+async def ocpp_websocket_endpoint(websocket: WebSocket, charge_point_id: str):
     """OCPP WebSocket endpoint for charge points"""
     await websocket.accept()
     logger.info(f"Charge point {charge_point_id} connected")
 
-    ws_adapter = LoggingWebSocketAdapter(websocket, charge_point_id, db)
+    # Validate charger before connecting
+    is_valid, message = await validate_and_connect_charger(charge_point_id, connected_charge_points)
+    if not is_valid:
+        logger.warning(f"Validation failed for {charge_point_id}: {message}")
+        await websocket.close(code=1008, reason=message)
+        return
+
+    ws_adapter = LoggingWebSocketAdapter(websocket, charge_point_id)
     cp = ChargePoint(charge_point_id, ws_adapter)
     connected_charge_points[charge_point_id] = {
         "websocket": websocket,
@@ -256,18 +268,25 @@ async def ocpp_websocket_endpoint(websocket: WebSocket, charge_point_id: str, db
             del connected_charge_points[charge_point_id]
         logger.info(f"Charge point {charge_point_id} removed from connected list")
 
-# ============ STARTUP EVENT ============
+# ============ STARTUP/SHUTDOWN EVENTS ============
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize database tables on startup"""
-    from database import engine
-    from models import Base
-    Base.metadata.create_all(engine)
-    logger.info("Database tables created/verified")
+    """Initialize database on startup"""
+    await init_db()
+    logger.info("Database initialized with Tortoise ORM")
     logger.info("OCPP Central System API started")
     logger.info("REST API available at: /api/")
     logger.info("OCPP WebSocket available at: /ocpp/{charge_point_id}")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close database connections on shutdown"""
+    await close_db()
+    logger.info("Database connections closed")
+
+# Alternative: Register Tortoise with FastAPI (simpler but less control)
+# register_tortoise_app(app)
 
 if __name__ == "__main__":
     import uvicorn
