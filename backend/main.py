@@ -30,7 +30,7 @@ logging.basicConfig(
 logger = logging.getLogger("ocpp-server")
 
 # FastAPI app
-app = FastAPI(title="OCPP Central System API", version="1.0.0")
+app = FastAPI(title="OCPP Central System API", version="0.0.2")
 
 # Store connected charge points with metadata
 connected_charge_points: Dict[str, Dict] = {}
