@@ -1,0 +1,11 @@
+asyncpg==0.30.0
+fastapi[standard]==0.115.12
+ocpp==2.0.0
+pydantic==2.11.5
+pytest==8.3.4
+python-dotenv==1.1.0
+Requests==2.32.4
+tortoise-orm[asyncpg]>=0.22.0
+uvicorn==0.34.3
+watchdog==6.0.0
+websocket_client==1.8.0
