@@ -1,9 +1,10 @@
+# main.py
 import os
 import datetime
 from typing import Dict, List
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 
-from database import  init_db, close_db
+from database import init_db, close_db
 from schemas import OCPPCommand, OCPPResponse, MessageLogResponse, ChargePointStatus
 from crud import (
     log_message, 
@@ -21,6 +22,8 @@ from ocpp.routing import on
 import logging
 import json
 
+# Import routers
+from routers import stations, chargers
 
 # Configure logging
 logging.basicConfig(
@@ -30,7 +33,11 @@ logging.basicConfig(
 logger = logging.getLogger("ocpp-server")
 
 # FastAPI app
-app = FastAPI(title="OCPP Central System API", version="0.0.2")
+app = FastAPI(
+    title="OCPP Central System API", 
+    version="0.1.0",
+    description="EV Charging Station Management System with OCPP 1.6 support"
+)
 
 # Store connected charge points with metadata
 connected_charge_points: Dict[str, Dict] = {}
@@ -66,6 +73,24 @@ class ChargePoint(OcppChargePoint):
         await update_charger_status(self.id, status)
         
         return call_result.StatusNotification()
+
+    @on('StartTransaction')
+    async def on_start_transaction(self, connector_id, id_tag, meter_start, timestamp, **kwargs):
+        logger.info(f"StartTransaction from {self.id}: connector_id={connector_id}, id_tag={id_tag}, meter_start={meter_start}")
+        # You can add transaction creation logic here
+        # For now, just accept with a dummy transaction ID
+        return call_result.StartTransaction(
+            transaction_id=1,  # You should generate a real transaction ID
+            id_tag_info={"status": "Accepted"}
+        )
+
+    @on('StopTransaction')
+    async def on_stop_transaction(self, transaction_id, meter_stop, timestamp, **kwargs):
+        logger.info(f"StopTransaction from {self.id}: transaction_id={transaction_id}, meter_stop={meter_stop}")
+        # You can add transaction completion logic here
+        return call_result.StopTransaction(
+            id_tag_info={"status": "Accepted"}
+        )
 
 # Adapter to make FastAPI's WebSocket compatible with python-ocpp
 class FastAPIWebSocketAdapter:
@@ -137,9 +162,13 @@ async def send_ocpp_request(charge_point_id: str, action: str, payload: Dict = N
         return False, f"ChargePoint instance for {charge_point_id} not found"
 
     try:
-        # Example: only RemoteStartTransaction is implemented here
         if action == "RemoteStartTransaction":
             req = call.RemoteStartTransaction(**(payload or {}))
+            response = await cp.call(req)
+            logger.info(f"Sent {action} request to {charge_point_id}")
+            return True, response
+        elif action == "RemoteStopTransaction":
+            req = call.RemoteStopTransaction(**(payload or {}))
             response = await cp.call(req)
             logger.info(f"Sent {action} request to {charge_point_id}")
             return True, response
@@ -155,88 +184,13 @@ async def send_ocpp_request(charge_point_id: str, action: str, payload: Dict = N
         logger.error(f"Error sending request to {charge_point_id}: {e}", exc_info=True)
         return False, str(e)
 
-# ============ REST API ENDPOINTS ============
+# ============ Include Routers ============
+app.include_router(stations.router)
+app.include_router(chargers.router)
 
-@app.get("/")
-def read_root():
-    return {"message": "OCPP Central System API", "version": "0.0.1"}
-
-@app.get("/api/")
-def read_api_root():
-    return {"Hello": "World"}
-
-# OCPP Management Endpoints
-@app.get("/api/charge-points", response_model=List[ChargePointStatus])
-def get_connected_charge_points():
-    """Get list of all connected charge points"""
-    charge_points = []
-    for cp_id, cp_data in connected_charge_points.items():
-        charge_points.append(ChargePointStatus(
-            charge_point_id=cp_id,
-            connected=True,
-            last_seen=cp_data.get("last_seen")
-        ))
-    return charge_points
-
-@app.post("/api/ocpp/command", response_model=OCPPResponse)
-async def send_ocpp_command(command: OCPPCommand):
-    """Send OCPP command to a charge point"""
-    success, result = await send_ocpp_request(
-        command.charge_point_id, 
-        command.action, 
-        command.payload
-    )
-    
-    if success:
-        # Extract correlation_id from the OCPP response message (index 1 if result is a list)
-        correlation_id = result[1] if isinstance(result, list) and len(result) > 1 else None
-       
-        return OCPPResponse(
-            success=True,
-            message=result,
-            correlation_id=correlation_id
-        )
-    else:
-        raise HTTPException(status_code=400, detail=result)
-
-@app.get("/api/ocpp/logs/{charge_point_id}")
-async def get_charge_point_logs(charge_point_id: str, limit: int = 100):
-    """Get OCPP message logs for a specific charge point"""
-    logs = await get_logs_by_charge_point(charge_point_id, limit)
-    return [
-        MessageLogResponse(
-            id=str(log.id),
-            charger_id=log.charge_point_id,
-            direction=log.direction,
-            message_type=log.message_type,
-            payload=log.payload,
-            timestamp=log.timestamp,
-            status=log.status,
-            correlation_id=log.correlation_id
-        ) for log in logs
-    ]
-
-@app.get("/api/ocpp/logs")
-async def get_all_logs(limit: int = 100):
-    """Get all OCPP message logs"""
-    logs = await get_logs(limit)
-    return [
-        MessageLogResponse(
-            id=str(log.id),
-            charger_id=log.charge_point_id,
-            direction=log.direction,
-            message_type=log.message_type,
-            payload=log.payload,
-            timestamp=log.timestamp,
-            status=log.status,
-            correlation_id=log.correlation_id
-        ) for log in logs
-    ]
-
-# ============ WEBSOCKET ENDPOINTS (OCPP) ============
-
+# ============ OCPP WebSocket Endpoint ============
 @app.websocket("/ocpp/{charge_point_id}")
-async def ocpp_websocket_endpoint(websocket: WebSocket, charge_point_id: str):
+async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
     """OCPP WebSocket endpoint for charge points"""
     await websocket.accept()
     logger.info(f"Charge point {charge_point_id} connected")
@@ -268,6 +222,90 @@ async def ocpp_websocket_endpoint(websocket: WebSocket, charge_point_id: str):
             del connected_charge_points[charge_point_id]
         logger.info(f"Charge point {charge_point_id} removed from connected list")
 
+# ============ Basic API Endpoints ============
+
+@app.get("/")
+def read_root():
+    return {
+        "message": "OCPP Central System API",
+        "version": "0.1.0",
+        "docs": "/docs",
+        "ocpp_endpoint": "/ocpp/{charge_point_id}"
+    }
+
+@app.get("/api/")
+def read_api_root():
+    return {
+        "endpoints": {
+            "stations": "/api/admin/stations",
+            "chargers": "/api/admin/chargers",
+            "charge_points": "/api/charge-points",
+            "logs": "/api/logs"
+        }
+    }
+
+# Legacy endpoints - these were in your original main.py
+@app.get("/api/charge-points", response_model=List[ChargePointStatus])
+def get_connected_charge_points():
+    """Get list of all connected charge points"""
+    charge_points = []
+    for cp_id, cp_data in connected_charge_points.items():
+        charge_points.append(ChargePointStatus(
+            charge_point_id=cp_id,
+            connected_at=cp_data["connected_at"],
+            last_seen=cp_data["last_seen"],
+            status="online"
+        ))
+    return charge_points
+
+@app.post("/api/charge-points/{charge_point_id}/request")
+async def send_command_to_charge_point(charge_point_id: str, command: OCPPCommand):
+    """Send OCPP command to a specific charge point"""
+    success, result = await send_ocpp_request(charge_point_id, command.action, command.payload)
+    
+    if success:
+        return OCPPResponse(
+            success=True,
+            message=f"Command {command.action} sent successfully",
+            data=result.dict() if hasattr(result, 'dict') else str(result)
+        )
+    else:
+        raise HTTPException(status_code=400, detail=result)
+
+@app.get("/api/logs", response_model=List[MessageLogResponse])
+async def get_message_logs(limit: int = 100):
+    """Get recent OCPP message logs"""
+    logs = await get_logs(limit)
+    return [
+        MessageLogResponse(
+            id=log.id,
+            charge_point_id=log.charge_point_id,
+            direction=log.direction,
+            message_type=log.message_type,
+            payload=log.payload,
+            status=log.status,
+            correlation_id=log.correlation_id,
+            timestamp=log.timestamp
+        ) for log in logs
+    ]
+
+@app.get("/api/logs/{charge_point_id}", response_model=List[MessageLogResponse])
+async def get_charge_point_logs(charge_point_id: str, limit: int = 100):
+    """Get OCPP message logs for a specific charge point"""
+    logs = await get_logs_by_charge_point(charge_point_id, limit)
+    return [
+        MessageLogResponse(
+            id=log.id,
+            charge_point_id=log.charge_point_id,
+            direction=log.direction,
+            message_type=log.message_type,
+            payload=log.payload,
+            status=log.status,
+            correlation_id=log.correlation_id,
+            timestamp=log.timestamp
+        ) for log in logs
+    ]
+
 # ============ STARTUP/SHUTDOWN EVENTS ============
 
 @app.on_event("startup")
@@ -277,6 +315,7 @@ async def startup_event():
     logger.info("Database initialized with Tortoise ORM")
     logger.info("OCPP Central System API started")
     logger.info("REST API available at: /api/")
+    logger.info("API Documentation available at: /docs")
     logger.info("OCPP WebSocket available at: /ocpp/{charge_point_id}")
 
 @app.on_event("shutdown")
@@ -284,9 +323,6 @@ async def shutdown_event():
     """Close database connections on shutdown"""
     await close_db()
     logger.info("Database connections closed")
-
-# Alternative: Register Tortoise with FastAPI (simpler but less control)
-# register_tortoise_app(app)
 
 if __name__ == "__main__":
     import uvicorn
