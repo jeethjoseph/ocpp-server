@@ -332,7 +332,7 @@ async def change_charger_availability(
         charger.charge_point_string_id,
         "ChangeAvailability",
         {
-            "connectorId": connector_id,
+            "connector_id": connector_id,
             "type": type
         }
     )
