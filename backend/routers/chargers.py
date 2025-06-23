@@ -74,7 +74,7 @@ class TransactionBasicInfo(BaseModel):
     id: int
     user_id: int
     start_time: datetime
-    status: str
+    transaction_status: str
     
     class Config:
         from_attributes = True
@@ -216,7 +216,7 @@ async def get_charger_details(charger_id: int):
     # Get current active transaction if any
     current_transaction = await Transaction.filter(
         charger_id=charger_id,
-        status__in=["STARTED", "PENDING_START", "RUNNING"]
+        transaction_status__in=["STARTED", "PENDING_START", "RUNNING"]
     ).first()
     
     # Build response
@@ -284,7 +284,7 @@ async def remote_stop_charging(charger_id: int, reason: Optional[str] = "Request
     # Get active transaction
     transaction = await Transaction.filter(
         charger_id=charger_id,
-        status__in=["STARTED", "RUNNING"]
+        transaction_status__in=["STARTED", "RUNNING"]
     ).first()
     
     if not transaction:

@@ -27,3 +27,4 @@ class ChargePointStatus(BaseModel):
     charge_point_id: str
     connected: bool
     last_seen: Optional[datetime.datetime]
+    connected_at: Optional[datetime.datetime]

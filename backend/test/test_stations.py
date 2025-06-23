@@ -1,41 +1,55 @@
 # tests/test_stations.py
 import pytest
-from httpx import AsyncClient
+from httpx import AsyncClient, ASGITransport
 from fastapi import status
-from tortoise.contrib.test import initializer, finalizer
+from tortoise import Tortoise
 
-from main import app
-from models import ChargingStation, Charger
+from main import app, connected_charge_points
+from models import ChargingStation, Charger, Connector, Transaction, OCPPLog
 
 # Test database URL - use a separate test database
-TEST_DB_URL = "postgres://user:pass@localhost:5432/test_ocpp_db"
-
+TEST_DB_URL = "postgres://test_user:test_pass@localhost:5432/test_ocpp_db"
 @pytest.fixture(scope="module")
 def anyio_backend():
     return "asyncio"
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 async def client():
-    initializer(
-        ["models"],
-        db_url=TEST_DB_URL,
-        app_label="models",
-    )
-    async with AsyncClient(app=app, base_url="http://test") as ac:
-        yield ac
-    finalizer()
-
-@pytest.fixture(autouse=True)
-async def cleanup_db():
-    """Clean up database before each test"""
-    await ChargingStation.all().delete()
+    # Initialize Tortoise with test database
+    config = {
+        "connections": {"default": TEST_DB_URL},
+        "apps": {
+            "models": {
+                "models": ["models"],
+                "default_connection": "default",
+            }
+        },
+    }
+    await Tortoise.init(config=config)
+    await Tortoise.generate_schemas()
+    
+    # Clean up database before each test (after initialization)
+    await Transaction.all().delete()
+    await Connector.all().delete()
     await Charger.all().delete()
-    yield
-    # Cleanup after test if needed
+    await ChargingStation.all().delete()
+    await OCPPLog.all().delete()
+    # Clear connected charge points
+    connected_charge_points.clear()
+    
+    async with AsyncClient(
+        transport=ASGITransport(app=app), 
+        base_url="http://test"
+    ) as ac:
+        yield ac
+    
+    # Close connections
+    await Tortoise.close_connections()
 
 class TestStationEndpoints:
     """Integration tests for Station Management API"""
     
+    @pytest.mark.asyncio
     async def test_create_station(self, client: AsyncClient):
         """Test creating a new station"""
         station_data = {
@@ -59,6 +73,7 @@ class TestStationEndpoints:
         station = await ChargingStation.get(id=data["station"]["id"])
         assert station.name == station_data["name"]
     
+    @pytest.mark.asyncio
     async def test_list_stations_empty(self, client: AsyncClient):
         """Test listing stations when none exist"""
         response = await client.get("/api/admin/stations")
@@ -70,6 +85,7 @@ class TestStationEndpoints:
         assert data["page"] == 1
         assert data["limit"] == 10
     
+    @pytest.mark.asyncio
     async def test_list_stations_with_pagination(self, client: AsyncClient):
         """Test station listing with pagination"""
         # Create multiple stations
@@ -95,6 +111,7 @@ class TestStationEndpoints:
         assert len(data["data"]) == 5
         assert data["page"] == 2
     
+    @pytest.mark.asyncio
     async def test_list_stations_with_search(self, client: AsyncClient):
         """Test station search functionality"""
         # Create test stations
@@ -108,6 +125,7 @@ class TestStationEndpoints:
         assert data["total"] == 1
         assert data["data"][0]["name"] == "Bangalore Central"
     
+    @pytest.mark.asyncio
     async def test_get_station_details(self, client: AsyncClient):
         """Test getting station details with chargers"""
         # Create station
@@ -141,6 +159,7 @@ class TestStationEndpoints:
         assert data["chargers"][0]["name"] == "Charger 1"
         assert data["chargers"][1]["latest_status"] == "CHARGING"
     
+    @pytest.mark.asyncio
     async def test_get_station_not_found(self, client: AsyncClient):
         """Test getting non-existent station"""
         response = await client.get("/api/admin/stations/9999")
@@ -148,6 +167,7 @@ class TestStationEndpoints:
         assert response.status_code == status.HTTP_404_NOT_FOUND
         assert response.json()["detail"] == "Station not found"
     
+    @pytest.mark.asyncio
     async def test_update_station(self, client: AsyncClient):
         """Test updating station information"""
         # Create station
@@ -175,6 +195,7 @@ class TestStationEndpoints:
         updated_station = await ChargingStation.get(id=station.id)
         assert updated_station.name == "New Name"
     
+    @pytest.mark.asyncio
     async def test_update_station_partial(self, client: AsyncClient):
         """Test partial update of station"""
         station = await ChargingStation.create(
@@ -191,6 +212,7 @@ class TestStationEndpoints:
         assert data["station"]["latitude"] == 13.0000
         assert data["station"]["name"] == "Original"  # Unchanged
     
+    @pytest.mark.asyncio
     async def test_delete_station(self, client: AsyncClient):
         """Test deleting a station"""
         # Create station with charger
@@ -216,6 +238,7 @@ class TestStationEndpoints:
         assert await ChargingStation.filter(id=station.id).first() is None
         assert await Charger.filter(id=charger.id).first() is None
     
+    @pytest.mark.asyncio
     async def test_delete_station_not_found(self, client: AsyncClient):
         """Test deleting non-existent station"""
         response = await client.delete("/api/admin/stations/9999")

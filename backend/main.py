@@ -3,6 +3,7 @@ import os
 import datetime
 from typing import Dict, List
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 
 from database import init_db, close_db
 from schemas import OCPPCommand, OCPPResponse, MessageLogResponse, ChargePointStatus
@@ -37,6 +38,15 @@ app = FastAPI(
     title="OCPP Central System API", 
     version="0.1.0",
     description="EV Charging Station Management System with OCPP 1.6 support"
+)
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],  # Frontend origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Store connected charge points with metadata
@@ -254,7 +264,7 @@ def get_connected_charge_points():
             charge_point_id=cp_id,
             connected_at=cp_data["connected_at"],
             last_seen=cp_data["last_seen"],
-            status="online"
+            connected=True
         ))
     return charge_points
 

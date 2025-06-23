@@ -163,7 +163,7 @@ async def delete_station(station_id: int):
         raise HTTPException(status_code=404, detail="Station not found")
     
     # Check if there are any active charging sessions
-    # For now, we'll just delete - you can add transaction checks later
+    # For now, we'll just delete - we can add transaction checks later
     
     await station.delete()
     

@@ -9,7 +9,9 @@ def on_change(event):
 
 if __name__ == "__main__":
     patterns = ["*.py"]
-    event_handler = PatternMatchingEventHandler(patterns=patterns, ignore_directories=True)
+    ignore_patterns = ["*/.venv/*", "*/__pycache__/*", "*/.pytest_cache/*", "*/.mypy_cache/*"]
+
+    event_handler = PatternMatchingEventHandler(patterns=patterns,ignore_patterns=ignore_patterns, ignore_directories=True)
     event_handler.on_modified = on_change
     event_handler.on_created = on_change
 

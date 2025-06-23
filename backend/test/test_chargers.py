@@ -1,34 +1,37 @@
 # tests/test_chargers.py
 import pytest
-from httpx import AsyncClient
+from httpx import AsyncClient, ASGITransport
 from fastapi import status
-from tortoise.contrib.test import initializer, finalizer
+from tortoise import Tortoise
 from unittest.mock import patch, MagicMock
 import uuid
+import random
 
 from main import app, connected_charge_points
-from models import ChargingStation, Charger, Connector, Transaction, OCPPLog
+from models import ChargingStation, Charger, Connector, Transaction, OCPPLog, User, VehicleProfile
 
-TEST_DB_URL = "postgres://user:pass@localhost:5432/test_ocpp_db"
+TEST_DB_URL = "postgres://test_user:test_pass@localhost:5432/test_ocpp_db"
 
 @pytest.fixture(scope="module")
 def anyio_backend():
     return "asyncio"
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 async def client():
-    initializer(
-        ["models"],
-        db_url=TEST_DB_URL,
-        app_label="models",
-    )
-    async with AsyncClient(app=app, base_url="http://test") as ac:
-        yield ac
-    finalizer()
-
-@pytest.fixture(autouse=True)
-async def cleanup_db():
-    """Clean up database before each test"""
+    # Initialize Tortoise with test database
+    config = {
+        "connections": {"default": TEST_DB_URL},
+        "apps": {
+            "models": {
+                "models": ["models"],
+                "default_connection": "default",
+            }
+        },
+    }
+    await Tortoise.init(config=config)
+    await Tortoise.generate_schemas()
+    
+    # Clean up database before each test (after initialization)
     await Transaction.all().delete()
     await Connector.all().delete()
     await Charger.all().delete()
@@ -36,7 +39,15 @@ async def cleanup_db():
     await OCPPLog.all().delete()
     # Clear connected charge points
     connected_charge_points.clear()
-    yield
+    
+    async with AsyncClient(
+        transport=ASGITransport(app=app), 
+        base_url="http://test"
+    ) as ac:
+        yield ac
+    
+    # Close connections
+    await Tortoise.close_connections()
 
 @pytest.fixture
 async def test_station():
@@ -69,9 +80,21 @@ async def test_charger(test_station):
     )
     return charger
 
+@pytest.fixture
+async def test_user():
+    """Create a test user with a unique phone number"""
+    phone_number = f"9{random.randint(100000000, 999999999)}"
+    return await User.create(phone_number=phone_number)
+
+@pytest.fixture
+async def test_vehicle(test_user):
+    """Create a test vehicle profile for the user"""
+    return await VehicleProfile.create(user=test_user)
+
 class TestChargerEndpoints:
     """Integration tests for Charger Management API"""
     
+    @pytest.mark.asyncio
     async def test_create_charger(self, client: AsyncClient, test_station):
         """Test creating a new charger"""
         charger_data = {
@@ -110,6 +133,7 @@ class TestChargerEndpoints:
         assert len(connectors) == 2
         assert connectors[0].connector_type in ["CCS2", "CHAdeMO"]
     
+    @pytest.mark.asyncio
     async def test_create_charger_station_not_found(self, client: AsyncClient):
         """Test creating charger with non-existent station"""
         charger_data = {
@@ -123,6 +147,7 @@ class TestChargerEndpoints:
         assert response.status_code == status.HTTP_404_NOT_FOUND
         assert response.json()["detail"] == "Station not found"
     
+    @pytest.mark.asyncio
     async def test_list_chargers(self, client: AsyncClient, test_station):
         """Test listing chargers with filters"""
         # Create multiple chargers
@@ -150,6 +175,7 @@ class TestChargerEndpoints:
         data = response.json()
         assert data["total"] == 3
     
+    @pytest.mark.asyncio
     async def test_get_charger_details(self, client: AsyncClient, test_charger, test_station):
         """Test getting charger details"""
         response = await client.get(f"/api/admin/chargers/{test_charger.id}")
@@ -162,23 +188,26 @@ class TestChargerEndpoints:
         assert data["connectors"][0]["connector_type"] == "Type2"
         assert data["current_transaction"] is None
     
-    async def test_get_charger_with_active_transaction(self, client: AsyncClient, test_charger):
+    @pytest.mark.asyncio
+    async def test_get_charger_with_active_transaction(self, client: AsyncClient, test_charger, test_user, test_vehicle):
         """Test getting charger with active transaction"""
-        # Create active transaction
+        # Only call test_vehicle once and reuse
+        vehicle = test_vehicle
+        user = test_user
+        # Create active transaction with unique status
         transaction = await Transaction.create(
-            user_id=1,
+            user_id=user.id,
             charger_id=test_charger.id,
-            vehicle_id=1,
-            status="RUNNING"
+            vehicle_id=vehicle.id,
+            transaction_status="RUNNING"
         )
-        
         response = await client.get(f"/api/admin/chargers/{test_charger.id}")
         data = response.json()
-        
         assert data["current_transaction"] is not None
         assert data["current_transaction"]["id"] == transaction.id
-        assert data["current_transaction"]["status"] == "RUNNING"
+        assert data["current_transaction"]["transaction_status"] == "RUNNING"
     
+    @pytest.mark.asyncio
     async def test_update_charger(self, client: AsyncClient, test_charger):
         """Test updating charger information"""
         update_data = {
@@ -194,6 +223,7 @@ class TestChargerEndpoints:
         assert data["charger"]["latest_status"] == "UNAVAILABLE"
         assert data["charger"]["model"] == "Model X"  # Unchanged
     
+    @pytest.mark.asyncio
     async def test_delete_charger(self, client: AsyncClient, test_charger):
         """Test deleting a charger"""
         response = await client.delete(f"/api/admin/chargers/{test_charger.id}")
@@ -205,37 +235,36 @@ class TestChargerEndpoints:
         assert await Charger.filter(id=test_charger.id).first() is None
         assert await Connector.filter(charger_id=test_charger.id).count() == 0
     
+    @pytest.mark.asyncio
     @patch('main.send_ocpp_request')
     async def test_remote_stop_charging(self, mock_send_ocpp, client: AsyncClient, test_charger):
         """Test remote stop charging command"""
+        # Create unique user and vehicle for this test
+        user = await User.create(phone_number=f"9{random.randint(100000000, 999999999)}")
+        vehicle = await VehicleProfile.create(user=user)
         # Create active transaction
         transaction = await Transaction.create(
-            user_id=1,
+            user_id=user.id,
             charger_id=test_charger.id,
-            vehicle_id=1,
-            status="RUNNING"
+            vehicle_id=vehicle.id,
+            transaction_status="RUNNING"
         )
-        
         # Mock charger as connected
         connected_charge_points[test_charger.charge_point_string_id] = {
             "cp": MagicMock(),
             "websocket": MagicMock()
         }
-        
         # Mock OCPP response
         mock_send_ocpp.return_value = (True, {"status": "Accepted"})
-        
         response = await client.post(
             f"/api/admin/chargers/{test_charger.id}/remote-stop",
             json={"reason": "Operator request"}
         )
-        
         assert response.status_code == status.HTTP_200_OK
         data = response.json()
         assert data["success"] is True
         assert data["message"] == "Stop command sent successfully"
         assert data["transaction_id"] == str(transaction.id)
-        
         # Verify OCPP command was called
         mock_send_ocpp.assert_called_once_with(
             test_charger.charge_point_string_id,
@@ -243,21 +272,24 @@ class TestChargerEndpoints:
             {"transactionId": transaction.id}
         )
     
+    @pytest.mark.asyncio
     async def test_remote_stop_charger_not_connected(self, client: AsyncClient, test_charger):
         """Test remote stop when charger is offline"""
+        # Create unique user and vehicle for this test
+        user = await User.create(phone_number=f"9{random.randint(100000000, 999999999)}")
+        vehicle = await VehicleProfile.create(user=user)
         # Create transaction
         await Transaction.create(
-            user_id=1,
+            user_id=user.id,
             charger_id=test_charger.id,
-            vehicle_id=1,
-            status="RUNNING"
+            vehicle_id=vehicle.id,
+            transaction_status="RUNNING"
         )
-        
         response = await client.post(f"/api/admin/chargers/{test_charger.id}/remote-stop")
-        
         assert response.status_code == status.HTTP_409_CONFLICT
         assert response.json()["detail"] == "Charger is not connected"
     
+    @pytest.mark.asyncio
     @patch('main.send_ocpp_request')
     async def test_change_availability(self, mock_send_ocpp, client: AsyncClient, test_charger):
         """Test changing charger availability"""
@@ -286,6 +318,7 @@ class TestChargerEndpoints:
             {"connectorId": 1, "type": "Inoperative"}
         )
     
+    @pytest.mark.asyncio
     async def test_change_availability_invalid_type(self, client: AsyncClient, test_charger):
         """Test change availability with invalid type"""
         response = await client.post(
@@ -294,6 +327,7 @@ class TestChargerEndpoints:
         
         assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
     
+    @pytest.mark.asyncio
     async def test_get_charger_logs(self, client: AsyncClient, test_charger):
         """Test getting OCPP logs for a charger"""
         # Create some logs
