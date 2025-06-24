@@ -142,6 +142,23 @@ async def get_bulk_connection_status(chargers: List[Charger]) -> Dict[str, bool]
     
     return status_dict
 
+def charger_to_response(charger: Charger, connection_status: bool) -> ChargerResponse:
+    """Convert a Charger model to ChargerResponse with connection status"""
+    return ChargerResponse(
+        id=charger.id,
+        charge_point_string_id=charger.charge_point_string_id,
+        station_id=charger.station_id,
+        name=charger.name,
+        model=charger.model,
+        vendor=charger.vendor,
+        serial_number=charger.serial_number,
+        latest_status=charger.latest_status,
+        last_heart_beat_time=charger.last_heart_beat_time,
+        created_at=charger.created_at,
+        updated_at=charger.updated_at,
+        connection_status=connection_status
+    )
+
 @router.get("", response_model=ChargerListResponse)
 async def list_chargers(
     page: int = Query(1, ge=1),
@@ -182,9 +199,8 @@ async def list_chargers(
     # Build response with connection status
     charger_responses = []
     for charger in chargers:
-        charger_dict = ChargerResponse.model_validate(charger, from_attributes=True).model_dump()
-        charger_dict['connection_status'] = connection_status_dict.get(charger.charge_point_string_id, False)
-        charger_responses.append(ChargerResponse(**charger_dict))
+        connection_status = connection_status_dict.get(charger.charge_point_string_id, False)
+        charger_responses.append(charger_to_response(charger, connection_status))
     
     return ChargerListResponse(
         data=charger_responses,
@@ -232,11 +248,9 @@ async def create_charger(charger_data: ChargerCreate):
         
         # Get connection status for response (new charger won't be connected yet)
         connection_status_dict = await get_bulk_connection_status([charger])
-        charger_dict = ChargerResponse.model_validate(charger, from_attributes=True).model_dump()
-        charger_dict['connection_status'] = connection_status_dict.get(charger.charge_point_string_id, False)
-        
+        connection_status = connection_status_dict.get(charger.charge_point_string_id, False)
         return {
-            "charger": ChargerResponse(**charger_dict),
+            "charger": charger_to_response(charger, connection_status),
             "ocpp_url": ocpp_url,
             "message": "Charger onboarded successfully"
         }
@@ -263,12 +277,10 @@ async def get_charger_details(charger_id: int):
     
     # Get connection status
     connection_status_dict = await get_bulk_connection_status([charger])
-    charger_dict = ChargerResponse.model_validate(charger, from_attributes=True).model_dump()
-    charger_dict['connection_status'] = connection_status_dict.get(charger.charge_point_string_id, False)
-    
+    connection_status = connection_status_dict.get(charger.charge_point_string_id, False)
     # Build response
     response = ChargerDetailResponse(
-        charger=ChargerResponse(**charger_dict),
+        charger=charger_to_response(charger, connection_status),
         station=StationBasicInfo.model_validate(station, from_attributes=True),
         connectors=[ConnectorResponse.model_validate(c, from_attributes=True) for c in connectors]
     )
@@ -295,11 +307,9 @@ async def update_charger(charger_id: int, update_data: ChargerUpdate):
     
     # Get connection status for response
     connection_status_dict = await get_bulk_connection_status([charger])
-    charger_dict = ChargerResponse.model_validate(charger, from_attributes=True).model_dump()
-    charger_dict['connection_status'] = connection_status_dict.get(charger.charge_point_string_id, False)
-    
+    connection_status = connection_status_dict.get(charger.charge_point_string_id, False)
     return {
-        "charger": ChargerResponse(**charger_dict),
+        "charger": charger_to_response(charger, connection_status),
         "message": "Charger updated successfully"
     }
 
@@ -384,7 +394,7 @@ async def change_charger_availability(
         charger.charge_point_string_id,
         "ChangeAvailability",
         {
-            "connector_id": connector_id,
+            "connectorId": connector_id,
             "type": type
         }
     )

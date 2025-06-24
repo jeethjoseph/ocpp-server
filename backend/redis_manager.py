@@ -21,8 +21,8 @@ class RedisConnectionManager:
             await self.redis_client.ping()
             logger.info("Connected to Redis successfully")
         except Exception as e:
-            logger.error(f"Failed to connect to Redis: {e}")
-            raise
+            logger.warning(f"Failed to connect to Redis: {e}. Running in fallback mode without Redis.")
+            self.redis_client = None
     
     async def disconnect(self):
         """Close Redis connection"""

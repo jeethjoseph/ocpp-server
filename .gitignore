@@ -7,3 +7,4 @@ test.html
 .idea/*
 alembic.ini
 .vscode/*
+dump.rdb
