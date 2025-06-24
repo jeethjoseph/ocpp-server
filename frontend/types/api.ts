@@ -39,6 +39,7 @@ export interface Charger {
   serial_number?: string;
   latest_status: string;
   last_heart_beat_time?: string;
+  connection_status: boolean;
   created_at: string;
   updated_at: string;
 }

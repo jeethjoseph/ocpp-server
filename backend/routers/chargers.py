@@ -41,6 +41,7 @@ class ChargerResponse(BaseModel):
     serial_number: Optional[str]
     latest_status: str
     last_heart_beat_time: Optional[datetime]
+    connection_status: bool
     created_at: datetime
     updated_at: datetime
     
@@ -107,11 +108,39 @@ router = APIRouter(
     tags=["Charger Management"]
 )
 
+# Import Redis manager for connection status
+from redis_manager import redis_manager
+
 # Import the global connected_charge_points from main.py
 # This is a bit hacky but works for now - in production you'd use a proper state manager
 def get_connected_charge_points():
     from main import connected_charge_points
     return connected_charge_points
+
+async def get_bulk_connection_status(chargers: List[Charger]) -> Dict[str, bool]:
+    """Get connection status for multiple chargers efficiently"""
+    # Get all connected chargers from Redis at once
+    connected_charger_ids = set(await redis_manager.get_all_connected_chargers())
+    
+    current_time = datetime.now()
+    status_dict = {}
+    
+    for charger in chargers:
+        # Check Redis connection first
+        is_connected_redis = charger.charge_point_string_id in connected_charger_ids
+        if not is_connected_redis:
+            status_dict[charger.charge_point_string_id] = False
+            continue
+        
+        # Check heartbeat timeout (5 minutes)
+        if not charger.last_heart_beat_time:
+            status_dict[charger.charge_point_string_id] = False
+            continue
+        
+        time_diff = current_time - charger.last_heart_beat_time.replace(tzinfo=None)
+        status_dict[charger.charge_point_string_id] = time_diff.total_seconds() <= 300
+    
+    return status_dict
 
 @router.get("", response_model=ChargerListResponse)
 async def list_chargers(
@@ -147,7 +176,15 @@ async def list_chargers(
     offset = (page - 1) * limit
     chargers = await query.offset(offset).limit(limit)
     
-    charger_responses = [ChargerResponse.model_validate(charger, from_attributes=True) for charger in chargers]
+    # Get connection status for all chargers efficiently
+    connection_status_dict = await get_bulk_connection_status(chargers)
+    
+    # Build response with connection status
+    charger_responses = []
+    for charger in chargers:
+        charger_dict = ChargerResponse.model_validate(charger, from_attributes=True).model_dump()
+        charger_dict['connection_status'] = connection_status_dict.get(charger.charge_point_string_id, False)
+        charger_responses.append(ChargerResponse(**charger_dict))
     
     return ChargerListResponse(
         data=charger_responses,
@@ -193,8 +230,13 @@ async def create_charger(charger_data: ChargerCreate):
         # You should configure this based on your actual domain
         ocpp_url = f"ws://your-domain.com/ocpp/{charge_point_id}"
         
+        # Get connection status for response (new charger won't be connected yet)
+        connection_status_dict = await get_bulk_connection_status([charger])
+        charger_dict = ChargerResponse.model_validate(charger, from_attributes=True).model_dump()
+        charger_dict['connection_status'] = connection_status_dict.get(charger.charge_point_string_id, False)
+        
         return {
-            "charger": ChargerResponse.model_validate(charger, from_attributes=True),
+            "charger": ChargerResponse(**charger_dict),
             "ocpp_url": ocpp_url,
             "message": "Charger onboarded successfully"
         }
@@ -219,9 +261,14 @@ async def get_charger_details(charger_id: int):
         transaction_status__in=["STARTED", "PENDING_START", "RUNNING"]
     ).first()
     
+    # Get connection status
+    connection_status_dict = await get_bulk_connection_status([charger])
+    charger_dict = ChargerResponse.model_validate(charger, from_attributes=True).model_dump()
+    charger_dict['connection_status'] = connection_status_dict.get(charger.charge_point_string_id, False)
+    
     # Build response
     response = ChargerDetailResponse(
-        charger=ChargerResponse.model_validate(charger, from_attributes=True),
+        charger=ChargerResponse(**charger_dict),
         station=StationBasicInfo.model_validate(station, from_attributes=True),
         connectors=[ConnectorResponse.model_validate(c, from_attributes=True) for c in connectors]
     )
@@ -246,8 +293,13 @@ async def update_charger(charger_id: int, update_data: ChargerUpdate):
     
     await charger.save()
     
+    # Get connection status for response
+    connection_status_dict = await get_bulk_connection_status([charger])
+    charger_dict = ChargerResponse.model_validate(charger, from_attributes=True).model_dump()
+    charger_dict['connection_status'] = connection_status_dict.get(charger.charge_point_string_id, False)
+    
     return {
-        "charger": ChargerResponse.model_validate(charger, from_attributes=True),
+        "charger": ChargerResponse(**charger_dict),
         "message": "Charger updated successfully"
     }
 

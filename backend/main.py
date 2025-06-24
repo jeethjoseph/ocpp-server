@@ -15,6 +15,7 @@ from crud import (
     update_charger_status
 )
 from models import OCPPLog
+from redis_manager import redis_manager
 
 from ocpp.v16 import ChargePoint as OcppChargePoint
 from ocpp.v16 import call, call_result
@@ -49,7 +50,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Store connected charge points with metadata
+# Store connected charge points with metadata (now moved to Redis)
+# Keep this for backward compatibility but will be deprecated
 connected_charge_points: Dict[str, Dict] = {}
 
 # Define a ChargePoint class using python-ocpp
@@ -69,7 +71,7 @@ class ChargePoint(OcppChargePoint):
     @on('Heartbeat')
     async def on_heartbeat(self, **kwargs):
         logger.info(f"Heartbeat from {self.id}")
-        # Update last heartbeat time
+        # Update charger status and heartbeat time in database
         await update_charger_status(self.id, "AVAILABLE")
         
         return call_result.Heartbeat(
@@ -162,11 +164,14 @@ class LoggingWebSocketAdapter(FastAPIWebSocketAdapter):
 
 # Function to send OCPP requests from central system to charge point
 async def send_ocpp_request(charge_point_id: str, action: str, payload: Dict = None):
-    if charge_point_id not in connected_charge_points:
+    # Check Redis for connection status
+    is_connected = await redis_manager.is_charger_connected(charge_point_id)
+    if not is_connected:
         logger.warning(f"Charge point {charge_point_id} not connected")
         return False, f"Charge point {charge_point_id} not connected"
 
-    cp = connected_charge_points[charge_point_id].get("cp")
+    # Fallback to in-memory dict for actual ChargePoint instance (until full migration)
+    cp = connected_charge_points.get(charge_point_id, {}).get("cp")
     if not cp:
         logger.warning(f"ChargePoint instance for {charge_point_id} not found")
         return False, f"ChargePoint instance for {charge_point_id} not found"
@@ -214,12 +219,18 @@ async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
 
     ws_adapter = LoggingWebSocketAdapter(websocket, charge_point_id)
     cp = ChargePoint(charge_point_id, ws_adapter)
-    connected_charge_points[charge_point_id] = {
+    
+    # Store connection data in both places during transition
+    connection_data = {
         "websocket": websocket,
         "cp": cp,
         "connected_at": datetime.datetime.now(datetime.timezone.utc),
         "last_seen": datetime.datetime.now(datetime.timezone.utc)
     }
+    connected_charge_points[charge_point_id] = connection_data
+    
+    # Add to Redis
+    await redis_manager.add_connected_charger(charge_point_id, connection_data)
 
     try:
         await cp.start()
@@ -228,8 +239,10 @@ async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
     except Exception as e:
         logger.error(f"WebSocket error for {charge_point_id}: {e}", exc_info=True)
     finally:
+        # Remove from both in-memory and Redis
         if charge_point_id in connected_charge_points:
             del connected_charge_points[charge_point_id]
+        await redis_manager.remove_connected_charger(charge_point_id)
         logger.info(f"Charge point {charge_point_id} removed from connected list")
 
 # ============ Basic API Endpoints ============
@@ -256,16 +269,25 @@ def read_api_root():
 
 # Legacy endpoints - these were in your original main.py
 @app.get("/api/charge-points", response_model=List[ChargePointStatus])
-def get_connected_charge_points():
-    """Get list of all connected charge points"""
+async def get_connected_charge_points():
+    """Get list of all connected charge points"""  
+    from models import Charger
     charge_points = []
-    for cp_id, cp_data in connected_charge_points.items():
-        charge_points.append(ChargePointStatus(
-            charge_point_id=cp_id,
-            connected_at=cp_data["connected_at"],
-            last_seen=cp_data["last_seen"],
-            connected=True
-        ))
+    # Get from Redis
+    connected_charger_ids = await redis_manager.get_all_connected_chargers()
+    
+    for cp_id in connected_charger_ids:
+        connected_at = await redis_manager.get_charger_connected_at(cp_id)
+        # Get heartbeat info from database
+        charger = await Charger.filter(charge_point_string_id=cp_id).first()
+        
+        if connected_at and charger:
+            charge_points.append(ChargePointStatus(
+                charge_point_id=cp_id,
+                connected_at=connected_at,
+                last_seen=charger.last_heart_beat_time or connected_at,
+                connected=True  # If it's in Redis, it's connected
+            ))
     return charge_points
 
 @app.post("/api/charge-points/{charge_point_id}/request")
@@ -320,9 +342,11 @@ async def get_charge_point_logs(charge_point_id: str, limit: int = 100):
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize database on startup"""
+    """Initialize database and Redis on startup"""
     await init_db()
+    await redis_manager.connect()
     logger.info("Database initialized with Tortoise ORM")
+    logger.info("Redis connection established")
     logger.info("OCPP Central System API started")
     logger.info("REST API available at: /api/")
     logger.info("API Documentation available at: /docs")
@@ -330,9 +354,10 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Close database connections on shutdown"""
+    """Close database and Redis connections on shutdown"""
     await close_db()
-    logger.info("Database connections closed")
+    await redis_manager.disconnect()
+    logger.info("Database and Redis connections closed")
 
 if __name__ == "__main__":
     import uvicorn

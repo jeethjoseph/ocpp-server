@@ -107,6 +107,12 @@ export default function ChargersPage() {
     }
   };
 
+  const getConnectionStatusColor = (connected: boolean) => {
+    return connected 
+      ? 'bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400'
+      : 'bg-red-100 text-red-800 dark:bg-red-900/20 dark:text-red-400';
+  };
+
   if (loading && chargers.length === 0) {
     return <div className="text-center py-8 text-muted-foreground">Loading chargers...</div>;
   }
@@ -177,6 +183,9 @@ export default function ChargersPage() {
                   Status
                 </th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap">
+                  Connection
+                </th>
+                <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap">
                   Station
                 </th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap">
@@ -204,6 +213,11 @@ export default function ChargersPage() {
                   <td className="px-6 py-4 whitespace-nowrap">
                     <span className={`px-2 py-1 text-xs font-medium rounded-full ${getStatusColor(charger.latest_status)}`}>
                       {charger.latest_status}
+                    </span>
+                  </td>
+                  <td className="px-6 py-4 whitespace-nowrap">
+                    <span className={`px-2 py-1 text-xs font-medium rounded-full ${getConnectionStatusColor(charger.connection_status)}`}>
+                      {charger.connection_status ? 'Connected' : 'Disconnected'}
                     </span>
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap text-sm text-muted-foreground">
