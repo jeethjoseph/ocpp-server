@@ -46,6 +46,7 @@ async def client():
     # Close connections
     await Tortoise.close_connections()
 
+@pytest.mark.unit
 class TestStationEndpoints:
     """Integration tests for Station Management API"""
     

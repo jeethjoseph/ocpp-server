@@ -28,19 +28,22 @@ class TestRunner:
         if event_path:
             print(f"📁 Change detected: {event_path}")
         
-        # Choose test command based on what changed and test type
+        # Choose test command based on what changed and test type (using native pytest)
         if self.test_type == "unit":
-            cmd = [sys.executable, "scripts/run_tests.py", "--unit"]
+            cmd = ["pytest", "-m", "unit", "--tb=short", "-q"]
             print("🧪 Running unit tests...")
         elif self.test_type == "all":
-            cmd = [sys.executable, "scripts/run_tests.py", "--all"] 
+            cmd = ["pytest", "--tb=short", "-q"]
             print("🔄 Running all tests...")
         elif self.test_type == "infrastructure":
-            cmd = [sys.executable, "scripts/run_tests.py", "--infrastructure"]
+            cmd = ["pytest", "-m", "infrastructure", "--tb=short", "-q"]
             print("🏗️  Running infrastructure tests...")
+        elif self.test_type == "integration":
+            cmd = ["pytest", "-m", "integration", "--tb=short", "-q"]
+            print("🔗 Running integration tests...")
         else:
-            # Default to unit tests
-            cmd = [sys.executable, "scripts/run_tests.py", "--unit"]
+            # Default to unit tests (fastest)
+            cmd = ["pytest", "-m", "unit", "--tb=short", "-q"]
             print("🧪 Running unit tests...")
         
         try:
@@ -77,7 +80,7 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description="Watch files and run tests automatically")
-    parser.add_argument("--type", choices=["unit", "all", "infrastructure"], 
+    parser.add_argument("--type", choices=["unit", "all", "infrastructure", "integration"], 
                        default="unit", help="Type of tests to run on changes")
     parser.add_argument("--include", nargs="+", default=["*.py"], 
                        help="File patterns to watch")
@@ -106,7 +109,12 @@ def main():
     observer.start()
     
     print(f"👀 Watching for {args.include} changes (ignoring {args.exclude})")
-    print(f"🧪 Will run: {args.type} tests")
+    print(f"🧪 Will run: {args.type} tests using native pytest")
+    print("💡 Available test types:")
+    print("   unit         - Fast API tests (~1s)")
+    print("   infrastructure - Redis/DB tests (~5s)")
+    print("   integration  - OCPP WebSocket tests (~45s, requires server)")
+    print("   all          - Complete test suite")
     print("Press Ctrl+C to stop.")
     
     # Run tests once at startup

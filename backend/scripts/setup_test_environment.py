@@ -121,12 +121,15 @@ async def main():
     logger.info("🏁 Test environment setup complete!")
     
     if redis_ok and db_ok:
-        logger.info("✅ Ready to run all tests:")
-        logger.info("   Unit tests: pytest tests/test_*.py")
-        logger.info("   Infrastructure: pytest tests/test_infrastructure.py")
-        logger.info("   Integration: pytest tests/test_integration.py (requires server running)")
+        logger.info("✅ Ready to run all tests with native pytest:")
+        logger.info("   Unit tests (fast):         pytest -m unit")
+        logger.info("   Infrastructure tests:      pytest -m infrastructure") 
+        logger.info("   Integration tests:          pytest -m integration (requires server running)")
+        logger.info("   All tests except slow:      pytest -m 'not slow'")
+        logger.info("   Complete test suite:        pytest")
     else:
         logger.info("⚠️  Some tests may be skipped due to missing infrastructure")
+        logger.info("💡 Use 'pytest -m unit' to run tests that don't require external services")
 
 if __name__ == "__main__":
     asyncio.run(main())

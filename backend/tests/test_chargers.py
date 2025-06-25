@@ -9,6 +9,7 @@ import random
 from main import connected_charge_points
 from models import Charger, Connector, Transaction, OCPPLog, User, VehicleProfile
 
+@pytest.mark.unit
 class TestChargerEndpoints:
     """Integration tests for Charger Management API"""
     

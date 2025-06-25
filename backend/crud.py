@@ -1,3 +1,4 @@
+# This file is to aggregate all CRUD operations related to OCPP logs and charger connections.
 import datetime
 from typing import List, Optional, Tuple
 from models import OCPPLog, Charger

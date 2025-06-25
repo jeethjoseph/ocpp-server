@@ -122,7 +122,8 @@ async def get_bulk_connection_status(chargers: List[Charger]) -> Dict[str, bool]
     # Get all connected chargers from Redis at once
     connected_charger_ids = set(await redis_manager.get_all_connected_chargers())
     
-    current_time = datetime.now()
+    from datetime import timezone
+    current_time = datetime.now(timezone.utc)
     status_dict = {}
     
     for charger in chargers:
@@ -137,7 +138,7 @@ async def get_bulk_connection_status(chargers: List[Charger]) -> Dict[str, bool]
             status_dict[charger.charge_point_string_id] = False
             continue
         
-        time_diff = current_time - charger.last_heart_beat_time.replace(tzinfo=None)
+        time_diff = current_time - charger.last_heart_beat_time
         status_dict[charger.charge_point_string_id] = time_diff.total_seconds() <= 300
     
     return status_dict

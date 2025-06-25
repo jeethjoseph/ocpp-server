@@ -12,6 +12,7 @@ from tortoise import Tortoise
 
 logger = logging.getLogger(__name__)
 
+@pytest.mark.infrastructure
 class TestInfrastructure:
     """Test basic infrastructure components"""
     
