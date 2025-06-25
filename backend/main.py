@@ -379,6 +379,7 @@ async def heartbeat_monitor(charge_point_id: str, websocket: WebSocket):
             await asyncio.sleep(30)  # Check every 30 seconds
             try:
                 # Check if WebSocket is still connected
+                logger.debug(f"Checking heartbeat for {charge_point_id}")
                 if websocket.client_state.value != 1:  # 1 = CONNECTED
                     logger.warning(f"WebSocket disconnected for {charge_point_id}")
                     await cleanup_dead_connection(charge_point_id)
@@ -387,7 +388,7 @@ async def heartbeat_monitor(charge_point_id: str, websocket: WebSocket):
                 # Update last seen timestamp
                 if charge_point_id in connected_charge_points:
                     connected_charge_points[charge_point_id]["last_seen"] = datetime.datetime.now(datetime.timezone.utc)
-                    
+                logger.info(f"Heartbeat successful for {charge_point_id}")    
             except Exception as e:
                 logger.warning(f"Heartbeat failed for {charge_point_id}: {e}")
                 await cleanup_dead_connection(charge_point_id)
