@@ -65,7 +65,7 @@ class ChargePoint(OcppChargePoint):
     async def on_boot_notification(self, charge_point_vendor, charge_point_model, **kwargs):
         logger.info(f"BootNotification from {self.id}: vendor={charge_point_vendor}, model={charge_point_model}")
         # Update charger status in database
-        await update_charger_status(self.id, "AVAILABLE")
+        await update_charger_status(self.id, "Available")
         
         return call_result.BootNotification(
             current_time=datetime.datetime.utcnow().isoformat() + "Z",
@@ -77,7 +77,7 @@ class ChargePoint(OcppChargePoint):
     async def on_heartbeat(self, **kwargs):
         logger.info(f"Heartbeat from {self.id}")
         # Update charger status and heartbeat time in database
-        await update_charger_status(self.id, "AVAILABLE")
+        await update_charger_status(self.id, "Available")
         
         return call_result.Heartbeat(
             current_time=datetime.datetime.utcnow().isoformat() + "Z"

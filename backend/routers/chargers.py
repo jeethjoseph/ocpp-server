@@ -231,7 +231,7 @@ async def create_charger(charger_data: ChargerCreate):
             model=charger_data.model,
             vendor=charger_data.vendor,
             serial_number=charger_data.serial_number,
-            latest_status="UNAVAILABLE"
+            latest_status="Unavailable"
         )
         
         # Create connectors

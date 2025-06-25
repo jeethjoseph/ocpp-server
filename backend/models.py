@@ -10,15 +10,15 @@ class TransactionTypeEnum(str, enum.Enum):
     CHARGE_DEDUCT = "CHARGE_DEDUCT"
 
 class ChargerStatusEnum(str, enum.Enum):
-    AVAILABLE = "AVAILABLE"
-    PREPARING = "PREPARING"
-    CHARGING = "CHARGING"
-    SUSPENDED_EVSE = "SUSPENDED_EVSE"
-    SUSPENDED_EV = "SUSPENDED_EV"
-    FINISHING = "FINISHING"
-    RESERVED = "RESERVED"
-    UNAVAILABLE = "UNAVAILABLE"
-    FAULTED = "FAULTED"
+    AVAILABLE = "Available"
+    PREPARING = "Preparing"
+    CHARGING = "Charging"
+    SUSPENDED_EVSE = "SuspendedEVSE"
+    SUSPENDED_EV = "SuspendedEV"
+    FINISHING = "Finishing"
+    RESERVED = "Reserved"
+    UNAVAILABLE = "Unavailable"
+    FAULTED = "Faulted"
 
 class TransactionStatusEnum(str, enum.Enum):
     STARTED = "STARTED"
