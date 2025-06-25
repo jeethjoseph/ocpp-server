@@ -75,7 +75,10 @@ class ChargePoint(OcppChargePoint):
 
     @on('Heartbeat')
     async def on_heartbeat(self, **kwargs):
-        logger.info(f"Heartbeat from {self.id}")
+        # Update last heartbeat timestamp for this charge point
+        if self.id in connected_charge_points:
+            connected_charge_points[self.id]["last_heartbeat"] = datetime.datetime.now(datetime.timezone.utc)
+        logger.info(f"Received OCPP Heartbeat from {self.id}")
         # Update charger status and heartbeat time in database
         await update_charger_status(self.id, "Available")
         
@@ -373,30 +376,28 @@ async def cleanup_dead_connection(charge_point_id: str):
     logger.warning(f"Dead connection cleaned up for charge point {charge_point_id}")
 
 async def heartbeat_monitor(charge_point_id: str, websocket: WebSocket):
-    """Monitor WebSocket connection health by checking client state"""
+    """Monitor OCPP Heartbeat message to check device liveness."""
+    HEARTBEAT_TIMEOUT = 90  # seconds (2x expected heartbeat interval)
     try:
         while True:
             await asyncio.sleep(30)  # Check every 30 seconds
             try:
-                # Check if WebSocket is still connected
-                logger.debug(f"Checking heartbeat for {charge_point_id}")
-                if websocket.client_state.value != 1:  # 1 = CONNECTED
-                    logger.warning(f"WebSocket disconnected for {charge_point_id}")
+                now = datetime.datetime.now(datetime.timezone.utc)
+                last_heartbeat = None
+                if charge_point_id in connected_charge_points:
+                    last_heartbeat = connected_charge_points[charge_point_id].get("last_heartbeat")
+                if last_heartbeat is None:
+                    # No heartbeat received yet, use last_seen or connected_at
+                    last_heartbeat = connected_charge_points[charge_point_id].get("last_seen") or connected_charge_points[charge_point_id].get("connected_at")
+                if last_heartbeat is None or (now - last_heartbeat).total_seconds() > HEARTBEAT_TIMEOUT:
+                    logger.warning(f"No OCPP Heartbeat from {charge_point_id} in {HEARTBEAT_TIMEOUT} seconds. Cleaning up.")
                     await cleanup_dead_connection(charge_point_id)
                     break
-                
-                await websocket.send_text("__ping__")  # You can use a custom ping message
-                logger.debug(f"Sent ping to {charge_point_id}")
-                
-                # Update last seen timestamp
-                if charge_point_id in connected_charge_points:
-                    connected_charge_points[charge_point_id]["last_seen"] = datetime.datetime.now(datetime.timezone.utc)
-                logger.info(f"Heartbeat successful for {charge_point_id}")    
+                logger.info(f"Heartbeat monitor: {charge_point_id} last heartbeat {(now - last_heartbeat).total_seconds():.1f}s ago")
             except Exception as e:
-                logger.warning(f"Heartbeat failed for {charge_point_id}: {e}")
+                logger.warning(f"Heartbeat monitor error for {charge_point_id}: {e}")
                 await cleanup_dead_connection(charge_point_id)
                 break
-                
     except asyncio.CancelledError:
         # Task was cancelled, normal shutdown
         pass
