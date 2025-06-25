@@ -385,6 +385,9 @@ async def heartbeat_monitor(charge_point_id: str, websocket: WebSocket):
                     await cleanup_dead_connection(charge_point_id)
                     break
                 
+                await websocket.send_text("__ping__")  # You can use a custom ping message
+                logger.debug(f"Sent ping to {charge_point_id}")
+                
                 # Update last seen timestamp
                 if charge_point_id in connected_charge_points:
                     connected_charge_points[charge_point_id]["last_seen"] = datetime.datetime.now(datetime.timezone.utc)
