@@ -68,6 +68,7 @@ export default function ChargerDetailPage() {
   const getEnergyConsumed = () => transaction?.energy_consumed_kwh;
   const getStartTime = () => transaction?.start_time;
 
+
   // Clear transaction handler
   const clearTransaction = () => {
     setLastTransactionId(null);

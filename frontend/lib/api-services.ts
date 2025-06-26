@@ -10,7 +10,6 @@ import {
   ChargerListResponse,
   ChargerDetail,
   MeterValue,
-  Transaction,
   TransactionDetail,
   ApiResponse,
 } from "@/types/api";
@@ -27,7 +26,7 @@ export const stationService = {
     if (params?.limit) searchParams.set("limit", params.limit.toString());
     if (params?.search) searchParams.set("search", params.search);
     if (params?.sort) searchParams.set("sort", params.sort);
-    
+
     const query = searchParams.toString();
     return api.get<StationListResponse>(
       `/api/admin/stations${query ? `?${query}` : ""}`
@@ -49,10 +48,12 @@ export const stationService = {
     api.post<ApiResponse<{ station: Station }>>("/api/admin/stations", data),
 
   update: (id: number, data: StationUpdate) =>
-    api.put<ApiResponse<{ station: Station }>>(`/api/admin/stations/${id}`, data),
+    api.put<ApiResponse<{ station: Station }>>(
+      `/api/admin/stations/${id}`,
+      data
+    ),
 
-  delete: (id: number) =>
-    api.delete<ApiResponse>(`/api/admin/stations/${id}`),
+  delete: (id: number) => api.delete<ApiResponse>(`/api/admin/stations/${id}`),
 };
 
 export const chargerService = {
@@ -68,18 +69,18 @@ export const chargerService = {
     if (params?.page) searchParams.set("page", params.page.toString());
     if (params?.limit) searchParams.set("limit", params.limit.toString());
     if (params?.status) searchParams.set("status", params.status);
-    if (params?.station_id) searchParams.set("station_id", params.station_id.toString());
+    if (params?.station_id)
+      searchParams.set("station_id", params.station_id.toString());
     if (params?.search) searchParams.set("search", params.search);
     if (params?.sort) searchParams.set("sort", params.sort);
-    
+
     const query = searchParams.toString();
     return api.get<ChargerListResponse>(
       `/api/admin/chargers${query ? `?${query}` : ""}`
     );
   },
 
-  getById: (id: number) =>
-    api.get<ChargerDetail>(`/api/admin/chargers/${id}`),
+  getById: (id: number) => api.get<ChargerDetail>(`/api/admin/chargers/${id}`),
 
   create: (data: ChargerCreate) =>
     api.post<ApiResponse<{ charger: Charger; ocpp_url: string }>>(
@@ -88,10 +89,12 @@ export const chargerService = {
     ),
 
   update: (id: number, data: ChargerUpdate) =>
-    api.put<ApiResponse<{ charger: Charger }>>(`/api/admin/chargers/${id}`, data),
+    api.put<ApiResponse<{ charger: Charger }>>(
+      `/api/admin/chargers/${id}`,
+      data
+    ),
 
-  delete: (id: number) =>
-    api.delete<ApiResponse>(`/api/admin/chargers/${id}`),
+  delete: (id: number) => api.delete<ApiResponse>(`/api/admin/chargers/${id}`),
 
   changeAvailability: (
     id: number,
@@ -109,10 +112,10 @@ export const chargerService = {
     ),
 
   remoteStart: (id: number, connectorId: number = 1, idTag: string = "admin") =>
-    api.post<ApiResponse>(
-      `/api/admin/chargers/${id}/remote-start`,
-      { connector_id: connectorId, id_tag: idTag }
-    ),
+    api.post<ApiResponse>(`/api/admin/chargers/${id}/remote-start`, {
+      connector_id: connectorId,
+      id_tag: idTag,
+    }),
 };
 
 export const transactionService = {
@@ -131,11 +134,12 @@ export const transactionService = {
     if (params?.limit) searchParams.set("limit", params.limit.toString());
     if (params?.status) searchParams.set("status", params.status);
     if (params?.user_id) searchParams.set("user_id", params.user_id.toString());
-    if (params?.charger_id) searchParams.set("charger_id", params.charger_id.toString());
+    if (params?.charger_id)
+      searchParams.set("charger_id", params.charger_id.toString());
     if (params?.start_date) searchParams.set("start_date", params.start_date);
     if (params?.end_date) searchParams.set("end_date", params.end_date);
     if (params?.sort) searchParams.set("sort", params.sort);
-    
+
     const query = searchParams.toString();
     return api.get<{
       data: unknown[];
@@ -143,9 +147,7 @@ export const transactionService = {
       page: number;
       limit: number;
       summary: Record<string, unknown>;
-    }>(
-      `/api/admin/transactions${query ? `?${query}` : ""}`
-    );
+    }>(`/api/admin/transactions${query ? `?${query}` : ""}`);
   },
 
   getById: (id: number) =>
@@ -158,8 +160,5 @@ export const transactionService = {
     }>(`/api/admin/transactions/${id}/meter-values`),
 
   forceStop: (id: number, reason: string) =>
-    api.post<ApiResponse>(
-      `/api/admin/transactions/${id}/stop`,
-      { reason }
-    ),
+    api.post<ApiResponse>(`/api/admin/transactions/${id}/stop`, { reason }),
 };

@@ -65,6 +65,34 @@ class ChargePoint(OcppChargePoint):
     @on('BootNotification')
     async def on_boot_notification(self, charge_point_vendor, charge_point_model, **kwargs):
         logger.info(f"BootNotification from {self.id}: vendor={charge_point_vendor}, model={charge_point_model}")
+        
+        # Check for ongoing transactions and mark them as FAILED with reason REBOOT
+        from models import Transaction, TransactionStatusEnum
+        try:
+            ongoing_transactions = await Transaction.filter(
+                charger__charge_point_string_id=self.id,
+                transaction_status__in=[
+                    TransactionStatusEnum.RUNNING,
+                    TransactionStatusEnum.STARTED,
+                    TransactionStatusEnum.PENDING_START,
+                    TransactionStatusEnum.PENDING_STOP
+                ]
+            ).all()
+            
+            if ongoing_transactions:
+                logger.info(f"Found {len(ongoing_transactions)} ongoing transactions for charger {self.id} during boot - marking as FAILED")
+                for transaction in ongoing_transactions:
+                    transaction.transaction_status = TransactionStatusEnum.FAILED
+                    transaction.stop_reason = "REBOOT"
+                    transaction.end_time = datetime.datetime.now(datetime.timezone.utc)
+                    await transaction.save()
+                    logger.info(f"Marked transaction {transaction.id} as FAILED due to REBOOT")
+            else:
+                logger.info(f"No ongoing transactions found for charger {self.id} during boot")
+                
+        except Exception as e:
+            logger.error(f"Error checking ongoing transactions for {self.id} during boot: {e}", exc_info=True)
+        
         # Don't assume status - wait for StatusNotification from charge point
         
         return call_result.BootNotification(

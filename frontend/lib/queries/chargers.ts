@@ -2,6 +2,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { chargerService, stationService } from "@/lib/api-services";
 import { ChargerListResponse } from "@/types/api";
 import { toast } from "sonner";
+import { transactionKeys } from "./transactions";
 
 // Query Keys
 export const chargerKeys = {
@@ -173,6 +174,18 @@ export function useRemoteStop() {
     onSuccess: () => {
       // Invalidate chargers to refetch latest status
       queryClient.invalidateQueries({ queryKey: chargerKeys.all });
+      // Invalidate transactions to refetch final transaction status and energy consumed
+      queryClient.invalidateQueries({ queryKey: transactionKeys.all });
+      
+      // Delayed refetches to handle OCPP backend processing delays
+      const refetchDelays = [3000, 6000]; // 3s, 6s - optimized based on testing
+      refetchDelays.forEach((delay) => {
+        setTimeout(() => {
+          queryClient.invalidateQueries({ queryKey: chargerKeys.all });
+          queryClient.invalidateQueries({ queryKey: transactionKeys.all });
+        }, delay);
+      });
+      
       toast.success("Remote stop initiated");
     },
     onError: (err) => {
