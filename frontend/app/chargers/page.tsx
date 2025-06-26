@@ -1,104 +1,92 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import { Charger, ChargerCreate, Station } from "@/types/api";
-import { chargerService, stationService } from "@/lib/api-services";
+import { useState } from "react";
+import { Zap, Plus } from "lucide-react";
+
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Table } from "@/components/ui/table";
+
+import { ChargerCreate, Station } from "@/types/api";
+import { 
+  useChargers, 
+  useStations, 
+  useChangeAvailability, 
+  useDeleteCharger 
+} from "@/lib/queries/chargers";
 
 export default function ChargersPage() {
-  const [chargers, setChargers] = useState<Charger[]>([]);
-  const [stations, setStations] = useState<Station[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
   const [stationFilter, setStationFilter] = useState("");
   const [currentPage, setCurrentPage] = useState(1);
-  const [totalPages, setTotalPages] = useState(1);
 
-  const loadChargers = async () => {
-    try {
-      setLoading(true);
-      const response = await chargerService.getAll({
-        page: currentPage,
-        limit: 10,
-        search: searchTerm || undefined,
-        status: statusFilter || undefined,
-        station_id: stationFilter ? parseInt(stationFilter) : undefined,
-      });
-      setChargers(response.data);
-      setTotalPages(Math.ceil(response.total / 10));
-    } catch (err) {
-      setError("Failed to load chargers");
-      console.error(err);
-    } finally {
-      setLoading(false);
-    }
-  };
+  // TanStack Query hooks
+  const {
+    data: chargersData,
+    isLoading: loadingChargers,
+    error: chargersError,
+  } = useChargers({
+    page: currentPage,
+    limit: 10,
+    search: searchTerm || undefined,
+    status: statusFilter || undefined,
+    station_id: stationFilter ? parseInt(stationFilter) : undefined,
+  });
 
-  const loadStations = async () => {
-    try {
-      const response = await stationService.getAll({ limit: 100 });
-      setStations(response.data);
-    } catch (err) {
-      console.error("Failed to load stations:", err);
-    }
-  };
+  const {
+    data: stationsData,
+    isLoading: loadingStations,
+  } = useStations({ limit: 100 });
 
-  useEffect(() => {
-    loadStations();
-  }, []);
+  const changeAvailabilityMutation = useChangeAvailability();
+  const deleteChargerMutation = useDeleteCharger();
+  
+  // Track loading state per charger
+  const [toggleLoadingChargers, setToggleLoadingChargers] = useState<Set<number>>(new Set());
 
-  useEffect(() => {
-    loadChargers();
-  }, [currentPage, searchTerm, statusFilter, stationFilter]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Extract data from queries
+  const chargers = chargersData?.data || [];
+  const stations = stationsData?.data || [];
+  const totalPages = chargersData ? Math.ceil(chargersData.total / 10) : 1;
+  const loading = loadingChargers || loadingStations;
+  const error = chargersError ? "Failed to load chargers" : null;
 
   const handleCreateCharger = async (data: ChargerCreate) => {
-    try {
-      await chargerService.create(data);
-      setShowCreateModal(false);
-      loadChargers();
-    } catch (err) {
-      setError("Failed to create charger");
-      console.error(err);
-    }
+    // TODO: Add mutation for create charger
+    console.log("Create charger:", data);
+    setShowCreateModal(false);
   };
 
   const handleDeleteCharger = async (id: number) => {
     if (!confirm("Are you sure you want to delete this charger?")) return;
-
-    try {
-      await chargerService.delete(id);
-      loadChargers();
-    } catch (err) {
-      setError("Failed to delete charger");
-      console.error(err);
-    }
+    deleteChargerMutation.mutate(id);
   };
 
   const handleChangeAvailability = async (
     chargerId: number,
     currentStatus: string
   ) => {
-    try {
-      const newType =
-        currentStatus !== "Unavailable" ? "Inoperative" : "Operative";
-      await chargerService.changeAvailability(chargerId, newType, 0);
-      loadChargers();
-    } catch (err: unknown) {
-      const errorMessage = err instanceof Error ? err.message : String(err);
-      if (
-        errorMessage.includes("409") ||
-        errorMessage.includes("not connected")
-      ) {
-        setError(
-          "Cannot change availability: Charger is not connected. Please ensure the charger is online and try again."
-        );
-      } else {
-        setError("Failed to change availability: " + errorMessage);
+    const newType = currentStatus !== "Unavailable" ? "Inoperative" : "Operative";
+    
+    // Add charger to loading set
+    setToggleLoadingChargers(prev => new Set(prev).add(chargerId));
+    
+    changeAvailabilityMutation.mutate(
+      { id: chargerId, type: newType, connectorId: 0 },
+      {
+        onSettled: () => {
+          // Remove charger from loading set when done (success or error)
+          setToggleLoadingChargers(prev => {
+            const newSet = new Set(prev);
+            newSet.delete(chargerId);
+            return newSet;
+          });
+        }
       }
-      console.error(err);
-    }
+    );
   };
 
   const getStatusColor = (status: string) => {
@@ -132,10 +120,22 @@ export default function ChargersPage() {
       : "bg-red-100 text-red-800 dark:bg-red-900/20 dark:text-red-400";
   };
 
-  if (loading && chargers.length === 0) {
+  if (loading) {
     return (
-      <div className="text-center py-8 text-muted-foreground">
-        Loading chargers...
+      <div className="flex items-center justify-center py-8">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary mx-auto"></div>
+          <p className="text-muted-foreground mt-2">Loading chargers...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="text-center py-8">
+        <p className="text-destructive">Failed to load chargers</p>
+        <p className="text-muted-foreground text-sm mt-1">Please try refreshing the page</p>
       </div>
     );
   }
@@ -143,59 +143,59 @@ export default function ChargersPage() {
   return (
     <div className="space-y-6">
       <div className="flex justify-between items-center">
-        <h1 className="text-3xl font-bold text-foreground">Chargers</h1>
-        <button
-          onClick={() => setShowCreateModal(true)}
-          className="bg-primary text-primary-foreground px-4 py-2 rounded-lg hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 transition-colors">
-          Add Charger
-        </button>
-      </div>
-
-      {error && (
-        <div className="bg-destructive/10 border border-destructive/20 text-destructive px-4 py-3 rounded">
-          {error}
+        <div>
+          <h1 className="text-3xl font-bold">Chargers</h1>
+          <p className="text-muted-foreground">Manage your charging devices</p>
         </div>
-      )}
-
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
-        <input
-          type="text"
-          placeholder="Search chargers..."
-          value={searchTerm}
-          onChange={(e) => setSearchTerm(e.target.value)}
-          className="px-4 py-2 border border-border bg-input text-foreground rounded-lg focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 transition-colors"
-        />
-        <select
-          value={statusFilter}
-          onChange={(e) => setStatusFilter(e.target.value)}
-          className="px-4 py-2 border border-border bg-input text-foreground rounded-lg focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 transition-colors">
-          <option value="">All Statuses</option>
-          <option value="Available">Available</option>
-          <option value="Preparing">Preparing</option>
-          <option value="Charging">Charging</option>
-          <option value="SuspendedEVSE">Suspended EVSE</option>
-          <option value="SuspendedEV">Suspended EV</option>
-          <option value="Finishing">Finishing</option>
-          <option value="Reserved">Reserved</option>
-          <option value="Unavailable">Unavailable</option>
-          <option value="Faulted">Faulted</option>
-        </select>
-        <select
-          value={stationFilter}
-          onChange={(e) => setStationFilter(e.target.value)}
-          className="px-4 py-2 border border-border bg-input text-foreground rounded-lg focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 transition-colors">
-          <option value="">All Stations</option>
-          {stations.map((station) => (
-            <option key={station.id} value={station.id}>
-              {station.name}
-            </option>
-          ))}
-        </select>
+        <Button onClick={() => setShowCreateModal(true)}>
+          <Plus className="h-4 w-4 mr-2" />
+          Add Charger
+        </Button>
       </div>
 
-      <div className="bg-card shadow-md border border-border overflow-hidden sm:rounded-lg">
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[800px] divide-y divide-border">
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Zap className="h-5 w-5" />
+            Chargers
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+            <Input
+              placeholder="Search chargers..."
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+            />
+            <select
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value)}
+              className="px-4 py-2 border border-border bg-input text-foreground rounded-lg focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 transition-colors">
+              <option value="">All Statuses</option>
+              <option value="Available">Available</option>
+              <option value="Preparing">Preparing</option>
+              <option value="Charging">Charging</option>
+              <option value="SuspendedEVSE">Suspended EVSE</option>
+              <option value="SuspendedEV">Suspended EV</option>
+              <option value="Finishing">Finishing</option>
+              <option value="Reserved">Reserved</option>
+              <option value="Unavailable">Unavailable</option>
+              <option value="Faulted">Faulted</option>
+            </select>
+            <select
+              value={stationFilter}
+              onChange={(e) => setStationFilter(e.target.value)}
+              className="px-4 py-2 border border-border bg-input text-foreground rounded-lg focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 transition-colors">
+              <option value="">All Stations</option>
+              {stations.map((station) => (
+                <option key={station.id} value={station.id}>
+                  {station.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <Table>
             <thead className="bg-muted">
               <tr>
                 <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap">
@@ -275,19 +275,28 @@ export default function ChargersPage() {
                             charger.latest_status
                           )
                         }
-                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 ${
+                        disabled={toggleLoadingChargers.has(charger.id)}
+                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed ${
                           charger.latest_status === "Available"
                             ? "bg-green-600"
                             : "bg-muted"
                         }`}
-                        title="Toggle charger availability">
-                        <span
-                          className={`inline-block h-4 w-4 transform rounded-full bg-background transition-transform ${
-                            charger.latest_status === "Available"
-                              ? "translate-x-6"
-                              : "translate-x-1"
-                          }`}
-                        />
+                        title={
+                          toggleLoadingChargers.has(charger.id)
+                            ? "Changing availability..."
+                            : "Toggle charger availability"
+                        }>
+                        {toggleLoadingChargers.has(charger.id) ? (
+                          <div className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-background border-t-transparent mx-auto" />
+                        ) : (
+                          <span
+                            className={`inline-block h-4 w-4 transform rounded-full bg-background transition-transform ${
+                              charger.latest_status === "Available"
+                                ? "translate-x-6"
+                                : "translate-x-1"
+                            }`}
+                          />
+                        )}
                       </button>
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium space-x-2">
@@ -301,9 +310,9 @@ export default function ChargersPage() {
                 );
               })}
             </tbody>
-          </table>
-        </div>
-      </div>
+          </Table>
+        </CardContent>
+      </Card>
 
       {totalPages > 1 && (
         <div className="flex justify-center space-x-2 mt-6">

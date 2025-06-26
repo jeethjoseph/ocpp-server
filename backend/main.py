@@ -14,7 +14,8 @@ from crud import (
     get_logs, 
     get_logs_by_charge_point, 
     validate_and_connect_charger,
-    update_charger_status
+    update_charger_status,
+    update_charger_heartbeat
 )
 from models import OCPPLog
 from redis_manager import redis_manager
@@ -64,8 +65,7 @@ class ChargePoint(OcppChargePoint):
     @on('BootNotification')
     async def on_boot_notification(self, charge_point_vendor, charge_point_model, **kwargs):
         logger.info(f"BootNotification from {self.id}: vendor={charge_point_vendor}, model={charge_point_model}")
-        # Update charger status in database
-        await update_charger_status(self.id, "Available")
+        # Don't assume status - wait for StatusNotification from charge point
         
         return call_result.BootNotification(
             current_time=datetime.datetime.utcnow().isoformat() + "Z",
@@ -79,8 +79,8 @@ class ChargePoint(OcppChargePoint):
         if self.id in connected_charge_points:
             connected_charge_points[self.id]["last_heartbeat"] = datetime.datetime.now(datetime.timezone.utc)
         logger.info(f"Received OCPP Heartbeat from {self.id}")
-        # Update charger status and heartbeat time in database
-        await update_charger_status(self.id, "Available")
+        # Only update heartbeat time, don't assume status - wait for StatusNotification
+        await update_charger_heartbeat(self.id)
         
         return call_result.Heartbeat(
             current_time=datetime.datetime.utcnow().isoformat() + "Z"

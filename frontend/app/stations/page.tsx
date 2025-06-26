@@ -1,80 +1,104 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
-import { Station, StationCreate, StationUpdate } from "@/types/api";
-import { stationService } from "@/lib/api-services";
+import { useState } from "react";
+import { Building2, MapPin, Plus, Pencil, Trash2 } from "lucide-react";
+
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
+
+import { StationCreate, StationUpdate } from "@/types/api";
+import {
+  useStations,
+  useCreateStation,
+  useUpdateStation,
+  useDeleteStation,
+} from "@/lib/queries/stations";
 
 export default function StationsPage() {
-  const [stations, setStations] = useState<Station[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [showCreateModal, setShowCreateModal] = useState(false);
-  const [editingStation, setEditingStation] = useState<Station | null>(null);
+  const [showCreateDialog, setShowCreateDialog] = useState(false);
+  const [editingStation, setEditingStation] = useState<any>(null);
   const [searchTerm, setSearchTerm] = useState("");
   const [currentPage, setCurrentPage] = useState(1);
-  const [totalPages, setTotalPages] = useState(1);
 
-  // Move loadStations to component scope so it can be used elsewhere
-  const loadStations = useCallback(async () => {
-    try {
-      setLoading(true);
-      const response = await stationService.getAll({
-        page: currentPage,
-        limit: 10,
-        search: searchTerm || undefined,
-      });
-      setStations(response.data);
-      setTotalPages(Math.ceil(response.total / 10));
-    } catch (err) {
-      setError("Failed to load stations");
-      console.error(err);
-    } finally {
-      setLoading(false);
-    }
-  }, [currentPage, searchTerm]);
+  // TanStack Query hooks
+  const {
+    data: stationsData,
+    isLoading,
+    error,
+  } = useStations({
+    page: currentPage,
+    limit: 10,
+    search: searchTerm || undefined,
+  });
 
-  useEffect(() => {
-    loadStations();
-  }, [loadStations]);
+  const createStationMutation = useCreateStation();
+  const updateStationMutation = useUpdateStation();
+  const deleteStationMutation = useDeleteStation();
 
-  const handleCreateStation = async (data: StationCreate) => {
-    try {
-      await stationService.create(data);
-      setShowCreateModal(false);
-      loadStations();
-    } catch (err) {
-      setError("Failed to create station");
-      console.error(err);
-    }
+  // Extract data from query
+  const stations = stationsData?.data || [];
+  const totalPages = stationsData ? Math.ceil(stationsData.total / 10) : 1;
+
+  const handleCreateStation = (data: StationCreate) => {
+    createStationMutation.mutate(data, {
+      onSuccess: () => {
+        setShowCreateDialog(false);
+      },
+    });
   };
 
-  const handleUpdateStation = async (id: number, data: StationUpdate) => {
-    try {
-      await stationService.update(id, data);
-      setEditingStation(null);
-      loadStations();
-    } catch (err) {
-      setError("Failed to update station");
-      console.error(err);
-    }
+  const handleUpdateStation = (data: StationUpdate) => {
+    if (!editingStation) return;
+    updateStationMutation.mutate(
+      { id: editingStation.id, data },
+      {
+        onSuccess: () => {
+          setEditingStation(null);
+        },
+      }
+    );
   };
 
-  const handleDeleteStation = async (id: number) => {
+  const handleDeleteStation = (id: number) => {
     if (!confirm("Are you sure you want to delete this station?")) return;
-
-    try {
-      await stationService.delete(id);
-      loadStations();
-    } catch (err) {
-      setError("Failed to delete station");
-      console.error(err);
-    }
+    deleteStationMutation.mutate(id);
   };
 
-  if (loading && stations.length === 0) {
+  if (isLoading) {
     return (
-      <div className="text-center py-8 text-muted-foreground">
-        Loading stations...
+      <div className="flex items-center justify-center py-8">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary mx-auto"></div>
+          <p className="text-muted-foreground mt-2">Loading stations...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="text-center py-8">
+        <p className="text-destructive">Failed to load stations</p>
+        <p className="text-muted-foreground text-sm mt-1">Please try refreshing the page</p>
       </div>
     );
   }
@@ -82,138 +106,152 @@ export default function StationsPage() {
   return (
     <div className="space-y-6">
       <div className="flex justify-between items-center">
-        <h1 className="text-3xl font-bold text-foreground">
-          Charging Stations
-        </h1>
-        <button
-          onClick={() => setShowCreateModal(true)}
-          className="bg-primary text-primary-foreground px-4 py-2 rounded-lg hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-primary transition-colors duration-200">
-          Add Station
-        </button>
-      </div>
-
-      {error && (
-        <div className="bg-destructive/10 border border-destructive/20 text-destructive px-4 py-3 rounded-lg">
-          {error}
+        <div>
+          <h1 className="text-3xl font-bold">Charging Stations</h1>
+          <p className="text-muted-foreground">Manage your charging station locations</p>
         </div>
-      )}
-
-      <div className="flex gap-4 mb-6">
-        <input
-          type="text"
-          placeholder="Search stations..."
-          value={searchTerm}
-          onChange={(e) => setSearchTerm(e.target.value)}
-          className="flex-1 px-4 py-2 bg-input border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary text-foreground placeholder:text-muted-foreground transition-colors duration-200"
-        />
+        <Dialog open={showCreateDialog} onOpenChange={setShowCreateDialog}>
+          <DialogTrigger asChild>
+            <Button>
+              <Plus className="h-4 w-4 mr-2" />
+              Add Station
+            </Button>
+          </DialogTrigger>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Create New Station</DialogTitle>
+              <DialogDescription>
+                Add a new charging station location to your network.
+              </DialogDescription>
+            </DialogHeader>
+            <StationForm
+              onSubmit={handleCreateStation}
+              isLoading={createStationMutation.isPending}
+            />
+          </DialogContent>
+        </Dialog>
       </div>
 
-      <div className="bg-card shadow overflow-hidden sm:rounded-lg border border-border">
-        <div className="overflow-x-auto">
-          <table className="min-w-full divide-y divide-border">
-            <thead className="bg-muted">
-              <tr>
-                <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">
-                  Name
-                </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">
-                  Address
-                </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">
-                  Location
-                </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">
-                  Created
-                </th>
-                <th className="px-6 py-3 text-right text-xs font-medium text-muted-foreground uppercase tracking-wider">
-                  Actions
-                </th>
-              </tr>
-            </thead>
-            <tbody className="bg-card divide-y divide-border">
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Building2 className="h-5 w-5" />
+            Stations
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="flex gap-4 mb-6">
+            <Input
+              placeholder="Search stations..."
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              className="max-w-sm"
+            />
+          </div>
+
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Name</TableHead>
+                <TableHead>Address</TableHead>
+                <TableHead>Location</TableHead>
+                <TableHead>Created</TableHead>
+                <TableHead className="text-right">Actions</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
               {stations.map((station) => (
-                <tr
-                  key={station.id}
-                  className="hover:bg-accent transition-colors duration-150">
-                  <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-card-foreground">
-                    {station.name}
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-muted-foreground">
-                    {station.address}
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-muted-foreground">
-                    {station.latitude.toFixed(4)},{" "}
-                    {station.longitude.toFixed(4)}
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-muted-foreground">
-                    {new Date(station.created_at).toLocaleDateString()}
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium space-x-2">
-                    <button
-                      onClick={() => setEditingStation(station)}
-                      className="text-primary hover:text-primary/80 transition-colors duration-200">
-                      Edit
-                    </button>
-                    <button
-                      onClick={() => handleDeleteStation(station.id)}
-                      className="text-destructive hover:text-destructive/80 transition-colors duration-200">
-                      Delete
-                    </button>
-                  </td>
-                </tr>
+                <TableRow key={station.id}>
+                  <TableCell className="font-medium">{station.name}</TableCell>
+                  <TableCell>{station.address}</TableCell>
+                  <TableCell>
+                    <div className="flex items-center gap-1">
+                      <MapPin className="h-3 w-3" />
+                      <span className="text-sm">
+                        {station.latitude?.toFixed(4)}, {station.longitude?.toFixed(4)}
+                      </span>
+                    </div>
+                  </TableCell>
+                  <TableCell>{new Date(station.created_at).toLocaleDateString()}</TableCell>
+                  <TableCell className="text-right">
+                    <div className="flex items-center justify-end gap-2">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setEditingStation(station)}
+                      >
+                        <Pencil className="h-4 w-4" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => handleDeleteStation(station.id)}
+                        disabled={deleteStationMutation.isPending}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    </div>
+                  </TableCell>
+                </TableRow>
               ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
+            </TableBody>
+          </Table>
+        </CardContent>
+      </Card>
 
       {totalPages > 1 && (
-        <div className="flex justify-center space-x-2 mt-6">
-          <button
+        <div className="flex justify-center items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
             onClick={() => setCurrentPage((prev) => Math.max(1, prev - 1))}
             disabled={currentPage === 1}
-            className="px-3 py-2 text-sm border border-border rounded bg-card text-card-foreground hover:bg-accent disabled:opacity-50 disabled:cursor-not-allowed transition-colors duration-200">
+          >
             Previous
-          </button>
-          <span className="px-3 py-2 text-sm text-muted-foreground">
+          </Button>
+          <span className="text-sm text-muted-foreground">
             Page {currentPage} of {totalPages}
           </span>
-          <button
-            onClick={() =>
-              setCurrentPage((prev) => Math.min(totalPages, prev + 1))
-            }
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setCurrentPage((prev) => Math.min(totalPages, prev + 1))}
             disabled={currentPage === totalPages}
-            className="px-3 py-2 text-sm border border-border rounded bg-card text-card-foreground hover:bg-accent disabled:opacity-50 disabled:cursor-not-allowed transition-colors duration-200">
+          >
             Next
-          </button>
+          </Button>
         </div>
       )}
 
-      {showCreateModal && (
-        <StationModal
-          onSubmit={handleCreateStation}
-          onClose={() => setShowCreateModal(false)}
-        />
-      )}
-
-      {editingStation && (
-        <StationModal
-          station={editingStation}
-          onSubmit={(data) => handleUpdateStation(editingStation.id, data)}
-          onClose={() => setEditingStation(null)}
-        />
-      )}
+      {/* Edit Station Dialog */}
+      <Dialog open={!!editingStation} onOpenChange={() => setEditingStation(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Edit Station</DialogTitle>
+            <DialogDescription>
+              Update the station information.
+            </DialogDescription>
+          </DialogHeader>
+          {editingStation && (
+            <StationForm
+              station={editingStation}
+              onSubmit={handleUpdateStation}
+              isLoading={updateStationMutation.isPending}
+            />
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
 
-interface StationModalProps {
-  station?: Station;
+interface StationFormProps {
+  station?: any;
   onSubmit: (data: StationCreate) => void;
-  onClose: () => void;
+  isLoading: boolean;
 }
 
-function StationModal({ station, onSubmit, onClose }: StationModalProps) {
+function StationForm({ station, onSubmit, isLoading }: StationFormProps) {
   const [formData, setFormData] = useState({
     name: station?.name || "",
     address: station?.address || "",
@@ -227,93 +265,73 @@ function StationModal({ station, onSubmit, onClose }: StationModalProps) {
   };
 
   return (
-    <div className="fixed inset-0 bg-background/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-      <div className="bg-card rounded-lg max-w-md w-full p-6 border border-border shadow-lg">
-        <h2 className="text-lg font-medium mb-4 text-card-foreground">
-          {station ? "Edit Station" : "Create Station"}
-        </h2>
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <label className="block text-sm font-medium text-card-foreground mb-1">
-              Name
-            </label>
-            <input
-              type="text"
-              required
-              value={formData.name}
-              onChange={(e) =>
-                setFormData({ ...formData, name: e.target.value })
-              }
-              className="w-full px-3 py-2 bg-input border border-border rounded-md focus:outline-none focus:ring-2 focus:ring-primary text-foreground transition-colors duration-200"
-            />
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-card-foreground mb-1">
-              Address
-            </label>
-            <input
-              type="text"
-              required
-              value={formData.address}
-              onChange={(e) =>
-                setFormData({ ...formData, address: e.target.value })
-              }
-              className="w-full px-3 py-2 bg-input border border-border rounded-md focus:outline-none focus:ring-2 focus:ring-primary text-foreground transition-colors duration-200"
-            />
-          </div>
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-medium text-card-foreground mb-1">
-                Latitude
-              </label>
-              <input
-                type="number"
-                step="any"
-                required
-                value={formData.latitude}
-                onChange={(e) =>
-                  setFormData({
-                    ...formData,
-                    latitude: parseFloat(e.target.value),
-                  })
-                }
-                className="w-full px-3 py-2 bg-input border border-border rounded-md focus:outline-none focus:ring-2 focus:ring-primary text-foreground transition-colors duration-200"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-card-foreground mb-1">
-                Longitude
-              </label>
-              <input
-                type="number"
-                step="any"
-                required
-                value={formData.longitude}
-                onChange={(e) =>
-                  setFormData({
-                    ...formData,
-                    longitude: parseFloat(e.target.value),
-                  })
-                }
-                className="w-full px-3 py-2 bg-input border border-border rounded-md focus:outline-none focus:ring-2 focus:ring-primary text-foreground transition-colors duration-200"
-              />
-            </div>
-          </div>
-          <div className="flex justify-end space-x-3 pt-4">
-            <button
-              type="button"
-              onClick={onClose}
-              className="px-4 py-2 text-sm font-medium text-muted-foreground bg-secondary rounded-md hover:bg-secondary/80 transition-colors duration-200">
-              Cancel
-            </button>
-            <button
-              type="submit"
-              className="px-4 py-2 text-sm font-medium text-primary-foreground bg-primary rounded-md hover:bg-primary/90 transition-colors duration-200">
-              {station ? "Update" : "Create"}
-            </button>
-          </div>
-        </form>
+    <form onSubmit={handleSubmit} className="space-y-4">
+      <div className="space-y-2">
+        <Label htmlFor="name">Name</Label>
+        <Input
+          id="name"
+          type="text"
+          required
+          value={formData.name}
+          onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+          disabled={isLoading}
+        />
       </div>
-    </div>
+      
+      <div className="space-y-2">
+        <Label htmlFor="address">Address</Label>
+        <Input
+          id="address"
+          type="text"
+          required
+          value={formData.address}
+          onChange={(e) => setFormData({ ...formData, address: e.target.value })}
+          disabled={isLoading}
+        />
+      </div>
+      
+      <div className="grid grid-cols-2 gap-4">
+        <div className="space-y-2">
+          <Label htmlFor="latitude">Latitude</Label>
+          <Input
+            id="latitude"
+            type="number"
+            step="any"
+            required
+            value={formData.latitude}
+            onChange={(e) =>
+              setFormData({
+                ...formData,
+                latitude: parseFloat(e.target.value),
+              })
+            }
+            disabled={isLoading}
+          />
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="longitude">Longitude</Label>
+          <Input
+            id="longitude"
+            type="number"
+            step="any"
+            required
+            value={formData.longitude}
+            onChange={(e) =>
+              setFormData({
+                ...formData,
+                longitude: parseFloat(e.target.value),
+              })
+            }
+            disabled={isLoading}
+          />
+        </div>
+      </div>
+      
+      <DialogFooter>
+        <Button type="submit" disabled={isLoading}>
+          {isLoading ? "Saving..." : station ? "Update" : "Create"}
+        </Button>
+      </DialogFooter>
+    </form>
   );
 }

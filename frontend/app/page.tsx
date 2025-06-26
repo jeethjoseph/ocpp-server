@@ -1,201 +1,144 @@
-'use client';
+"use client";
 
-import { useState, useEffect } from 'react';
-import Link from 'next/link';
-import { stationService, chargerService } from '@/lib/api-services';
+import Link from "next/link";
+import { Building2, Zap, CheckCircle, Clock } from "lucide-react";
+
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { useDashboardStats } from "@/lib/queries/dashboard";
 
 export default function Dashboard() {
-  const [stats, setStats] = useState({
-    totalStations: 0,
-    totalChargers: 0,
-    availableChargers: 0,
-    occupiedChargers: 0,
-  });
-  const [loading, setLoading] = useState(true);
+  const { data: stats, isLoading, error } = useDashboardStats();
 
-  useEffect(() => {
-    const loadStats = async () => {
-      try {
-        const [stationsResponse, chargersResponse] = await Promise.all([
-          stationService.getAll({ limit: 1 }),
-          chargerService.getAll({ limit: 100 }),
-        ]);
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center py-8">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary mx-auto"></div>
+          <p className="text-muted-foreground mt-2">Loading dashboard...</p>
+        </div>
+      </div>
+    );
+  }
 
-        const chargers = chargersResponse.data;
-        setStats({
-          totalStations: stationsResponse.total,
-          totalChargers: chargers.length,
-          availableChargers: chargers.filter(c => c.latest_status === 'AVAILABLE').length,
-          occupiedChargers: chargers.filter(c => c.latest_status === 'OCCUPIED').length,
-        });
-      } catch (error) {
-        console.error('Failed to load stats:', error);
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    loadStats();
-  }, []);
-
-  if (loading) {
-    return <div className="text-center py-8 text-muted-foreground">Loading dashboard...</div>;
+  if (error) {
+    return (
+      <div className="text-center py-8">
+        <p className="text-destructive">Failed to load dashboard data</p>
+        <p className="text-muted-foreground text-sm mt-1">Please try refreshing the page</p>
+      </div>
+    );
   }
 
   return (
     <div className="space-y-8">
       <div>
-        <h1 className="text-3xl font-bold text-foreground">OCPP Admin Dashboard</h1>
-        <p className="mt-2 text-muted-foreground">
+        <h1 className="text-3xl font-bold">OCPP Admin Dashboard</h1>
+        <p className="text-muted-foreground mt-2">
           Manage your EV charging stations and chargers
         </p>
       </div>
 
+      {/* Stats Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-        <div className="bg-card overflow-hidden shadow-md rounded-lg border border-border transition-all duration-200 hover:shadow-lg">
-          <div className="p-5">
-            <div className="flex items-center">
-              <div className="flex-shrink-0">
-                <div className="w-8 h-8 bg-primary rounded-md flex items-center justify-center">
-                  <svg className="w-5 h-5 text-primary-foreground" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" />
-                  </svg>
-                </div>
-              </div>
-              <div className="ml-5 w-0 flex-1">
-                <dl>
-                  <dt className="text-sm font-medium text-muted-foreground truncate">
-                    Total Stations
-                  </dt>
-                  <dd className="text-lg font-medium text-card-foreground">
-                    {stats.totalStations}
-                  </dd>
-                </dl>
-              </div>
-            </div>
-          </div>
-          <div className="bg-muted/50 px-5 py-3">
-            <div className="text-sm">
-              <Link href="/stations" className="font-medium text-primary hover:text-primary/80 transition-colors duration-200">
-                Manage stations
+        <Card>
+          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+            <CardTitle className="text-sm font-medium">Total Stations</CardTitle>
+            <Building2 className="h-4 w-4 text-muted-foreground" />
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold">{stats?.totalStations || 0}</div>
+            <p className="text-xs text-muted-foreground">
+              <Link href="/stations" className="text-primary hover:underline">
+                Manage stations →
               </Link>
-            </div>
-          </div>
-        </div>
+            </p>
+          </CardContent>
+        </Card>
 
-        <div className="bg-card overflow-hidden shadow-md rounded-lg border border-border transition-all duration-200 hover:shadow-lg">
-          <div className="p-5">
-            <div className="flex items-center">
-              <div className="flex-shrink-0">
-                <div className="w-8 h-8 bg-green-500 dark:bg-green-600 rounded-md flex items-center justify-center">
-                  <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-                  </svg>
-                </div>
-              </div>
-              <div className="ml-5 w-0 flex-1">
-                <dl>
-                  <dt className="text-sm font-medium text-muted-foreground truncate">
-                    Total Chargers
-                  </dt>
-                  <dd className="text-lg font-medium text-card-foreground">
-                    {stats.totalChargers}
-                  </dd>
-                </dl>
-              </div>
+        <Card>
+          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+            <CardTitle className="text-sm font-medium">Total Chargers</CardTitle>
+            <Zap className="h-4 w-4 text-muted-foreground" />
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold">{stats?.totalChargers || 0}</div>
+            <div className="flex gap-1 mt-1">
+              <Badge variant="success" className="text-xs">
+                {stats?.connectedChargers || 0} online
+              </Badge>
+              <Badge variant="outline" className="text-xs">
+                {stats?.disconnectedChargers || 0} offline
+              </Badge>
             </div>
-          </div>
-          <div className="bg-muted/50 px-5 py-3">
-            <div className="text-sm">
-              <Link href="/chargers" className="font-medium text-green-600 hover:text-green-700 dark:text-green-500 dark:hover:text-green-400 transition-colors duration-200">
-                Manage chargers
-              </Link>
-            </div>
-          </div>
-        </div>
+          </CardContent>
+        </Card>
 
-        <div className="bg-card overflow-hidden shadow-md rounded-lg border border-border transition-all duration-200 hover:shadow-lg">
-          <div className="p-5">
-            <div className="flex items-center">
-              <div className="flex-shrink-0">
-                <div className="w-8 h-8 bg-green-500 dark:bg-green-600 rounded-md flex items-center justify-center">
-                  <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                  </svg>
-                </div>
-              </div>
-              <div className="ml-5 w-0 flex-1">
-                <dl>
-                  <dt className="text-sm font-medium text-muted-foreground truncate">
-                    Available Chargers
-                  </dt>
-                  <dd className="text-lg font-medium text-card-foreground">
-                    {stats.availableChargers}
-                  </dd>
-                </dl>
-              </div>
-            </div>
-          </div>
-        </div>
+        <Card>
+          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+            <CardTitle className="text-sm font-medium">Available</CardTitle>
+            <CheckCircle className="h-4 w-4 text-green-600" />
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold text-green-600">{stats?.availableChargers || 0}</div>
+            <p className="text-xs text-muted-foreground">Ready for charging</p>
+          </CardContent>
+        </Card>
 
-        <div className="bg-card overflow-hidden shadow-md rounded-lg border border-border transition-all duration-200 hover:shadow-lg">
-          <div className="p-5">
-            <div className="flex items-center">
-              <div className="flex-shrink-0">
-                <div className="w-8 h-8 bg-primary rounded-md flex items-center justify-center">
-                  <svg className="w-5 h-5 text-primary-foreground" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-                  </svg>
-                </div>
+        <Card>
+          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+            <CardTitle className="text-sm font-medium">Status Overview</CardTitle>
+            <Clock className="h-4 w-4 text-muted-foreground" />
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-1">
+              <div className="flex justify-between text-sm">
+                <span>Charging:</span>
+                <Badge variant="info">{stats?.chargingChargers || 0}</Badge>
               </div>
-              <div className="ml-5 w-0 flex-1">
-                <dl>
-                  <dt className="text-sm font-medium text-muted-foreground truncate">
-                    Occupied Chargers
-                  </dt>
-                  <dd className="text-lg font-medium text-card-foreground">
-                    {stats.occupiedChargers}
-                  </dd>
-                </dl>
+              <div className="flex justify-between text-sm">
+                <span>Unavailable:</span>
+                <Badge variant="warning">{stats?.unavailableChargers || 0}</Badge>
+              </div>
+              <div className="flex justify-between text-sm">
+                <span>Faulted:</span>
+                <Badge variant="destructive">{stats?.faultedChargers || 0}</Badge>
               </div>
             </div>
-          </div>
-        </div>
+          </CardContent>
+        </Card>
       </div>
 
-      <div className="bg-card shadow-md rounded-lg p-6 border border-border">
-        <h2 className="text-lg font-medium text-card-foreground mb-4">Quick Actions</h2>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <Link
-            href="/stations"
-            className="flex items-center p-4 border border-border rounded-lg hover:bg-accent transition-colors duration-200 group"
-          >
-            <div className="flex-shrink-0">
-              <svg className="w-6 h-6 text-primary group-hover:text-primary/80 transition-colors duration-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-              </svg>
-            </div>
-            <div className="ml-3">
-              <p className="text-sm font-medium text-card-foreground">Add New Station</p>
-              <p className="text-sm text-muted-foreground">Create a new charging station</p>
-            </div>
-          </Link>
-          <Link
-            href="/chargers"
-            className="flex items-center p-4 border border-border rounded-lg hover:bg-accent transition-colors duration-200 group"
-          >
-            <div className="flex-shrink-0">
-              <svg className="w-6 h-6 text-green-600 dark:text-green-500 group-hover:text-green-500 dark:group-hover:text-green-400 transition-colors duration-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-              </svg>
-            </div>
-            <div className="ml-3">
-              <p className="text-sm font-medium text-card-foreground">Add New Charger</p>
-              <p className="text-sm text-muted-foreground">Onboard a new charger</p>
-            </div>
-          </Link>
-        </div>
-      </div>
+      {/* Quick Actions */}
+      <Card>
+        <CardHeader>
+          <CardTitle>Quick Actions</CardTitle>
+          <CardDescription>Common management tasks</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <Button asChild variant="outline" className="h-auto p-4 justify-start">
+              <Link href="/stations">
+                <Building2 className="h-5 w-5 mr-2" />
+                <div className="text-left">
+                  <div className="font-medium">Add New Station</div>
+                  <div className="text-sm text-muted-foreground">Create a new charging station</div>
+                </div>
+              </Link>
+            </Button>
+            <Button asChild variant="outline" className="h-auto p-4 justify-start">
+              <Link href="/chargers">
+                <Zap className="h-5 w-5 mr-2" />
+                <div className="text-left">
+                  <div className="font-medium">Add New Charger</div>
+                  <div className="text-sm text-muted-foreground">Onboard a new charger</div>
+                </div>
+              </Link>
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
     </div>
   );
 }

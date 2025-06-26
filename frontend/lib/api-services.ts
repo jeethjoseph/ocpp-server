@@ -1,4 +1,4 @@
-import { apiClient } from "./api";
+import { api } from "./api-client";
 import {
   Station,
   StationCreate,
@@ -26,13 +26,13 @@ export const stationService = {
     if (params?.sort) searchParams.set("sort", params.sort);
     
     const query = searchParams.toString();
-    return apiClient.get<StationListResponse>(
+    return api.get<StationListResponse>(
       `/api/admin/stations${query ? `?${query}` : ""}`
     );
   },
 
   getById: (id: number) =>
-    apiClient.get<{
+    api.get<{
       station: Station;
       chargers: Array<{
         id: number;
@@ -43,13 +43,13 @@ export const stationService = {
     }>(`/api/admin/stations/${id}`),
 
   create: (data: StationCreate) =>
-    apiClient.post<ApiResponse<{ station: Station }>>("/api/admin/stations", data),
+    api.post<ApiResponse<{ station: Station }>>("/api/admin/stations", data),
 
   update: (id: number, data: StationUpdate) =>
-    apiClient.put<ApiResponse<{ station: Station }>>(`/api/admin/stations/${id}`, data),
+    api.put<ApiResponse<{ station: Station }>>(`/api/admin/stations/${id}`, data),
 
   delete: (id: number) =>
-    apiClient.delete<ApiResponse>(`/api/admin/stations/${id}`),
+    api.delete<ApiResponse>(`/api/admin/stations/${id}`),
 };
 
 export const chargerService = {
@@ -70,37 +70,37 @@ export const chargerService = {
     if (params?.sort) searchParams.set("sort", params.sort);
     
     const query = searchParams.toString();
-    return apiClient.get<ChargerListResponse>(
+    return api.get<ChargerListResponse>(
       `/api/admin/chargers${query ? `?${query}` : ""}`
     );
   },
 
   getById: (id: number) =>
-    apiClient.get<ChargerDetail>(`/api/admin/chargers/${id}`),
+    api.get<ChargerDetail>(`/api/admin/chargers/${id}`),
 
   create: (data: ChargerCreate) =>
-    apiClient.post<ApiResponse<{ charger: Charger; ocpp_url: string }>>(
+    api.post<ApiResponse<{ charger: Charger; ocpp_url: string }>>(
       "/api/admin/chargers",
       data
     ),
 
   update: (id: number, data: ChargerUpdate) =>
-    apiClient.put<ApiResponse<{ charger: Charger }>>(`/api/admin/chargers/${id}`, data),
+    api.put<ApiResponse<{ charger: Charger }>>(`/api/admin/chargers/${id}`, data),
 
   delete: (id: number) =>
-    apiClient.delete<ApiResponse>(`/api/admin/chargers/${id}`),
+    api.delete<ApiResponse>(`/api/admin/chargers/${id}`),
 
   changeAvailability: (
     id: number,
     type: "Inoperative" | "Operative",
     connectorId: number
   ) =>
-    apiClient.post<ApiResponse>(
+    api.post<ApiResponse>(
       `/api/admin/chargers/${id}/change-availability?type=${type}&connector_id=${connectorId}`
     ),
 
   remoteStop: (id: number, reason?: string) =>
-    apiClient.post<ApiResponse>(
+    api.post<ApiResponse>(
       `/api/admin/chargers/${id}/remote-stop`,
       reason ? { reason } : undefined
     ),
