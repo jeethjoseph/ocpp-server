@@ -28,11 +28,11 @@ import logging
 import json
 
 # Import routers
-from routers import stations, chargers
+from routers import stations, chargers, transactions
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO,  # Back to INFO level after debugging
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger("ocpp-server")
@@ -75,9 +75,11 @@ class ChargePoint(OcppChargePoint):
 
     @on('Heartbeat')
     async def on_heartbeat(self, **kwargs):
-        # Update last heartbeat timestamp for this charge point
+        # Update both last heartbeat and last seen timestamps for this charge point
+        current_time = datetime.datetime.now(datetime.timezone.utc)
         if self.id in connected_charge_points:
-            connected_charge_points[self.id]["last_heartbeat"] = datetime.datetime.now(datetime.timezone.utc)
+            connected_charge_points[self.id]["last_heartbeat"] = current_time
+            connected_charge_points[self.id]["last_seen"] = current_time  # Fix: Update last_seen on heartbeat
         logger.info(f"Received OCPP Heartbeat from {self.id}")
         # Only update heartbeat time, don't assume status - wait for StatusNotification
         await update_charger_heartbeat(self.id)
@@ -91,6 +93,10 @@ class ChargePoint(OcppChargePoint):
         logger.info(f"StatusNotification from {self.id}: connector_id={connector_id}, status={status}, error_code={error_code}, info={info}")
         
         try:
+            # Update last seen timestamp
+            if self.id in connected_charge_points:
+                connected_charge_points[self.id]["last_seen"] = datetime.datetime.now(datetime.timezone.utc)
+                
             # Update charger status in database
             result = await update_charger_status(self.id, status)
             if not result:
@@ -137,10 +143,10 @@ class ChargePoint(OcppChargePoint):
                 charger=charger,
                 vehicle=vehicle,
                 start_meter_kwh=float(meter_start) / 1000,  # Convert Wh to kWh
-                transaction_status=TransactionStatusEnum.STARTED
+                transaction_status=TransactionStatusEnum.RUNNING  # Changed from STARTED to RUNNING
             )
             
-            logger.info(f"Created transaction {transaction.id} for charger {self.id}")
+            logger.info(f"🔋 Created transaction {transaction.id} for charger {self.id} with status RUNNING")
             
             return call_result.StartTransaction(
                 transaction_id=transaction.id,
@@ -156,7 +162,7 @@ class ChargePoint(OcppChargePoint):
 
     @on('StopTransaction')
     async def on_stop_transaction(self, transaction_id, meter_stop, timestamp, **kwargs):
-        logger.info(f"StopTransaction from {self.id}: transaction_id={transaction_id}, meter_stop={meter_stop}")
+        logger.info(f"🛑 StopTransaction from {self.id}: transaction_id={transaction_id}, meter_stop={meter_stop}")
         
         from models import Transaction, TransactionStatusEnum
         import datetime
@@ -165,10 +171,12 @@ class ChargePoint(OcppChargePoint):
             # Get transaction from database
             transaction = await Transaction.filter(id=transaction_id).first()
             if not transaction:
-                logger.error(f"Transaction {transaction_id} not found")
+                logger.error(f"🛑 ❌ Transaction {transaction_id} not found")
                 return call_result.StopTransaction(
                     id_tag_info={"status": "Invalid"}
                 )
+            
+            logger.info(f"🛑 Transaction {transaction_id} status before stop: {transaction.transaction_status}")
             
             # Update transaction with end values
             transaction.end_meter_kwh = float(meter_stop) / 1000  # Convert Wh to kWh
@@ -179,7 +187,7 @@ class ChargePoint(OcppChargePoint):
             
             await transaction.save()
             
-            logger.info(f"Completed transaction {transaction_id}: {transaction.energy_consumed_kwh} kWh consumed")
+            logger.info(f"🛑 ✅ Completed transaction {transaction_id}: {transaction.energy_consumed_kwh} kWh consumed, status changed to COMPLETED")
             
             return call_result.StopTransaction(
                 id_tag_info={"status": "Accepted"}
@@ -193,65 +201,128 @@ class ChargePoint(OcppChargePoint):
 
     @on('MeterValues')
     async def on_meter_values(self, connector_id, meter_value, transaction_id=None, **kwargs):
-        logger.info(f"MeterValues from {self.id}: connector_id={connector_id}, transaction_id={transaction_id}")
+        logger.info(f"🔋 MeterValues from {self.id}: connector_id={connector_id}, transaction_id={transaction_id}")
+        logger.debug(f"🔋 Raw meter_value data: {meter_value}")
         
         from models import Transaction, MeterValue
         
         try:
-            if transaction_id:
-                # Get transaction from database
-                transaction = await Transaction.filter(id=transaction_id).first()
-                if not transaction:
-                    logger.warning(f"Transaction {transaction_id} not found for meter values")
-                    return call_result.MeterValues()
+            # Update last seen timestamp
+            if self.id in connected_charge_points:
+                connected_charge_points[self.id]["last_seen"] = datetime.datetime.now(datetime.timezone.utc)
                 
-                # Process meter values
-                for meter_reading in meter_value:
-                    timestamp = meter_reading.get('timestamp')
-                    sampled_values = meter_reading.get('sampledValue', [])
+            if not transaction_id:
+                logger.warning(f"🔋 ❌ No transaction_id provided for meter values from {self.id} - DISCARDING")
+                return call_result.MeterValues()
+                
+            # Get transaction from database
+            logger.debug(f"🔋 Looking up transaction {transaction_id} in database...")
+            transaction = await Transaction.filter(id=transaction_id).prefetch_related('charger').first()
+            if not transaction:
+                logger.error(f"🔋 ❌ Transaction {transaction_id} not found in database for meter values from {self.id}")
+                # Let's also check what transactions exist
+                all_transactions = await Transaction.all().values('id', 'transaction_status')
+                logger.error(f"🔋 Available transactions: {all_transactions}")
+                return call_result.MeterValues()
+                
+            logger.debug(f"🔋 ✅ Found transaction {transaction_id} for charger {transaction.charger.charge_point_string_id}")
+            
+            # Process meter values - group all measurands by timestamp
+            meter_records_created = 0
+            for i, meter_reading in enumerate(meter_value):
+                timestamp = meter_reading.get('timestamp')
+                # Handle both camelCase and snake_case for OCPP compatibility
+                sampled_values = meter_reading.get('sampledValue', meter_reading.get('sampled_value', []))
+                logger.debug(f"🔋 Processing meter reading {i+1}: timestamp={timestamp}, samples={len(sampled_values)}")
+                
+                # Collect all measurand values for this timestamp
+                meter_data = {
+                    'reading_kwh': None,
+                    'current': None,
+                    'voltage': None,
+                    'power_kw': None
+                }
+                
+                for j, sample in enumerate(sampled_values):
+                    value = sample.get('value')
+                    measurand = sample.get('measurand', 'Energy.Active.Import.Register')
+                    unit = sample.get('unit', 'Wh')
+                    logger.debug(f"🔋   Sample {j+1}: {measurand}={value} {unit}")
                     
-                    for sample in sampled_values:
-                        value = sample.get('value')
-                        measurand = sample.get('measurand', 'Energy.Active.Import.Register')
-                        unit = sample.get('unit', 'Wh')
+                    if not value:
+                        logger.warning(f"🔋   ⚠️ Empty value for {measurand} - skipping")
+                        continue
                         
-                        if measurand == 'Energy.Active.Import.Register' and value:
+                    try:
+                        if measurand == 'Energy.Active.Import.Register':
                             # Store energy reading
                             reading_kwh = float(value)
                             if unit == 'Wh':
                                 reading_kwh = reading_kwh / 1000  # Convert Wh to kWh
+                            meter_data['reading_kwh'] = reading_kwh
+                            logger.debug(f"🔋   ✅ Energy: {reading_kwh} kWh")
                             
-                            await MeterValue.create(
-                                transaction=transaction,
-                                reading_kwh=reading_kwh
-                            )
+                        elif measurand == 'Current.Import':
+                            # Store current reading
+                            current = float(value)
+                            if unit == 'mA':
+                                current = current / 1000  # Convert mA to A
+                            meter_data['current'] = current
+                            logger.debug(f"🔋   ✅ Current: {current} A")
                             
-                            logger.info(f"Stored meter value: {reading_kwh} kWh for transaction {transaction_id}")
-                        
-                        elif measurand == 'Current.Import' and value:
-                            # Update current reading (could store in separate field or latest meter value)
-                            pass
-                        
-                        elif measurand == 'Voltage' and value:
-                            # Update voltage reading
-                            pass
-                        
-                        elif measurand == 'Power.Active.Import' and value:
-                            # Update power reading
+                        elif measurand == 'Voltage':
+                            # Store voltage reading
+                            voltage = float(value)
+                            if unit == 'mV':
+                                voltage = voltage / 1000  # Convert mV to V
+                            meter_data['voltage'] = voltage
+                            logger.debug(f"🔋   ✅ Voltage: {voltage} V")
+                            
+                        elif measurand == 'Power.Active.Import':
+                            # Store power reading
                             power_kw = float(value)
                             if unit == 'W':
                                 power_kw = power_kw / 1000  # Convert W to kW
+                            meter_data['power_kw'] = power_kw
+                            logger.debug(f"🔋   ✅ Power: {power_kw} kW")
+                        else:
+                            logger.debug(f"🔋   ⚠️ Unknown measurand: {measurand} - ignoring")
                             
-                            # Store power in the latest meter value (you could enhance this)
-                            latest_meter = await MeterValue.filter(transaction=transaction).order_by('-created_at').first()
-                            if latest_meter:
-                                latest_meter.power_kw = power_kw
-                                await latest_meter.save()
+                    except (ValueError, TypeError) as e:
+                        logger.error(f"🔋   ❌ Error parsing {measurand} value '{value}': {e}")
+                        continue
+                
+                # Only create meter value record if we have at least energy reading
+                if meter_data['reading_kwh'] is not None:
+                    try:
+                        logger.debug(f"🔋 💾 Creating MeterValue record in database...")
+                        meter_record = await MeterValue.create(
+                            transaction=transaction,
+                            reading_kwh=meter_data['reading_kwh'],
+                            current=meter_data['current'],
+                            voltage=meter_data['voltage'],
+                            power_kw=meter_data['power_kw']
+                        )
+                        meter_records_created += 1
+                        
+                        logger.info(f"🔋 ✅ STORED meter value ID={meter_record.id} for transaction {transaction_id}: "
+                                  f"Energy={meter_data['reading_kwh']} kWh, "
+                                  f"Current={meter_data['current']} A, "
+                                  f"Voltage={meter_data['voltage']} V, "
+                                  f"Power={meter_data['power_kw']} kW")
+                    except Exception as db_error:
+                        logger.error(f"🔋 ❌ DATABASE ERROR creating meter value: {db_error}", exc_info=True)
+                        # Continue processing other readings even if one fails
+                        
+                else:
+                    logger.warning(f"🔋 ⚠️ No energy reading found in meter data - skipping record")
+                    logger.debug(f"🔋 Meter data was: {meter_data}")
             
+            logger.info(f"🔋 📊 Summary: Created {meter_records_created} meter value records for transaction {transaction_id}")
             return call_result.MeterValues()
             
         except Exception as e:
-            logger.error(f"Error processing meter values for {self.id}: {e}", exc_info=True)
+            logger.error(f"🔋 ❌ FATAL ERROR processing meter values for {self.id}: {e}", exc_info=True)
             return call_result.MeterValues()
 
 # Adapter to make FastAPI's WebSocket compatible with python-ocpp
@@ -414,11 +485,22 @@ async def periodic_cleanup():
             current_time = datetime.datetime.now(datetime.timezone.utc)
             stale_connections = []
             
-            # Find connections that haven't been seen for more than 2 minutes
+            # Find connections that haven't been seen for more than 5 minutes (300 seconds)
+            # This should be longer than heartbeat timeout (90s) to avoid false positives
             for charge_point_id, connection_data in connected_charge_points.items():
                 last_seen = connection_data.get("last_seen")
-                if last_seen and (current_time - last_seen).total_seconds() > 120:
+                last_heartbeat = connection_data.get("last_heartbeat")
+                
+                # Use the most recent of last_seen or last_heartbeat
+                most_recent = max(
+                    last_seen or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc),
+                    last_heartbeat or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+                )
+                
+                # Only mark as stale if no activity for 5 minutes (much longer than heartbeat timeout)
+                if (current_time - most_recent).total_seconds() > 300:
                     stale_connections.append(charge_point_id)
+                    logger.warning(f"Connection {charge_point_id} stale: last activity {(current_time - most_recent).total_seconds():.1f}s ago")
             
             # Clean up stale connections
             for charge_point_id in stale_connections:
@@ -431,6 +513,7 @@ async def periodic_cleanup():
 # ============ Include Routers ============
 app.include_router(stations.router)
 app.include_router(chargers.router)
+app.include_router(transactions.router)
 
 # ============ OCPP WebSocket Endpoint ============
 @app.websocket("/ocpp/{charge_point_id}")

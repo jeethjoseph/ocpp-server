@@ -89,11 +89,56 @@ export interface ChargerDetail {
   };
   connectors: Connector[];
   current_transaction?: {
-    id: number;
-    user_id: number;
-    start_time: string;
-    status: string;
+    transaction_id: number;
   };
+}
+
+export interface MeterValue {
+  id: number;
+  created_at: string;
+  updated_at: string;
+  reading_kwh: number;
+  current?: number;
+  voltage?: number;
+  power_kw?: number;
+}
+
+export interface Transaction {
+  id: number;
+  user_id: number;
+  charger_id: number;
+  start_meter_kwh?: number;
+  end_meter_kwh?: number;
+  energy_consumed_kwh?: number;
+  start_time: string;
+  end_time?: string;
+  stop_reason?: string;
+  transaction_status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TransactionDetail {
+  transaction: Transaction;
+  user: {
+    id: number;
+    full_name?: string;
+    email?: string;
+    phone_number?: string;
+  };
+  charger: {
+    id: number;
+    name: string;
+    charge_point_string_id: string;
+  };
+  meter_values: MeterValue[];
+  wallet_transactions: Array<{
+    id: number;
+    amount: number;
+    type: string;
+    description?: string;
+    created_at: string;
+  }>;
 }
 
 export interface ApiResponse<T = any> {

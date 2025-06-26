@@ -49,6 +49,7 @@ export function useCreateStation() {
     },
     onError: (err) => {
       const errorMessage = err instanceof Error ? err.message : String(err);
+      console.error("Create station error:", errorMessage);
       toast.error("Failed to create station");
     },
   });
@@ -69,6 +70,7 @@ export function useUpdateStation() {
     },
     onError: (err) => {
       const errorMessage = err instanceof Error ? err.message : String(err);
+      console.error("Update station error:", errorMessage);
       toast.error("Failed to update station");
     },
   });
@@ -115,6 +117,7 @@ export function useDeleteStation() {
         });
       }
       const errorMessage = err instanceof Error ? err.message : String(err);
+      console.error("Delete station error:", errorMessage);
       toast.error("Failed to delete station");
     },
     onSettled: () => {

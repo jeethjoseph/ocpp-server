@@ -1,7 +1,8 @@
 "use client";
 
 import { useState } from "react";
-import { Zap, Plus } from "lucide-react";
+import { Zap, Plus, ExternalLink } from "lucide-react";
+import Link from "next/link";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -300,9 +301,15 @@ export default function ChargersPage() {
                       </button>
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium space-x-2">
+                      <Link
+                        href={`/chargers/${charger.id}`}
+                        className="text-primary hover:text-primary/80 transition-colors">
+                        <ExternalLink className="h-4 w-4 inline mr-1" />
+                        View
+                      </Link>
                       <button
                         onClick={() => handleDeleteCharger(charger.id)}
-                        className="text-destructive hover:text-destructive/80 transition-colors">
+                        className="text-destructive hover:text-destructive/80 transition-colors ml-2">
                         Delete
                       </button>
                     </td>

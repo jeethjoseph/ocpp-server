@@ -9,6 +9,9 @@ import {
   ChargerUpdate,
   ChargerListResponse,
   ChargerDetail,
+  MeterValue,
+  Transaction,
+  TransactionDetail,
   ApiResponse,
 } from "@/types/api";
 
@@ -103,5 +106,60 @@ export const chargerService = {
     api.post<ApiResponse>(
       `/api/admin/chargers/${id}/remote-stop`,
       reason ? { reason } : undefined
+    ),
+
+  remoteStart: (id: number, connectorId: number = 1, idTag: string = "admin") =>
+    api.post<ApiResponse>(
+      `/api/admin/chargers/${id}/remote-start`,
+      { connector_id: connectorId, id_tag: idTag }
+    ),
+};
+
+export const transactionService = {
+  getAll: (params?: {
+    page?: number;
+    limit?: number;
+    status?: string;
+    user_id?: number;
+    charger_id?: number;
+    start_date?: string;
+    end_date?: string;
+    sort?: string;
+  }) => {
+    const searchParams = new URLSearchParams();
+    if (params?.page) searchParams.set("page", params.page.toString());
+    if (params?.limit) searchParams.set("limit", params.limit.toString());
+    if (params?.status) searchParams.set("status", params.status);
+    if (params?.user_id) searchParams.set("user_id", params.user_id.toString());
+    if (params?.charger_id) searchParams.set("charger_id", params.charger_id.toString());
+    if (params?.start_date) searchParams.set("start_date", params.start_date);
+    if (params?.end_date) searchParams.set("end_date", params.end_date);
+    if (params?.sort) searchParams.set("sort", params.sort);
+    
+    const query = searchParams.toString();
+    return api.get<{
+      data: unknown[];
+      total: number;
+      page: number;
+      limit: number;
+      summary: Record<string, unknown>;
+    }>(
+      `/api/admin/transactions${query ? `?${query}` : ""}`
+    );
+  },
+
+  getById: (id: number) =>
+    api.get<TransactionDetail>(`/api/admin/transactions/${id}`),
+
+  getMeterValues: (id: number) =>
+    api.get<{
+      meter_values: MeterValue[];
+      energy_chart_data: Record<string, unknown>;
+    }>(`/api/admin/transactions/${id}/meter-values`),
+
+  forceStop: (id: number, reason: string) =>
+    api.post<ApiResponse>(
+      `/api/admin/transactions/${id}/stop`,
+      { reason }
     ),
 };

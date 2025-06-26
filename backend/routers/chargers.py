@@ -71,11 +71,8 @@ class StationBasicInfo(BaseModel):
     class Config:
         from_attributes = True
 
-class TransactionBasicInfo(BaseModel):
-    id: int
-    user_id: int
-    start_time: datetime
-    transaction_status: str
+class CurrentTransactionInfo(BaseModel):
+    transaction_id: int
     
     class Config:
         from_attributes = True
@@ -84,7 +81,7 @@ class ChargerDetailResponse(BaseModel):
     charger: ChargerResponse
     station: StationBasicInfo
     connectors: List[ConnectorResponse]
-    current_transaction: Optional[TransactionBasicInfo] = None
+    current_transaction: Optional[CurrentTransactionInfo] = None
 
 class OCPPLogResponse(BaseModel):
     id: int
@@ -287,7 +284,7 @@ async def get_charger_details(charger_id: int):
     )
     
     if current_transaction:
-        response.current_transaction = TransactionBasicInfo.model_validate(current_transaction, from_attributes=True)
+        response.current_transaction = CurrentTransactionInfo(transaction_id=current_transaction.id)
     
     return response
 
@@ -327,6 +324,58 @@ async def delete_charger(charger_id: int):
     
     return {"message": "Charger removed successfully"}
 
+@router.post("/{charger_id}/remote-start", response_model=dict)
+async def remote_start_charging(charger_id: int, connector_id: int = 1, id_tag: str = "admin"):
+    """Start charging remotely"""
+    
+    # FIXME: connector_id is hardcoded to 1 - should dynamically select available connector
+    # or allow user to choose from available connectors for this charger
+    
+    charger = await Charger.filter(id=charger_id).first()
+    if not charger:
+        raise HTTPException(status_code=404, detail="Charger not found")
+    
+    # Check if charger status is suitable for remote start
+    if charger.latest_status != "Preparing":
+        raise HTTPException(status_code=409, detail=f"Cannot start charging. Charger status is {charger.latest_status}, should be Preparing")
+    
+    # Get connected charge points
+    connected_cps = get_connected_charge_points()
+    
+    if charger.charge_point_string_id not in connected_cps:
+        raise HTTPException(status_code=409, detail="Charger is not connected")
+    
+    # Check if there's already an active transaction
+    existing_transaction = await Transaction.filter(
+        charger_id=charger_id,
+        transaction_status__in=["STARTED", "PENDING_START", "RUNNING"]
+    ).first()
+    
+    if existing_transaction:
+        raise HTTPException(status_code=409, detail="There is already an active charging session")
+    
+    # Import and use the send_ocpp_request function
+    from main import send_ocpp_request
+    
+    # Send RemoteStartTransaction command
+    success, response = await send_ocpp_request(
+        charger.charge_point_string_id,
+        "RemoteStartTransaction",
+        {
+            "connector_id": connector_id,
+            "id_tag": id_tag
+        }
+    )
+    
+    if success:
+        return {
+            "success": True,
+            "message": "Remote start command sent successfully",
+            "connector_id": connector_id
+        }
+    else:
+        raise HTTPException(status_code=500, detail=f"Failed to send start command: {response}")
+
 @router.post("/{charger_id}/remote-stop", response_model=dict)
 async def remote_stop_charging(charger_id: int, reason: Optional[str] = "Requested by operator"):
     """Stop charging remotely"""
@@ -357,7 +406,7 @@ async def remote_stop_charging(charger_id: int, reason: Optional[str] = "Request
     success, response = await send_ocpp_request(
         charger.charge_point_string_id,
         "RemoteStopTransaction",
-        {"transactionId": transaction.id}
+        {"transaction_id": transaction.id}
     )
     
     if success:

@@ -225,30 +225,71 @@ class OCPPChargerSimulator:
         return response
     
     def send_meter_values(self, connector_id: int = 1) -> dict:
-        """Send MeterValues message"""
+        """Send comprehensive MeterValues message with all measurands"""
         if not self.transaction_id:
             return {}
         
-        current_energy = 2000 + (time.time() % 1000)  # Simulate increasing energy
+        # Simulate realistic charging values
+        time_elapsed = time.time() % 1000
+        current_energy = 2000 + time_elapsed  # Increasing energy consumption
+        
+        # Simulate realistic electrical values during charging
+        import random
+        base_current = 32.0  # 32A typical for AC charging
+        base_voltage = 230.0  # 230V typical for AC charging
+        base_power = 7.4  # 7.4kW typical for AC charging
+        
+        # Add some realistic variation
+        current_variation = random.uniform(0.9, 1.1)
+        voltage_variation = random.uniform(0.98, 1.02)
+        power_variation = random.uniform(0.9, 1.1)
+        
+        current_amps = base_current * current_variation
+        voltage_volts = base_voltage * voltage_variation  
+        power_watts = base_power * power_variation * 1000  # Convert kW to W
         
         payload = {
             "connectorId": connector_id,
             "transactionId": self.transaction_id,
             "meterValue": [{
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
-                "sampledValue": [{
-                    "value": str(int(current_energy)),
-                    "context": "Sample.Periodic",
-                    "format": "Raw",
-                    "measurand": "Energy.Active.Import.Register",
-                    "unit": "Wh"
-                }]
+                "sampledValue": [
+                    {
+                        "value": str(int(current_energy)),
+                        "context": "Sample.Periodic",
+                        "format": "Raw",
+                        "measurand": "Energy.Active.Import.Register",
+                        "unit": "Wh"
+                    },
+                    {
+                        "value": str(round(current_amps, 2)),
+                        "context": "Sample.Periodic", 
+                        "format": "Raw",
+                        "measurand": "Current.Import",
+                        "unit": "A"
+                    },
+                    {
+                        "value": str(round(voltage_volts, 1)),
+                        "context": "Sample.Periodic",
+                        "format": "Raw", 
+                        "measurand": "Voltage",
+                        "unit": "V"
+                    },
+                    {
+                        "value": str(int(power_watts)),
+                        "context": "Sample.Periodic",
+                        "format": "Raw",
+                        "measurand": "Power.Active.Import", 
+                        "unit": "W"
+                    }
+                ]
             }]
         }
         
         response = self._send_message("MeterValues", payload)
         self.statistics["meter_values"] += 1
-        print(f"⚡ [{self.charge_point_id}] Meter value sent: {int(current_energy)} Wh")
+        print(f"⚡ [{self.charge_point_id}] Meter values sent: "
+              f"{int(current_energy)} Wh, {current_amps:.1f}A, {voltage_volts:.1f}V, {power_watts/1000:.1f}kW")
         return response
     
     def handle_remote_start_transaction(self, message_id: str, payload: dict) -> bool:

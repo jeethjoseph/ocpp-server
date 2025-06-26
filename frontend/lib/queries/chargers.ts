@@ -1,6 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { chargerService, stationService } from "@/lib/api-services";
-import { ChargerListResponse, StationListResponse } from "@/types/api";
+import { ChargerListResponse } from "@/types/api";
 import { toast } from "sonner";
 
 // Query Keys
@@ -50,6 +50,41 @@ export function useCharger(id: number) {
     queryKey: chargerKeys.detail(id),
     queryFn: () => chargerService.getById(id),
     enabled: !!id,
+    staleTime: 1000 * 10, // 10 seconds
+    refetchInterval: 1000 * 10, // Auto-refresh every 10 seconds
+  });
+}
+
+// Remote Start Mutation Hook
+export function useRemoteStart() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({
+      id,
+      connectorId = 1,
+      idTag = "admin",
+    }: {
+      id: number;
+      connectorId?: number;
+      idTag?: string;
+    }) => {
+      return chargerService.remoteStart(id, connectorId, idTag);
+    },
+    onSuccess: (_, variables) => {
+      // Invalidate charger details to refetch latest status
+      queryClient.invalidateQueries({ queryKey: chargerKeys.detail(variables.id) });
+      toast.success("Remote start command sent successfully. Waiting for charger to start charging...");
+    },
+    onError: (err) => {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      console.error("Remote start error:", errorMessage);
+      if (errorMessage.includes("409") || errorMessage.includes("not connected")) {
+        toast.error("Charger not connected or not in correct state");
+      } else {
+        toast.error("Failed to start charging");
+      }
+    },
   });
 }
 
@@ -142,7 +177,12 @@ export function useRemoteStop() {
     },
     onError: (err) => {
       const errorMessage = err instanceof Error ? err.message : String(err);
-      toast.error("Failed to initiate remote stop");
+      console.error("Remote stop error:", errorMessage);
+      if (errorMessage.includes("409") || errorMessage.includes("not connected")) {
+        toast.error("Charger not connected or no active session");
+      } else {
+        toast.error("Failed to initiate remote stop");
+      }
     },
   });
 }
@@ -160,6 +200,7 @@ export function useDeleteCharger() {
     },
     onError: (err) => {
       const errorMessage = err instanceof Error ? err.message : String(err);
+      console.error("Delete charger error:", errorMessage);
       toast.error("Failed to delete charger");
     },
   });

@@ -25,7 +25,7 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 
-import { StationCreate, StationUpdate } from "@/types/api";
+import { Station, StationCreate, StationUpdate } from "@/types/api";
 import {
   useStations,
   useCreateStation,
@@ -35,7 +35,7 @@ import {
 
 export default function StationsPage() {
   const [showCreateDialog, setShowCreateDialog] = useState(false);
-  const [editingStation, setEditingStation] = useState<any>(null);
+  const [editingStation, setEditingStation] = useState<Station | null>(null);
   const [searchTerm, setSearchTerm] = useState("");
   const [currentPage, setCurrentPage] = useState(1);
 
@@ -246,7 +246,7 @@ export default function StationsPage() {
 }
 
 interface StationFormProps {
-  station?: any;
+  station?: Station;
   onSubmit: (data: StationCreate) => void;
   isLoading: boolean;
 }
