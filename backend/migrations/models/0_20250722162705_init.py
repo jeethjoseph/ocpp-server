@@ -3,17 +3,7 @@ from tortoise import BaseDBAsyncClient
 
 async def upgrade(db: BaseDBAsyncClient) -> str:
     return """
-        CREATE TABLE IF NOT EXISTS "admin_user" (
-    "id" SERIAL NOT NULL PRIMARY KEY,
-    "created_at" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updated_at" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "email" VARCHAR(255),
-    "phone_number" VARCHAR(255) UNIQUE,
-    "password_hash" VARCHAR(255),
-    "full_name" VARCHAR(255),
-    "is_active" BOOL NOT NULL DEFAULT True
-);
-CREATE TABLE IF NOT EXISTS "charging_station" (
+        CREATE TABLE IF NOT EXISTS "charging_station" (
     "id" SERIAL NOT NULL PRIMARY KEY,
     "created_at" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updated_at" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -36,11 +26,11 @@ CREATE TABLE IF NOT EXISTS "charger" (
     "imsi" VARCHAR(100),
     "meter_type" VARCHAR(100),
     "meter_serial_number" VARCHAR(100),
-    "latest_status" VARCHAR(14) NOT NULL,
+    "latest_status" VARCHAR(13) NOT NULL,
     "last_heart_beat_time" TIMESTAMPTZ,
     "station_id" INT NOT NULL REFERENCES "charging_station" ("id") ON DELETE CASCADE
 );
-COMMENT ON COLUMN "charger"."latest_status" IS 'AVAILABLE: AVAILABLE\nPREPARING: PREPARING\nCHARGING: CHARGING\nSUSPENDED_EVSE: SUSPENDED_EVSE\nSUSPENDED_EV: SUSPENDED_EV\nFINISHING: FINISHING\nRESERVED: RESERVED\nUNAVAILABLE: UNAVAILABLE\nFAULTED: FAULTED';
+COMMENT ON COLUMN "charger"."latest_status" IS 'AVAILABLE: Available\nPREPARING: Preparing\nCHARGING: Charging\nSUSPENDED_EVSE: SuspendedEVSE\nSUSPENDED_EV: SuspendedEV\nFINISHING: Finishing\nRESERVED: Reserved\nUNAVAILABLE: Unavailable\nFAULTED: Faulted';
 CREATE TABLE IF NOT EXISTS "connector" (
     "id" SERIAL NOT NULL PRIMARY KEY,
     "connector_id" INT NOT NULL,
@@ -83,14 +73,26 @@ CREATE TABLE IF NOT EXISTS "tariff" (
 );
 CREATE TABLE IF NOT EXISTS "user" (
     "id" SERIAL NOT NULL PRIMARY KEY,
+    "email" VARCHAR(255) NOT NULL UNIQUE,
+    "phone_number" VARCHAR(255) UNIQUE,
+    "supabase_user_id" VARCHAR(255) UNIQUE,
+    "auth_provider" VARCHAR(6) NOT NULL DEFAULT 'EMAIL',
+    "full_name" VARCHAR(255),
+    "avatar_url" VARCHAR(500),
+    "role" VARCHAR(5) NOT NULL DEFAULT 'USER',
+    "is_active" BOOL NOT NULL DEFAULT True,
+    "is_email_verified" BOOL NOT NULL DEFAULT False,
+    "terms_accepted_at" TIMESTAMPTZ,
+    "preferred_language" VARCHAR(10) NOT NULL DEFAULT 'en',
+    "notification_preferences" JSONB NOT NULL,
+    "rfid_card_id" VARCHAR(255) UNIQUE,
+    "password_hash" VARCHAR(255),
     "created_at" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updated_at" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "email" VARCHAR(255),
-    "phone_number" VARCHAR(255) UNIQUE,
-    "password_hash" VARCHAR(255),
-    "full_name" VARCHAR(255),
-    "is_active" BOOL NOT NULL DEFAULT True
+    "last_login" TIMESTAMPTZ
 );
+COMMENT ON COLUMN "user"."auth_provider" IS 'EMAIL: EMAIL\nGOOGLE: GOOGLE';
+COMMENT ON COLUMN "user"."role" IS 'ADMIN: ADMIN\nUSER: USER';
 CREATE TABLE IF NOT EXISTS "valid_vehicle_profile" (
     "id" SERIAL NOT NULL PRIMARY KEY,
     "created_at" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,

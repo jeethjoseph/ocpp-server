@@ -1,4 +1,6 @@
 // Streamlined API client for TanStack Query
+import { supabase } from '@/lib/supabase';
+
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 export class ApiError extends Error {
@@ -18,9 +20,15 @@ async function apiRequest<T>(
 ): Promise<T> {
   const url = `${API_BASE_URL}${endpoint}`;
   
+  // Get current session token
+  const { data: { session } } = await supabase.auth.getSession();
+  
   const config: RequestInit = {
     headers: {
       "Content-Type": "application/json",
+      ...(session?.access_token && {
+        "Authorization": `Bearer ${session.access_token}`
+      }),
       ...options.headers,
     },
     ...options,
@@ -29,6 +37,25 @@ async function apiRequest<T>(
   const response = await fetch(url, config);
 
   if (!response.ok) {
+    // If token expired, try to refresh
+    if (response.status === 401 && session) {
+      const { data: { session: newSession }, error } = await supabase.auth.getSession();
+      if (newSession && !error) {
+        // Retry with new token
+        const retryConfig: RequestInit = {
+          ...config,
+          headers: {
+            ...config.headers,
+            "Authorization": `Bearer ${newSession.access_token}`
+          }
+        };
+        const retryResponse = await fetch(url, retryConfig);
+        if (retryResponse.ok) {
+          return retryResponse.json();
+        }
+      }
+    }
+    
     throw new ApiError(
       response.status,
       response.statusText,

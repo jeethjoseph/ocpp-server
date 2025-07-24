@@ -1,8 +1,10 @@
 'use client';
 
 import Link from 'next/link';
-import { usePathname } from 'next/navigation';
+import { usePathname, useRouter } from 'next/navigation';
 import { useTheme } from '@/contexts/ThemeContext';
+import { useAuth } from '@/contexts/AuthContext';
+import { Button } from '@/components/ui/button';
 
 const navigation = [
   { name: 'Dashboard', href: '/' },
@@ -12,7 +14,9 @@ const navigation = [
 
 export default function Navbar() {
   const pathname = usePathname();
+  const router = useRouter();
   const { theme, setTheme } = useTheme();
+  const { user, signOut, loading } = useAuth();
 
   const themeIcons = {
     light: '☀️',
@@ -28,6 +32,13 @@ export default function Navbar() {
   };
 
   const currentIcon = themeIcons[theme];
+
+  const handleSignOut = async () => {
+    const { error } = await signOut();
+    if (!error) {
+      router.push('/auth');
+    }
+  };
 
   return (
     <nav className="bg-card shadow border-b border-border transition-colors duration-300">
@@ -55,7 +66,7 @@ export default function Navbar() {
               ))}
             </div>
           </div>
-          <div className="flex items-center">
+          <div className="flex items-center space-x-4">
             <button
               onClick={cycleTheme}
               className="p-2 rounded-md text-muted-foreground hover:text-card-foreground hover:bg-accent transition-colors duration-200 text-lg"
@@ -63,6 +74,30 @@ export default function Navbar() {
             >
               {currentIcon}
             </button>
+            
+            {user ? (
+              <div className="flex items-center space-x-3">
+                <span className="text-sm text-muted-foreground">
+                  {user.email}
+                </span>
+                <Button
+                  onClick={handleSignOut}
+                  variant="outline"
+                  size="sm"
+                  disabled={loading}
+                >
+                  {loading ? 'Signing out...' : 'Sign Out'}
+                </Button>
+              </div>
+            ) : (
+              <Button
+                onClick={() => router.push('/auth')}
+                variant="default"
+                size="sm"
+              >
+                Sign In
+              </Button>
+            )}
           </div>
         </div>
       </div>

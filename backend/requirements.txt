@@ -14,3 +14,4 @@ httpx>=0.27.0               # For AsyncClient in tests
 pytest-cov>=5.0.0           # (Optional) For test coverage reports
 pytest-mock>=3.14.0         # (Optional) For mocking in tests
 redis>=5.0.0                # Redis client for connection tracking
+supabase>=2.0.0             # Supabase Python client for authentication

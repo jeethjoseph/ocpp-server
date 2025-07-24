@@ -1,10 +1,53 @@
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Environment files (keep .env.example)
 .env
+.env.local
+.env.production
+.env.staging
+
+# Virtual environment
 .venv
-test.html
+venv/
+env/
+
+# IDE and editor files
 .idea/*
-alembic.ini
 .vscode/*
+
+# Temporary files
+test.html
 dump.rdb
+
+# Database
+*.db
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# Node.js (for frontend)
+node_modules/
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+
+# Next.js
+.next/
+out/
+
+# Production build
+dist/
+build/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db

@@ -34,36 +34,68 @@ class MessageDirectionEnum(str, enum.Enum):
     INBOUND = "IN"
     OUTBOUND = "OUT"
 
+# New Supabase authentication enums
+class UserRoleEnum(str, enum.Enum):
+    ADMIN = "ADMIN"
+    USER = "USER"  # EV drivers
+
+class AuthProviderEnum(str, enum.Enum):
+    EMAIL = "EMAIL"
+    GOOGLE = "GOOGLE"
+   
+
 # Models
 class User(Model):
     id = fields.IntField(pk=True)
+    
+    # Authentication fields
+    email = fields.CharField(max_length=255, unique=True)
+    phone_number = fields.CharField(max_length=255, unique=True, null=True)
+    
+    # Supabase integration
+    supabase_user_id = fields.CharField(max_length=255, unique=True, null=True)
+    auth_provider = fields.CharEnumField(AuthProviderEnum, default=AuthProviderEnum.EMAIL)
+    
+    # Profile fields
+    full_name = fields.CharField(max_length=255, null=True)
+    avatar_url = fields.CharField(max_length=500, null=True)  # From Google/social
+    role = fields.CharEnumField(UserRoleEnum, default=UserRoleEnum.USER)
+    
+    # Status and permissions
+    is_active = fields.BooleanField(default=True)
+    is_email_verified = fields.BooleanField(default=False)
+    terms_accepted_at = fields.DatetimeField(null=True)
+    
+    # Additional EV user fields
+    preferred_language = fields.CharField(max_length=10, default="en")
+    notification_preferences = fields.JSONField(default=dict)
+    
+    # RFID/Card integration for OCPP
+    rfid_card_id = fields.CharField(max_length=255, unique=True, null=True)
+    
+    # Legacy password support (will be deprecated)
+    password_hash = fields.CharField(max_length=255, null=True)
+    
+    # Timestamps
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)
-    email = fields.CharField(max_length=255, null=True)
-    phone_number = fields.CharField(max_length=255, unique=True, null=True)
-    password_hash = fields.CharField(max_length=255, null=True)
-    full_name = fields.CharField(max_length=255, null=True)
-    is_active = fields.BooleanField(default=True)
+    last_login = fields.DatetimeField(null=True)
     
-    # Relationships
+    # Existing relationships (unchanged)
     wallet: fields.ReverseRelation["Wallet"]
     vehicles: fields.ReverseRelation["VehicleProfile"]
+    transactions: fields.ReverseRelation["Transaction"]
     
     class Meta:
         table = "user"
-
-class AdminUser(Model):
-    id = fields.IntField(pk=True)
-    created_at = fields.DatetimeField(auto_now_add=True)
-    updated_at = fields.DatetimeField(auto_now=True)
-    email = fields.CharField(max_length=255, null=True)
-    phone_number = fields.CharField(max_length=255, unique=True, null=True)
-    password_hash = fields.CharField(max_length=255, null=True)
-    full_name = fields.CharField(max_length=255, null=True)
-    is_active = fields.BooleanField(default=True)
-    
-    class Meta:
-        table = "admin_user"
+        
+    @property
+    def is_admin(self) -> bool:
+        return self.role == UserRoleEnum.ADMIN
+        
+    @property
+    def display_name(self) -> str:
+        return self.full_name or self.email.split('@')[0]
 
 class Wallet(Model):
     id = fields.IntField(pk=True)

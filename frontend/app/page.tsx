@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { Building2, Zap, CheckCircle, Clock } from "lucide-react";
+import { ProtectedRoute } from "@/components/auth/ProtectedRoute";
 
 import {
   Card,
@@ -40,7 +41,8 @@ export default function Dashboard() {
   }
 
   return (
-    <div className="space-y-8">
+    <ProtectedRoute>
+      <div className="space-y-8">
       <div>
         <h1 className="text-3xl font-bold">OCPP Admin Dashboard</h1>
         <p className="text-muted-foreground mt-2">
@@ -173,6 +175,7 @@ export default function Dashboard() {
           </div>
         </CardContent>
       </Card>
-    </div>
+      </div>
+    </ProtectedRoute>
   );
 }
