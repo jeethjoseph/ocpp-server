@@ -4,7 +4,7 @@ import "./globals.css";
 import Navbar from "@/components/Navbar";
 import { ThemeProvider } from "@/contexts/ThemeContext";
 import { QueryProvider } from "@/contexts/QueryClientProvider";
-import { AuthProvider } from "@/contexts/AuthContext";
+import { ClerkProvider } from '@clerk/nextjs';
 import { Toaster } from "sonner";
 
 const geistSans = Geist({
@@ -32,17 +32,17 @@ export default function RootLayout({
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased bg-background text-foreground transition-colors duration-300`}
       >
-        <QueryProvider>
-          <ThemeProvider>
-            <AuthProvider>
+        <ClerkProvider>
+          <QueryProvider>
+            <ThemeProvider>
               <Navbar />
               <main className="max-w-7xl mx-auto py-6 px-4 sm:px-6 lg:px-8">
                 {children}
               </main>
               <Toaster />
-            </AuthProvider>
-          </ThemeProvider>
-        </QueryProvider>
+            </ThemeProvider>
+          </QueryProvider>
+        </ClerkProvider>
       </body>
     </html>
   );

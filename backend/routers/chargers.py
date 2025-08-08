@@ -6,8 +6,9 @@ from datetime import datetime
 import uuid
 import logging
 
-from models import Charger, ChargingStation, Connector, Transaction, OCPPLog
+from models import Charger, ChargingStation, Connector, Transaction, OCPPLog, User
 from tortoise.exceptions import IntegrityError
+from auth_middleware import require_admin, require_user_or_admin
 
 logger = logging.getLogger(__name__)
 
@@ -208,7 +209,7 @@ async def list_chargers(
     )
 
 @router.post("", response_model=dict, status_code=201)
-async def create_charger(charger_data: ChargerCreate):
+async def create_charger(charger_data: ChargerCreate, admin_user: User = Depends(require_admin())):
     """Onboard a new charger"""
     
     # Verify station exists
@@ -289,7 +290,7 @@ async def get_charger_details(charger_id: int):
     return response
 
 @router.put("/{charger_id}", response_model=dict)
-async def update_charger(charger_id: int, update_data: ChargerUpdate):
+async def update_charger(charger_id: int, update_data: ChargerUpdate, admin_user: User = Depends(require_admin())):
     """Update charger information"""
     
     charger = await Charger.filter(id=charger_id).first()
@@ -312,7 +313,7 @@ async def update_charger(charger_id: int, update_data: ChargerUpdate):
     }
 
 @router.delete("/{charger_id}", response_model=dict)
-async def delete_charger(charger_id: int):
+async def delete_charger(charger_id: int, admin_user: User = Depends(require_admin())):
     """Remove a charger from the system"""
     
     charger = await Charger.filter(id=charger_id).first()
@@ -325,7 +326,7 @@ async def delete_charger(charger_id: int):
     return {"message": "Charger removed successfully"}
 
 @router.post("/{charger_id}/remote-start", response_model=dict)
-async def remote_start_charging(charger_id: int, connector_id: int = 1, id_tag: str = "admin"):
+async def remote_start_charging(charger_id: int, connector_id: int = 1, id_tag: str = "admin", user: User = Depends(require_user_or_admin())):
     """Start charging remotely"""
     
     # FIXME: connector_id is hardcoded to 1 - should dynamically select available connector
@@ -377,7 +378,7 @@ async def remote_start_charging(charger_id: int, connector_id: int = 1, id_tag: 
         raise HTTPException(status_code=500, detail=f"Failed to send start command: {response}")
 
 @router.post("/{charger_id}/remote-stop", response_model=dict)
-async def remote_stop_charging(charger_id: int, reason: Optional[str] = "Requested by operator"):
+async def remote_stop_charging(charger_id: int, reason: Optional[str] = "Requested by operator", user: User = Depends(require_user_or_admin())):
     """Stop charging remotely"""
     
     charger = await Charger.filter(id=charger_id).first()
@@ -422,7 +423,8 @@ async def remote_stop_charging(charger_id: int, reason: Optional[str] = "Request
 async def change_charger_availability(
     charger_id: int,
     type: str = Query(..., regex="^(Inoperative|Operative)$"),
-    connector_id: int = Query(..., ge=0)
+    connector_id: int = Query(..., ge=0),
+    admin_user: User = Depends(require_admin())
 ):
     """Change charger availability (Operative/Inoperative)"""
     

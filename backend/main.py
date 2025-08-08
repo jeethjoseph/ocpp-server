@@ -28,7 +28,7 @@ import logging
 import json
 
 # Import routers
-from routers import stations, chargers, transactions
+from routers import stations, chargers, transactions, auth, webhooks
 
 # Configure logging
 logging.basicConfig(
@@ -542,6 +542,8 @@ async def periodic_cleanup():
 app.include_router(stations.router)
 app.include_router(chargers.router)
 app.include_router(transactions.router)
+app.include_router(auth.router)
+app.include_router(webhooks.router)
 
 # ============ OCPP WebSocket Endpoint ============
 @app.websocket("/ocpp/{charge_point_id}")

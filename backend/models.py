@@ -34,7 +34,7 @@ class MessageDirectionEnum(str, enum.Enum):
     INBOUND = "IN"
     OUTBOUND = "OUT"
 
-# New Supabase authentication enums
+# Authentication enums
 class UserRoleEnum(str, enum.Enum):
     ADMIN = "ADMIN"
     USER = "USER"  # EV drivers
@@ -42,6 +42,7 @@ class UserRoleEnum(str, enum.Enum):
 class AuthProviderEnum(str, enum.Enum):
     EMAIL = "EMAIL"
     GOOGLE = "GOOGLE"
+    CLERK = "CLERK"
    
 
 # Models
@@ -52,9 +53,9 @@ class User(Model):
     email = fields.CharField(max_length=255, unique=True)
     phone_number = fields.CharField(max_length=255, unique=True, null=True)
     
-    # Supabase integration
-    supabase_user_id = fields.CharField(max_length=255, unique=True, null=True)
-    auth_provider = fields.CharEnumField(AuthProviderEnum, default=AuthProviderEnum.EMAIL)
+    # External authentication integration
+    clerk_user_id = fields.CharField(max_length=255, unique=True, null=True)
+    auth_provider = fields.CharEnumField(AuthProviderEnum, default=AuthProviderEnum.CLERK)
     
     # Profile fields
     full_name = fields.CharField(max_length=255, null=True)
@@ -87,7 +88,7 @@ class User(Model):
     transactions: fields.ReverseRelation["Transaction"]
     
     class Meta:
-        table = "user"
+        table = "app_user"
         
     @property
     def is_admin(self) -> bool:

@@ -30,20 +30,6 @@ class ChargePointStatus(BaseModel):
     connected_at: Optional[datetime.datetime]
 
 # Auth Schemas
-class SignUpRequest(BaseModel):
-    email: str
-    password: str
-    user_metadata: Optional[Dict] = {}
-
-class SignInRequest(BaseModel):
-    email: str
-    password: str
-
-class AuthResponse(BaseModel):
-    access_token: str
-    refresh_token: str
-    user: Dict
-    expires_in: int
 
 class UserResponse(BaseModel):
     id: str

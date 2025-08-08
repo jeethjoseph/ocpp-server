@@ -1,12 +1,13 @@
 # routers/stations.py
 from typing import List, Optional
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel
 from datetime import datetime
 import uuid
 
-from models import ChargingStation, Charger
+from models import ChargingStation, Charger, User
 from tortoise.exceptions import IntegrityError
+from auth_middleware import require_admin, get_current_user_with_db
 
 # Pydantic schemas for request/response
 class StationCreate(BaseModel):
@@ -98,7 +99,7 @@ async def list_stations(
     )
 
 @router.post("", response_model=dict, status_code=201)
-async def create_station(station_data: StationCreate):
+async def create_station(station_data: StationCreate, admin_user: User = Depends(require_admin())):
     """Create a new charging station"""
     
     try:
@@ -135,7 +136,7 @@ async def get_station_details(station_id: int):
     )
 
 @router.put("/{station_id}", response_model=dict)
-async def update_station(station_id: int, update_data: StationUpdate):
+async def update_station(station_id: int, update_data: StationUpdate, admin_user: User = Depends(require_admin())):
     """Update station information"""
     
     station = await ChargingStation.filter(id=station_id).first()
@@ -155,7 +156,7 @@ async def update_station(station_id: int, update_data: StationUpdate):
     }
 
 @router.delete("/{station_id}", response_model=dict)
-async def delete_station(station_id: int):
+async def delete_station(station_id: int, admin_user: User = Depends(require_admin())):
     """Delete a charging station (cascades to chargers)"""
     
     station = await ChargingStation.filter(id=station_id).first()

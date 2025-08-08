@@ -1,22 +1,29 @@
 'use client';
 
 import Link from 'next/link';
-import { usePathname, useRouter } from 'next/navigation';
+import { usePathname } from 'next/navigation';
 import { useTheme } from '@/contexts/ThemeContext';
-import { useAuth } from '@/contexts/AuthContext';
+import { SignInButton, SignedIn, SignedOut, UserButton } from '@clerk/nextjs';
 import { Button } from '@/components/ui/button';
+import { useUserRole } from './RoleWrapper';
 
-const navigation = [
-  { name: 'Dashboard', href: '/' },
+const userNavigation = [
+  { name: 'Dashboard', href: '/dashboard' },
   { name: 'Stations', href: '/stations' },
-  { name: 'Chargers', href: '/chargers' },
+  { name: 'My Sessions', href: '/my-sessions' },
+];
+
+const adminNavigation = [
+  { name: 'Admin Dashboard', href: '/admin' },
+  { name: 'Stations', href: '/admin/stations' },
+  { name: 'Chargers', href: '/admin/chargers' },
+  { name: 'Users', href: '/admin/users' },
 ];
 
 export default function Navbar() {
   const pathname = usePathname();
-  const router = useRouter();
   const { theme, setTheme } = useTheme();
-  const { user, signOut, loading } = useAuth();
+  const { role, isAdmin, isUser, isLoaded } = useUserRole();
 
   const themeIcons = {
     light: '☀️',
@@ -33,12 +40,8 @@ export default function Navbar() {
 
   const currentIcon = themeIcons[theme];
 
-  const handleSignOut = async () => {
-    const { error } = await signOut();
-    if (!error) {
-      router.push('/auth');
-    }
-  };
+  // Determine which navigation to show
+  const navigation = isAdmin ? adminNavigation : userNavigation;
 
   return (
     <nav className="bg-card shadow border-b border-border transition-colors duration-300">
@@ -46,9 +49,11 @@ export default function Navbar() {
         <div className="flex justify-between h-16">
           <div className="flex">
             <div className="flex-shrink-0 flex items-center">
-              <h1 className="text-xl font-bold text-card-foreground">
-                OCPP Admin
-              </h1>
+              <Link href={isAdmin ? "/admin" : "/dashboard"}>
+                <h1 className="text-xl font-bold text-card-foreground hover:text-primary transition-colors">
+                  OCPP {isAdmin ? 'Admin' : 'Dashboard'}
+                </h1>
+              </Link>
             </div>
             <div className="hidden sm:ml-6 sm:flex sm:space-x-8">
               {navigation.map((item) => (
@@ -75,29 +80,25 @@ export default function Navbar() {
               {currentIcon}
             </button>
             
-            {user ? (
-              <div className="flex items-center space-x-3">
-                <span className="text-sm text-muted-foreground">
-                  {user.email}
+            <SignedIn>
+              {isLoaded && role && (
+                <span className={`px-2 py-1 rounded-full text-xs font-medium ${
+                  isAdmin 
+                    ? 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200' 
+                    : 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200'
+                }`}>
+                  {role}
                 </span>
-                <Button
-                  onClick={handleSignOut}
-                  variant="outline"
-                  size="sm"
-                  disabled={loading}
-                >
-                  {loading ? 'Signing out...' : 'Sign Out'}
+              )}
+              <UserButton />
+            </SignedIn>
+            <SignedOut>
+              <SignInButton>
+                <Button variant="default" size="sm">
+                  Sign In
                 </Button>
-              </div>
-            ) : (
-              <Button
-                onClick={() => router.push('/auth')}
-                variant="default"
-                size="sm"
-              >
-                Sign In
-              </Button>
-            )}
+              </SignInButton>
+            </SignedOut>
           </div>
         </div>
       </div>
