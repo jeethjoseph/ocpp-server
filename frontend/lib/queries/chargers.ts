@@ -70,7 +70,13 @@ export function useRemoteStart() {
       connectorId?: number;
       idTag?: string;
     }) => {
-      return chargerService.remoteStart(id, connectorId, idTag);
+      
+      try {
+        const result = await chargerService.remoteStart(id, connectorId, idTag);
+        return result;
+      } catch (error) {
+        throw error;
+      }
     },
     onSuccess: (_, variables) => {
       // Invalidate charger details to refetch latest status

@@ -71,12 +71,12 @@ CREATE TABLE IF NOT EXISTS "tariff" (
     "is_global" BOOL NOT NULL DEFAULT False,
     "charger_id" INT REFERENCES "charger" ("id") ON DELETE CASCADE
 );
-CREATE TABLE IF NOT EXISTS "user" (
+CREATE TABLE IF NOT EXISTS "app_user" (
     "id" SERIAL NOT NULL PRIMARY KEY,
     "email" VARCHAR(255) NOT NULL UNIQUE,
     "phone_number" VARCHAR(255) UNIQUE,
-    "supabase_user_id" VARCHAR(255) UNIQUE,
-    "auth_provider" VARCHAR(6) NOT NULL DEFAULT 'EMAIL',
+    "clerk_user_id" VARCHAR(255) UNIQUE,
+    "auth_provider" VARCHAR(6) NOT NULL DEFAULT 'CLERK',
     "full_name" VARCHAR(255),
     "avatar_url" VARCHAR(500),
     "role" VARCHAR(5) NOT NULL DEFAULT 'USER',
@@ -91,8 +91,8 @@ CREATE TABLE IF NOT EXISTS "user" (
     "updated_at" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "last_login" TIMESTAMPTZ
 );
-COMMENT ON COLUMN "user"."auth_provider" IS 'EMAIL: EMAIL\nGOOGLE: GOOGLE';
-COMMENT ON COLUMN "user"."role" IS 'ADMIN: ADMIN\nUSER: USER';
+COMMENT ON COLUMN "app_user"."auth_provider" IS 'EMAIL: EMAIL\nGOOGLE: GOOGLE\nCLERK: CLERK';
+COMMENT ON COLUMN "app_user"."role" IS 'ADMIN: ADMIN\nUSER: USER';
 CREATE TABLE IF NOT EXISTS "valid_vehicle_profile" (
     "id" SERIAL NOT NULL PRIMARY KEY,
     "created_at" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -108,7 +108,7 @@ CREATE TABLE IF NOT EXISTS "vehicle_profile" (
     "make" VARCHAR(100),
     "model" VARCHAR(100),
     "year" INT,
-    "user_id" INT NOT NULL REFERENCES "user" ("id") ON DELETE CASCADE
+    "user_id" INT NOT NULL REFERENCES "app_user" ("id") ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS "transaction" (
     "id" SERIAL NOT NULL PRIMARY KEY,
@@ -122,8 +122,8 @@ CREATE TABLE IF NOT EXISTS "transaction" (
     "stop_reason" TEXT,
     "transaction_status" VARCHAR(13) NOT NULL,
     "charger_id" INT NOT NULL REFERENCES "charger" ("id") ON DELETE CASCADE,
-    "user_id" INT NOT NULL REFERENCES "user" ("id") ON DELETE CASCADE,
-    "vehicle_id" INT NOT NULL REFERENCES "vehicle_profile" ("id") ON DELETE CASCADE
+    "user_id" INT NOT NULL REFERENCES "app_user" ("id") ON DELETE CASCADE,
+    "vehicle_id" INT REFERENCES "vehicle_profile" ("id") ON DELETE CASCADE
 );
 COMMENT ON COLUMN "transaction"."transaction_status" IS 'STARTED: STARTED\nPENDING_START: PENDING_START\nRUNNING: RUNNING\nPENDING_STOP: PENDING_STOP\nSTOPPED: STOPPED\nCOMPLETED: COMPLETED\nCANCELLED: CANCELLED\nFAILED: FAILED';
 CREATE TABLE IF NOT EXISTS "meter_value" (
@@ -141,7 +141,7 @@ CREATE TABLE IF NOT EXISTS "wallet" (
     "created_at" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updated_at" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "balance" DECIMAL(10,2),
-    "user_id" INT NOT NULL UNIQUE REFERENCES "user" ("id") ON DELETE CASCADE
+    "user_id" INT NOT NULL UNIQUE REFERENCES "app_user" ("id") ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS "wallet_transaction" (
     "id" SERIAL NOT NULL PRIMARY KEY,

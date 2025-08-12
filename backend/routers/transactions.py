@@ -217,16 +217,32 @@ async def force_stop_transaction(transaction_id: int, request: StopTransactionRe
     transaction.end_time = datetime.utcnow()
     await transaction.save()
     
-    # Calculate final amount if needed
+    # Process wallet billing
     final_amount = None
-    if transaction.energy_consumed_kwh:
-        # TODO: Calculate based on tariff
-        final_amount = transaction.energy_consumed_kwh * 10  # Placeholder calculation
+    billing_message = "No billing processed"
+    
+    if transaction.energy_consumed_kwh and transaction.energy_consumed_kwh > 0:
+        from services.wallet_service import WalletService
+        try:
+            success, message, billing_amount = await WalletService.process_transaction_billing(transaction_id)
+            if success:
+                final_amount = float(billing_amount) if billing_amount else 0.0
+                billing_message = f"Billing successful: ₹{billing_amount}" if billing_amount else message
+                logger.info(f"💰 Force stop billing successful for transaction {transaction_id}: ₹{billing_amount}")
+            else:
+                billing_message = f"Billing failed: {message}"
+                logger.warning(f"💰 Force stop billing failed for transaction {transaction_id}: {message}")
+        except Exception as billing_error:
+            billing_message = f"Billing error: {str(billing_error)}"
+            logger.error(f"💰 Force stop billing error for transaction {transaction_id}: {billing_error}")
+    else:
+        billing_message = "No energy consumed - no billing required"
     
     return {
         "success": True,
         "message": "Transaction force stopped successfully",
-        "final_amount": final_amount
+        "final_amount": final_amount,
+        "billing_message": billing_message
     }
 
 @router.get("/{transaction_id}/meter-values", response_model=MeterValuesListResponse)

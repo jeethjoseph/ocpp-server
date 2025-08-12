@@ -329,6 +329,10 @@ async def delete_charger(charger_id: int, admin_user: User = Depends(require_adm
 async def remote_start_charging(charger_id: int, connector_id: int = 1, id_tag: str = "admin", user: User = Depends(require_user_or_admin())):
     """Start charging remotely"""
     
+    # Use the user's integer ID as idTag (simple and under OCPP 20-char limit)
+    actual_id_tag = str(user.id)
+    logger.info(f"🚀 Remote start requested by user {user.clerk_user_id} (role: {user.role}) using idTag: {actual_id_tag}")
+    
     # FIXME: connector_id is hardcoded to 1 - should dynamically select available connector
     # or allow user to choose from available connectors for this charger
     
@@ -358,13 +362,13 @@ async def remote_start_charging(charger_id: int, connector_id: int = 1, id_tag: 
     # Import and use the send_ocpp_request function
     from main import send_ocpp_request
     
-    # Send RemoteStartTransaction command
+    # Send RemoteStartTransaction command with authenticated user's clerk ID
     success, response = await send_ocpp_request(
         charger.charge_point_string_id,
         "RemoteStartTransaction",
         {
             "connector_id": connector_id,
-            "id_tag": id_tag
+            "id_tag": actual_id_tag  # Use authenticated user's ID
         }
     )
     
@@ -403,6 +407,21 @@ async def remote_stop_charging(charger_id: int, reason: Optional[str] = "Request
     if not transaction:
         raise HTTPException(status_code=409, detail="No active charging session found")
     
+    # Security check: Only transaction owner or admin can stop the session
+    from models import UserRoleEnum
+    is_admin = user.role == UserRoleEnum.ADMIN
+    is_owner = transaction.user_id == user.id
+    
+    if not is_admin and not is_owner:
+        raise HTTPException(
+            status_code=403, 
+            detail="You can only stop your own charging sessions"
+        )
+    
+    # Log admin override for audit trail
+    if is_admin and not is_owner:
+        logger.info(f"🛡️ Admin {user.email} stopping transaction {transaction.id} belonging to user {transaction.user_id}")
+    
     # Send RemoteStopTransaction command
     success, response = await send_ocpp_request(
         charger.charge_point_string_id,
@@ -411,13 +430,23 @@ async def remote_stop_charging(charger_id: int, reason: Optional[str] = "Request
     )
     
     if success:
+        action_type = "Admin override stop" if is_admin and not is_owner else "Remote stop"
         return {
             "success": True,
-            "message": "Stop command sent successfully",
-            "transaction_id": str(transaction.id)
+            "message": f"{action_type} command sent successfully",
+            "transaction_id": transaction.id,
+            "charger_id": charger_id,
+            "transaction_owner": transaction.user_id,
+            "stopped_by": user.id
         }
     else:
-        raise HTTPException(status_code=500, detail=f"Failed to send stop command: {response}")
+        # Don't modify transaction state - let user know the command failed
+        error_msg = f"Failed to send stop command to charger: {response}"
+        logger.warning(f"Remote stop failed for transaction {transaction.id}: {error_msg}")
+        raise HTTPException(
+            status_code=409, 
+            detail=f"Unable to stop charging session. {error_msg}. Please try again or contact support."
+        )
 
 @router.post("/{charger_id}/change-availability", response_model=dict)
 async def change_charger_availability(

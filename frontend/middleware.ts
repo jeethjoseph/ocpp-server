@@ -4,10 +4,11 @@ import { NextResponse } from 'next/server'
 
 const isProtectedRoute = createRouteMatcher([
   '/',
-  '/dashboard(.*)',
   '/admin(.*)',
   '/stations(.*)',
-  '/chargers(.*)',
+  '/charge(.*)',
+  '/scanner(.*)',
+  '/my-sessions(.*)',
   '/api(.*)',
 ])
 
@@ -25,65 +26,42 @@ async function assignDefaultRole(userId: string) {
     const user = await client.users.getUser(userId);
     const currentRole = user.publicMetadata?.role;
     
-    console.log(`🔍 assignDefaultRole check - User ${userId} current role in Clerk: ${currentRole || 'none'}`);
-    
     // Only set default USER role if no role exists
     if (!currentRole) {
       await client.users.updateUserMetadata(userId, {
         publicMetadata: { role: "USER" }
       });
-      console.log(`✅ Assigned default USER role to user ${userId}`);
-    } else {
-      console.log(`⚠️  User ${userId} already has role: ${currentRole}, NOT overwriting`);
     }
   } catch (error) {
-    console.error("❌ Failed to set default role:", error);
+    console.error("Failed to set default role:", error);
   }
 }
 
 function handleRoleBasedRouting(req: any, role: string) {
   const { pathname } = req.nextUrl;
   
-  console.log(`🔄 handleRoleBasedRouting - Path: ${pathname}, Role: ${role}`);
-  
   // Admin routes - only admins can access
   if (pathname.startsWith('/admin')) {
     if (role !== 'ADMIN') {
-      console.log(`❌ Non-admin user attempted to access admin route: ${pathname}`);
-      return NextResponse.redirect(new URL('/dashboard', req.url));
+      return NextResponse.redirect(new URL('/', req.url));
     }
-    console.log(`✅ Admin accessing admin route: ${pathname}`);
     return NextResponse.next();
-  }
-  
-  // Redirect admin users from regular dashboard to admin dashboard
-  if (pathname === '/dashboard' && role === 'ADMIN') {
-    console.log(`🔄 Redirecting admin from /dashboard to /admin`);
-    return NextResponse.redirect(new URL('/admin', req.url));
   }
   
   // Redirect admin users from root to admin dashboard
   if (pathname === '/' && role === 'ADMIN') {
-    console.log(`🔄 Redirecting admin from / to /admin`);
     return NextResponse.redirect(new URL('/admin', req.url));
   }
   
-  // Redirect regular users from root to user dashboard  
-  if (pathname === '/' && role === 'USER') {
-    console.log(`🔄 Redirecting user from / to /dashboard`);
-    return NextResponse.redirect(new URL('/dashboard', req.url));
-  }
+  // Regular users can access root directly - no redirect needed
+  // Root page now has proper RBAC to show user content
   
-  console.log(`✅ Allowing access to ${pathname}`);
   return NextResponse.next();
 }
 
 export default clerkMiddleware(async (auth, req) => {
-  console.log(`🚀 Middleware triggered for: ${req.nextUrl.pathname}`);
-  
   // Skip processing for public routes
   if (isPublicRoute(req)) {
-    console.log(`✅ Public route, skipping: ${req.nextUrl.pathname}`);
     return NextResponse.next();
   }
   
@@ -100,32 +78,24 @@ export default clerkMiddleware(async (auth, req) => {
     
     // If no role is set in session, check actual role in Clerk database
     if (!role) {
-      console.log(`🔍 User ${userId} has no role in session, fetching from Clerk database...`);
-      
       try {
         const client = await clerkClient();
         const user = await client.users.getUser(userId);
         const actualRole = user.publicMetadata?.role as string;
         
-        console.log(`🔍 Actual role from Clerk database: ${actualRole || 'none'}`);
-        
         if (actualRole) {
           // Use the actual role from database
-          console.log(`✅ Using database role: ${actualRole}`);
           return handleRoleBasedRouting(req, actualRole);
         } else {
           // No role exists, set default
-          console.log(`🔧 No role found, assigning default USER`);
           assignDefaultRole(userId);
           return handleRoleBasedRouting(req, "USER");
         }
       } catch (error) {
-        console.error("❌ Failed to fetch user from Clerk:", error);
+        console.error("Failed to fetch user from Clerk:", error);
         return handleRoleBasedRouting(req, "USER");
       }
     }
-    
-    console.log(`✅ User ${userId} has role: ${role}`);
     
     // Handle routing based on role
     return handleRoleBasedRouting(req, role);

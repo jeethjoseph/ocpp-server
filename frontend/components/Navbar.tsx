@@ -8,7 +8,7 @@ import { Button } from '@/components/ui/button';
 import { useUserRole } from './RoleWrapper';
 
 const userNavigation = [
-  { name: 'Dashboard', href: '/dashboard' },
+  { name: 'Scanner', href: '/scanner' },
   { name: 'Stations', href: '/stations' },
   { name: 'My Sessions', href: '/my-sessions' },
 ];
@@ -23,7 +23,7 @@ const adminNavigation = [
 export default function Navbar() {
   const pathname = usePathname();
   const { theme, setTheme } = useTheme();
-  const { role, isAdmin, isUser, isLoaded } = useUserRole();
+  const { role, isAdmin, isLoaded } = useUserRole();
 
   const themeIcons = {
     light: '☀️',
@@ -49,9 +49,9 @@ export default function Navbar() {
         <div className="flex justify-between h-16">
           <div className="flex">
             <div className="flex-shrink-0 flex items-center">
-              <Link href={isAdmin ? "/admin" : "/dashboard"}>
+              <Link href={isAdmin ? "/admin" : "/"}>
                 <h1 className="text-xl font-bold text-card-foreground hover:text-primary transition-colors">
-                  OCPP {isAdmin ? 'Admin' : 'Dashboard'}
+                  OCPP {isAdmin ? 'Admin' : 'User'}
                 </h1>
               </Link>
             </div>

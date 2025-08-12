@@ -29,6 +29,7 @@ class TransactionStatusEnum(str, enum.Enum):
     COMPLETED = "COMPLETED"
     CANCELLED = "CANCELLED"
     FAILED = "FAILED"
+    BILLING_FAILED = "BILLING_FAILED"
 
 class MessageDirectionEnum(str, enum.Enum):
     INBOUND = "IN"
@@ -229,7 +230,7 @@ class Transaction(Model):
     updated_at = fields.DatetimeField(auto_now=True)
     user = fields.ForeignKeyField("models.User", related_name="transactions")
     charger = fields.ForeignKeyField("models.Charger", related_name="transactions")
-    vehicle = fields.ForeignKeyField("models.VehicleProfile", related_name="transactions")
+    vehicle = fields.ForeignKeyField("models.VehicleProfile", related_name="transactions", null=True)
     start_meter_kwh = fields.FloatField(null=True)
     end_meter_kwh = fields.FloatField(null=True)
     energy_consumed_kwh = fields.FloatField(null=True)

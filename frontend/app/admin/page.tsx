@@ -2,10 +2,13 @@
 
 import { AdminOnly, useUserRole } from "@/components/RoleWrapper";
 import { Card } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
 import Link from "next/link";
+import { useDashboardStats } from "@/lib/queries/dashboard";
 
 export default function AdminDashboard() {
   const { user } = useUserRole();
+  const { data: stats, isLoading, error } = useDashboardStats();
 
   return (
     <AdminOnly fallback={
@@ -148,28 +151,67 @@ export default function AdminDashboard() {
         </div>
 
         {/* System Overview */}
-        <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
-          <Card className="p-4">
-            <h4 className="text-sm font-medium text-gray-600">Total Stations</h4>
-            <p className="text-2xl font-bold">--</p>
-          </Card>
-          <Card className="p-4">
-            <h4 className="text-sm font-medium text-gray-600">Total Chargers</h4>
-            <p className="text-2xl font-bold">--</p>
-          </Card>
-          <Card className="p-4">
-            <h4 className="text-sm font-medium text-gray-600">Active Sessions</h4>
-            <p className="text-2xl font-bold text-green-600">--</p>
-          </Card>
-          <Card className="p-4">
-            <h4 className="text-sm font-medium text-gray-600">Total Users</h4>
-            <p className="text-2xl font-bold">--</p>
-          </Card>
-          <Card className="p-4">
-            <h4 className="text-sm font-medium text-gray-600">System Status</h4>
-            <p className="text-2xl font-bold text-green-600">Online</p>
-          </Card>
-        </div>
+        {isLoading ? (
+          <div className="flex items-center justify-center py-8">
+            <div className="text-center">
+              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary mx-auto"></div>
+              <p className="text-muted-foreground mt-2">Loading dashboard data...</p>
+            </div>
+          </div>
+        ) : error ? (
+          <div className="text-center py-8">
+            <p className="text-red-600">Failed to load dashboard data</p>
+            <p className="text-gray-600 text-sm mt-1">
+              Please try refreshing the page
+            </p>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
+            <Card className="p-4">
+              <h4 className="text-sm font-medium text-gray-600">Total Stations</h4>
+              <p className="text-2xl font-bold">{stats?.totalStations || 0}</p>
+            </Card>
+            <Card className="p-4">
+              <h4 className="text-sm font-medium text-gray-600">Total Chargers</h4>
+              <p className="text-2xl font-bold">{stats?.totalChargers || 0}</p>
+              <div className="flex gap-1 mt-2">
+                <Badge variant="default" className="text-xs">
+                  {stats?.connectedChargers || 0} online
+                </Badge>
+                <Badge variant="outline" className="text-xs">
+                  {stats?.disconnectedChargers || 0} offline
+                </Badge>
+              </div>
+            </Card>
+            <Card className="p-4">
+              <h4 className="text-sm font-medium text-gray-600">Available</h4>
+              <p className="text-2xl font-bold text-green-600">{stats?.availableChargers || 0}</p>
+              <p className="text-xs text-gray-500 mt-1">Ready for charging</p>
+            </Card>
+            <Card className="p-4">
+              <h4 className="text-sm font-medium text-gray-600">Charging Now</h4>
+              <p className="text-2xl font-bold text-blue-600">{stats?.chargingChargers || 0}</p>
+              <p className="text-xs text-gray-500 mt-1">Active sessions</p>
+            </Card>
+            <Card className="p-4">
+              <h4 className="text-sm font-medium text-gray-600">Status Overview</h4>
+              <div className="space-y-1 mt-2">
+                <div className="flex justify-between text-sm">
+                  <span>Unavailable:</span>
+                  <Badge variant="secondary" className="text-xs">
+                    {stats?.unavailableChargers || 0}
+                  </Badge>
+                </div>
+                <div className="flex justify-between text-sm">
+                  <span>Faulted:</span>
+                  <Badge variant="destructive" className="text-xs">
+                    {stats?.faultedChargers || 0}
+                  </Badge>
+                </div>
+              </div>
+            </Card>
+          </div>
+        )}
       </div>
     </AdminOnly>
   );

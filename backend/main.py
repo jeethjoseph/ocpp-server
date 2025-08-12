@@ -28,7 +28,7 @@ import logging
 import json
 
 # Import routers
-from routers import stations, chargers, transactions, auth, webhooks
+from routers import stations, chargers, transactions, auth, webhooks, users
 
 # Configure logging
 logging.basicConfig(
@@ -155,9 +155,36 @@ class ChargePoint(OcppChargePoint):
                     id_tag_info={"status": "Invalid"}
                 )
             
-            # For now, create a test user if id_tag doesn't exist
-            # In production, you'd lookup user by id_tag
-            user, _ = await User.get_or_create(phone_number=f"user_{id_tag}")
+            # Look up user by integer ID (which is now passed as id_tag)
+            # This provides an additional security layer beyond API authentication
+            user = None
+            
+            try:
+                user_id = int(id_tag)
+                user = await User.filter(id=user_id).first()
+                logger.info(f"OCPP StartTransaction: Looking up user by ID: {user_id}, found: {user is not None}")
+                
+                if user and not user.is_active:
+                    logger.error(f"OCPP StartTransaction: User {user_id} is deactivated")
+                    return call_result.StartTransaction(
+                        transaction_id=0,
+                        id_tag_info={"status": "Blocked"}
+                    )
+            except ValueError:
+                # id_tag is not an integer - might be legacy/simulator format
+                logger.warning(f"OCPP StartTransaction: id_tag '{id_tag}' is not an integer, treating as legacy format")
+            
+            if not user:
+                # Fallback for testing/simulator - create temporary user
+                logger.warning(f"OCPP StartTransaction: User not found for id_tag {id_tag}, creating temporary user for simulator")
+                user, _ = await User.get_or_create(
+                    phone_number=f"temp_{id_tag}",
+                    defaults={
+                        "email": f"temp_{id_tag}@simulator.local",
+                        "full_name": f"Temporary User {id_tag}",
+                        "clerk_user_id": None  # Mark as temporary user
+                    }
+                )
             
             # Get or create a vehicle profile for the user
             vehicle, _ = await VehicleProfile.get_or_create(
@@ -193,6 +220,7 @@ class ChargePoint(OcppChargePoint):
         logger.info(f"🛑 StopTransaction from {self.id}: transaction_id={transaction_id}, meter_stop={meter_stop}")
         
         from models import Transaction, TransactionStatusEnum
+        from services.wallet_service import WalletService
         import datetime
         
         try:
@@ -215,7 +243,24 @@ class ChargePoint(OcppChargePoint):
             
             await transaction.save()
             
-            logger.info(f"🛑 ✅ Completed transaction {transaction_id}: {transaction.energy_consumed_kwh} kWh consumed, status changed to COMPLETED")
+            logger.info(f"🛑 ✅ Transaction stopped {transaction_id}: {transaction.energy_consumed_kwh} kWh consumed")
+            
+            # Process wallet billing asynchronously
+            try:
+                success, message, billing_amount = await WalletService.process_transaction_billing(transaction_id)
+                if success:
+                    if billing_amount and billing_amount > 0:
+                        logger.info(f"💰 Billing successful for transaction {transaction_id}: ₹{billing_amount}")
+                    else:
+                        logger.info(f"💰 {message} for transaction {transaction_id}")
+                else:
+                    logger.warning(f"💰 Billing failed for transaction {transaction_id}: {message}")
+            except Exception as billing_error:
+                logger.error(f"💰 Unexpected error in billing for transaction {transaction_id}: {billing_error}", exc_info=True)
+                # Mark transaction as billing failed
+                await Transaction.filter(id=transaction_id).update(
+                    transaction_status=TransactionStatusEnum.BILLING_FAILED
+                )
             
             return call_result.StopTransaction(
                 id_tag_info={"status": "Accepted"}
@@ -544,6 +589,7 @@ app.include_router(chargers.router)
 app.include_router(transactions.router)
 app.include_router(auth.router)
 app.include_router(webhooks.router)
+app.include_router(users.router)
 
 # ============ OCPP WebSocket Endpoint ============
 @app.websocket("/ocpp/{charge_point_id}")
@@ -702,6 +748,10 @@ async def startup_event():
     # Start periodic cleanup task
     cleanup_task = asyncio.create_task(periodic_cleanup())
     
+    # Start billing retry service
+    from services.billing_retry_service import start_billing_retry_service
+    await start_billing_retry_service()
+    
     logger.info("Database initialized with Tortoise ORM")
     logger.info("Redis connection established")
     logger.info("Periodic cleanup task started")
@@ -722,6 +772,10 @@ async def shutdown_event():
             await cleanup_task
         except asyncio.CancelledError:
             pass
+    
+    # Stop billing retry service
+    from services.billing_retry_service import stop_billing_retry_service
+    await stop_billing_retry_service()
     
     await close_db()
     await redis_manager.disconnect()

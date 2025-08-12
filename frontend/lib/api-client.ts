@@ -24,15 +24,24 @@ async function apiRequest<T>(
   let token: string | null = null;
   
   // Client-side: get token from window.Clerk
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   if (typeof window !== 'undefined' && (window as any).Clerk) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const clerk = (window as any).Clerk;
+    
+    
     if (clerk.session) {
       try {
         token = await clerk.session.getToken();
+        
       } catch (error) {
-        console.warn('Failed to get Clerk token:', error);
+        console.error('❌ Failed to get Clerk token:', error);
       }
+    } else {
+      console.warn('⚠️ No Clerk session found');
     }
+  } else {
+    console.warn('⚠️ Clerk not available on window object');
   }
   
   const config: RequestInit = {
@@ -46,17 +55,28 @@ async function apiRequest<T>(
     ...options,
   };
 
+
   const response = await fetch(url, config);
 
   if (!response.ok) {
+    let errorDetails = 'Unknown error';
+    try {
+      const errorText = await response.text();
+      errorDetails = errorText;
+    } catch (e) {
+      console.error('Failed to read error response:', e);
+    }
+    
     throw new ApiError(
       response.status,
       response.statusText,
-      `API request failed: ${response.status} ${response.statusText}`
+      `API request failed: ${response.status} ${response.statusText} - ${errorDetails}`
     );
   }
 
-  return response.json();
+  const responseData = await response.json();
+
+  return responseData;
 }
 
 export const api = {

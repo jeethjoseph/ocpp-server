@@ -1,7 +1,6 @@
 "use client";
 
 import { useUser } from "@clerk/nextjs";
-import { useEffect, useState } from "react";
 
 interface RoleWrapperProps {
   children: React.ReactNode;
