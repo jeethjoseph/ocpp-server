@@ -6,6 +6,14 @@ pytest==8.3.4
 python-dotenv==1.1.0
 Requests==2.32.4
 tortoise-orm[asyncpg]>=0.22.0
+aerich==0.9.1                  # Database migration tool for Tortoise ORM
 uvicorn==0.34.3
 watchdog==6.0.0
 websocket_client==1.8.0
+pytest-asyncio>=0.23.0      # For async test support with pytest
+httpx>=0.27.0               # For AsyncClient in tests
+pytest-cov>=5.0.0           # (Optional) For test coverage reports
+pytest-mock>=3.14.0         # (Optional) For mocking in tests
+redis>=5.0.0                # Redis client for connection tracking
+svix>=1.40.0                # Webhook verification for Clerk
+clerk-backend-api>=3.1.0    # Clerk Python backend SDK

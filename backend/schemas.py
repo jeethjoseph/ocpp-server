@@ -27,3 +27,16 @@ class ChargePointStatus(BaseModel):
     charge_point_id: str
     connected: bool
     last_seen: Optional[datetime.datetime]
+    connected_at: Optional[datetime.datetime]
+
+# Auth Schemas
+
+class UserResponse(BaseModel):
+    id: str
+    email: str
+    user_metadata: Dict
+    created_at: str
+
+class ErrorResponse(BaseModel):
+    error: str
+    message: str

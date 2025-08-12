@@ -1,3 +1,4 @@
+# This file is to aggregate all CRUD operations related to OCPP logs and charger connections.
 import datetime
 from typing import List, Optional, Tuple
 from models import OCPPLog, Charger
@@ -75,6 +76,15 @@ async def update_charger_status(charge_point_id: str, status: str) -> bool:
     charger = await Charger.filter(charge_point_string_id=charge_point_id).first()
     if charger:
         charger.latest_status = status
+        charger.last_heart_beat_time = datetime.datetime.now(datetime.timezone.utc)
+        await charger.save()
+        return True
+    return False
+
+async def update_charger_heartbeat(charge_point_id: str) -> bool:
+    """Update only charger heartbeat time without changing status"""
+    charger = await Charger.filter(charge_point_string_id=charge_point_id).first()
+    if charger:
         charger.last_heart_beat_time = datetime.datetime.now(datetime.timezone.utc)
         await charger.save()
         return True

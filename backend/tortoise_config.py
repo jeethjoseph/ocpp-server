@@ -3,6 +3,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Detect environment for SSL configuration
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+IS_PRODUCTION = ENVIRONMENT.lower() in ["production", "prod"]
+
+# SSL configuration: require in production, disable in development
+ssl_config = "require" if IS_PRODUCTION else "disable"
+
 TORTOISE_ORM = {
     "connections": {
         "default": {
@@ -13,7 +20,7 @@ TORTOISE_ORM = {
                 "user": os.getenv("DB_USER"),
                 "password": os.getenv("DB_PASSWORD"),
                 "database": os.getenv("DB_NAME"),
-                "ssl": True,
+                "ssl": ssl_config,  # Environment-aware SSL
             }
         }
     },

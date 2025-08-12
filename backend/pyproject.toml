@@ -2,3 +2,13 @@
 tortoise_orm = "tortoise_config.TORTOISE_ORM"
 location = "./migrations"
 src_folder = "./."
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "unit: Unit tests (fast, no external dependencies)",
+    "integration: Integration tests (requires running server)",
+    "infrastructure: Infrastructure tests (requires Redis and database)",
+    "slow: Slow tests that take more than 30 seconds"
+]

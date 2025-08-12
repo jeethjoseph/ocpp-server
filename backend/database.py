@@ -6,18 +6,25 @@ from tortoise.contrib.fastapi import register_tortoise
 
 load_dotenv()
 
+# Detect environment for SSL configuration
+ENVIRONMENT = os.environ.get("ENVIRONMENT", "development")
+IS_PRODUCTION = ENVIRONMENT.lower() in ["production", "prod"]
+
+# SSL configuration: require in production, disable in development
+ssl_config = "require" if IS_PRODUCTION else "disable"
+
 # Use credential-based config instead of URL string
 TORTOISE_ORM = {
     "connections": {
         "default": {
-            "engine": "tortoise.backends.asyncpg",  # or tortoise.backends.psycopg if using psycopg
+            "engine": "tortoise.backends.asyncpg",
             "credentials": {
                 "host": os.environ.get("DB_HOST"),
                 "port": int(os.environ.get("DB_PORT", 5432)),
                 "user": os.environ.get("DB_USER"),
                 "password": os.environ.get("DB_PASSWORD"),
                 "database": os.environ.get("DB_NAME"),
-                "ssl": "require", 
+                "ssl": ssl_config,  # Environment-aware SSL
             }
         }
     },
