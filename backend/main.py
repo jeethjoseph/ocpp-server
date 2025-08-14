@@ -155,35 +155,23 @@ class ChargePoint(OcppChargePoint):
                     id_tag_info={"status": "Invalid"}
                 )
             
-            # Look up user by integer ID (which is now passed as id_tag)
-            # This provides an additional security layer beyond API authentication
-            user = None
-            
-            try:
-                user_id = int(id_tag)
-                user = await User.filter(id=user_id).first()
-                logger.info(f"OCPP StartTransaction: Looking up user by ID: {user_id}, found: {user is not None}")
-                
-                if user and not user.is_active:
-                    logger.error(f"OCPP StartTransaction: User {user_id} is deactivated")
-                    return call_result.StartTransaction(
-                        transaction_id=0,
-                        id_tag_info={"status": "Blocked"}
-                    )
-            except ValueError:
-                # id_tag is not an integer - might be legacy/simulator format
-                logger.warning(f"OCPP StartTransaction: id_tag '{id_tag}' is not an integer, treating as legacy format")
+            # Look up user by RFID card ID
+            user = await User.filter(rfid_card_id=id_tag).first()
             
             if not user:
-                # Fallback for testing/simulator - create temporary user
-                logger.warning(f"OCPP StartTransaction: User not found for id_tag {id_tag}, creating temporary user for simulator")
-                user, _ = await User.get_or_create(
-                    phone_number=f"temp_{id_tag}",
-                    defaults={
-                        "email": f"temp_{id_tag}@simulator.local",
-                        "full_name": f"Temporary User {id_tag}",
-                        "clerk_user_id": None  # Mark as temporary user
-                    }
+                logger.error(f"OCPP StartTransaction: No user found with rfid_card_id '{id_tag}', rejecting transaction")
+                return call_result.StartTransaction(
+                    transaction_id=0,
+                    id_tag_info={"status": "Invalid"}
+                )
+            
+            logger.info(f"OCPP StartTransaction: Found user by rfid_card_id '{id_tag}': {user.email}")
+            
+            if not user.is_active:
+                logger.error(f"OCPP StartTransaction: User {user.email} is deactivated")
+                return call_result.StartTransaction(
+                    transaction_id=0,
+                    id_tag_info={"status": "Blocked"}
                 )
             
             # Get or create a vehicle profile for the user

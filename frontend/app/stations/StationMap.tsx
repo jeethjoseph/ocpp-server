@@ -6,7 +6,8 @@ import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 
 // Fix for default markers in React Leaflet
-delete (L.Icon.Default.prototype as any)._getIconUrl;
+// Fix for default markers in React Leaflet
+delete (L.Icon.Default.prototype as { _getIconUrl?: unknown })._getIconUrl;
 L.Icon.Default.mergeOptions({
   iconRetinaUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-icon-2x.png',
   iconUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-icon.png',
@@ -90,7 +91,7 @@ function MapController({ userLocation, stations }: { userLocation: {lat: number;
       // Create bounds that include user location and all stations
       const bounds = L.latLngBounds([
         [userLocation.lat, userLocation.lng],
-        ...stations.map(station => [station.latitude, station.longitude])
+        ...stations.map(station => [station.latitude, station.longitude] as [number, number])
       ]);
       
       map.fitBounds(bounds, { 
@@ -100,7 +101,7 @@ function MapController({ userLocation, stations }: { userLocation: {lat: number;
     } else if (stations.length > 0) {
       // Just fit stations if no user location
       const bounds = L.latLngBounds(
-        stations.map(station => [station.latitude, station.longitude])
+        stations.map(station => [station.latitude, station.longitude] as [number, number])
       );
       map.fitBounds(bounds, { 
         padding: [20, 20],
@@ -115,7 +116,7 @@ function MapController({ userLocation, stations }: { userLocation: {lat: number;
   return null;
 }
 
-export default function StationMap({ stations, userLocation, onStationSelect, selectedStation }: StationMapProps) {
+export default function StationMap({ stations, userLocation, onStationSelect }: StationMapProps) {
   // Default center (San Francisco)
   const defaultCenter: [number, number] = [37.7749, -122.4194];
   const center: [number, number] = userLocation 

@@ -117,6 +117,10 @@ async def handle_user_created(data: dict):
                 logger.info(f"Updated existing user {primary_email} with Clerk ID")
             return
         
+        # Generate unique RFID/ID tag for OCPP
+        import uuid
+        rfid_card_id = str(uuid.uuid4()).replace('-', '')[:20]  # 20 char limit for OCPP
+        
         # Create new user
         user = await User.create(
             clerk_user_id=clerk_user_id,
@@ -128,7 +132,8 @@ async def handle_user_created(data: dict):
             auth_provider="CLERK",
             is_active=True,
             preferred_language="en",
-            notification_preferences="{}"
+            notification_preferences="{}",
+            rfid_card_id=rfid_card_id
         )
         
         # Create wallet for user

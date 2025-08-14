@@ -326,11 +326,14 @@ async def delete_charger(charger_id: int, admin_user: User = Depends(require_adm
     return {"message": "Charger removed successfully"}
 
 @router.post("/{charger_id}/remote-start", response_model=dict)
-async def remote_start_charging(charger_id: int, connector_id: int = 1, id_tag: str = "admin", user: User = Depends(require_user_or_admin())):
+async def remote_start_charging(charger_id: int, connector_id: int = 1, user: User = Depends(require_user_or_admin())):
     """Start charging remotely"""
     
-    # Use the user's integer ID as idTag (simple and under OCPP 20-char limit)
-    actual_id_tag = str(user.id)
+    # Use the user's RFID card ID as idTag for OCPP identification
+    if not user.rfid_card_id:
+        raise HTTPException(status_code=409, detail="User does not have an RFID card ID assigned")
+    
+    actual_id_tag = user.rfid_card_id
     logger.info(f"🚀 Remote start requested by user {user.clerk_user_id} (role: {user.role}) using idTag: {actual_id_tag}")
     
     # FIXME: connector_id is hardcoded to 1 - should dynamically select available connector
@@ -368,7 +371,7 @@ async def remote_start_charging(charger_id: int, connector_id: int = 1, id_tag: 
         "RemoteStartTransaction",
         {
             "connector_id": connector_id,
-            "id_tag": actual_id_tag  # Use authenticated user's ID
+            "id_tag": actual_id_tag  # Use authenticated user's RFID card ID
         }
     )
     

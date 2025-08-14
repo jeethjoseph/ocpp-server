@@ -7,8 +7,10 @@ load_dotenv()
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 IS_PRODUCTION = ENVIRONMENT.lower() in ["production", "prod"]
 
-# SSL configuration: require in production, disable in development
-ssl_config = "require" if IS_PRODUCTION else "disable"
+# SSL configuration: always require for cloud databases like Neon
+db_host = os.getenv("DB_HOST", "localhost")
+is_cloud_db = any(provider in db_host for provider in ["neon.tech", "aws.com", "gcp.com", "azure.com"])
+ssl_config = "require" if (IS_PRODUCTION or is_cloud_db) else "disable"
 
 TORTOISE_ORM = {
     "connections": {

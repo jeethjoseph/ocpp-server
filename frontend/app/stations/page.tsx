@@ -38,7 +38,7 @@ export default function StationsPage() {
   const [selectedStation, setSelectedStation] = useState<Station | null>(null);
 
   // Fetch stations data
-  const { data: stationsData, isLoading, error } = useStations({ limit: 50 });
+  const { data: stationsData, isLoading } = useStations({ limit: 50 });
   const stations = stationsData?.data || [];
 
   // Get user location
@@ -51,7 +51,7 @@ export default function StationsPage() {
             lng: position.coords.longitude
           });
         },
-        (error) => {
+        () => {
           // Default to a sample location if denied
           setUserLocation({ lat: 37.7749, lng: -122.4194 });
         }
@@ -100,14 +100,6 @@ export default function StationsPage() {
     );
   }
 
-  if (error) {
-    return (
-      <div className="text-center py-8">
-        <p className="text-destructive">Failed to load charging stations</p>
-        <p className="text-muted-foreground text-sm mt-1">Please try refreshing the page</p>
-      </div>
-    );
-  }
 
   return (
     <div className="min-h-screen">
