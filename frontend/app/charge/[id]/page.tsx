@@ -80,7 +80,6 @@ export default function UserChargePage() {
   const getTransactionStatus = () =>
     transaction?.transaction_status || "Unknown";
   const getEnergyConsumed = () => transaction?.energy_consumed_kwh;
-  const getStartTime = () => transaction?.start_time;
 
   const handleRemoteStart = () => {
     if (!charger) return;

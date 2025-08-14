@@ -1,23 +1,29 @@
 # OCPP Server Makefile for Database Management
 
-# Database configuration
-DB_HOST=localhost
-DB_PORT=5432
-DB_USER=ocpp_user
-DB_PASSWORD=ocpp_password
-DB_NAME=ocpp_db
+# Database configuration - load from .env file
+include backend/.env
+export
+
+# Fallback to local database if not set in .env
+DB_HOST ?= localhost
+DB_PORT ?= 5432  
+DB_USER ?= ocpp_user
+DB_PASSWORD ?= ocpp_password
+DB_NAME ?= ocpp_db
 PG_SUPERUSER=$(shell whoami)
 
 # Directories
 BACKEND_DIR=backend
 SCRIPTS_DIR=$(BACKEND_DIR)/scripts
 
-.PHONY: help db-reset db-drop-user db-create-user db-drop db-create migrate seed setup-dev
+.PHONY: help db-reset db-reset-cloud db-first-time db-drop-user db-create-user db-drop db-create migrate seed setup-dev truncate-tables
 
 help:
 	@echo "Available commands:"
 	@echo "  help          - Show this help message"
-	@echo "  db-reset      - Complete database reset (drop, recreate, init schema, seed)"
+	@echo "  db-reset      - Database reset (drop, recreate, migrate, seed)"
+	@echo "  db-reset-cloud- Cloud database reset (truncate tables, migrate, seed)"
+	@echo "  db-first-time - First-time setup (drop, recreate, init-db, seed)"
 	@echo "  db-drop-user  - Drop database user"
 	@echo "  db-create-user- Create database user"
 	@echo "  db-drop       - Drop database"
@@ -27,9 +33,17 @@ help:
 	@echo "  seed          - Run seed script"
 	@echo "  setup-dev     - Initial development setup"
 
-# Complete database reset
-db-reset: db-drop db-drop-user db-create-user db-create init-fresh-db seed
+# Complete database reset (uses existing migrations)
+db-reset: db-drop db-drop-user db-create-user db-create migrate seed
 	@echo "✅ Database reset complete!"
+
+# Cloud database reset (for managed databases like Neon)
+db-reset-cloud: truncate-tables migrate seed
+	@echo "✅ Cloud database reset complete!"
+
+# First-time setup (only use when no migrations exist yet)
+db-first-time: db-drop db-drop-user db-create-user db-create init-fresh-db seed
+	@echo "✅ First-time database setup complete!"
 
 # Drop database user
 db-drop-user:
@@ -97,3 +111,8 @@ test-migrations:
 	@echo "   Applying test migration..."
 	cd $(BACKEND_DIR) && source .venv/bin/activate && aerich upgrade
 	@echo "✅ Migration system working correctly!"
+
+# Truncate tables (for cloud databases where you can't drop/create DB)
+truncate-tables:
+	@echo "🗑️  Truncating all tables..."
+	cd $(BACKEND_DIR) && source .venv/bin/activate && python scripts/truncate_tables.py

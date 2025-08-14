@@ -56,8 +56,9 @@ export default function AdminChargersPage() {
   const loading = loadingChargers || loadingStations;
   const error = chargersError ? "Failed to load chargers" : null;
 
-  const handleCreateCharger = async (data: ChargerCreate) => {
+  const handleCreateCharger = async (chargerData: ChargerCreate) => {
     // TODO: Add mutation for create charger
+    console.log('Creating charger:', chargerData);
     setShowCreateModal(false);
   };
 

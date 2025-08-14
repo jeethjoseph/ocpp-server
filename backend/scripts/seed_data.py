@@ -116,9 +116,12 @@ class DatabaseSeeder:
         
         # Create admin users
         for admin in admin_data:
-            user = await User.create(**admin)
-            self.users.append(user)
-            print(f"  ✅ Created admin: {user.email}")
+            try:
+                user = await User.create(**admin)
+                self.users.append(user)
+                print(f"  ✅ Created admin: {user.email}")
+            except Exception as e:
+                print(f"  ❌ Failed to create admin {admin['email']}: {str(e)}")
             
         # Create driver users
         for driver in driver_data:
@@ -128,15 +131,22 @@ class DatabaseSeeder:
                 "terms_accepted_at": datetime.now(),
                 "last_login": datetime.now() - timedelta(days=random.randint(1, 30))
             })
-            user = await User.create(**driver)
-            self.users.append(user)
-            print(f"  ✅ Created user: {user.email}")
+            try:
+                user = await User.create(**driver)
+                self.users.append(user)
+                print(f"  ✅ Created user: {user.email}")
+            except Exception as e:
+                print(f"  ❌ Failed to create user {driver['email']}: {str(e)}")
 
     async def create_wallets_and_transactions(self):
         """Create wallets and transaction history for users"""
         print("💰 Creating wallets and transactions...")
         
-        for user in self.users:
+        # Refresh users from database to get current IDs after any truncation
+        fresh_users = await User.all()
+        print(f"  Found {len(fresh_users)} users in database")
+        
+        for user in fresh_users:
             # Create wallets for ALL users (admins and regular users)
             # Admins can also be charged for transactions they start
             if user.role == UserRoleEnum.USER:
@@ -355,10 +365,19 @@ class DatabaseSeeder:
         
         transaction_count = random.randint(20, 40)
         
+        # Get fresh users for transactions  
+        fresh_users = await User.all()
+        regular_users = [u for u in fresh_users if u.role == UserRoleEnum.USER]
+        
         for _ in range(transaction_count):
-            user = random.choice([u for u in self.users if u.role == UserRoleEnum.USER])
+            user = random.choice(regular_users)
             charger = random.choice(self.chargers)
-            vehicle = random.choice([v for v in self.vehicles if v.user == user]) if random.random() > 0.3 else None
+            # Every transaction must have a vehicle (required by database schema)
+            user_vehicles = [v for v in self.vehicles if v.user == user]
+            if not user_vehicles:
+                print(f"  ⚠️  No vehicle found for user {user.email}, skipping transaction")
+                continue
+            vehicle = random.choice(user_vehicles)
             
             # Random transaction timing
             transaction_start = start_date + timedelta(
@@ -375,7 +394,7 @@ class DatabaseSeeder:
             # Transaction status and timing
             status = random.choices(
                 list(TransactionStatusEnum),
-                weights=[1, 1, 2, 1, 8, 6, 1, 1],  # Bias towards COMPLETED and STOPPED
+                weights=[1, 1, 2, 1, 8, 6, 1, 1, 1],  # Bias towards COMPLETED and STOPPED, added weight for BILLING_FAILED
                 k=1
             )[0]
             
