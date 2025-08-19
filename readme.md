@@ -1,6 +1,6 @@
 # OCPP Charging Station Management System
 
-A comprehensive EV charging station management system implementing OCPP 1.6 protocol with modern web technologies. This system provides real-time monitoring, control, and management of electric vehicle charging infrastructure.
+A comprehensive, production-ready EV charging station management system implementing OCPP 1.6 protocol with modern web technologies. This system provides real-time monitoring, control, and management of electric vehicle charging infrastructure with role-based access control and integrated financial management.
 
 ## 🏗️ Architecture Overview
 
@@ -17,19 +17,20 @@ A comprehensive EV charging station management system implementing OCPP 1.6 prot
 │  ┌─────────────────┐   │   ┌─────────────────────────────────┐ │
 │  │  Web Dashboard  │◄──┼──►│     REST API Server             │ │
 │  │                 │   │   │                                 │ │
-│  │ • Auth UI       │   │   │ • Station Management            │ │
-│  │ • Station Mgmt  │   │   │ • Charger Control               │ │
-│  │ • Real-time     │   │   │ • Transaction Tracking          │ │
-│  │   Monitoring    │   │   │ • User Management               │ │
+│  │ • Admin UI      │   │   │ • Station Management            │ │
+│  │ • User UI       │   │   │ • Charger Control               │ │
+│  │ • Interactive   │   │   │ • Transaction Tracking          │ │
+│  │   Maps          │   │   │ • User Management               │ │
+│  │ • QR Scanner    │   │   │ • Wallet Operations             │ │
 │  └─────────────────┘   │   └─────────────────────────────────┘ │
 │                        │              │                        │
 │  ┌─────────────────┐   │   ┌─────────────────────────────────┐ │
-│  │ Supabase Auth   │◄──┼──►│    OCPP WebSocket Server        │ │
+│  │   Clerk Auth    │◄──┼──►│    OCPP WebSocket Server        │ │
 │  │                 │   │   │                                 │ │
 │  │ • JWT Tokens    │   │   │ • OCPP 1.6 Protocol            │ │
-│  │ • User Sessions │   │   │ • Real-time Communication       │ │
-│  └─────────────────┘   │   │ • Connection Management         │ │
-│                        │   └─────────────────────────────────┘ │
+│  │ • RBAC          │   │   │ • Real-time Communication       │ │
+│  │ • User Sessions │   │   │ • Connection Management         │ │
+│  └─────────────────┘   │   └─────────────────────────────────┘ │
 │                        │              │                        │
 └─────────────────────────┼──────────────┼────────────────────────┘
                          │              │
@@ -43,6 +44,7 @@ A comprehensive EV charging station management system implementing OCPP 1.6 prot
            │  │ • Chargers  │    │ • Sessions      │  │
            │  │ • Txns      │    │ • Real-time     │  │
            │  │ • Users     │    │   State         │  │
+           │  │ • Wallets   │    │ • Cache         │  │
            │  └─────────────┘    └─────────────────┘  │
            └─────────────────────────────────────────┘
                          │
@@ -60,24 +62,26 @@ A comprehensive EV charging station management system implementing OCPP 1.6 prot
 
 ### Backend (Python FastAPI)
 - **Framework**: FastAPI with Uvicorn ASGI server
-- **Database**: PostgreSQL with Tortoise ORM
+- **Database**: PostgreSQL with Tortoise ORM (async)
 - **Cache**: Redis for connection state management
-- **Authentication**: Supabase JWT validation
+- **Authentication**: Clerk JWT validation with role-based access
 - **Protocol**: OCPP 1.6 WebSocket implementation
 - **API**: RESTful APIs with OpenAPI documentation
-- **Deployment**: Docker on Render
+- **Deployment**: Production-ready on Render
 
 ### Frontend (Next.js)
-- **Framework**: Next.js 15 with App Router
+- **Framework**: Next.js 15 with App Router and React 19
 - **Language**: TypeScript for type safety
-- **Styling**: Tailwind CSS with shadcn/ui components
+- **Styling**: Tailwind CSS v4 with Shadcn/ui components
 - **State Management**: TanStack Query for server state
-- **Authentication**: Supabase client-side auth
+- **Authentication**: Clerk client-side auth with RBAC
+- **Maps**: React Leaflet for interactive station maps
+- **QR Scanning**: ZXing library for charger access
 - **Deployment**: Vercel with automatic deployments
 
 ### Infrastructure
-- **Authentication**: Supabase for user management
-- **Database**: PostgreSQL (Supabase or managed)
+- **Authentication**: Clerk for user management and JWT
+- **Database**: PostgreSQL with SSL (Tortoise ORM + AsyncPG)
 - **Cache**: Redis for real-time state
 - **Hosting**: Render (backend) + Vercel (frontend)
 
@@ -87,8 +91,8 @@ A comprehensive EV charging station management system implementing OCPP 1.6 prot
 - Node.js 18+ (for frontend)
 - Python 3.9+ (for backend)
 - PostgreSQL database
-- Redis instance (optional)
-- Supabase project
+- Redis instance
+- Clerk account for authentication
 
 ### Backend Setup
 
@@ -99,11 +103,16 @@ cd backend
 pip install -r requirements.txt
 
 # Environment configuration
-cp .env.example .env
-# Edit .env with your database and Supabase credentials
+# Set the following environment variables:
+export DATABASE_URL="postgresql://user:password@localhost:5432/ocpp_db"
+export REDIS_URL="redis://localhost:6379"
+export CLERK_SECRET_KEY="your-clerk-secret-key"
+export CLERK_JWT_VERIFICATION_KEY="your-clerk-jwt-key"
+export CLERK_WEBHOOK_SECRET="your-clerk-webhook-secret"
+export ENVIRONMENT="development"
 
-# Database setup
-python -c "from database import init_db; import asyncio; asyncio.run(init_db())"
+# Database migrations
+aerich upgrade
 
 # Start development server
 python main.py
@@ -118,8 +127,10 @@ cd frontend
 npm install
 
 # Environment configuration
-cp .env.example .env.local
-# Edit .env.local with your Supabase and API credentials
+# Create .env.local with:
+echo "NEXT_PUBLIC_API_URL=http://localhost:8000" >> .env.local
+echo "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=your-clerk-publishable-key" >> .env.local
+echo "CLERK_SECRET_KEY=your-clerk-secret-key" >> .env.local
 
 # Start development server
 npm run dev
@@ -132,16 +143,17 @@ npm run dev
 # Database
 DATABASE_URL=postgresql://user:password@localhost:5432/ocpp_db
 
-# Supabase
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_ANON_KEY=your-anon-key
-SUPABASE_JWT_SECRET=your-jwt-secret
-
-# Redis (optional)
+# Redis
 REDIS_URL=redis://localhost:6379
 
-# Environment
+# Clerk Authentication
+CLERK_SECRET_KEY=sk_test_...
+CLERK_JWT_VERIFICATION_KEY=...
+CLERK_WEBHOOK_SECRET=whsec_...
+
+# Application
 ENVIRONMENT=development
+PORT=8000
 ```
 
 **Frontend (.env.local)**:
@@ -149,61 +161,89 @@ ENVIRONMENT=development
 # API
 NEXT_PUBLIC_API_URL=http://localhost:8000
 
-# Supabase
-NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-key
+# Clerk Authentication
+NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_...
+CLERK_SECRET_KEY=sk_test_...
 ```
 
 ## 📱 Features
 
+### Role-Based Access Control
+- **USER Role**: Station finder, QR scanner, personal charging history
+- **ADMIN Role**: Full system management, charger control, user administration
+
 ### Dashboard Features
 - **Real-time Monitoring**: Live charger status and connection monitoring
-- **Station Management**: Create and manage charging station locations
-- **Charger Control**: Remote start/stop and availability control
-- **Transaction Tracking**: Complete charging session history
-- **User Management**: Admin panel for user administration
-- **Analytics**: Energy consumption and usage statistics
+- **Station Management**: Create and manage charging station locations with maps
+- **Charger Control**: Remote start/stop and availability control via OCPP
+- **Transaction Tracking**: Complete charging session history with energy analytics
+- **User Management**: Admin panel for user administration and wallet management
+- **Interactive Maps**: React Leaflet integration for station discovery
+- **QR Code Scanning**: Quick charger access via mobile scanning
 
-### OCPP Features
-- **OCPP 1.6 Compliance**: Full implementation of OCPP 1.6 specification
+### OCPP 1.6 Features
+- **Full OCPP 1.6 Compliance**: All core messages and remote commands
 - **Real-time Communication**: WebSocket-based charge point communication
-- **Message Logging**: Complete audit trail of OCPP messages
+- **Message Logging**: Complete audit trail of OCPP messages with correlation IDs
 - **Connection Management**: Automatic heartbeat monitoring and cleanup
-- **Transaction Management**: Start/stop transaction handling
+- **Transaction Management**: Complete lifecycle from start to billing
 - **Meter Values**: Real-time energy measurement collection
 
-### Authentication Features
-- **Modern Auth**: Supabase-powered authentication system
-- **Multiple Providers**: Email/password and Google OAuth support
-- **Role-Based Access**: Admin and user role separation
-- **Session Management**: Automatic token refresh and session handling
-- **Protected Routes**: Secure access to admin functionality
+### Financial Integration
+- **Wallet System**: User balance management with automatic billing
+- **Transaction Billing**: Energy-based charging with automated processing
+- **Billing Retry Service**: Automatic recovery for failed transactions
+- **Payment Integration**: Ready for payment gateway integration
 
 ## 🏗️ API Documentation
 
+### OCPP WebSocket Endpoint
+- **Endpoint**: `ws://localhost:8000/ocpp/{charge_point_id}`
+- **Authentication**: Database validation of charge point registration
+- **Supported Messages**: BootNotification, Heartbeat, StatusNotification, StartTransaction, StopTransaction, MeterValues
+- **Remote Commands**: RemoteStartTransaction, RemoteStopTransaction, ChangeAvailability
+
 ### REST API Endpoints
 
-**Station Management**:
-- `GET /api/admin/stations` - List all stations
-- `POST /api/admin/stations` - Create new station
-- `PUT /api/admin/stations/{id}` - Update station
-- `DELETE /api/admin/stations/{id}` - Delete station
+**Admin Management** (`/api/admin/` - Requires ADMIN role):
+```
+# Stations
+GET    /api/admin/stations              # List stations with charger count
+POST   /api/admin/stations              # Create new station
+GET    /api/admin/stations/{id}         # Get station details
+PUT    /api/admin/stations/{id}         # Update station
+DELETE /api/admin/stations/{id}         # Delete station
 
-**Charger Management**:
-- `GET /api/admin/chargers` - List all chargers
-- `POST /api/admin/chargers` - Create new charger
-- `PUT /api/admin/chargers/{id}` - Update charger
-- `DELETE /api/admin/chargers/{id}` - Delete charger
-- `POST /api/admin/chargers/{id}/remote-start` - Remote start charging
-- `POST /api/admin/chargers/{id}/remote-stop` - Remote stop charging
+# Chargers  
+GET    /api/admin/chargers              # List chargers with real-time status
+POST   /api/admin/chargers              # Create new charger
+GET    /api/admin/chargers/{id}         # Get charger details
+PUT    /api/admin/chargers/{id}         # Update charger
+DELETE /api/admin/chargers/{id}         # Delete charger
+POST   /api/admin/chargers/{id}/remote-start      # Remote start charging
+POST   /api/admin/chargers/{id}/remote-stop       # Remote stop charging
+POST   /api/admin/chargers/{id}/change-availability # Change charger availability
 
-**Transaction Management**:
-- `GET /api/admin/transactions` - List all transactions
-- `GET /api/admin/transactions/{id}/meter-values` - Get meter readings
-- `POST /api/admin/transactions/{id}/force-stop` - Force stop transaction
+# Transactions
+GET    /api/admin/transactions          # List transactions with analytics
+GET    /api/admin/transactions/{id}     # Get transaction details
+GET    /api/admin/transactions/{id}/meter-values # Get meter readings
+```
 
-**OCPP WebSocket**:
-- `WS /ocpp/{charge_point_id}` - OCPP charge point connection
+**User Management**:
+```
+GET    /auth/profile                    # Current user profile
+GET    /users                           # List users (admin) or current user
+GET    /users/{id}                      # User details with wallet info
+GET    /users/{id}/transactions         # User transaction history
+```
+
+**Legacy APIs** (Backward Compatibility):
+```
+GET    /api/charge-points               # List connected charge points
+POST   /api/charge-points/{id}/request  # Send OCPP command
+GET    /api/logs                        # OCPP message logs
+```
 
 ### API Documentation
 - **Interactive Docs**: Available at `http://localhost:8000/docs`
@@ -212,86 +252,189 @@ NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-key
 ## 🔧 Deployment
 
 ### Backend Deployment (Render)
-- Build Command: `pip install -r requirements.txt`
-- Start Command: `python main.py`
-- Environment Variables: Set DATABASE_URL, SUPABASE_* variables
+```yaml
+# Service Configuration
+services:
+  - type: web
+    name: ocpp-backend
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main.py"
+    plan: standard
+    healthCheckPath: "/"
+```
+
+**Environment Variables**: Set DATABASE_URL, REDIS_URL, CLERK_* variables
 
 ### Frontend Deployment (Vercel)
-- Framework: Next.js
-- Environment Variables: Set NEXT_PUBLIC_API_URL, NEXT_PUBLIC_SUPABASE_* variables
+- **Framework**: Next.js with automatic optimization
+- **Environment Variables**: Set NEXT_PUBLIC_API_URL, NEXT_PUBLIC_CLERK_* variables
 
 ## 🧪 Testing
 
 ### Backend Testing
 ```bash
 cd backend
+
+# Run all tests
 pytest
+
+# Run by category
+pytest -m unit          # Fast unit tests (~1 second)
+pytest -m integration   # Full OCPP WebSocket tests (~45 seconds)
+pytest -m infrastructure # Database/Redis tests (~5 seconds)
+
+# Run with coverage
+pytest --cov=. --cov-report=html
 ```
 
 ### OCPP Testing
 ```bash
+# Test complete charging session
+python simulators/ocpp_simulator_full_success.py
+
+# Test availability changes
+python simulators/ocpp_simulator_change_availability.py
+
 # Test WebSocket connection
 websocat ws://localhost:8000/ocpp/CP001
-
-# Test API endpoints
-curl http://localhost:8000/api/admin/chargers
 ```
 
-## 📊 File Structure
+## 📊 Project Structure
 
 ### Backend Structure
 ```
 backend/
-├── main.py                 # FastAPI app entrypoint
-├── models.py              # Tortoise ORM models
-├── database.py            # Database configuration
-├── schemas.py             # Pydantic models
-├── crud.py                # CRUD operations
-├── auth_middleware.py     # JWT validation
+├── main.py                 # FastAPI app with OCPP WebSocket endpoint
+├── models.py              # Tortoise ORM models with OCPP enums
+├── auth_middleware.py     # Clerk JWT authentication
 ├── redis_manager.py       # Redis connection management
+├── tortoise_config.py     # Database configuration
 ├── routers/               # API route modules
-│   ├── stations.py
-│   ├── chargers.py
-│   └── transactions.py
-├── migrations/            # Database migrations
-├── tests/                 # Test suite
-└── requirements.txt
+│   ├── stations.py        # Station management
+│   ├── chargers.py        # Charger management with OCPP commands
+│   ├── transactions.py    # Transaction tracking
+│   ├── users.py           # User management
+│   └── webhooks.py        # Clerk webhook handling
+├── services/              # Business logic
+│   ├── wallet_service.py  # Billing and payments
+│   └── billing_retry_service.py # Failed transaction recovery
+├── tests/                 # Comprehensive test suite
+├── simulators/            # OCPP charger simulators
+└── migrations/            # Database migrations
 ```
 
 ### Frontend Structure
 ```
 frontend/
 ├── app/                   # Next.js App Router
-│   ├── auth/             # Authentication pages
-│   ├── stations/         # Station management
-│   └── chargers/         # Charger monitoring
-├── components/           # React components
-│   ├── ui/              # shadcn/ui components
-│   └── auth/            # Auth-specific components
-├── contexts/            # React context providers
-├── lib/                 # Utilities and API client
-└── types/              # TypeScript definitions
+│   ├── layout.tsx         # Root layout with providers
+│   ├── page.tsx           # Role-based dashboard
+│   ├── auth/              # Authentication pages
+│   ├── admin/             # Admin-only management interface
+│   ├── stations/          # Station finder with maps
+│   ├── scanner/           # QR code scanning
+│   └── charge/            # Individual charger interface
+├── components/            # React components
+│   ├── ui/               # Shadcn/ui components
+│   ├── Navbar.tsx        # Role-based navigation
+│   ├── RoleWrapper.tsx   # RBAC components
+│   └── QRScanner.tsx     # QR code scanning
+├── contexts/             # React context providers
+├── lib/                  # API integration and utilities
+│   ├── api-client.ts     # HTTP client with Clerk auth
+│   ├── api-services.ts   # Domain-specific API services
+│   └── queries/          # TanStack Query hooks
+└── types/                # TypeScript definitions
 ```
 
 ## 🔐 Security Features
-- **JWT Authentication**: Supabase-powered token validation
-- **Role-Based Access**: Admin vs User permissions
-- **Protected Routes**: Automatic auth guards
-- **CORS Protection**: Secure cross-origin requests
-- **Input Validation**: Pydantic schema validation
+- **JWT Authentication**: Clerk-powered token validation with role-based access
+- **RBAC**: Comprehensive role separation (ADMIN vs USER)
+- **Protected Routes**: Automatic authentication guards
+- **CORS Protection**: Configured for secure cross-origin requests
+- **Input Validation**: Pydantic schema validation for all API inputs
+- **OCPP Security**: Charger registration validation before WebSocket connection
+- **Audit Trail**: Complete OCPP message logging for compliance
+
+## 📈 Performance & Scalability
+- **Async Architecture**: Full async/await pattern throughout backend
+- **Redis Caching**: Real-time connection state with O(1) lookups
+- **Database Optimization**: Connection pooling and optimized queries
+- **Frontend Optimization**: TanStack Query with intelligent caching
+- **Bundle Optimization**: Code splitting and lazy loading
+- **CDN Deployment**: Global edge deployment via Vercel
+
+## 🛠️ Known Issues & Technical Debt
+
+### Critical Issue: Boot Notification Transaction Handling
+**Location**: `backend/main.py:69-94`
+**Issue**: Currently fails ongoing transactions immediately on charger reboot
+**Impact**: Users lose active charging sessions unnecessarily
+**Solution**: Implement transaction reconciliation with PENDING_RECONCILIATION status
+
+### Performance Improvements
+- Database query optimization for N+1 patterns
+- Frontend bundle size reduction through code splitting
+- Enhanced Redis connection pooling
+
+### Security Enhancements
+- OCPP message schema validation
+- API rate limiting implementation
+- Enhanced audit logging
+
+## 🚀 Future Roadmap
+
+### Short-term (Next 3 months)
+- Fix boot notification transaction handling
+- Enhanced OCPP command support (Reset, GetConfiguration, UnlockConnector)
+- Performance optimizations and query improvements
+- Rate limiting and enhanced security
+
+### Medium-term (3-6 months)
+- Advanced analytics and reporting dashboard
+- Push notifications and offline PWA features
+- Multi-tenant architecture support
+- Predictive maintenance features
+
+### Long-term (6+ months)
+- OCPP 2.0.1 migration path
+- Smart grid integration capabilities
+- Machine learning for demand forecasting
+- Advanced payment systems and roaming support
 
 ## 📜 License
 
 This project is licensed under the MIT License.
 
-## 🆘 Support
+## 🆘 Support & Documentation
 
-### Useful Resources
-- [OCPP 1.6 Specification](https://www.openchargealliance.org/protocols/ocpp-16/)
-- [FastAPI Documentation](https://fastapi.tiangolo.com/)
-- [Next.js Documentation](https://nextjs.org/docs)
-- [Supabase Documentation](https://supabase.com/docs)
+### Additional Resources
+- **Architecture Documentation**: `docs/v1/comprehensive-architecture-documentation.md`
+- **LLM Context**: `docs/v1/llm-context-document.md`
+- **OCPP 1.6 Specification**: Available in `docs/v1/` directory
+- **API Documentation**: Available at `/docs` endpoint when running
+
+### Development Commands
+```bash
+# Backend
+cd backend
+python main.py                    # Start server
+aerich migrate --name "desc"      # Create migration
+aerich upgrade                    # Apply migrations
+pytest                           # Run tests
+
+# Frontend  
+cd frontend
+npm run dev                      # Start development
+npm run build                    # Build for production
+npm run lint                     # Lint code
+```
 
 ---
 
 **Built with ❤️ for the EV charging ecosystem**
+
+**Current Status**: Production-ready system actively managing real-world charging infrastructure
+**Version**: 2.0  
+**Last Updated**: January 2025
