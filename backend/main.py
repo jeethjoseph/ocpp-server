@@ -66,32 +66,8 @@ class ChargePoint(OcppChargePoint):
     async def on_boot_notification(self, charge_point_vendor, charge_point_model, **kwargs):
         logger.info(f"BootNotification from {self.id}: vendor={charge_point_vendor}, model={charge_point_model}")
         
-        # Check for ongoing transactions and mark them as FAILED with reason REBOOT
-        from models import Transaction, TransactionStatusEnum
-        try:
-            ongoing_transactions = await Transaction.filter(
-                charger__charge_point_string_id=self.id,
-                transaction_status__in=[
-                    TransactionStatusEnum.RUNNING,
-                    TransactionStatusEnum.STARTED,
-                    TransactionStatusEnum.PENDING_START,
-                    TransactionStatusEnum.PENDING_STOP
-                ]
-            ).all()
-            
-            if ongoing_transactions:
-                logger.info(f"Found {len(ongoing_transactions)} ongoing transactions for charger {self.id} during boot - marking as FAILED")
-                for transaction in ongoing_transactions:
-                    transaction.transaction_status = TransactionStatusEnum.FAILED
-                    transaction.stop_reason = "REBOOT"
-                    transaction.end_time = datetime.datetime.now(datetime.timezone.utc)
-                    await transaction.save()
-                    logger.info(f"Marked transaction {transaction.id} as FAILED due to REBOOT")
-            else:
-                logger.info(f"No ongoing transactions found for charger {self.id} during boot")
-                
-        except Exception as e:
-            logger.error(f"Error checking ongoing transactions for {self.id} during boot: {e}", exc_info=True)
+        # Don't automatically fail transactions on reboot - let StatusNotification handle actual status
+        # The charger will send StatusNotification after boot which will determine if transactions should fail
         
         # Don't assume status - wait for StatusNotification from charge point
         
@@ -131,6 +107,71 @@ class ChargePoint(OcppChargePoint):
                 logger.warning(f"Failed to update status for charger {self.id} - charger not found in database")
             else:
                 logger.info(f"Successfully updated charger {self.id} status to {status}")
+            
+            # Check if status indicates not charging and fail ongoing transactions
+            # Charging states: Charging, Preparing, SuspendedEVSE, SuspendedEV, Finishing
+            charging_states = {"Charging", "Preparing", "SuspendedEVSE", "SuspendedEV", "Finishing"}
+            
+            if status not in charging_states:
+                from models import Transaction, TransactionStatusEnum, MeterValue
+                try:
+                    ongoing_transactions = await Transaction.filter(
+                        charger__charge_point_string_id=self.id,
+                        transaction_status__in=[
+                            TransactionStatusEnum.RUNNING,
+                            TransactionStatusEnum.STARTED,
+                            TransactionStatusEnum.PENDING_START,
+                            TransactionStatusEnum.PENDING_STOP
+                        ]
+                    ).all()
+                    
+                    if ongoing_transactions:
+                        logger.info(f"Status {status} indicates not charging - found {len(ongoing_transactions)} ongoing transactions for charger {self.id} - marking as FAILED")
+                        from services.wallet_service import WalletService
+                        
+                        for transaction in ongoing_transactions:
+                            # Calculate energy consumption from latest meter value if not already set
+                            if transaction.end_meter_kwh is None:
+                                latest_meter_value = await MeterValue.filter(
+                                    transaction_id=transaction.id
+                                ).order_by("-created_at").first()
+                                
+                                if latest_meter_value:
+                                    transaction.end_meter_kwh = latest_meter_value.reading_kwh
+                                    transaction.energy_consumed_kwh = transaction.end_meter_kwh - (transaction.start_meter_kwh or 0)
+                                    logger.info(f"Calculated energy consumption for failed transaction {transaction.id}: {transaction.energy_consumed_kwh} kWh (from latest meter value: {latest_meter_value.reading_kwh} kWh)")
+                                else:
+                                    logger.warning(f"No meter values found for failed transaction {transaction.id} - cannot calculate energy consumption")
+                            
+                            transaction.transaction_status = TransactionStatusEnum.FAILED
+                            transaction.stop_reason = f"STATUS_CHANGE_TO_{status}"
+                            transaction.end_time = datetime.datetime.now(datetime.timezone.utc)
+                            await transaction.save()
+                            logger.info(f"Marked transaction {transaction.id} as FAILED due to status change to {status}")
+                            
+                            # Process billing if we have energy consumption data
+                            if transaction.energy_consumed_kwh is not None and transaction.energy_consumed_kwh > 0:
+                                try:
+                                    success, message, billing_amount = await WalletService.process_transaction_billing(transaction.id)
+                                    if success:
+                                        if billing_amount and billing_amount > 0:
+                                            logger.info(f"💰 Billing successful for failed transaction {transaction.id}: ${billing_amount}")
+                                        else:
+                                            logger.info(f"💰 {message} for failed transaction {transaction.id}")
+                                    else:
+                                        logger.warning(f"💰 Billing failed for failed transaction {transaction.id}: {message}")
+                                except Exception as billing_error:
+                                    logger.error(f"💰 Unexpected error in billing for failed transaction {transaction.id}: {billing_error}", exc_info=True)
+                                    await Transaction.filter(id=transaction.id).update(
+                                        transaction_status=TransactionStatusEnum.BILLING_FAILED
+                                    )
+                            else:
+                                logger.warning(f"💰 Cannot bill failed transaction {transaction.id} - no energy consumed (energy: {transaction.energy_consumed_kwh} kWh)")
+                    else:
+                        logger.debug(f"Status {status} indicates not charging but no ongoing transactions found for charger {self.id}")
+                        
+                except Exception as e:
+                    logger.error(f"Error checking ongoing transactions for {self.id} on status change to {status}: {e}", exc_info=True)
             
             return call_result.StatusNotification()
             

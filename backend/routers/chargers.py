@@ -83,6 +83,7 @@ class ChargerDetailResponse(BaseModel):
     station: StationBasicInfo
     connectors: List[ConnectorResponse]
     current_transaction: Optional[CurrentTransactionInfo] = None
+    recent_transaction: Optional[CurrentTransactionInfo] = None
 
 class OCPPLogResponse(BaseModel):
     id: int
@@ -274,6 +275,18 @@ async def get_charger_details(charger_id: int):
         transaction_status__in=["STARTED", "PENDING_START", "RUNNING"]
     ).first()
     
+    # If no active transaction, get the most recent completed transaction (within last 5 minutes)
+    # This helps users see billing info after remote stops by admin
+    recent_transaction = None
+    if not current_transaction:
+        from datetime import datetime, timezone, timedelta
+        five_minutes_ago = datetime.now(timezone.utc) - timedelta(minutes=5)
+        recent_transaction = await Transaction.filter(
+            charger_id=charger_id,
+            transaction_status__in=["COMPLETED", "STOPPED", "BILLING_FAILED", "FAILED"],
+            end_time__gte=five_minutes_ago
+        ).order_by('-end_time').first()
+    
     # Get connection status
     connection_status_dict = await get_bulk_connection_status([charger])
     connection_status = connection_status_dict.get(charger.charge_point_string_id, False)
@@ -284,8 +297,13 @@ async def get_charger_details(charger_id: int):
         connectors=[ConnectorResponse.model_validate(c, from_attributes=True) for c in connectors]
     )
     
+    # Set current transaction only if truly active
     if current_transaction:
         response.current_transaction = CurrentTransactionInfo(transaction_id=current_transaction.id)
+    
+    # Set recent transaction separately (for billing display after completion)
+    if recent_transaction:
+        response.recent_transaction = CurrentTransactionInfo(transaction_id=recent_transaction.id)
     
     return response
 

@@ -285,10 +285,14 @@ const mutation = useMutation({
 ### Backend Setup
 ```bash
 cd backend
+# IMPORTANT: Always activate the virtual environment first
+source .venv/bin/activate
 pip install -r requirements.txt
 # Set environment variables: DATABASE_URL, REDIS_URL, CLERK_* credentials
 python main.py  # Starts on port 8000 with OCPP WebSocket endpoint
 ```
+
+**Note for AI Assistants**: Always activate the virtual environment with `source .venv/bin/activate` before running any Python commands in the backend directory. The project uses a virtual environment located at `backend/.venv/`.
 
 ### Frontend Setup  
 ```bash
@@ -302,6 +306,7 @@ npm run dev  # Starts on port 3000 with role-based routing
 ### Database Migrations
 ```bash
 cd backend
+source .venv/bin/activate
 aerich migrate --name "description"  # Generate migration
 aerich upgrade  # Apply migration to database
 ```

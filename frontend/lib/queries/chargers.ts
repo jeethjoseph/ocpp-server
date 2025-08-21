@@ -46,13 +46,13 @@ export function useStations(params: { limit?: number } = {}) {
 }
 
 // Individual Charger Query Hook
-export function useCharger(id: number) {
+export function useCharger(id: number, hasActiveTransaction?: boolean) {
   return useQuery({
     queryKey: chargerKeys.detail(id),
     queryFn: () => chargerService.getById(id),
     enabled: !!id,
-    staleTime: 1000 * 10, // 10 seconds
-    refetchInterval: 1000 * 10, // Auto-refresh every 10 seconds
+    staleTime: hasActiveTransaction ? 1000 * 5 : 1000 * 10, // 5s during active session, 10s otherwise
+    refetchInterval: hasActiveTransaction ? 1000 * 5 : 1000 * 10, // More frequent polling during active sessions
   });
 }
 
@@ -178,13 +178,12 @@ export function useRemoteStop() {
       return chargerService.remoteStop(id, reason);
     },
     onSuccess: () => {
-      // Invalidate chargers to refetch latest status
+      // Immediate invalidation
       queryClient.invalidateQueries({ queryKey: chargerKeys.all });
-      // Invalidate transactions to refetch final transaction status and energy consumed
       queryClient.invalidateQueries({ queryKey: transactionKeys.all });
       
-      // Delayed refetches to handle OCPP backend processing delays
-      const refetchDelays = [3000, 6000]; // 3s, 6s - optimized based on testing
+      // More aggressive refetching for better UX
+      const refetchDelays = [1000, 2000, 4000, 8000]; // 1s, 2s, 4s, 8s - faster initial checks
       refetchDelays.forEach((delay) => {
         setTimeout(() => {
           queryClient.invalidateQueries({ queryKey: chargerKeys.all });

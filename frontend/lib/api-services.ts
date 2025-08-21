@@ -153,6 +153,16 @@ export const transactionService = {
   getById: (id: number) =>
     api.get<TransactionDetail>(`/api/admin/transactions/${id}`),
 
+  // User-accessible endpoints (works for both users and admins)
+  getUserTransaction: (id: number) =>
+    api.get<TransactionDetail>(`/users/transaction/${id}`),
+
+  getUserTransactionMeterValues: (id: number) =>
+    api.get<{
+      meter_values: MeterValue[];
+      energy_chart_data: Record<string, unknown>;
+    }>(`/users/transaction/${id}/meter-values`),
+
   getMeterValues: (id: number) =>
     api.get<{
       meter_values: MeterValue[];
