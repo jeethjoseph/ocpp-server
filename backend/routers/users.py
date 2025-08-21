@@ -3,7 +3,7 @@ from typing import List, Optional
 from tortoise.exceptions import DoesNotExist
 from decimal import Decimal
 
-from auth_middleware import require_admin
+from auth_middleware import require_admin, require_user_or_admin
 from models import User, Transaction, WalletTransaction, Wallet, UserRoleEnum
 from schemas import BaseModel
 import logging
@@ -371,3 +371,130 @@ async def get_user_wallet_transactions(
     except Exception as e:
         logger.error(f"Error getting user wallet transactions {user_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve user wallet transactions")
+
+@router.get("/transaction/{transaction_id}", response_model=dict)
+async def get_user_transaction_details(
+    transaction_id: int,
+    current_user: User = Depends(require_user_or_admin())
+):
+    """Get transaction details for the current user's own transactions"""
+    from models import Transaction, MeterValue, WalletTransaction, Charger
+    
+    try:
+        # Get transaction and verify it belongs to the current user (or admin can access any)
+        from models import UserRoleEnum
+        if current_user.role == UserRoleEnum.ADMIN:
+            transaction = await Transaction.filter(id=transaction_id).first()
+        else:
+            transaction = await Transaction.filter(id=transaction_id, user_id=current_user.id).first()
+            
+        if not transaction:
+            raise HTTPException(status_code=404, detail="Transaction not found or access denied")
+        
+        # Get related data
+        charger = await Charger.filter(id=transaction.charger_id).first()
+        meter_values = await MeterValue.filter(transaction_id=transaction_id).order_by("created_at")
+        wallet_transactions = await WalletTransaction.filter(charging_transaction_id=transaction_id).all()
+        
+        if not charger:
+            raise HTTPException(status_code=500, detail="Related charger data not found")
+        
+        return {
+            "transaction": {
+                "id": transaction.id,
+                "user_id": transaction.user_id,
+                "charger_id": transaction.charger_id,
+                "start_meter_kwh": transaction.start_meter_kwh,
+                "end_meter_kwh": transaction.end_meter_kwh,
+                "energy_consumed_kwh": transaction.energy_consumed_kwh,
+                "start_time": transaction.start_time.isoformat() if transaction.start_time else None,
+                "end_time": transaction.end_time.isoformat() if transaction.end_time else None,
+                "stop_reason": transaction.stop_reason,
+                "transaction_status": transaction.transaction_status.value,
+                "created_at": transaction.created_at.isoformat(),
+                "updated_at": transaction.updated_at.isoformat()
+            },
+            "user": {
+                "id": current_user.id,
+                "full_name": current_user.full_name,
+                "email": current_user.email,
+                "phone_number": current_user.phone_number
+            },
+            "charger": {
+                "id": charger.id,
+                "name": charger.name,
+                "charge_point_string_id": charger.charge_point_string_id
+            },
+            "meter_values": [
+                {
+                    "id": mv.id,
+                    "reading_kwh": mv.reading_kwh,
+                    "current": mv.current,
+                    "voltage": mv.voltage,
+                    "power_kw": mv.power_kw,
+                    "created_at": mv.created_at.isoformat()
+                } for mv in meter_values
+            ],
+            "wallet_transactions": [
+                {
+                    "id": wt.id,
+                    "amount": float(wt.amount),
+                    "type": wt.type.value,
+                    "description": wt.description,
+                    "created_at": wt.created_at.isoformat()
+                } for wt in wallet_transactions
+            ]
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting user transaction details {transaction_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve transaction details")
+
+@router.get("/transaction/{transaction_id}/meter-values", response_model=dict)
+async def get_user_transaction_meter_values(
+    transaction_id: int,
+    current_user: User = Depends(require_user_or_admin())
+):
+    """Get meter values for the current user's own transaction"""
+    from models import Transaction, MeterValue, UserRoleEnum
+    
+    try:
+        # Get transaction and verify it belongs to the current user (or admin can access any)
+        if current_user.role == UserRoleEnum.ADMIN:
+            transaction = await Transaction.filter(id=transaction_id).first()
+        else:
+            transaction = await Transaction.filter(id=transaction_id, user_id=current_user.id).first()
+            
+        if not transaction:
+            raise HTTPException(status_code=404, detail="Transaction not found or access denied")
+        
+        meter_values = await MeterValue.filter(transaction_id=transaction_id).order_by("created_at")
+        
+        # Build energy chart data for frontend visualization
+        energy_chart_data = {
+            "labels": [mv.created_at.isoformat() for mv in meter_values],
+            "energy_data": [mv.reading_kwh for mv in meter_values],
+            "power_data": [mv.power_kw or 0 for mv in meter_values]
+        }
+        
+        return {
+            "meter_values": [
+                {
+                    "id": mv.id,
+                    "reading_kwh": mv.reading_kwh,
+                    "current": mv.current,
+                    "voltage": mv.voltage,
+                    "power_kw": mv.power_kw,
+                    "created_at": mv.created_at.isoformat()
+                } for mv in meter_values
+            ],
+            "energy_chart_data": energy_chart_data
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting user transaction meter values {transaction_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve meter values")

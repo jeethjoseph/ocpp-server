@@ -13,8 +13,8 @@ import {
   useRemoteStop,
 } from "@/lib/queries/chargers";
 import {
-  useTransaction,
-  useTransactionMeterValues,
+  useAdminTransaction,
+  useAdminTransactionMeterValues,
 } from "@/lib/queries/transactions";
 
 // Transaction data comes exclusively from transaction API
@@ -41,12 +41,13 @@ export default function ChargerDetailPage() {
   const charger = chargerData?.charger;
   const station = chargerData?.station;
   const currentTransactionId = chargerData?.current_transaction?.transaction_id;
+  const recentTransactionId = chargerData?.recent_transaction?.transaction_id;
 
-  // Get transaction ID to use (current or last known)
-  const transactionIdToShow = currentTransactionId || lastTransactionId;
+  // Get transaction ID to use (current, recent, or last known)
+  const transactionIdToShow = currentTransactionId || recentTransactionId || lastTransactionId;
 
   // Fetch full transaction details using transactions API
-  const { data: transactionData } = useTransaction(transactionIdToShow || 0);
+  const { data: transactionData } = useAdminTransaction(transactionIdToShow || 0);
   const transaction = transactionData?.transaction;
 
   // Track last known transaction ID for persistence
@@ -57,7 +58,7 @@ export default function ChargerDetailPage() {
   }, [currentTransactionId]);
 
   // Meter values query - only enabled if there's a transaction
-  const { data: meterValuesData } = useTransactionMeterValues(
+  const { data: meterValuesData } = useAdminTransactionMeterValues(
     transactionIdToShow || 0
   );
   const meterValues = meterValuesData?.meter_values || [];
@@ -280,6 +281,8 @@ export default function ChargerDetailPage() {
               <CardTitle>
                 {currentTransactionId
                   ? "Current Charging Session"
+                  : recentTransactionId 
+                  ? "Recent Charging Session"
                   : "Last Charging Session"}
               </CardTitle>
               {!currentTransactionId && transaction && (

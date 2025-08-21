@@ -100,6 +100,9 @@ export interface ChargerDetail {
   current_transaction?: {
     transaction_id: number;
   };
+  recent_transaction?: {
+    transaction_id: number;
+  };
 }
 
 export interface MeterValue {

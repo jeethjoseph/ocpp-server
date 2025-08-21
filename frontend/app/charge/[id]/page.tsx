@@ -35,12 +35,13 @@ export default function UserChargePage() {
   const chargerId = parseInt(params.id as string);
 
   const [lastTransactionId, setLastTransactionId] = useState<number | null>(null);
+  const [hasActiveTransaction, setHasActiveTransaction] = useState(false);
 
   const {
     data: chargerData,
     isLoading: chargerLoading,
     error: chargerError,
-  } = useCharger(chargerId);
+  } = useCharger(chargerId, hasActiveTransaction);
   
   const remoteStartMutation = useRemoteStart();
   const remoteStopMutation = useRemoteStop();
@@ -48,8 +49,9 @@ export default function UserChargePage() {
   const charger = chargerData?.charger;
   const station = chargerData?.station;
   const currentTransactionId = chargerData?.current_transaction?.transaction_id;
+  const recentTransactionId = chargerData?.recent_transaction?.transaction_id;
 
-  const transactionIdToShow = currentTransactionId || lastTransactionId;
+  const transactionIdToShow = currentTransactionId || recentTransactionId || lastTransactionId;
 
   const { data: transactionData } = useTransaction(transactionIdToShow || 0);
   const transaction = transactionData?.transaction;
@@ -68,6 +70,7 @@ export default function UserChargePage() {
     if (currentTransactionId) {
       setLastTransactionId(currentTransactionId);
     }
+    setHasActiveTransaction(!!currentTransactionId);
   }, [currentTransactionId]);
 
   // Clear transaction handler (like admin page)
@@ -83,6 +86,8 @@ export default function UserChargePage() {
 
   const handleRemoteStart = () => {
     if (!charger) return;
+    // Only clear last transaction if we're starting a new one
+    // This prevents losing track of recently completed transactions
     setLastTransactionId(null);
     remoteStartMutation.mutate(
       { 
@@ -300,7 +305,7 @@ export default function UserChargePage() {
             <CardHeader className="pb-4 flex flex-row items-center justify-between">
               <CardTitle className="flex items-center gap-2 text-lg text-card-foreground">
                 <Battery className="h-5 w-5" />
-                {currentTransactionId ? "Active Session" : "Last Session"}
+                {currentTransactionId ? "Active Session" : recentTransactionId ? "Recent Session" : "Last Session"}
               </CardTitle>
               {!currentTransactionId && transaction && (
                 <Button
@@ -324,11 +329,21 @@ export default function UserChargePage() {
               
               {/* Energy Display - Prominent */}
               <div className="text-center mb-6">
-                <p className="text-sm text-muted-foreground mb-2">Energy Consumed</p>
+                <p className="text-sm text-muted-foreground mb-2">
+                  {currentTransactionId ? "Live Energy Reading" : "Energy Consumed"}
+                </p>
                 <p className="text-4xl font-bold text-green-600">
-                  {(getEnergyConsumed() || 0).toFixed(2)}
+                  {currentTransactionId && latestMeterValue?.reading_kwh 
+                    ? latestMeterValue.reading_kwh.toFixed(2)
+                    : (getEnergyConsumed() || 0).toFixed(2)
+                  }
                 </p>
                 <p className="text-xl text-green-600">kWh</p>
+                {currentTransactionId && latestMeterValue?.reading_kwh && (
+                  <p className="text-xs text-muted-foreground mt-1">
+                    Live reading from charger
+                  </p>
+                )}
               </div>
               
               {/* Duration - If Active */}
