@@ -67,11 +67,34 @@ export default function AdminChargersPage() {
     deleteChargerMutation.mutate(id);
   };
 
+  const canChangeAvailability = (status: string) => {
+    // Only allow availability changes for Available and Unavailable statuses
+    return status === "Available" || status === "Unavailable";
+  };
+
+  const getAvailabilityToggleState = (status: string) => {
+    // Green/ON for Available, Gray/OFF for all others
+    return status === "Available";
+  };
+
   const handleChangeAvailability = async (
     chargerId: number,
     currentStatus: string
   ) => {
-    const newType = currentStatus !== "Unavailable" ? "Inoperative" : "Operative";
+    // OCPP 1.6 compliant logic: only allow toggle between Available <-> Unavailable
+    let newType: "Inoperative" | "Operative" | null = null;
+    
+    if (currentStatus === "Available") {
+      newType = "Inoperative"; // Available -> Unavailable
+    } else if (currentStatus === "Unavailable") {
+      newType = "Operative"; // Unavailable -> Available
+    }
+    
+    // Don't proceed if status change isn't allowed
+    if (!newType) {
+      console.warn(`Cannot change availability for charger with status: ${currentStatus}`);
+      return;
+    }
     
     // Add charger to loading set
     setToggleLoadingChargers(prev => new Set(prev).add(chargerId));
@@ -281,23 +304,28 @@ export default function AdminChargersPage() {
                                 charger.latest_status
                               )
                             }
-                            disabled={toggleLoadingChargers.has(charger.id)}
+                            disabled={
+                              toggleLoadingChargers.has(charger.id) ||
+                              !canChangeAvailability(charger.latest_status)
+                            }
                             className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed ${
-                              charger.latest_status === "Available"
+                              getAvailabilityToggleState(charger.latest_status)
                                 ? "bg-green-600"
                                 : "bg-muted"
                             }`}
                             title={
                               toggleLoadingChargers.has(charger.id)
                                 ? "Changing availability..."
-                                : "Toggle charger availability"
+                                : !canChangeAvailability(charger.latest_status)
+                                ? `Cannot toggle availability for ${charger.latest_status} status`
+                                : "Toggle charger availability (Available ↔ Unavailable)"
                             }>
                             {toggleLoadingChargers.has(charger.id) ? (
                               <div className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-background border-t-transparent mx-auto" />
                             ) : (
                               <span
                                 className={`inline-block h-4 w-4 transform rounded-full bg-background transition-transform ${
-                                  charger.latest_status === "Available"
+                                  getAvailabilityToggleState(charger.latest_status)
                                     ? "translate-x-6"
                                     : "translate-x-1"
                                 }`}
