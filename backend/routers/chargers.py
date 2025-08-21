@@ -476,11 +476,29 @@ async def change_charger_availability(
     connector_id: int = Query(..., ge=0),
     admin_user: User = Depends(require_admin())
 ):
-    """Change charger availability (Operative/Inoperative)"""
+    """Change charger availability (Operative/Inoperative) - OCPP 1.6 compliant"""
     
     charger = await Charger.filter(id=charger_id).first()
     if not charger:
         raise HTTPException(status_code=404, detail="Charger not found")
+    
+    # OCPP 1.6 Compliance: Validate state transitions
+    current_status = charger.latest_status
+    
+    if type == "Inoperative":
+        # Can only set to Inoperative if currently Available
+        if current_status != "Available":
+            raise HTTPException(
+                status_code=409, 
+                detail=f"Cannot set charger to Inoperative. Current status is '{current_status}'. Only 'Available' chargers can be made Inoperative."
+            )
+    elif type == "Operative":
+        # Can only set to Operative if currently Unavailable
+        if current_status != "Unavailable":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot set charger to Operative. Current status is '{current_status}'. Only 'Unavailable' chargers can be made Operative."
+            )
     
     # Get connected charge points
     connected_cps = get_connected_charge_points()
@@ -504,7 +522,9 @@ async def change_charger_availability(
     if success:
         return {
             "success": True,
-            "message": f"Availability changed to {type} successfully"
+            "message": f"Availability changed to {type} successfully",
+            "previous_status": current_status,
+            "expected_new_status": "Available" if type == "Operative" else "Unavailable"
         }
     else:
         raise HTTPException(status_code=500, detail=f"Failed to change availability: {response}")
