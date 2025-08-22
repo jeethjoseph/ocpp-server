@@ -133,6 +133,7 @@ def require_role(required_role: 'UserRoleEnum'):
         from models import UserRoleEnum
         
         if user.role != required_role:
+            print(f"DEBUG: Role mismatch - Required: {required_role.value}, User has: {user.role.value}, User ID: {user.id}")
             raise HTTPException(
                 status_code=403, 
                 detail=f"Access denied. Required role: {required_role.value}, your role: {user.role.value}"
@@ -145,6 +146,11 @@ def require_admin():
     """Convenience dependency for admin-only endpoints"""
     from models import UserRoleEnum
     return require_role(UserRoleEnum.ADMIN)
+
+def require_user():
+    """Convenience dependency for user-only endpoints"""
+    from models import UserRoleEnum
+    return require_role(UserRoleEnum.USER)
 
 def require_user_or_admin():
     """Dependency for endpoints accessible by both users and admins"""

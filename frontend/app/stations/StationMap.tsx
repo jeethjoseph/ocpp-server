@@ -4,6 +4,11 @@ import { useEffect } from 'react';
 import { MapContainer, TileLayer, Marker, Popup, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
+import type { PublicStationResponse } from "@/lib/api-services";
+
+interface StationWithDistance extends PublicStationResponse {
+  distance?: number;
+}
 
 // Fix for default markers in React Leaflet
 // Fix for default markers in React Leaflet
@@ -14,29 +19,55 @@ L.Icon.Default.mergeOptions({
   shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-shadow.png',
 });
 
-// Custom station icon
-const stationIcon = L.divIcon({
-  html: `
-    <div style="
-      background-color: #22c55e;
-      width: 24px;
-      height: 24px;
-      border-radius: 50%;
-      border: 2px solid white;
-      box-shadow: 0 2px 4px rgba(0,0,0,0.2);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    ">
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="white">
-        <path d="M12 2L13.09 8.26L22 9L17 14L18.18 22L12 19L5.82 22L7 14L2 9L10.91 8.26L12 2Z"/>
-      </svg>
-    </div>
-  `,
-  className: '',
-  iconSize: [24, 24],
-  iconAnchor: [12, 12],
-});
+// Create station icon based on availability status
+const createStationIcon = (available: number, total: number) => {
+  let bgColor = '#ef4444'; // red for offline/error
+  if (available > 0) {
+    bgColor = '#22c55e'; // green for available
+  } else if (total > 0) {
+    bgColor = '#eab308'; // yellow for all busy
+  }
+  
+  return L.divIcon({
+    html: `
+      <div style="
+        background-color: ${bgColor};
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        border: 3px solid white;
+        box-shadow: 0 3px 6px rgba(0,0,0,0.3);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+      ">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="white">
+          <path d="M12 2L13.09 8.26L22 9L17 14L18.18 22L12 19L5.82 22L7 14L2 9L10.91 8.26L12 2Z"/>
+        </svg>
+        <div style="
+          position: absolute;
+          bottom: -6px;
+          right: -6px;
+          background-color: white;
+          border-radius: 50%;
+          width: 14px;
+          height: 14px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 10px;
+          font-weight: bold;
+          color: ${bgColor};
+          box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+        ">${available}</div>
+      </div>
+    `,
+    className: '',
+    iconSize: [32, 32],
+    iconAnchor: [16, 16],
+  });
+};
 
 // User location icon
 const userIcon = L.divIcon({
@@ -64,27 +95,24 @@ const userIcon = L.divIcon({
   iconAnchor: [8, 8],
 });
 
-interface Station {
-  id: number;
-  name: string;
-  address: string;
-  latitude: number;
-  longitude: number;
-  availableChargers?: number;
-  totalChargers?: number;
-  rating?: number;
-  pricePerKwh?: number;
-}
 
 interface StationMapProps {
-  stations: Station[];
+  stations: StationWithDistance[];
   userLocation: {lat: number; lng: number} | null;
-  onStationSelect: (station: Station) => void;
-  selectedStation: Station | null;
+  onStationSelect: (station: StationWithDistance) => void;
+  selectedStation: StationWithDistance | null;
+  onStationCenter: (station: StationWithDistance) => void;
+  onMapReady?: (map: L.Map) => void;
 }
 
-function MapController({ userLocation, stations }: { userLocation: {lat: number; lng: number} | null, stations: Station[] }) {
+function MapController({ userLocation, stations, onMapReady }: { userLocation: {lat: number; lng: number} | null, stations: StationWithDistance[], onMapReady?: (map: L.Map) => void }) {
   const map = useMap();
+  
+  useEffect(() => {
+    if (onMapReady) {
+      onMapReady(map);
+    }
+  }, [map, onMapReady]);
   
   useEffect(() => {
     if (userLocation && stations.length > 0) {
@@ -116,7 +144,7 @@ function MapController({ userLocation, stations }: { userLocation: {lat: number;
   return null;
 }
 
-export default function StationMap({ stations, userLocation, onStationSelect }: StationMapProps) {
+export default function StationMap({ stations, userLocation, onStationSelect, onStationCenter, onMapReady }: StationMapProps) {
   // Default center (San Francisco)
   const defaultCenter: [number, number] = [37.7749, -122.4194];
   const center: [number, number] = userLocation 
@@ -136,7 +164,7 @@ export default function StationMap({ stations, userLocation, onStationSelect }: 
           attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
         />
         
-        <MapController userLocation={userLocation} stations={stations} />
+        <MapController userLocation={userLocation} stations={stations} onMapReady={onMapReady} />
         
         {/* User location marker */}
         {userLocation && (
@@ -157,9 +185,12 @@ export default function StationMap({ stations, userLocation, onStationSelect }: 
           <Marker
             key={station.id}
             position={[station.latitude, station.longitude]}
-            icon={stationIcon}
+            icon={createStationIcon(station.available_chargers || 0, station.total_chargers || 0)}
             eventHandlers={{
-              click: () => onStationSelect(station)
+              click: () => {
+                onStationCenter(station);
+                onStationSelect(station);
+              }
             }}
           >
             <Popup>
@@ -167,17 +198,24 @@ export default function StationMap({ stations, userLocation, onStationSelect }: 
                 <div className="font-medium text-gray-900 mb-1">{station.name}</div>
                 <div className="text-sm text-gray-600 mb-2">{station.address}</div>
                 
-                <div className="flex items-center justify-between text-sm mb-2">
-                  <span className="text-green-600 font-medium">
-                    {station.availableChargers}/{station.totalChargers} available
-                  </span>
-                  <span className="text-yellow-500">
-                    ★ {station.rating}
-                  </span>
+                <div className="flex justify-center mb-3">
+                  <div className="text-center p-2 bg-gray-50 rounded">
+                    <div className="text-sm font-bold text-green-600">
+                      {station.available_chargers || 0}/{station.total_chargers || 0}
+                    </div>
+                    <div className="text-xs text-gray-600">Available</div>
+                  </div>
                 </div>
                 
-                <div className="text-sm text-gray-600 mb-2">
-                  ${station.pricePerKwh}/kWh
+                <div className="space-y-1 text-sm mb-3">
+                  <div className="flex justify-between">
+                    <span className="text-gray-600">Price:</span>
+                    <span className="font-medium">₹{station.price_per_kwh || 'N/A'}/kWh</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-gray-600">Connectors:</span>
+                    <span className="font-medium text-right">{station.connector_types?.join(', ') || 'N/A'}</span>
+                  </div>
                 </div>
                 
                 <button

@@ -166,9 +166,10 @@ async def list_chargers(
     status: Optional[str] = None,
     station_id: Optional[int] = None,
     search: Optional[str] = None,
-    sort: Optional[str] = Query("created_at", regex="^(created_at|updated_at|name|latest_status)$")
+    sort: Optional[str] = Query("created_at", regex="^(created_at|updated_at|name|latest_status)$"),
+    admin_user: User = Depends(require_admin())
 ):
-    """List all chargers with filtering options"""
+    """List all chargers with filtering options (admin only)"""
     
     query = Charger.all()
     
@@ -258,8 +259,8 @@ async def create_charger(charger_data: ChargerCreate, admin_user: User = Depends
         raise HTTPException(status_code=400, detail="Charger creation failed - check serial number uniqueness")
 
 @router.get("/{charger_id}", response_model=ChargerDetailResponse)
-async def get_charger_details(charger_id: int):
-    """Get detailed charger information"""
+async def get_charger_details(charger_id: int, admin_user: User = Depends(require_admin())):
+    """Get detailed charger information (admin only)"""
     
     charger = await Charger.filter(id=charger_id).first()
     if not charger:

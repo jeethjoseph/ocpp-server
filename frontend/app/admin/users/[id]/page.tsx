@@ -15,7 +15,7 @@ function UserProfileCard({ user }: { user: UserDetail }) {
       <div className="flex items-start justify-between mb-4">
         <div>
           <h2 className="text-2xl font-bold">{user.display_name}</h2>
-          <p className="text-gray-600">{user.email}</p>
+          <p className="text-muted-foreground">{user.email}</p>
         </div>
         <div className="flex items-center gap-2">
           {user.is_active ? (
@@ -32,7 +32,7 @@ function UserProfileCard({ user }: { user: UserDetail }) {
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
         {/* Contact Information */}
         <div>
-          <h3 className="font-semibold text-gray-900 mb-3">Contact Information</h3>
+          <h3 className="font-semibold text-foreground mb-3">Contact Information</h3>
           <div className="space-y-2 text-sm">
             <div>
               <span className="font-medium">Email:</span> {user.email}
@@ -50,7 +50,7 @@ function UserProfileCard({ user }: { user: UserDetail }) {
         
         {/* Account Details */}
         <div>
-          <h3 className="font-semibold text-gray-900 mb-3">Account Details</h3>
+          <h3 className="font-semibold text-foreground mb-3">Account Details</h3>
           <div className="space-y-2 text-sm">
             <div>
               <span className="font-medium">User ID:</span> {user.id}
@@ -71,7 +71,7 @@ function UserProfileCard({ user }: { user: UserDetail }) {
         
         {/* Activity */}
         <div>
-          <h3 className="font-semibold text-gray-900 mb-3">Activity</h3>
+          <h3 className="font-semibold text-foreground mb-3">Activity</h3>
           <div className="space-y-2 text-sm">
             <div>
               <span className="font-medium">Created:</span> {new Date(user.created_at).toLocaleDateString()}
@@ -84,7 +84,7 @@ function UserProfileCard({ user }: { user: UserDetail }) {
                 <span className="font-medium">Last Login:</span> {new Date(user.last_login).toLocaleDateString()}
               </div>
             ) : (
-              <div className="text-gray-500">Never logged in</div>
+              <div className="text-muted-foreground">Never logged in</div>
             )}
             {user.terms_accepted_at && (
               <div>
@@ -98,19 +98,19 @@ function UserProfileCard({ user }: { user: UserDetail }) {
       {/* Wallet Information */}
       <div className="mt-6 pt-6 border-t">
         <div className="flex items-center justify-between mb-3">
-          <h3 className="font-semibold text-gray-900">Wallet & Usage</h3>
-          <div className="text-2xl font-bold text-green-600">
+          <h3 className="font-semibold text-foreground">Wallet & Usage</h3>
+          <div className="text-2xl font-bold text-green-400">
             ₹{user.wallet_balance?.toFixed(2) || '0.00'}
           </div>
         </div>
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
-          <div className="text-center p-3 bg-gray-50 rounded-lg">
+          <div className="text-center p-3 bg-muted rounded-lg">
             <div className="font-semibold text-lg">{user.total_transactions}</div>
-            <div className="text-gray-600">Charging Sessions</div>
+            <div className="text-muted-foreground">Charging Sessions</div>
           </div>
-          <div className="text-center p-3 bg-gray-50 rounded-lg">
+          <div className="text-center p-3 bg-muted rounded-lg">
             <div className="font-semibold text-lg">{user.total_wallet_transactions}</div>
-            <div className="text-gray-600">Wallet Transactions</div>
+            <div className="text-muted-foreground">Wallet Transactions</div>
           </div>
         </div>
       </div>
@@ -118,7 +118,7 @@ function UserProfileCard({ user }: { user: UserDetail }) {
       {/* Notification Preferences */}
       {user.notification_preferences && Object.keys(user.notification_preferences).length > 0 && (
         <div className="mt-6 pt-6 border-t">
-          <h3 className="font-semibold text-gray-900 mb-3">Notification Preferences</h3>
+          <h3 className="font-semibold text-foreground mb-3">Notification Preferences</h3>
           <div className="flex flex-wrap gap-2">
             {Object.entries(user.notification_preferences).map(([key, value]) => (
               <Badge key={key} variant={value ? "default" : "secondary"}>
@@ -139,8 +139,8 @@ function TransactionSummaryCard({ userId }: { userId: number }) {
     return (
       <Card className="p-6">
         <div className="animate-pulse space-y-3">
-          <div className="h-4 bg-gray-200 rounded w-1/3"></div>
-          <div className="h-8 bg-gray-200 rounded"></div>
+          <div className="h-4 bg-muted rounded w-1/3"></div>
+          <div className="h-8 bg-muted rounded"></div>
         </div>
       </Card>
     );
@@ -149,34 +149,34 @@ function TransactionSummaryCard({ userId }: { userId: number }) {
   if (error || !summary) {
     return (
       <Card className="p-6">
-        <p className="text-red-600">Failed to load transaction summary</p>
+        <p className="text-red-400">Failed to load transaction summary</p>
       </Card>
     );
   }
   
   return (
     <Card className="p-6">
-      <h3 className="font-semibold text-gray-900 mb-4">Transaction Summary</h3>
+      <h3 className="font-semibold text-foreground mb-4">Transaction Summary</h3>
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <div className="text-center p-4 bg-blue-50 rounded-lg">
-          <div className="text-2xl font-bold text-blue-600">{summary.charging_transactions}</div>
-          <div className="text-sm text-blue-800">Charging Sessions</div>
+        <div className="text-center p-4 bg-blue-50 dark:bg-blue-950 rounded-lg">
+          <div className="text-2xl font-bold text-blue-600 dark:text-blue-400">{summary.charging_transactions}</div>
+          <div className="text-sm text-blue-800 dark:text-blue-300">Charging Sessions</div>
         </div>
-        <div className="text-center p-4 bg-purple-50 rounded-lg">
-          <div className="text-2xl font-bold text-purple-600">{summary.wallet_transactions}</div>
-          <div className="text-sm text-purple-800">Wallet Transactions</div>
+        <div className="text-center p-4 bg-purple-50 dark:bg-purple-950 rounded-lg">
+          <div className="text-2xl font-bold text-purple-600 dark:text-purple-400">{summary.wallet_transactions}</div>
+          <div className="text-sm text-purple-800 dark:text-purple-300">Wallet Transactions</div>
         </div>
-        <div className="text-center p-4 bg-green-50 rounded-lg">
-          <div className="text-2xl font-bold text-green-600">{summary.total_energy_consumed} kWh</div>
-          <div className="text-sm text-green-800">Energy Consumed</div>
+        <div className="text-center p-4 bg-green-50 dark:bg-green-950 rounded-lg">
+          <div className="text-2xl font-bold text-green-600 dark:text-green-400">{summary.total_energy_consumed} kWh</div>
+          <div className="text-sm text-green-800 dark:text-green-300">Energy Consumed</div>
         </div>
-        <div className="text-center p-4 bg-red-50 rounded-lg">
-          <div className="text-2xl font-bold text-red-600">₹{summary.total_amount_spent}</div>
-          <div className="text-sm text-red-800">Total Spent</div>
+        <div className="text-center p-4 bg-red-50 dark:bg-red-950 rounded-lg">
+          <div className="text-2xl font-bold text-red-400 dark:text-red-400">₹{summary.total_amount_spent}</div>
+          <div className="text-sm text-red-800 dark:text-red-300">Total Spent</div>
         </div>
       </div>
       {summary.last_transaction_date && (
-        <div className="mt-4 text-sm text-gray-600">
+        <div className="mt-4 text-sm text-muted-foreground">
           <span className="font-medium">Last Transaction:</span> {new Date(summary.last_transaction_date).toLocaleDateString()}
         </div>
       )}
@@ -195,9 +195,9 @@ export default function UserDetailPage() {
       <AdminOnly fallback={
         <div className="flex items-center justify-center min-h-[400px]">
           <div className="text-center">
-            <h2 className="text-2xl font-bold text-gray-900 mb-2">Access Denied</h2>
-            <p className="text-gray-600 mb-4">You need administrator privileges to view user details.</p>
-            <Link href="/admin" className="text-blue-600 hover:text-blue-800">
+            <h2 className="text-2xl font-bold text-foreground mb-2">Access Denied</h2>
+            <p className="text-muted-foreground mb-4">You need administrator privileges to view user details.</p>
+            <Link href="/admin" className="text-blue-500 hover:text-blue-400">
               Go to Admin Dashboard →
             </Link>
           </div>
@@ -218,17 +218,17 @@ export default function UserDetailPage() {
       <AdminOnly fallback={
         <div className="flex items-center justify-center min-h-[400px]">
           <div className="text-center">
-            <h2 className="text-2xl font-bold text-gray-900 mb-2">Access Denied</h2>
-            <p className="text-gray-600 mb-4">You need administrator privileges to view user details.</p>
-            <Link href="/admin" className="text-blue-600 hover:text-blue-800">
+            <h2 className="text-2xl font-bold text-foreground mb-2">Access Denied</h2>
+            <p className="text-muted-foreground mb-4">You need administrator privileges to view user details.</p>
+            <Link href="/admin" className="text-blue-500 hover:text-blue-400">
               Go to Admin Dashboard →
             </Link>
           </div>
         </div>
       }>
         <div className="text-center py-8">
-          <p className="text-red-600">User not found or failed to load</p>
-          <Link href="/admin/users" className="text-blue-600 hover:text-blue-800 mt-2 inline-block">
+          <p className="text-red-400">User not found or failed to load</p>
+          <Link href="/admin/users" className="text-blue-500 hover:text-blue-400 mt-2 inline-block">
             ← Back to Users
           </Link>
         </div>
@@ -240,9 +240,9 @@ export default function UserDetailPage() {
     <AdminOnly fallback={
       <div className="flex items-center justify-center min-h-[400px]">
         <div className="text-center">
-          <h2 className="text-2xl font-bold text-gray-900 mb-2">Access Denied</h2>
-          <p className="text-gray-600 mb-4">You need administrator privileges to view user details.</p>
-          <Link href="/admin" className="text-blue-600 hover:text-blue-800">
+          <h2 className="text-2xl font-bold text-foreground mb-2">Access Denied</h2>
+          <p className="text-muted-foreground mb-4">You need administrator privileges to view user details.</p>
+          <Link href="/admin" className="text-blue-500 hover:text-blue-400">
             Go to Admin Dashboard →
           </Link>
         </div>
@@ -252,7 +252,7 @@ export default function UserDetailPage() {
         {/* Header */}
         <div className="flex items-center justify-between">
           <div>
-            <Link href="/admin/users" className="text-blue-600 hover:text-blue-800 text-sm mb-2 inline-block">
+            <Link href="/admin/users" className="text-blue-500 hover:text-blue-400 text-sm mb-2 inline-block">
               ← Back to Users
             </Link>
             <h1 className="text-3xl font-bold">User Details</h1>
