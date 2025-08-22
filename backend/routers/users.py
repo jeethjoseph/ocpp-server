@@ -3,7 +3,7 @@ from typing import List, Optional
 from tortoise.exceptions import DoesNotExist
 from decimal import Decimal
 
-from auth_middleware import require_admin, require_user_or_admin
+from auth_middleware import require_admin, require_user_or_admin, require_user
 from models import User, Transaction, WalletTransaction, Wallet, UserRoleEnum
 from schemas import BaseModel
 import logging
@@ -57,6 +57,105 @@ class UserTransactionSummary(BaseModel):
     total_energy_consumed: float
     total_amount_spent: float
     last_transaction_date: Optional[str] = None
+
+@router.get("/my-sessions", response_model=dict)
+async def get_my_sessions(
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    current_user: User = Depends(require_user())
+):
+    """Get current user's charging sessions and wallet transactions
+
+    Note: This route must appear before dynamic '/{user_id}' routes to avoid
+    path-matching conflicts that could incorrectly enforce ADMIN access.
+    """
+    try:
+        offset = (page - 1) * limit
+        
+        # Get all transactions (charging + standalone wallet transactions)
+        # First, get charging transactions with their related wallet transactions
+        charging_transactions = await Transaction.filter(user=current_user).prefetch_related(
+            'charger__station', 'wallet_transactions'
+        ).order_by('-created_at')
+        
+        # Get wallet transaction IDs that are already linked to charging transactions
+        linked_wallet_transaction_ids = set()
+        for ct in charging_transactions:
+            for wt in ct.wallet_transactions:
+                linked_wallet_transaction_ids.add(wt.id)
+        
+        # Get standalone wallet transactions (topups and charges not linked to charging sessions)
+        standalone_wallet_transactions = await WalletTransaction.filter(
+            wallet__user=current_user
+        ).exclude(id__in=linked_wallet_transaction_ids).order_by('-created_at')
+        
+        # Combine all transactions by date
+        all_transactions = []
+        
+        # Add charging transactions with their wallet transactions grouped
+        for ct in charging_transactions:
+            charging_amount = abs(sum(float(wt.amount) for wt in ct.wallet_transactions if wt.type.value in ["CHARGE", "CHARGE_DEDUCT"]))
+            
+            transaction_data = {
+                "id": ct.id,
+                "type": "charging",
+                "station_name": ct.charger.station.name if ct.charger.station else "Unknown Station",
+                "charger_name": ct.charger.name or f"Charger {ct.charger.id}",
+                "energy_consumed_kwh": ct.energy_consumed_kwh,
+                "start_time": ct.start_time.isoformat() if ct.start_time else None,
+                "end_time": ct.end_time.isoformat() if ct.end_time else None,
+                "status": ct.transaction_status.value,
+                "amount": charging_amount if charging_amount > 0 else None,
+                "created_at": ct.created_at.isoformat(),
+                # Include linked wallet transaction details
+                "wallet_transactions": [
+                    {
+                        "id": wt.id,
+                        "amount": float(wt.amount),
+                        "type": wt.type.value,
+                        "description": wt.description,
+                        "created_at": wt.created_at.isoformat()
+                    } for wt in ct.wallet_transactions
+                ]
+            }
+            all_transactions.append(transaction_data)
+        
+        # Add standalone wallet transactions (topups, refunds, etc.)
+        for wt in standalone_wallet_transactions:
+            all_transactions.append({
+                "id": wt.id,
+                "type": "wallet",
+                "transaction_type": wt.type.value,
+                "amount": float(wt.amount),
+                "description": wt.description,
+                "payment_metadata": wt.payment_metadata,
+                "created_at": wt.created_at.isoformat()
+            })
+        
+        # Sort by created_at descending
+        all_transactions.sort(key=lambda x: x['created_at'], reverse=True)
+        
+        # Apply pagination after sorting
+        paginated_transactions = all_transactions[offset:offset + limit]
+        
+        # Get totals (charging transactions + standalone wallet transactions only)
+        total_charging = await Transaction.filter(user=current_user).count()
+        total_standalone_wallet = await WalletTransaction.filter(
+            wallet__user=current_user
+        ).exclude(id__in=linked_wallet_transaction_ids).count()
+        total = total_charging + total_standalone_wallet
+        
+        return {
+            "data": paginated_transactions,
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "total_pages": (total + limit - 1) // limit
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting user sessions for {current_user.id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve sessions")
 
 @router.get("", response_model=UserListResponse)
 async def list_users(
@@ -134,7 +233,7 @@ async def list_users(
         logger.error(f"Error listing users: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve users")
 
-@router.get("/{user_id}", response_model=UserDetail)
+@router.get("/{user_id:int}", response_model=UserDetail)
 async def get_user(
     user_id: int,
     admin_user: User = Depends(require_admin())
@@ -181,7 +280,7 @@ async def get_user(
         logger.error(f"Error getting user {user_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve user")
 
-@router.put("/{user_id}/deactivate", response_model=UserSoftDeleteResponse)
+@router.put("/{user_id:int}/deactivate", response_model=UserSoftDeleteResponse)
 async def soft_delete_user(
     user_id: int,
     admin_user: User = Depends(require_admin())
@@ -208,7 +307,7 @@ async def soft_delete_user(
         logger.error(f"Error deactivating user {user_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to deactivate user")
 
-@router.put("/{user_id}/reactivate", response_model=dict)
+@router.put("/{user_id:int}/reactivate", response_model=dict)
 async def reactivate_user(
     user_id: int,
     admin_user: User = Depends(require_admin())
@@ -237,7 +336,7 @@ async def reactivate_user(
         logger.error(f"Error reactivating user {user_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to reactivate user")
 
-@router.get("/{user_id}/transactions-summary", response_model=UserTransactionSummary)
+@router.get("/{user_id:int}/transactions-summary", response_model=UserTransactionSummary)
 async def get_user_transaction_summary(
     user_id: int,
     admin_user: User = Depends(require_admin())
@@ -287,7 +386,7 @@ async def get_user_transaction_summary(
         raise HTTPException(status_code=500, detail="Failed to retrieve transaction summary")
 
 # Additional endpoints for user transaction details
-@router.get("/{user_id}/transactions", response_model=dict)
+@router.get("/{user_id:int}/transactions", response_model=dict)
 async def get_user_charging_transactions(
     user_id: int,
     page: int = Query(1, ge=1),
@@ -331,7 +430,7 @@ async def get_user_charging_transactions(
         logger.error(f"Error getting user transactions {user_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve user transactions")
 
-@router.get("/{user_id}/wallet-transactions", response_model=dict)
+@router.get("/{user_id:int}/wallet-transactions", response_model=dict)
 async def get_user_wallet_transactions(
     user_id: int,
     page: int = Query(1, ge=1),

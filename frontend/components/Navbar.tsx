@@ -2,10 +2,12 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
+import { useState } from 'react';
 import { useTheme } from '@/contexts/ThemeContext';
 import { SignInButton, SignedIn, SignedOut, UserButton } from '@clerk/nextjs';
 import { Button } from '@/components/ui/button';
 import { useUserRole } from './RoleWrapper';
+import { Menu, X } from 'lucide-react';
 
 const userNavigation = [
   { name: 'Scanner', href: '/scanner' },
@@ -24,6 +26,7 @@ export default function Navbar() {
   const pathname = usePathname();
   const { theme, setTheme } = useTheme();
   const { role, isAdmin, isLoaded } = useUserRole();
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
 
   const themeIcons = {
     light: '☀️',
@@ -55,6 +58,7 @@ export default function Navbar() {
                 </h1>
               </Link>
             </div>
+            {/* Desktop Navigation */}
             <div className="hidden sm:ml-6 sm:flex sm:space-x-8">
               {navigation.map((item) => (
                 <Link
@@ -71,6 +75,7 @@ export default function Navbar() {
               ))}
             </div>
           </div>
+          
           <div className="flex items-center space-x-4">
             <button
               onClick={cycleTheme}
@@ -82,7 +87,7 @@ export default function Navbar() {
             
             <SignedIn>
               {isLoaded && role && (
-                <span className={`px-2 py-1 rounded-full text-xs font-medium ${
+                <span className={`hidden sm:inline-flex px-2 py-1 rounded-full text-xs font-medium ${
                   isAdmin 
                     ? 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200' 
                     : 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200'
@@ -99,8 +104,45 @@ export default function Navbar() {
                 </Button>
               </SignInButton>
             </SignedOut>
+            
+            {/* Mobile menu button */}
+            <div className="sm:hidden">
+              <button
+                onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
+                className="p-2 rounded-md text-muted-foreground hover:text-card-foreground hover:bg-accent transition-colors duration-200"
+                aria-label="Toggle mobile menu"
+              >
+                {isMobileMenuOpen ? (
+                  <X className="h-6 w-6" />
+                ) : (
+                  <Menu className="h-6 w-6" />
+                )}
+              </button>
+            </div>
           </div>
         </div>
+        
+        {/* Mobile Navigation Menu */}
+        {isMobileMenuOpen && (
+          <div className="sm:hidden">
+            <div className="pt-2 pb-3 space-y-1 border-t border-border">
+              {navigation.map((item) => (
+                <Link
+                  key={item.name}
+                  href={item.href}
+                  className={`block pl-3 pr-4 py-2 text-base font-medium transition-colors duration-200 ${
+                    pathname === item.href
+                      ? 'bg-accent text-card-foreground border-r-4 border-primary'
+                      : 'text-muted-foreground hover:text-card-foreground hover:bg-accent'
+                  }`}
+                  onClick={() => setIsMobileMenuOpen(false)}
+                >
+                  {item.name}
+                </Link>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     </nav>
   );

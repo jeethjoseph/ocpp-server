@@ -17,34 +17,19 @@ export default function ScannerPage() {
   const [lastScannedCode, setLastScannedCode] = useState<string | null>(null);
 
   const extractChargerIdFromQR = (qrData: string): string | null => {
+    // Parse URL and extract charger ID from /charge/[id] pattern
+    // Supports any base URL: localhost, production domain, etc.
     try {
-      // Try to parse as JSON first (in case QR contains structured data)
-      const parsed = JSON.parse(qrData);
-      if (parsed.chargerId || parsed.charger_id || parsed.id) {
-        return (parsed.chargerId || parsed.charger_id || parsed.id).toString();
+      const url = new URL(qrData);
+      
+      // Extract from pathname: /charge/123 (any domain)
+      const pathPattern = /\/charge\/(\d+)$/i;
+      const pathMatch = url.pathname.match(pathPattern);
+      if (pathMatch) {
+        return pathMatch[1];
       }
     } catch {
-      // Not JSON, try other patterns
-    }
-
-    // Try to extract ID from URL patterns
-    const urlPattern = /charger[s]?[\/\-_]?(\d+)/i;
-    const urlMatch = qrData.match(urlPattern);
-    if (urlMatch) {
-      return urlMatch[1];
-    }
-
-    // Try to find standalone numbers (assuming the QR just contains the ID)
-    const numberPattern = /^\d+$/;
-    if (numberPattern.test(qrData.trim())) {
-      return qrData.trim();
-    }
-
-    // Try to extract numbers from text like "Charger ID: 123" or "ID123"
-    const idPattern = /(?:charger[_\s]*)?(?:id[_\s]*[:=]?\s*)(\d+)/i;
-    const idMatch = qrData.match(idPattern);
-    if (idMatch) {
-      return idMatch[1];
+      // Not a valid URL
     }
 
     return null;

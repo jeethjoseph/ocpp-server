@@ -172,3 +172,34 @@ export const transactionService = {
   forceStop: (id: number, reason: string) =>
     api.post<ApiResponse>(`/api/admin/transactions/${id}/stop`, { reason }),
 };
+
+// Public stations service for user-facing pages
+export interface PublicStationResponse {
+  id: number;
+  name: string;
+  latitude: number;
+  longitude: number;
+  address: string;
+  available_chargers: number;
+  total_chargers: number;
+  connector_types: string[];
+  connector_details: Array<{
+    connector_type: string;
+    max_power_kw: number | null;
+    count: number;
+  }>;
+  price_per_kwh: number | null;
+}
+
+export interface PublicStationsListResponse {
+  data: PublicStationResponse[];
+  total: number;
+}
+
+export const publicStationService = {
+  getAll: () => 
+    api.get<PublicStationsListResponse>(`/api/public/stations`),
+  
+  getById: (id: number) => 
+    api.get<PublicStationResponse>(`/api/public/stations/${id}`)
+};
