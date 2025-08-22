@@ -42,7 +42,7 @@ export function useUsers({
 
   return useQuery({
     queryKey: userKeys.list({ page, limit, is_active, search }),
-    queryFn: () => api.get<UserListResponse>(`/users?${params.toString()}`),
+    queryFn: () => api.get<UserListResponse>(`/api/users?${params.toString()}`),
     staleTime: 30000, // 30 seconds
   });
 }
@@ -51,7 +51,7 @@ export function useUsers({
 export function useUser(userId: number, enabled = true) {
   return useQuery({
     queryKey: userKeys.detail(userId),
-    queryFn: () => api.get<UserDetail>(`/users/${userId}`),
+    queryFn: () => api.get<UserDetail>(`/api/users/${userId}`),
     enabled: enabled && !!userId,
     staleTime: 60000, // 1 minute
   });
@@ -61,7 +61,7 @@ export function useUser(userId: number, enabled = true) {
 export function useUserTransactionSummary(userId: number, enabled = true) {
   return useQuery({
     queryKey: userKeys.summary(userId),
-    queryFn: () => api.get<UserTransactionSummary>(`/users/${userId}/transactions-summary`),
+    queryFn: () => api.get<UserTransactionSummary>(`/api/users/${userId}/transactions-summary`),
     enabled: enabled && !!userId,
     staleTime: 60000, // 1 minute
   });
@@ -85,7 +85,7 @@ export function useUserTransactions({
 
   return useQuery({
     queryKey: [...userKeys.transactions(userId), { page, limit }],
-    queryFn: () => api.get<UserTransactionsResponse>(`/users/${userId}/transactions?${params.toString()}`),
+    queryFn: () => api.get<UserTransactionsResponse>(`/api/users/${userId}/transactions?${params.toString()}`),
     enabled: enabled && !!userId,
     staleTime: 60000, // 1 minute
   });
@@ -109,7 +109,7 @@ export function useUserWalletTransactions({
 
   return useQuery({
     queryKey: [...userKeys.walletTransactions(userId), { page, limit }],
-    queryFn: () => api.get<UserWalletTransactionsResponse>(`/users/${userId}/wallet-transactions?${params.toString()}`),
+    queryFn: () => api.get<UserWalletTransactionsResponse>(`/api/users/${userId}/wallet-transactions?${params.toString()}`),
     enabled: enabled && !!userId,
     staleTime: 60000, // 1 minute
   });
@@ -120,7 +120,7 @@ export function useDeactivateUser() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (userId: number) => api.put(`/users/${userId}/deactivate`),
+    mutationFn: (userId: number) => api.put(`/api/users/${userId}/deactivate`),
     onSuccess: () => {
       // Invalidate and refetch users list
       queryClient.invalidateQueries({ queryKey: userKeys.lists() });
@@ -134,7 +134,7 @@ export function useReactivateUser() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (userId: number) => api.put(`/users/${userId}/reactivate`),
+    mutationFn: (userId: number) => api.put(`/api/users/${userId}/reactivate`),
     onSuccess: () => {
       // Invalidate and refetch users list
       queryClient.invalidateQueries({ queryKey: userKeys.lists() });

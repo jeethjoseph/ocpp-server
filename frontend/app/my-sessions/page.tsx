@@ -55,7 +55,7 @@ interface SessionsResponse {
 
 const getSessionService = {
   getMySessions: (page: number = 1, limit: number = 20) =>
-    api.get<SessionsResponse>(`/users/my-sessions?page=${page}&limit=${limit}`)
+    api.get<SessionsResponse>(`/api/users/my-sessions?page=${page}&limit=${limit}`)
 };
 
 export default function MySessionsPage() {

@@ -5,7 +5,7 @@ from models import User
 import logging
 
 logger = logging.getLogger("auth-router")
-router = APIRouter(prefix="/auth", tags=["Authentication"])
+router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
 @router.get("/me", response_model=UserResponse)
 async def get_me(current_user: dict = Depends(get_current_user)):

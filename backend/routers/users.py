@@ -9,7 +9,7 @@ from schemas import BaseModel
 import logging
 
 logger = logging.getLogger("users-router")
-router = APIRouter(prefix="/users", tags=["User Management"])
+router = APIRouter(prefix="/api/users", tags=["User Management"])
 
 # Response Models
 class UserListItem(BaseModel):
