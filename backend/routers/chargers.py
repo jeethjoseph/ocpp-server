@@ -261,6 +261,7 @@ async def create_charger(charger_data: ChargerCreate, admin_user: User = Depends
 @router.get("/{charger_id}", response_model=ChargerDetailResponse)
 async def get_charger_details(charger_id: int, user: User = Depends(require_user_or_admin())):
     """Get detailed charger information (accessible by users and admins)"""
+
     
     charger = await Charger.filter(id=charger_id).first()
     if not charger:

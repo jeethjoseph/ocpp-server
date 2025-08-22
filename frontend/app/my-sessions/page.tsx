@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Card, CardContent } from "@/components/ui/card";
+
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { 
@@ -41,6 +42,7 @@ interface Transaction {
   transaction_type?: string;
   description?: string;
   payment_metadata?: any; // eslint-disable-line @typescript-eslint/no-explicit-any
+
 }
 
 interface SessionsResponse {
