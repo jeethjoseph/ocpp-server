@@ -5,7 +5,6 @@ import datetime
 from typing import Dict, List
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from websockets.exceptions import ConnectionClosed
 
 from database import init_db, close_db
 from schemas import OCPPCommand, OCPPResponse, MessageLogResponse, ChargePointStatus
@@ -23,6 +22,7 @@ from redis_manager import redis_manager
 from ocpp.v16 import ChargePoint as OcppChargePoint
 from ocpp.v16 import call, call_result
 from ocpp.routing import on
+from starlette.websockets import WebSocketState
 
 import logging
 import json
@@ -57,6 +57,13 @@ app.add_middleware(
 # Keep this for backward compatibility but will be deprecated
 connected_charge_points: Dict[str, Dict] = {}
 
+# Helper to determine if a WebSocket is currently in CONNECTED state (avoids magic numbers)
+def _is_ws_connected(ws: WebSocket) -> bool:
+    try:
+        return ws is not None and ws.client_state == WebSocketState.CONNECTED
+    except Exception:
+        return False
+
 # Global cleanup task
 cleanup_task = None
 
@@ -79,11 +86,10 @@ class ChargePoint(OcppChargePoint):
 
     @on('Heartbeat')
     async def on_heartbeat(self, **kwargs):
-        # Update both last heartbeat and last seen timestamps for this charge point
+        # Update last heartbeat timestamp for this charge point
         current_time = datetime.datetime.now(datetime.timezone.utc)
         if self.id in connected_charge_points:
             connected_charge_points[self.id]["last_heartbeat"] = current_time
-            connected_charge_points[self.id]["last_seen"] = current_time  # Fix: Update last_seen on heartbeat
         logger.info(f"Received OCPP Heartbeat from {self.id}")
         # Only update heartbeat time, don't assume status - wait for StatusNotification
         await update_charger_heartbeat(self.id)
@@ -97,10 +103,6 @@ class ChargePoint(OcppChargePoint):
         logger.info(f"StatusNotification from {self.id}: connector_id={connector_id}, status={status}, error_code={error_code}, info={info}")
         
         try:
-            # Update last seen timestamp
-            if self.id in connected_charge_points:
-                connected_charge_points[self.id]["last_seen"] = datetime.datetime.now(datetime.timezone.utc)
-                
             # Update charger status in database
             result = await update_charger_status(self.id, status)
             if not result:
@@ -309,10 +311,6 @@ class ChargePoint(OcppChargePoint):
         from models import Transaction, MeterValue
         
         try:
-            # Update last seen timestamp
-            if self.id in connected_charge_points:
-                connected_charge_points[self.id]["last_seen"] = datetime.datetime.now(datetime.timezone.utc)
-                
             if not transaction_id:
                 logger.warning(f"🔋 ❌ No transaction_id provided for meter values from {self.id} - DISCARDING")
                 return call_result.MeterValues()
@@ -446,6 +444,25 @@ class LoggingWebSocketAdapter(FastAPIWebSocketAdapter):
 
     async def recv(self):
         msg = await super().recv()
+        
+        # Ghost session detection - check if this charge point is in our connected list
+        if self.charge_point_id not in connected_charge_points:
+            logger.warning(f"[DISCONNECT] Ghost session detected for {self.charge_point_id} - message received but not in connected list")
+            
+            # Force close the ghost connection
+            try:
+                await self.websocket.close(code=1008, reason="Ghost session cleanup")
+                logger.info(f"[DISCONNECT] Closed ghost session WebSocket for {self.charge_point_id}")
+            except Exception as e:
+                logger.warning(f"[DISCONNECT] Error closing ghost session WebSocket for {self.charge_point_id}: {e}")
+            
+            # Don't process the message or log it - use WebSocketDisconnect to follow existing except path
+            from fastapi import WebSocketDisconnect
+            raise WebSocketDisconnect(code=1008)
+        
+        # Update last_seen for ANY incoming message from valid connections
+        connected_charge_points[self.charge_point_id]["last_seen"] = datetime.datetime.now(datetime.timezone.utc)
+        
         correlation_id = None
         try:
             parsed = json.loads(msg)
@@ -506,16 +523,17 @@ async def send_ocpp_request(charge_point_id: str, action: str, payload: Dict = N
         logger.warning(f"Invalid connection data for {charge_point_id}")
         return False, f"Invalid connection data for {charge_point_id}"
     
-    # Validate WebSocket connection is still alive
+    # Validate WebSocket connection is still alive (enum-based, no magic number)
     try:
-        if websocket.client_state.value != 1:  # 1 = CONNECTED
-            logger.warning(f"WebSocket not connected for {charge_point_id}")
-            await cleanup_dead_connection(charge_point_id)
-            return False, f"Connection lost for {charge_point_id}"
+        if not _is_ws_connected(websocket):
+            state_name = getattr(websocket.client_state, "name", str(getattr(websocket, "client_state", "unknown")))
+            logger.warning(f"WebSocket not connected for {charge_point_id} (state={state_name})")
+            await force_disconnect(charge_point_id, f"WebSocket not connected (state={state_name})")
+            return False, "Connection lost"
     except Exception as e:
         logger.warning(f"WebSocket validation failed for {charge_point_id}: {e}")
-        await cleanup_dead_connection(charge_point_id)
-        return False, f"Connection lost for {charge_point_id}"
+        await force_disconnect(charge_point_id, f"WebSocket validation failed: {e}")
+        return False, "Connection lost"
 
     try:
         if action == "RemoteStartTransaction":
@@ -540,13 +558,71 @@ async def send_ocpp_request(charge_point_id: str, action: str, payload: Dict = N
         logger.error(f"Error sending request to {charge_point_id}: {e}", exc_info=True)
         return False, str(e)
 
-# ============ Heartbeat Monitor ============
+# ============ Connection Management ============
+
+# Cleanup coordination locks to prevent race conditions
+cleanup_locks = {}  # Dict[str, asyncio.Lock]
+
+# Recently disconnected tombstone to prevent immediate reconnection races
+recently_disconnected = {}  # Dict[str, datetime]
+
+async def force_disconnect(charge_point_id: str, reason: str):
+    """Force complete disconnection of a charge point with proper cleanup"""
+    
+    # Ensure only one cleanup per charger at a time
+    if charge_point_id not in cleanup_locks:
+        cleanup_locks[charge_point_id] = asyncio.Lock()
+        
+    async with cleanup_locks[charge_point_id]:
+        logger.info(f"[DISCONNECT] Starting force disconnect for {charge_point_id}: {reason}")
+        
+        connection_data = connected_charge_points.get(charge_point_id)
+        if connection_data:
+            # 1. Cancel heartbeat task
+            heartbeat_task = connection_data.get("heartbeat_task")
+            if heartbeat_task and not heartbeat_task.done():
+                heartbeat_task.cancel()
+                logger.info(f"[DISCONNECT] Cancelled heartbeat task for {charge_point_id}")
+                
+            # 2. Close WebSocket with proper code (if not already closed)
+            websocket = connection_data.get("websocket")
+            if websocket:
+                try:
+                    if _is_ws_connected(websocket):
+                        await websocket.close(code=1001, reason=f"Server cleanup: {reason}")
+                        logger.info(f"[DISCONNECT] Sent WebSocket close frame to {charge_point_id}: {reason}")
+                    else:
+                        state_name = getattr(websocket.client_state, "name", str(getattr(websocket, "client_state", "unknown")))
+                        logger.info(f"[DISCONNECT] WebSocket for {charge_point_id} already closed (state={state_name})")
+                except Exception as e:
+                    logger.warning(f"[DISCONNECT] Error closing WebSocket for {charge_point_id}: {e}")
+                    if hasattr(websocket, '_transport') and websocket._transport:
+                        websocket._transport.close()
+                        logger.info(f"[DISCONNECT] Forced TCP closure for {charge_point_id}")
+                        
+        # 3. Atomic state cleanup
+        if charge_point_id in connected_charge_points:
+            del connected_charge_points[charge_point_id]
+        await redis_manager.remove_connected_charger(charge_point_id)
+        
+        # 4. Add tombstone to prevent immediate reconnection races
+        from datetime import timedelta
+        recently_disconnected[charge_point_id] = datetime.datetime.now(datetime.timezone.utc) + timedelta(seconds=5)
+        
+        # 5. Clean up old tombstones
+        current_time = datetime.datetime.now(datetime.timezone.utc)
+        expired_tombstones = [cp_id for cp_id, expire_time in recently_disconnected.items() if current_time > expire_time]
+        for cp_id in expired_tombstones:
+            del recently_disconnected[cp_id]
+        
+        # 6. Clean up the lock for this connection to prevent memory leak
+        cleanup_locks.pop(charge_point_id, None)
+        
+        logger.warning(f"[DISCONNECT] Force disconnected {charge_point_id}: {reason}")
+
 async def cleanup_dead_connection(charge_point_id: str):
-    """Clean up a dead connection from both memory and Redis"""
-    if charge_point_id in connected_charge_points:
-        del connected_charge_points[charge_point_id]
-    await redis_manager.remove_connected_charger(charge_point_id)
-    logger.warning(f"Dead connection cleaned up for charge point {charge_point_id}")
+    """Legacy cleanup function - redirects to force_disconnect"""
+    await force_disconnect(charge_point_id, "Dead connection detected")
 
 async def heartbeat_monitor(charge_point_id: str, websocket: WebSocket):
     """Monitor OCPP Heartbeat message to check device liveness."""
@@ -564,12 +640,12 @@ async def heartbeat_monitor(charge_point_id: str, websocket: WebSocket):
                     last_heartbeat = connected_charge_points[charge_point_id].get("last_seen") or connected_charge_points[charge_point_id].get("connected_at")
                 if last_heartbeat is None or (now - last_heartbeat).total_seconds() > HEARTBEAT_TIMEOUT:
                     logger.warning(f"No OCPP Heartbeat from {charge_point_id} in {HEARTBEAT_TIMEOUT} seconds. Cleaning up.")
-                    await cleanup_dead_connection(charge_point_id)
+                    await force_disconnect(charge_point_id, f"Heartbeat timeout ({HEARTBEAT_TIMEOUT}s)")
                     break
                 logger.info(f"Heartbeat monitor: {charge_point_id} last heartbeat {(now - last_heartbeat).total_seconds():.1f}s ago")
             except Exception as e:
                 logger.warning(f"Heartbeat monitor error for {charge_point_id}: {e}")
-                await cleanup_dead_connection(charge_point_id)
+                await force_disconnect(charge_point_id, f"Heartbeat monitor error: {e}")
                 break
     except asyncio.CancelledError:
         # Task was cancelled, normal shutdown
@@ -586,6 +662,7 @@ async def periodic_cleanup():
             
             current_time = datetime.datetime.now(datetime.timezone.utc)
             stale_connections = []
+            most_recent_times = {}  # Store per-connection most_recent for proper reason message
             
             # Find connections that haven't been seen for more than 5 minutes (300 seconds)
             # This should be longer than heartbeat timeout (90s) to avoid false positives
@@ -598,16 +675,19 @@ async def periodic_cleanup():
                     last_seen or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc),
                     last_heartbeat or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
                 )
+                most_recent_times[charge_point_id] = most_recent
                 
                 # Only mark as stale if no activity for 5 minutes (much longer than heartbeat timeout)
                 if (current_time - most_recent).total_seconds() > 300:
                     stale_connections.append(charge_point_id)
                     logger.warning(f"Connection {charge_point_id} stale: last activity {(current_time - most_recent).total_seconds():.1f}s ago")
             
-            # Clean up stale connections
+            # Clean up stale connections with proper reason message
             for charge_point_id in stale_connections:
+                most_recent = most_recent_times[charge_point_id]
+                inactive_seconds = (current_time - most_recent).total_seconds()
                 logger.warning(f"Cleaning up stale connection: {charge_point_id}")
-                await cleanup_dead_connection(charge_point_id)
+                await force_disconnect(charge_point_id, f"Stale connection (inactive for {inactive_seconds:.1f}s)")
                 
         except Exception as e:
             logger.error(f"Error in periodic cleanup: {e}")
@@ -628,6 +708,19 @@ async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
     await websocket.accept()
     logger.info(f"Charge point {charge_point_id} connected")
 
+    # Check for recent disconnection tombstone to prevent reconnection races
+    current_time = datetime.datetime.now(datetime.timezone.utc)
+    if charge_point_id in recently_disconnected:
+        expire_time = recently_disconnected[charge_point_id]
+        if current_time < expire_time:
+            remaining_seconds = (expire_time - current_time).total_seconds()
+            logger.warning(f"Rejecting immediate reconnection for {charge_point_id} - tombstone expires in {remaining_seconds:.1f}s")
+            await websocket.close(code=1013, reason="Too soon after disconnect")
+            return
+        else:
+            # Tombstone expired, remove it
+            del recently_disconnected[charge_point_id]
+
     # Validate charger before connecting
     is_valid, message = await validate_and_connect_charger(charge_point_id, connected_charge_points)
     if not is_valid:
@@ -638,10 +731,14 @@ async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
     ws_adapter = LoggingWebSocketAdapter(websocket, charge_point_id)
     cp = ChargePoint(charge_point_id, ws_adapter)
     
-    # Store connection data in both places during transition
+    # Start heartbeat monitor task
+    heartbeat_task = asyncio.create_task(heartbeat_monitor(charge_point_id, websocket))
+    
+    # Store connection data with heartbeat task handle for proper cleanup
     connection_data = {
         "websocket": websocket,
         "cp": cp,
+        "heartbeat_task": heartbeat_task,  # Store for cleanup
         "connected_at": datetime.datetime.now(datetime.timezone.utc),
         "last_seen": datetime.datetime.now(datetime.timezone.utc)
     }
@@ -649,29 +746,20 @@ async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
     
     # Add to Redis
     await redis_manager.add_connected_charger(charge_point_id, connection_data)
-
-    # Start heartbeat monitor
-    heartbeat_task = asyncio.create_task(heartbeat_monitor(charge_point_id, websocket))
     
     try:
         await cp.start()
     except WebSocketDisconnect:
-        logger.error(f"Charge point {charge_point_id} disconnected")
+        logger.error(f"[DISCONNECT] Charge point {charge_point_id} disconnected naturally")
+        # Apply tombstone on natural disconnect and let finally handle cleanup
+        await force_disconnect(charge_point_id, "Natural WebSocket disconnect")
+        return  # Avoid double cleanup in finally
     except Exception as e:
-        logger.error(f"WebSocket error for {charge_point_id}: {e}", exc_info=True)
+        logger.error(f"[DISCONNECT] WebSocket error for {charge_point_id}: {e}", exc_info=True)
     finally:
-        # Cancel heartbeat monitor
-        heartbeat_task.cancel()
-        try:
-            await heartbeat_task
-        except asyncio.CancelledError:
-            pass
-            
-        # Remove from both in-memory and Redis
+        # Use force_disconnect for proper cleanup if still connected
         if charge_point_id in connected_charge_points:
-            del connected_charge_points[charge_point_id]
-        await redis_manager.remove_connected_charger(charge_point_id)
-        logger.info(f"Charge point {charge_point_id} removed from connected list")
+            await force_disconnect(charge_point_id, "WebSocket session ended")
 
 # ============ Basic API Endpoints ============
 
