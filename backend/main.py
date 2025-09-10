@@ -22,6 +22,7 @@ from redis_manager import redis_manager
 from ocpp.v16 import ChargePoint as OcppChargePoint
 from ocpp.v16 import call, call_result
 from ocpp.routing import on
+from starlette.websockets import WebSocketState
 
 import logging
 import json
@@ -55,6 +56,13 @@ app.add_middleware(
 # Store connected charge points with metadata (now moved to Redis)
 # Keep this for backward compatibility but will be deprecated
 connected_charge_points: Dict[str, Dict] = {}
+
+# Helper to determine if a WebSocket is currently in CONNECTED state (avoids magic numbers)
+def _is_ws_connected(ws: WebSocket) -> bool:
+    try:
+        return ws is not None and ws.client_state == WebSocketState.CONNECTED
+    except Exception:
+        return False
 
 # Global cleanup task
 cleanup_task = None
@@ -515,16 +523,17 @@ async def send_ocpp_request(charge_point_id: str, action: str, payload: Dict = N
         logger.warning(f"Invalid connection data for {charge_point_id}")
         return False, f"Invalid connection data for {charge_point_id}"
     
-    # Validate WebSocket connection is still alive
+    # Validate WebSocket connection is still alive (enum-based, no magic number)
     try:
-        if websocket.client_state.value != 1:  # 1 = CONNECTED
-            logger.warning(f"WebSocket not connected for {charge_point_id}")
-            await force_disconnect(charge_point_id, "WebSocket not connected")
-            return False, f"Connection lost for {charge_point_id}"
+        if not _is_ws_connected(websocket):
+            state_name = getattr(websocket.client_state, "name", str(getattr(websocket, "client_state", "unknown")))
+            logger.warning(f"WebSocket not connected for {charge_point_id} (state={state_name})")
+            await force_disconnect(charge_point_id, f"WebSocket not connected (state={state_name})")
+            return False, "Connection lost"
     except Exception as e:
         logger.warning(f"WebSocket validation failed for {charge_point_id}: {e}")
         await force_disconnect(charge_point_id, f"WebSocket validation failed: {e}")
-        return False, f"Connection lost for {charge_point_id}"
+        return False, "Connection lost"
 
     try:
         if action == "RemoteStartTransaction":
@@ -575,16 +584,18 @@ async def force_disconnect(charge_point_id: str, reason: str):
                 heartbeat_task.cancel()
                 logger.info(f"[DISCONNECT] Cancelled heartbeat task for {charge_point_id}")
                 
-            # 2. Close WebSocket with proper code
+            # 2. Close WebSocket with proper code (if not already closed)
             websocket = connection_data.get("websocket")
             if websocket:
                 try:
-                    await websocket.close(code=1001, reason=f"Server cleanup: {reason}")
-                    logger.info(f"[DISCONNECT] Sent WebSocket close frame to {charge_point_id}: {reason}")
+                    if _is_ws_connected(websocket):
+                        await websocket.close(code=1001, reason=f"Server cleanup: {reason}")
+                        logger.info(f"[DISCONNECT] Sent WebSocket close frame to {charge_point_id}: {reason}")
+                    else:
+                        state_name = getattr(websocket.client_state, "name", str(getattr(websocket, "client_state", "unknown")))
+                        logger.info(f"[DISCONNECT] WebSocket for {charge_point_id} already closed (state={state_name})")
                 except Exception as e:
                     logger.warning(f"[DISCONNECT] Error closing WebSocket for {charge_point_id}: {e}")
-                    
-                    # Force TCP closure if WebSocket close fails
                     if hasattr(websocket, '_transport') and websocket._transport:
                         websocket._transport.close()
                         logger.info(f"[DISCONNECT] Forced TCP closure for {charge_point_id}")
