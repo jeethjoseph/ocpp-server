@@ -77,6 +77,7 @@ async def get_charger_logs(
                     naive_dt = datetime.fromisoformat(start_date + "T00:00:00")
                     local_dt = naive_dt.replace(tzinfo=local_tz)
                     start_dt = local_dt.astimezone(timezone.utc)
+
                 query = query.filter(timestamp__gte=start_dt)
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid start_date format. Use YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS")
@@ -102,6 +103,7 @@ async def get_charger_logs(
                     naive_dt = datetime.fromisoformat(end_date + "T23:59:59")
                     local_dt = naive_dt.replace(tzinfo=local_tz)
                     end_dt = local_dt.astimezone(timezone.utc)
+
                 query = query.filter(timestamp__lte=end_dt)
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid end_date format. Use YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS")
