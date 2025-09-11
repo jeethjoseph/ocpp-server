@@ -59,9 +59,24 @@ async def get_charger_logs(
             try:
                 # Handle both date-only and datetime formats
                 if 'T' in start_date:
-                    start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+                    # If timezone is provided, use as-is
+                    if start_date.endswith('Z') or '+' in start_date[-6:] or '-' in start_date[-6:]:
+                        start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+                    else:
+                        # No timezone provided - treat as local time and convert to UTC
+                        # Assume local timezone (you may want to make this configurable)
+                        from zoneinfo import ZoneInfo
+                        local_tz = ZoneInfo("Asia/Kolkata")  # Adjust to your local timezone
+                        naive_dt = datetime.fromisoformat(start_date)
+                        local_dt = naive_dt.replace(tzinfo=local_tz)
+                        start_dt = local_dt.astimezone(timezone.utc)
                 else:
-                    start_dt = datetime.fromisoformat(start_date + "T00:00:00+00:00")
+                    # Date only - treat as local date start of day
+                    from zoneinfo import ZoneInfo
+                    local_tz = ZoneInfo("Asia/Kolkata")  # Adjust to your local timezone
+                    naive_dt = datetime.fromisoformat(start_date + "T00:00:00")
+                    local_dt = naive_dt.replace(tzinfo=local_tz)
+                    start_dt = local_dt.astimezone(timezone.utc)
                 query = query.filter(timestamp__gte=start_dt)
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid start_date format. Use YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS")
@@ -70,9 +85,23 @@ async def get_charger_logs(
             try:
                 # Handle both date-only and datetime formats
                 if 'T' in end_date:
-                    end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+                    # If timezone is provided, use as-is
+                    if end_date.endswith('Z') or '+' in end_date[-6:] or '-' in end_date[-6:]:
+                        end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+                    else:
+                        # No timezone provided - treat as local time and convert to UTC
+                        from zoneinfo import ZoneInfo
+                        local_tz = ZoneInfo("Asia/Kolkata")  # Adjust to your local timezone
+                        naive_dt = datetime.fromisoformat(end_date)
+                        local_dt = naive_dt.replace(tzinfo=local_tz)
+                        end_dt = local_dt.astimezone(timezone.utc)
                 else:
-                    end_dt = datetime.fromisoformat(end_date + "T23:59:59+00:00")
+                    # Date only - treat as local date end of day
+                    from zoneinfo import ZoneInfo
+                    local_tz = ZoneInfo("Asia/Kolkata")  # Adjust to your local timezone
+                    naive_dt = datetime.fromisoformat(end_date + "T23:59:59")
+                    local_dt = naive_dt.replace(tzinfo=local_tz)
+                    end_dt = local_dt.astimezone(timezone.utc)
                 query = query.filter(timestamp__lte=end_dt)
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid end_date format. Use YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS")
