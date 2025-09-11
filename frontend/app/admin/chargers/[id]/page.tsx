@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Zap, Play, Square, Activity, Clock, MapPin, X, CreditCard } from "lucide-react";
 import { AdminOnly } from "@/components/RoleWrapper";
+import ChargerLogs from "@/components/ChargerLogs";
 import {
   useCharger,
   useRemoteStart,
@@ -464,6 +465,14 @@ export default function ChargerDetailPage() {
               </div>
             </CardContent>
           </Card>
+        )}
+
+        {/* OCPP Logs Section */}
+        {charger && (
+          <ChargerLogs 
+            chargePointId={charger.charge_point_string_id}
+            chargerName={charger.name}
+          />
         )}
       </div>
     </AdminOnly>

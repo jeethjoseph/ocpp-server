@@ -28,7 +28,7 @@ import logging
 import json
 
 # Import routers
-from routers import stations, chargers, transactions, auth, webhooks, users, public_stations
+from routers import stations, chargers, transactions, auth, webhooks, users, public_stations, logs
 
 # Configure logging
 logging.basicConfig(
@@ -700,6 +700,7 @@ app.include_router(auth.router)
 app.include_router(webhooks.router)
 app.include_router(users.router)
 app.include_router(public_stations.router)
+app.include_router(logs.router)
 
 # ============ OCPP WebSocket Endpoint ============
 @app.websocket("/ocpp/{charge_point_id}")

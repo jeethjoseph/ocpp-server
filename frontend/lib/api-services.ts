@@ -203,3 +203,57 @@ export const publicStationService = {
   getById: (id: number) => 
     api.get<PublicStationResponse>(`/api/public/stations/${id}`)
 };
+
+// Log service
+export interface LogEntry {
+  id: number;
+  created_at: string;
+  charge_point_id: string | null;
+  message_type: string | null;
+  direction: "IN" | "OUT";
+  payload: Record<string, any> | any[] | null;  // Allow both dict and array
+  status: string | null;
+  correlation_id: string | null;
+  timestamp: string;
+}
+
+export interface LogsResponse {
+  data: LogEntry[];
+  total: number;
+  limit: number;
+  has_more: boolean;
+  message?: string;
+}
+
+export interface LogSummary {
+  charge_point_id: string;
+  total_logs: number;
+  inbound_logs: number;
+  outbound_logs: number;
+  oldest_log_date: string | null;
+  newest_log_date: string | null;
+}
+
+export const logService = {
+  getChargerLogs: (
+    chargePointId: string,
+    params?: {
+      start_date?: string;
+      end_date?: string;
+      limit?: number;
+    }
+  ) => {
+    const searchParams = new URLSearchParams();
+    if (params?.start_date) searchParams.set("start_date", params.start_date);
+    if (params?.end_date) searchParams.set("end_date", params.end_date);
+    if (params?.limit) searchParams.set("limit", params.limit.toString());
+
+    const query = searchParams.toString();
+    return api.get<LogsResponse>(
+      `/api/admin/logs/charger/${chargePointId}${query ? `?${query}` : ""}`
+    );
+  },
+
+  getChargerLogSummary: (chargePointId: string) =>
+    api.get<LogSummary>(`/api/admin/logs/charger/${chargePointId}/summary`),
+};

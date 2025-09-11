@@ -21,9 +21,9 @@ env/
 test.html
 dump.rdb
 
-# Database
-*.db
-*.sqlite3
+# Database (PostgreSQL dumps and backups)
+*.sql
+*.dump
 
 # Logs
 *.log
