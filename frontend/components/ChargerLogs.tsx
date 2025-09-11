@@ -15,14 +15,25 @@ interface ChargerLogsProps {
 }
 
 export default function ChargerLogs({ chargePointId, chargerName }: ChargerLogsProps) {
-  // Set default to last 30 minutes
+  // Set default to last 30 minutes (in local timezone)
   const getDefaultDates = () => {
     const now = new Date();
     const thirtyMinsAgo = new Date(now.getTime() - 30 * 60 * 1000);
     
+    // Format for datetime-local input (needs to be in local timezone, not UTC)
+    const formatForDateTimeLocal = (date: Date) => {
+      const year = date.getFullYear();
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      const day = String(date.getDate()).padStart(2, '0');
+      const hours = String(date.getHours()).padStart(2, '0');
+      const minutes = String(date.getMinutes()).padStart(2, '0');
+      
+      return `${year}-${month}-${day}T${hours}:${minutes}`;
+    };
+    
     return {
-      start: thirtyMinsAgo.toISOString().slice(0, 16), // Format for datetime-local
-      end: now.toISOString().slice(0, 16)
+      start: formatForDateTimeLocal(thirtyMinsAgo),
+      end: formatForDateTimeLocal(now)
     };
   };
 
