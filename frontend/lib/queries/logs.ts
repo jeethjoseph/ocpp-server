@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { logService, LogsResponse, LogSummary } from "../api-services";
+import { logService } from "../api-services";
 
 export const useChargerLogs = (
   chargePointId: string,

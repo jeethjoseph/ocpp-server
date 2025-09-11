@@ -74,6 +74,7 @@ export default function ChargerLogs({ chargePointId, chargerName }: ChargerLogsP
     );
   };
 
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const renderPayload = (payload: Record<string, any> | any[] | null) => {
     if (!payload) return <span className="text-gray-500 dark:text-gray-400">No payload</span>;
     

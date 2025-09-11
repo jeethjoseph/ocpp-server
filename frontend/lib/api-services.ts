@@ -211,6 +211,7 @@ export interface LogEntry {
   charge_point_id: string | null;
   message_type: string | null;
   direction: "IN" | "OUT";
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   payload: Record<string, any> | any[] | null;  // Allow both dict and array
   status: string | null;
   correlation_id: string | null;
