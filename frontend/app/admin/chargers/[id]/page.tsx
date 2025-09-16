@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { Zap, Play, Square, Activity, Clock, MapPin, X, CreditCard } from "lucide-react";
 import { AdminOnly } from "@/components/RoleWrapper";
 import ChargerLogs from "@/components/ChargerLogs";
+import MeterValuesChart from "@/components/MeterValuesChart";
 import {
   useCharger,
   useRemoteStart,
@@ -465,6 +466,14 @@ export default function ChargerDetailPage() {
               </div>
             </CardContent>
           </Card>
+        )}
+
+        {/* Meter Values Chart */}
+        {meterValues.length > 0 && (
+          <MeterValuesChart
+            meterValues={meterValues}
+            transactionId={getTransactionId()}
+          />
         )}
 
         {/* OCPP Logs Section */}
