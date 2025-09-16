@@ -43,12 +43,12 @@ async def get_charger_logs(
     charge_point_id: str,
     start_date: Optional[str] = Query(None, description="Start date in ISO format (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)"),
     end_date: Optional[str] = Query(None, description="End date in ISO format (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)"),
-    limit: int = Query(100, ge=1, le=1000, description="Number of logs to return (max 1000)"),
+    limit: int = Query(100, ge=1, le=10000, description="Number of logs to return (max 10,000)"),
     admin_user: User = Depends(require_admin())
 ):
     """
     Get OCPP logs for a specific charger with optional date filtering.
-    Limited to 1000 rows maximum. Results ordered by most recent first.
+    Limited to 10,000 rows maximum. Results ordered by most recent first.
     """
     try:
         # Build query
@@ -114,9 +114,9 @@ async def get_charger_logs(
         # Check if we're hitting the limit
         has_more = total > limit
         message = None
-        if total > 1000:
-            message = "This query returns more than 1000 logs. Please contact the database administrator for a complete export or use more specific date filters."
-            limit = min(limit, 1000)  # Enforce 1000 row limit
+        if total > 10000:
+            message = "This query returns more than 10,000 logs. Please contact the database administrator for a complete export or use more specific date filters."
+            limit = min(limit, 10000)  # Enforce 10,000 row limit
         
         # Get logs ordered by most recent first
         logs = await query.order_by('-timestamp').limit(limit)
