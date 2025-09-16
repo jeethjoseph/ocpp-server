@@ -5,9 +5,11 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Calendar, AlertTriangle, ArrowUpDown } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Calendar, AlertTriangle, ArrowUpDown, Download } from "lucide-react";
 import { useChargerLogs, useChargerLogSummary } from "@/lib/queries/logs";
 import { LogEntry } from "@/lib/api-services";
+import { exportLogsToCSV } from "@/lib/csv-export";
 
 interface ChargerLogsProps {
   chargePointId: string;
@@ -54,6 +56,12 @@ export default function ChargerLogs({ chargePointId, chargerName }: ChargerLogsP
       limit: limit,
     }
   );
+
+  const handleExportCSV = () => {
+    if (logsResponse?.data && logsResponse.data.length > 0) {
+      exportLogsToCSV(logsResponse.data, chargerName || chargePointId);
+    }
+  };
 
 
   const formatTimestamp = (timestamp: string) => {
@@ -168,14 +176,14 @@ export default function ChargerLogs({ chargePointId, chargerName }: ChargerLogsP
             />
           </div>
           <div>
-            <Label htmlFor="limit" className="text-gray-700 dark:text-gray-300">Limit (max 1000)</Label>
+            <Label htmlFor="limit" className="text-gray-700 dark:text-gray-300">Limit (max 10,000)</Label>
             <Input
               id="limit"
               type="number"
               min="1"
-              max="1000"
+              max="10000"
               value={limit}
-              onChange={(e) => setLimit(Math.min(1000, Math.max(1, parseInt(e.target.value) || 100)))}
+              onChange={(e) => setLimit(Math.min(10000, Math.max(1, parseInt(e.target.value) || 100)))}
               className="mt-1 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-600 text-gray-900 dark:text-gray-100"
             />
           </div>
@@ -193,11 +201,24 @@ export default function ChargerLogs({ chargePointId, chargerName }: ChargerLogsP
 
         {/* Results Summary */}
         {logsResponse && (
-          <div className="mb-4 text-sm text-gray-600 dark:text-gray-400 bg-gray-50 dark:bg-gray-800 p-3 rounded-lg border border-gray-200 dark:border-gray-700">
-            <strong className="text-gray-900 dark:text-gray-100">
-              Showing {logsResponse.data.length} of {logsResponse.total} logs
-            </strong>
-            {logsResponse.has_more && <span className="text-blue-600 dark:text-blue-400"> (more available)</span>}
+          <div className="mb-4 flex items-center justify-between bg-gray-50 dark:bg-gray-800 p-3 rounded-lg border border-gray-200 dark:border-gray-700">
+            <div className="text-sm text-gray-600 dark:text-gray-400">
+              <strong className="text-gray-900 dark:text-gray-100">
+                Showing {logsResponse.data.length} of {logsResponse.total} logs
+              </strong>
+              {logsResponse.has_more && <span className="text-blue-600 dark:text-blue-400"> (more available)</span>}
+            </div>
+            {logsResponse.data.length > 0 && (
+              <Button
+                onClick={handleExportCSV}
+                variant="outline"
+                size="sm"
+                className="flex items-center gap-2"
+              >
+                <Download className="w-4 h-4" />
+                Export CSV
+              </Button>
+            )}
           </div>
         )}
 
