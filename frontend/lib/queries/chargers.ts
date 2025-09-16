@@ -31,8 +31,8 @@ export function useChargers(params: {
   return useQuery({
     queryKey: chargerKeys.list(params),
     queryFn: () => chargerService.getAll(params),
-    staleTime: 1000 * 10, // 10 seconds - frequent updates for OCPP status
-    refetchInterval: 1000 * 10, // Auto-refresh every 10 seconds for real-time status
+    staleTime: 1000 * 3, // 3 seconds - frequent updates for OCPP status
+    refetchInterval: 1000 * 3, // Auto-refresh every 3 seconds for real-time status
   });
 }
 
@@ -51,8 +51,8 @@ export function useCharger(id: number, hasActiveTransaction?: boolean) {
     queryKey: chargerKeys.detail(id),
     queryFn: () => chargerService.getById(id),
     enabled: !!id,
-    staleTime: hasActiveTransaction ? 1000 * 5 : 1000 * 10, // 5s during active session, 10s otherwise
-    refetchInterval: hasActiveTransaction ? 1000 * 5 : 1000 * 10, // More frequent polling during active sessions
+    staleTime: hasActiveTransaction ? 1000 * 2 : 1000 * 3, // 2s during active session, 3s otherwise
+    refetchInterval: hasActiveTransaction ? 1000 * 2 : 1000 * 3, // More frequent polling during active sessions
   });
 }
 

@@ -138,7 +138,7 @@ async def get_bulk_connection_status(chargers: List[Charger]) -> Dict[str, bool]
             continue
         
         time_diff = current_time - charger.last_heart_beat_time
-        status_dict[charger.charge_point_string_id] = time_diff.total_seconds() <= 180
+        status_dict[charger.charge_point_string_id] = time_diff.total_seconds() <= 5
     
     return status_dict
 
