@@ -5,7 +5,7 @@ OCPP 1.6 Charger Simulator for Real-World Testing
 This simulator acts like a real charging station:
 1. Connects to OCPP server
 2. Sends boot notification with clock reset
-3. Sends regular heartbeats every 45 seconds  
+3. Sends regular heartbeats every 10 seconds  
 4. Waits for remote start transaction commands
 5. Sends meter values every 30 seconds during charging
 6. Waits for remote stop transaction commands
@@ -42,7 +42,7 @@ class OCPPChargerSimulator:
         self.running = False
         
         # Timing intervals (in seconds)
-        self.heartbeat_interval = 45
+        self.heartbeat_interval = 10
         self.meter_value_interval = 30
         
         # Background tasks
@@ -355,7 +355,7 @@ class OCPPChargerSimulator:
         return False
     
     async def heartbeat_loop(self):
-        """Send heartbeats every 45 seconds"""
+        """Send heartbeats every 10 seconds"""
         while self.running:
             try:
                 await asyncio.sleep(self.heartbeat_interval)
@@ -545,8 +545,8 @@ Development Examples:
                        help="OCPP server URL (default: ws://localhost:8000)")
     
     # Timing settings
-    parser.add_argument("--heartbeat-interval", type=int, default=45, 
-                       help="Heartbeat interval in seconds (default: 45)")
+    parser.add_argument("--heartbeat-interval", type=int, default=10,
+                       help="Heartbeat interval in seconds (default: 10)")
     parser.add_argument("--meter-interval", type=int, default=30, 
                        help="Meter value interval in seconds (default: 30)")
     

@@ -132,13 +132,13 @@ async def get_bulk_connection_status(chargers: List[Charger]) -> Dict[str, bool]
             status_dict[charger.charge_point_string_id] = False
             continue
         
-        # Check heartbeat timeout (5 minutes)
+        # Check heartbeat timeout (15 seconds)
         if not charger.last_heart_beat_time:
             status_dict[charger.charge_point_string_id] = False
             continue
         
         time_diff = current_time - charger.last_heart_beat_time
-        status_dict[charger.charge_point_string_id] = time_diff.total_seconds() <= 5
+        status_dict[charger.charge_point_string_id] = time_diff.total_seconds() <= 15
     
     return status_dict
 
