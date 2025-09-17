@@ -44,7 +44,7 @@ class WebSocketCleanupTester:
         self.running = False
         
         # Test-specific settings
-        self.heartbeat_interval = 30
+        self.heartbeat_interval = 10
         self.test_mode = "normal"
         
         # Background tasks

@@ -39,7 +39,7 @@ class OCPPChangeAvailabilitySimulator:
         self.running = False
         
         # Timing intervals (in seconds)
-        self.heartbeat_interval = 30
+        self.heartbeat_interval = 10
         
         # Background tasks
         self.heartbeat_task = None
@@ -340,8 +340,8 @@ Examples:
                        help="OCPP server URL (default: ws://localhost:8000)")
     
     # Timing settings
-    parser.add_argument("--heartbeat-interval", type=int, default=30, 
-                       help="Heartbeat interval in seconds (default: 30)")
+    parser.add_argument("--heartbeat-interval", type=int, default=10,
+                       help="Heartbeat interval in seconds (default: 10)")
     
     args = parser.parse_args()
     
