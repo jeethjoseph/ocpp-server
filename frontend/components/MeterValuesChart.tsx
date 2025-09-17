@@ -20,15 +20,7 @@ interface MeterValuesChartProps {
   transactionId?: number;
 }
 
-interface ChartDataPoint {
-  timestamp: string;
-  timeDisplay: string;
-  reading_kwh: number;
-  current?: number;
-  voltage?: number;
-  power_kw?: number;
-  energy_delta?: number;
-}
+
 
 export default function MeterValuesChart({ meterValues, transactionId }: MeterValuesChartProps) {
   const chartData = useMemo(() => {
@@ -68,6 +60,7 @@ export default function MeterValuesChart({ meterValues, transactionId }: MeterVa
   }, [meterValues]);
 
   // Custom tooltip formatter
+  //eslint-disable-next-line @typescript-eslint/no-explicit-any
   const formatTooltipValue = (value: any, name: string) => {
     if (value === null || value === undefined) return ['--', name];
 
