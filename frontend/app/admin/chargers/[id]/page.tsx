@@ -401,7 +401,7 @@ export default function ChargerDetailPage() {
                     <div>
                       <p className="text-sm font-medium">Energy Reading</p>
                       <p className="text-xl font-bold">
-                        {mv.reading_kwh.toFixed(2)} kWh
+                        {mv.reading_kwh.toFixed(5)} kWh
                       </p>
                     </div>
                     {mv.power_kw && (
