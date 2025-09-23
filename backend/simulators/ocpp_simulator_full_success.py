@@ -185,7 +185,7 @@ class OCPPChargerSimulator:
         payload = {
             "connectorId": connector_id,
             "idTag": id_tag,
-            "meterStart": 1000,
+            "meterStart": 0,  # Start from 0 Wh for realistic energy tracking
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
         }
         
@@ -193,8 +193,15 @@ class OCPPChargerSimulator:
         if "transactionId" in response:
             self.transaction_id = response["transactionId"]
             self.statistics["transactions"] += 1
+
+            # Reset energy tracking for new transaction
+            if hasattr(self, '_transaction_start_time'):
+                delattr(self, '_transaction_start_time')
+            if hasattr(self, '_initial_energy_wh'):
+                delattr(self, '_initial_energy_wh')
+
             print(f"🔋 [{self.charge_point_id}] ⭐ TRANSACTION STARTED with ID: {self.transaction_id} ⭐")
-            
+
             # Start meter values automatically when transaction starts
             self.start_meter_value_task()
             print(f"⚡ [{self.charge_point_id}] Meter values started")
@@ -212,9 +219,17 @@ class OCPPChargerSimulator:
             self.meter_value_task = None
             print(f"⚡ [{self.charge_point_id}] Meter values stopped")
         
+        # Calculate final energy value for transaction end
+        final_energy = 0
+        if hasattr(self, '_transaction_start_time') and hasattr(self, '_initial_energy_wh'):
+            elapsed_seconds = time.time() - self._transaction_start_time
+            charging_power_w = 7400
+            energy_consumed_wh = (charging_power_w * elapsed_seconds) / 3600
+            final_energy = int(self._initial_energy_wh + energy_consumed_wh)
+
         payload = {
             "transactionId": self.transaction_id,
-            "meterStop": 5000,
+            "meterStop": final_energy,  # Use calculated final energy
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
             "reason": reason
         }
@@ -229,9 +244,20 @@ class OCPPChargerSimulator:
         if not self.transaction_id:
             return {}
         
-        # Simulate realistic charging values
-        time_elapsed = time.time() % 1000
-        current_energy = 2000 + time_elapsed  # Increasing energy consumption
+        # Simulate realistic EV charging energy accumulation
+        if not hasattr(self, '_transaction_start_time'):
+            self._transaction_start_time = time.time()
+            self._initial_energy_wh = 0  # Start from 0 Wh like a real charging session
+
+        # Calculate time elapsed since transaction started (in seconds)
+        elapsed_seconds = time.time() - self._transaction_start_time
+
+        # Realistic charging: 7.4kW = 7400W
+        # Energy = Power × Time, so 7400W × (seconds/3600) = Wh
+        charging_power_w = 7400  # 7.4kW in watts
+        energy_consumed_wh = (charging_power_w * elapsed_seconds) / 3600  # Convert seconds to hours
+
+        current_energy = self._initial_energy_wh + energy_consumed_wh
         
         # Simulate realistic electrical values during charging
         import random
@@ -289,7 +315,7 @@ class OCPPChargerSimulator:
         response = self._send_message("MeterValues", payload)
         self.statistics["meter_values"] += 1
         print(f"⚡ [{self.charge_point_id}] Meter values sent: "
-              f"{int(current_energy)} Wh, {current_amps:.1f}A, {voltage_volts:.1f}V, {power_watts/1000:.1f}kW")
+              f"{current_energy:.1f} Wh ({current_energy/1000:.2f} kWh), {current_amps:.1f}A, {voltage_volts:.1f}V, {power_watts/1000:.1f}kW")
         return response
     
     def handle_remote_start_transaction(self, message_id: str, payload: dict) -> bool:

@@ -421,8 +421,14 @@ class WebSocketCleanupTester:
         
         # Simulate network interruption by closing socket without proper close frame
         print(f"📡 [{self.charge_point_id}] Simulating network interruption...")
-        if self.ws:
-            self.ws.sock.close()  # Force close the underlying socket
+        if self.ws and hasattr(self.ws, 'sock') and self.ws.sock:
+            try:
+                self.ws.sock.close()  # Force close the underlying socket
+                print(f"📡 [{self.charge_point_id}] Forced socket closure")
+            except Exception as e:
+                print(f"📡 [{self.charge_point_id}] Socket already closed or error: {e}")
+        else:
+            print(f"📡 [{self.charge_point_id}] WebSocket or socket not available for interruption")
         
         self.disconnect(clean=False)
         
