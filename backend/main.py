@@ -607,7 +607,7 @@ async def force_disconnect(charge_point_id: str, reason: str):
         
         # 4. Add tombstone to prevent immediate reconnection races
         from datetime import timedelta
-        recently_disconnected[charge_point_id] = datetime.datetime.now(datetime.timezone.utc) + timedelta(seconds=1)
+        recently_disconnected[charge_point_id] = datetime.datetime.now(datetime.timezone.utc) + timedelta(milliseconds=100)
         
         # 5. Clean up old tombstones
         current_time = datetime.datetime.now(datetime.timezone.utc)
@@ -708,28 +708,37 @@ app.include_router(logs.router)
 @app.websocket("/ocpp/{charge_point_id}")
 async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
     """OCPP WebSocket endpoint for charge points"""
-    await websocket.accept()
-    logger.info(f"Charge point {charge_point_id} connected")
+    logger.info(f"[CONNECTION ATTEMPT] {charge_point_id} attempting WebSocket connection")
+
+    try:
+        await websocket.accept()
+        logger.info(f"[CONNECTION ATTEMPT] {charge_point_id} WebSocket handshake successful")
+    except Exception as e:
+        logger.error(f"[CONNECTION ATTEMPT] {charge_point_id} WebSocket handshake failed: {e}")
+        return
 
     # Check for recent disconnection tombstone to prevent reconnection races
     current_time = datetime.datetime.now(datetime.timezone.utc)
     if charge_point_id in recently_disconnected:
         expire_time = recently_disconnected[charge_point_id]
         if current_time < expire_time:
-            remaining_seconds = (expire_time - current_time).total_seconds()
-            logger.warning(f"Rejecting immediate reconnection for {charge_point_id} - tombstone expires in {remaining_seconds:.1f}s")
+            remaining_ms = (expire_time - current_time).total_seconds() * 1000
+            logger.warning(f"[CONNECTION ATTEMPT] Rejecting immediate reconnection for {charge_point_id} - tombstone expires in {remaining_ms:.1f}ms")
             await websocket.close(code=1013, reason="Too soon after disconnect")
             return
         else:
             # Tombstone expired, remove it
+            logger.info(f"[CONNECTION ATTEMPT] {charge_point_id} tombstone expired, allowing reconnection")
             del recently_disconnected[charge_point_id]
 
     # Validate charger before connecting
     is_valid, message = await validate_and_connect_charger(charge_point_id, connected_charge_points)
     if not is_valid:
-        logger.warning(f"Validation failed for {charge_point_id}: {message}")
+        logger.warning(f"[CONNECTION ATTEMPT] Validation failed for {charge_point_id}: {message}")
         await websocket.close(code=1008, reason=message)
         return
+
+    logger.info(f"[CONNECTION ATTEMPT] {charge_point_id} validation successful - establishing OCPP connection")
 
     ws_adapter = LoggingWebSocketAdapter(websocket, charge_point_id)
     cp = ChargePoint(charge_point_id, ws_adapter)
@@ -749,16 +758,22 @@ async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
     
     # Add to Redis
     await redis_manager.add_connected_charger(charge_point_id, connection_data)
-    
+
+    logger.info(f"[CONNECTION ATTEMPT] {charge_point_id} connection established successfully - starting OCPP message handling")
+
     try:
         await cp.start()
-    except WebSocketDisconnect:
-        logger.error(f"[DISCONNECT] Charge point {charge_point_id} disconnected naturally")
+    except WebSocketDisconnect as e:
+        logger.error(f"[DISCONNECT] Charge point {charge_point_id} disconnected naturally - WebSocket code: {getattr(e, 'code', 'unknown')}, reason: {getattr(e, 'reason', 'none')}")
+        logger.error(f"[DISCONNECT] WebSocket state at disconnect: {getattr(websocket, 'client_state', 'unknown')}")
+        logger.error(f"[DISCONNECT] Last seen: {connection_data.get('last_seen', 'never') if charge_point_id in connected_charge_points else 'connection not found'}")
         # Apply tombstone on natural disconnect and let finally handle cleanup
         await force_disconnect(charge_point_id, "Natural WebSocket disconnect")
         return  # Avoid double cleanup in finally
     except Exception as e:
         logger.error(f"[DISCONNECT] WebSocket error for {charge_point_id}: {e}", exc_info=True)
+        logger.error(f"[DISCONNECT] WebSocket state at error: {getattr(websocket, 'client_state', 'unknown')}")
+        logger.error(f"[DISCONNECT] Connection data at error: {connection_data if charge_point_id in connected_charge_points else 'connection not found'}")
     finally:
         # Use force_disconnect for proper cleanup if still connected
         if charge_point_id in connected_charge_points:
