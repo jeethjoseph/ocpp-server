@@ -626,7 +626,7 @@ async def cleanup_dead_connection(charge_point_id: str):
 
 async def heartbeat_monitor(charge_point_id: str, websocket: WebSocket):
     """Monitor OCPP Heartbeat message to check device liveness."""
-    HEARTBEAT_TIMEOUT = 15  # seconds - quick cleanup for no heartbeat
+    HEARTBEAT_TIMEOUT = 90  # seconds - disconnect if no heartbeat for 90 seconds
 
     try:
         while True:
@@ -678,8 +678,8 @@ async def periodic_cleanup():
                 )
                 most_recent_times[charge_point_id] = most_recent
                 
-                # Only mark as stale if no activity for 15 seconds (consistent with heartbeat timeout)
-                if (current_time - most_recent).total_seconds() > 15:
+                # Only mark as stale if no activity for 90 seconds (consistent with heartbeat timeout)
+                if (current_time - most_recent).total_seconds() > 90:
 
                     stale_connections.append(charge_point_id)
                     logger.warning(f"Connection {charge_point_id} stale: last activity {(current_time - most_recent).total_seconds():.1f}s ago")
