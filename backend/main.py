@@ -47,7 +47,7 @@ app = FastAPI(
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000","https://ocpp-frontend-mu.vercel.app" ],  # Frontend origins
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000","https://ocpp-frontend-mu.vercel.app", "https://lyncpower.com", "https://www.lyncpower.com" ],  # Frontend origins
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
