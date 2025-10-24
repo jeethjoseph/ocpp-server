@@ -44,14 +44,66 @@ app = FastAPI(
     description="EV Charging Station Management System with OCPP 1.6 support"
 )
 
-# Configure CORS
+# Configure CORS - Allow frontend domains
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000","https://ocpp-frontend-mu.vercel.app", "https://lyncpower.com", "https://www.lyncpower.com" ],  # Frontend origins
+    allow_origins=[
+        "http://localhost:3000",           # Local development
+        "http://127.0.0.1:3000",           # Local development
+        "https://powerlync.com",            # Production frontend
+        "https://www.powerlync.com",        # Production frontend (www)
+        "https://ocpp-frontend-mu.vercel.app",  # Legacy Vercel frontend
+        "https://lyncpower.com",            # Backend domain (for testing)
+        "https://www.lyncpower.com"         # Backend domain (www)
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Middleware to handle OPTIONS (CORS preflight) requests
+# This ensures OPTIONS requests don't hit authentication middleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
+
+class OptionsMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Handle OPTIONS requests immediately with proper CORS headers
+        if request.method == "OPTIONS":
+            # Get origin from request
+            origin = request.headers.get("origin", "*")
+
+            # Check if origin is allowed (optional security check)
+            allowed_origins = [
+                "http://localhost:3000",
+                "http://127.0.0.1:3000",
+                "https://powerlync.com",
+                "https://www.powerlync.com",
+                "https://ocpp-frontend-mu.vercel.app",
+                "https://lyncpower.com",
+                "https://www.lyncpower.com"
+            ]
+
+            # If origin is in allowed list, use it; otherwise use first allowed origin
+            if origin not in allowed_origins:
+                origin = allowed_origins[0] if allowed_origins else "*"
+
+            headers = {
+                "Access-Control-Allow-Origin": origin,
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+                "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept, Origin, User-Agent",
+                "Access-Control-Allow-Credentials": "true",
+                "Access-Control-Max-Age": "3600",  # Cache preflight for 1 hour
+            }
+
+            return Response(status_code=200, headers=headers)
+
+        # For non-OPTIONS requests, continue normally
+        response = await call_next(request)
+        return response
+
+app.add_middleware(OptionsMiddleware)
 
 # Store connected charge points with metadata (now moved to Redis)
 # Keep this for backward compatibility but will be deprecated

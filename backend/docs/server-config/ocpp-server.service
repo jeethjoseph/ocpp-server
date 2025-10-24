@@ -1,0 +1,200 @@
+# ============================================================================
+# OCPP Server Systemd Service Configuration (Detailed/Reference Version)
+# Purpose: Run FastAPI OCPP server as a system service with auto-restart
+#
+# NOTE: For production deployment, use ocpp-server-production.service
+# This file contains extensive comments and options for reference.
+# ============================================================================
+
+[Unit]
+Description=OCPP Central System API - EV Charging Station Management
+Documentation=https://github.com/yourusername/ocpp-server
+After=network.target postgresql.service redis.service
+# Start after network, PostgreSQL, and Redis are ready
+Wants=postgresql.service redis.service
+# Prefer PostgreSQL and Redis running, but don't fail if they're not
+
+[Service]
+# -------------------------------------------------------------------------
+# Service Type and User
+# -------------------------------------------------------------------------
+Type=simple
+# simple type: Standard service type for most applications
+# Use 'notify' only if uvicorn is configured with systemd support
+
+User=root
+# REPLACE 'root' with your application user (e.g., 'ocpp' or your username)
+# Running as root is NOT recommended for production - create a dedicated user
+
+Group=root
+# REPLACE with the group for your application user
+
+# -------------------------------------------------------------------------
+# Working Directory and Environment
+# -------------------------------------------------------------------------
+WorkingDirectory=/root/ocpp_server
+# ACTUAL PATH: /root/ocpp_server (verified on Vultr deployment)
+# This is where main.py is located (no /backend subdirectory)
+
+Environment="PATH=/root/ocpp_server/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+# ACTUAL PATH: /root/ocpp_server/.venv/bin (verified on Vultr)
+# This ensures Python dependencies are found
+
+# -------------------------------------------------------------------------
+# Environment Variables (Database, Redis, API Keys)
+# OPTION 1: Define inline (shown below)
+# OPTION 2: Use EnvironmentFile=/path/to/.env (more secure)
+# -------------------------------------------------------------------------
+
+# Database Configuration (optional - can use .env file from WorkingDirectory)
+# Environment="DATABASE_URL=postgresql://user:password@localhost:5432/ocpp_db"
+
+# Redis Configuration (optional - can use .env file)
+# Environment="REDIS_URL=redis://localhost:6379/0"
+
+# Supabase Configuration (optional - can use .env file)
+# Environment="SUPABASE_URL=https://your-project.supabase.co"
+# Environment="SUPABASE_KEY=your-supabase-anon-key"
+# Environment="SUPABASE_SERVICE_KEY=your-supabase-service-key"
+
+# Clerk Authentication (optional - can use .env file)
+# Environment="CLERK_SECRET_KEY=your-clerk-secret-key"
+# Environment="CLERK_PUBLISHABLE_KEY=your-clerk-publishable-key"
+
+# Application Settings (optional)
+# Environment="PORT=8080"
+# Environment="HOST=127.0.0.1"
+# Environment="ENVIRONMENT=production"
+
+# -------------------------------------------------------------------------
+# Service Execution Command
+# CRITICAL: Bind to 127.0.0.1:8080 (localhost only, nginx will proxy)
+# -------------------------------------------------------------------------
+ExecStart=/root/ocpp_server/.venv/bin/uvicorn main:app \
+    --host 127.0.0.1 \
+    --port 8080 \
+    --workers 2 \
+    --log-level info
+# ACTUAL PATH: /root/ocpp_server/.venv/bin/uvicorn (verified on Vultr)
+#
+# Explanation:
+# --host 127.0.0.1: Only listen on localhost (not exposed to internet)
+# --port 8080: Match nginx upstream configuration
+# --workers 2: Number of worker processes (adjust based on CPU cores)
+# --log-level info: Log verbosity (use 'debug' for troubleshooting)
+
+# -------------------------------------------------------------------------
+# Alternative: Using EnvironmentFile (More Secure)
+# -------------------------------------------------------------------------
+# EnvironmentFile=/root/ocpp_server/.env
+# Uncomment above and comment out individual Environment lines
+# Store secrets in .env file with proper permissions (chmod 600 .env)
+# The .env file in /root/ocpp_server/ will be automatically loaded by FastAPI
+
+# -------------------------------------------------------------------------
+# Service Restart and Resource Management
+# -------------------------------------------------------------------------
+Restart=always
+# Always restart the service if it crashes
+
+RestartSec=10
+# Wait 10 seconds before restarting after a failure
+
+# Resource Limits (Optional but Recommended)
+# LimitNOFILE=65536
+# Maximum number of open files (useful for many WebSocket connections)
+
+# TimeoutStartSec=60
+# Give service 60 seconds to start before considering it failed
+
+# TimeoutStopSec=30
+# Give service 30 seconds to gracefully shutdown
+
+# -------------------------------------------------------------------------
+# Standard Output and Error Handling
+# -------------------------------------------------------------------------
+StandardOutput=journal
+StandardError=journal
+# Send logs to systemd journal (view with: sudo journalctl -u ocpp-server -f)
+
+# SyslogIdentifier=ocpp-server
+# Optional: Custom identifier for syslog
+
+# -------------------------------------------------------------------------
+# Crash Recovery Settings
+# -------------------------------------------------------------------------
+StartLimitInterval=200
+# Time window for restart attempts
+
+StartLimitBurst=5
+# Maximum restart attempts within the interval
+
+[Install]
+WantedBy=multi-user.target
+# Start this service when the system reaches multi-user mode (normal boot)
+
+# ============================================================================
+# Installation Instructions:
+#
+# 1. Update Configuration (if needed):
+#    - Paths are already set for Vultr deployment: /root/ocpp_server
+#    - Change User and Group from 'root' to your application user (recommended)
+#    - Update environment variables or use .env file
+#
+# 2. Copy to systemd:
+#    sudo cp ocpp-server.service /etc/systemd/system/
+#
+# 3. Set proper permissions:
+#    sudo chmod 644 /etc/systemd/system/ocpp-server.service
+#
+# 4. Reload systemd:
+#    sudo systemctl daemon-reload
+#
+# 5. Enable service (start on boot):
+#    sudo systemctl enable ocpp-server
+#
+# 6. Start service:
+#    sudo systemctl start ocpp-server
+#
+# 7. Check status:
+#    sudo systemctl status ocpp-server
+#
+# 8. View logs:
+#    sudo journalctl -u ocpp-server -f
+#    (Press Ctrl+C to exit log view)
+#
+# 9. Restart service (after code changes):
+#    sudo systemctl restart ocpp-server
+#
+# 10. Stop service:
+#     sudo systemctl stop ocpp-server
+#
+# ============================================================================
+# Troubleshooting:
+#
+# Service won't start:
+# - Check logs: sudo journalctl -u ocpp-server -xe
+# - Verify paths in WorkingDirectory and ExecStart
+# - Ensure virtual environment exists and has dependencies installed
+# - Check environment variables are correct
+# - Verify port 8080 is not already in use: sudo netstat -tlnp | grep 8080
+#
+# Service crashes repeatedly:
+# - Check application logs: sudo journalctl -u ocpp-server -f
+# - Verify database connection: Check .env file in /root/ocpp_server/
+# - Verify Redis connection: redis-cli ping
+# - Check for missing Python dependencies
+#
+# Can't connect via nginx:
+# - Verify service is listening on 127.0.0.1:8080: sudo netstat -tlnp | grep 8080
+# - Should show: tcp  0  0  127.0.0.1:8080  0.0.0.0:*  LISTEN
+# - Check nginx is running: sudo systemctl status nginx
+# - Check nginx logs: sudo tail -f /var/log/nginx/ocpp_error.log
+#
+# ============================================================================
+# Verified Configuration (Vultr Deployment):
+# - WorkingDirectory: /root/ocpp_server (NOT /root/ocpp_server/backend)
+# - ExecStart: /root/ocpp_server/.venv/bin/uvicorn
+# - Type: simple (NOT notify - causes timeout issues)
+# - Binds to: 127.0.0.1:8080 (verified working)
+# ============================================================================
