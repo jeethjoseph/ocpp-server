@@ -58,6 +58,27 @@ class UserTransactionSummary(BaseModel):
     total_amount_spent: float
     last_transaction_date: Optional[str] = None
 
+@router.get("/my-wallet", response_model=dict)
+async def get_my_wallet(
+    current_user: User = Depends(require_user())
+):
+    """Get current user's wallet balance
+
+    Note: This route must appear before dynamic '/{user_id}' routes to avoid
+    path-matching conflicts that could incorrectly enforce ADMIN access.
+    """
+    try:
+        # Get wallet balance
+        wallet = await Wallet.filter(user=current_user).first()
+        wallet_balance = float(wallet.balance) if wallet and wallet.balance else 0.0
+
+        return {
+            "wallet_balance": wallet_balance
+        }
+    except Exception as e:
+        logger.error(f"Error getting wallet for user {current_user.id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve wallet balance")
+
 @router.get("/my-sessions", response_model=dict)
 async def get_my_sessions(
     page: int = Query(1, ge=1),

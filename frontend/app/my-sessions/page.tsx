@@ -6,14 +6,16 @@ import { Card, CardContent } from "@/components/ui/card";
 
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { 
-  Zap, 
-  ArrowUpCircle, 
+import {
+  Zap,
+  ArrowUpCircle,
   ArrowDownCircle,
   Clock,
   MapPin,
   Battery,
-  RefreshCw
+  RefreshCw,
+  Wallet,
+  Info
 } from "lucide-react";
 import { api } from "@/lib/api-client";
 
@@ -53,9 +55,15 @@ interface SessionsResponse {
   total_pages: number;
 }
 
+interface WalletResponse {
+  wallet_balance: number;
+}
+
 const getSessionService = {
   getMySessions: (page: number = 1, limit: number = 20) =>
-    api.get<SessionsResponse>(`/api/users/my-sessions?page=${page}&limit=${limit}`)
+    api.get<SessionsResponse>(`/api/users/my-sessions?page=${page}&limit=${limit}`),
+  getMyWallet: () =>
+    api.get<WalletResponse>(`/api/users/my-wallet`)
 };
 
 export default function MySessionsPage() {
@@ -68,8 +76,15 @@ export default function MySessionsPage() {
     staleTime: 30000, // 30 seconds
   });
 
+  const { data: walletData, isLoading: isLoadingWallet, refetch: refetchWallet } = useQuery({
+    queryKey: ["my-wallet"],
+    queryFn: () => getSessionService.getMyWallet(),
+    staleTime: 30000, // 30 seconds
+  });
+
   const transactions = sessionsData?.data || [];
   const totalPages = sessionsData?.total_pages || 1;
+  const walletBalance = walletData?.wallet_balance ?? 0;
 
   const formatDate = (dateString: string) => {
     return new Date(dateString).toLocaleString();
@@ -133,11 +148,30 @@ export default function MySessionsPage() {
             View your charging history and wallet transactions
           </p>
         </div>
-        <Button onClick={() => refetch()} variant="outline" size="sm">
+        <Button onClick={() => { refetch(); refetchWallet(); }} variant="outline" size="sm">
           <RefreshCw className="h-4 w-4 mr-2" />
           Refresh
         </Button>
       </div>
+
+      {/* Wallet Balance Card */}
+      <Card>
+        <CardContent className="py-6">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center space-x-4">
+              <div className="p-3 bg-green-100 rounded-lg">
+                <Wallet className="h-6 w-6 text-green-600" />
+              </div>
+              <div>
+                <p className="text-sm text-muted-foreground">Current Wallet Balance</p>
+                <p className="text-3xl font-bold text-foreground">
+                  {isLoadingWallet ? '...' : formatCurrency(walletBalance)}
+                </p>
+              </div>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
 
       {transactions.length === 0 ? (
         <Card>
@@ -193,7 +227,7 @@ export default function MySessionsPage() {
                           </div>
                           
                           {/* Show related wallet transactions */}
-                          {transaction.wallet_transactions && transaction.wallet_transactions.length > 0 && (
+                          {transaction.wallet_transactions && transaction.wallet_transactions.length > 0 ? (
                             <div className="mt-2 pt-2 border-t border-border">
                               <div className="text-xs text-muted-foreground mb-1">Payment Details:</div>
                               {transaction.wallet_transactions.map((wt) => (
@@ -203,6 +237,16 @@ export default function MySessionsPage() {
                                 </div>
                               ))}
                             </div>
+                          ) : (
+                            // Show "No billing" message for completed/stopped sessions with no charges
+                            ['COMPLETED', 'STOPPED'].includes(transaction.status?.toUpperCase() || '') && (
+                              <div className="mt-2 pt-2 border-t border-border">
+                                <div className="text-xs text-green-600 dark:text-green-400 flex items-center space-x-1">
+                                  <Info className="h-3 w-3" />
+                                  <span>No billing - No energy consumed</span>
+                                </div>
+                              </div>
+                            )
                           )}
                         </div>
                       </div>
