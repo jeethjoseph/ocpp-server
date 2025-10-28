@@ -401,7 +401,7 @@ export default function UserChargePage() {
         )}
 
         {/* Billing Information - Show when transaction ends */}
-        {transactionData?.wallet_transactions && transactionData.wallet_transactions.length > 0 && (
+        {transaction && ['COMPLETED', 'STOPPED'].includes(getTransactionStatus()) && (
           <Card className="border-0 shadow-lg bg-card">
             <CardHeader className="pb-4">
               <CardTitle className="flex items-center gap-2 text-lg text-card-foreground">
@@ -410,55 +410,76 @@ export default function UserChargePage() {
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="space-y-3">
-                {transactionData.wallet_transactions.map((walletTx) => (
-                  <div key={walletTx.id} className="flex justify-between items-start p-4 bg-gradient-to-r from-red-50 to-red-100 dark:from-red-900/20 dark:to-red-800/20 border border-red-200 dark:border-red-700 rounded-lg">
-                    <div className="flex-1">
-                      <p className="font-semibold text-red-900 dark:text-red-100">
-                        {walletTx.type === 'CHARGE_DEDUCT' ? '⚡ Charging Bill' : walletTx.type}
-                      </p>
-                      {walletTx.description && (
-                        <p className="text-sm text-red-700 dark:text-red-300 mt-1">
-                          {walletTx.description}
+              {transactionData?.wallet_transactions && transactionData.wallet_transactions.length > 0 ? (
+                <>
+                  <div className="space-y-3">
+                    {transactionData.wallet_transactions.map((walletTx) => (
+                      <div key={walletTx.id} className="flex justify-between items-start p-4 bg-gradient-to-r from-red-50 to-red-100 dark:from-red-900/20 dark:to-red-800/20 border border-red-200 dark:border-red-700 rounded-lg">
+                        <div className="flex-1">
+                          <p className="font-semibold text-red-900 dark:text-red-100">
+                            {walletTx.type === 'CHARGE_DEDUCT' ? '⚡ Charging Bill' : walletTx.type}
+                          </p>
+                          {walletTx.description && (
+                            <p className="text-sm text-red-700 dark:text-red-300 mt-1">
+                              {walletTx.description}
+                            </p>
+                          )}
+                          <p className="text-xs text-red-600 dark:text-red-400 mt-2">
+                            Billed on {new Date(walletTx.created_at).toLocaleDateString()} at {new Date(walletTx.created_at).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}
+                          </p>
+                        </div>
+                        <div className="text-right ml-4">
+                          <p className="text-2xl font-bold text-red-600 dark:text-red-400">
+                            ₹{Math.abs(walletTx.amount).toFixed(2)}
+                          </p>
+                          <p className="text-sm text-red-600 dark:text-red-400 font-medium">
+                            Charged
+                          </p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Total billing summary - Mobile optimized */}
+                  <div className="border-t border-gray-200 dark:border-gray-700 pt-4 mt-4">
+                    <div className="bg-gray-50 dark:bg-gray-800 p-4 rounded-lg">
+                      <div className="flex justify-between items-center">
+                        <p className="text-lg font-semibold text-gray-900 dark:text-gray-100">
+                          Total Paid:
                         </p>
-                      )}
-                      <p className="text-xs text-red-600 dark:text-red-400 mt-2">
-                        Billed on {new Date(walletTx.created_at).toLocaleDateString()} at {new Date(walletTx.created_at).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}
-                      </p>
-                    </div>
-                    <div className="text-right ml-4">
-                      <p className="text-2xl font-bold text-red-600 dark:text-red-400">
-                        ₹{Math.abs(walletTx.amount).toFixed(2)}
-                      </p>
-                      <p className="text-sm text-red-600 dark:text-red-400 font-medium">
-                        Charged
-                      </p>
+                        <p className="text-3xl font-bold text-red-600 dark:text-red-400">
+                          ₹{Math.abs(transactionData.wallet_transactions.reduce(
+                            (sum, wt) => sum + (wt.amount < 0 ? Math.abs(wt.amount) : 0),
+                            0
+                          )).toFixed(2)}
+                        </p>
+                      </div>
+                      <div className="flex justify-between items-center mt-2">
+                        <p className="text-sm text-gray-600 dark:text-gray-400">
+                          Debited from your wallet
+                        </p>
+                        <p className="text-sm text-gray-600 dark:text-gray-400">
+                          Session #{getTransactionId()}
+                        </p>
+                      </div>
                     </div>
                   </div>
-                ))}
-              </div>
-              
-              {/* Total billing summary - Mobile optimized */}
-              {transactionData.wallet_transactions.length > 0 && (
-                <div className="border-t border-gray-200 dark:border-gray-700 pt-4 mt-4">
-                  <div className="bg-gray-50 dark:bg-gray-800 p-4 rounded-lg">
-                    <div className="flex justify-between items-center">
-                      <p className="text-lg font-semibold text-gray-900 dark:text-gray-100">
-                        Total Paid:
-                      </p>
-                      <p className="text-3xl font-bold text-red-600 dark:text-red-400">
-                        ₹{Math.abs(transactionData.wallet_transactions.reduce(
-                          (sum, wt) => sum + (wt.amount < 0 ? Math.abs(wt.amount) : 0), 
-                          0
-                        )).toFixed(2)}
-                      </p>
+                </>
+              ) : (
+                <div className="bg-gradient-to-r from-green-50 to-blue-50 dark:from-green-900/20 dark:to-blue-800/20 border border-green-200 dark:border-green-700 p-6 rounded-lg text-center">
+                  <div className="flex flex-col items-center space-y-3">
+                    <div className="w-16 h-16 bg-green-100 dark:bg-green-800/30 rounded-full flex items-center justify-center">
+                      <Info className="h-8 w-8 text-green-600 dark:text-green-400" />
                     </div>
-                    <div className="flex justify-between items-center mt-2">
-                      <p className="text-sm text-gray-600 dark:text-gray-400">
-                        Debited from your wallet
+                    <div>
+                      <p className="text-lg font-semibold text-green-900 dark:text-green-100">
+                        No Billing Required
                       </p>
-                      <p className="text-sm text-gray-600 dark:text-gray-400">
-                        Session #{getTransactionId()}
+                      <p className="text-sm text-green-700 dark:text-green-300 mt-2">
+                        No energy was consumed during this session.
+                      </p>
+                      <p className="text-xs text-green-600 dark:text-green-400 mt-1">
+                        Your wallet was not charged.
                       </p>
                     </div>
                   </div>

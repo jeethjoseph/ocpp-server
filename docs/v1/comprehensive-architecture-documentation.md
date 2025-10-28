@@ -4,11 +4,13 @@
 
 This document provides comprehensive technical documentation for a production-ready **Open Charge Point Protocol (OCPP) 1.6** compliant Charging Station Management System (CSMS). The system implements a full-stack solution for managing Electric Vehicle (EV) charging stations with real-time monitoring, remote control capabilities, role-based access control, and integrated financial management.
 
-**System Version**: 2.0  
-**OCPP Compliance**: OCPP 1.6 Full Implementation  
-**Architecture**: Modern async Python backend with React frontend  
-**Authentication**: Clerk-powered JWT authentication with RBAC  
-**Deployment**: Production-ready on Render (backend) + Vercel (frontend)  
+**System Version**: 2.1
+**OCPP Compliance**: OCPP 1.6 Full Implementation
+**Architecture**: Modern async Python backend with React frontend
+**Authentication**: Clerk-powered JWT authentication with RBAC
+**Deployment**: Production-ready on Render (backend) + Vercel (frontend)
+**Current Branch**: 39-feature---user-transaction-pages-zero-charged-transactions
+**Last Updated**: January 2025  
 
 ---
 
@@ -30,7 +32,8 @@ This document provides comprehensive technical documentation for a production-re
 14. [Performance & Scalability](#performance--scalability)
 15. [Technical Debt & Known Issues](#technical-debt--known-issues)
 16. [Deployment & Operations](#deployment--operations)
-17. [Future Roadmap](#future-roadmap)
+17. [Recent Changes & Updates](#recent-changes--updates)
+18. [Future Roadmap](#future-roadmap)
 
 ---
 
@@ -67,28 +70,32 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 ### Backend Technologies (`/backend/`)
 | Component | Technology | Version | Purpose |
 |-----------|------------|---------|---------|
-| **Web Framework** | FastAPI | Latest | High-performance async web framework |
+| **Web Framework** | FastAPI | 0.115.12 | High-performance async web framework |
 | **OCPP Library** | python-ocpp | 2.0.0 | OCPP 1.6 protocol implementation |
-| **Database ORM** | Tortoise ORM | Latest | Async database operations with PostgreSQL |
+| **Database ORM** | Tortoise ORM | 0.25.1 | Async database operations with PostgreSQL |
 | **Authentication** | Clerk SDK | Latest | JWT validation and webhook handling |
 | **Message Queue** | Redis | Latest | Connection state management and caching |
 | **WebSocket** | Native FastAPI | - | Real-time OCPP communication |
-| **Testing** | Pytest | Latest | Comprehensive test framework with async support |
+| **Testing** | Pytest | 8.3.4 | Comprehensive test framework with async support |
 | **Validation** | Pydantic | Latest | Data validation and serialization |
-| **Migration** | Aerich | Latest | Database schema migrations |
+| **Migration** | Aerich | 0.9.1 | Database schema migrations |
+| **Server** | Uvicorn | 0.34.3 | ASGI server for production deployment |
 
 ### Frontend Technologies (`/frontend/`)
 | Component | Technology | Version | Purpose |
 |-----------|------------|---------|---------|
 | **Framework** | Next.js | 15.3.4 | React-based frontend with App Router |
-| **Language** | TypeScript | Latest | Type safety and developer experience |
+| **Language** | TypeScript | 5.x | Type safety and developer experience |
+| **Runtime** | React | 19.0.0 | Latest React with concurrent features |
 | **Styling** | Tailwind CSS | v4 | Utility-first CSS framework |
 | **UI Library** | Shadcn/ui | Latest | Radix UI-based component system |
-| **State Management** | TanStack Query | Latest | Server state management and caching |
-| **Authentication** | Clerk React | Latest | Client-side authentication |
-| **Maps** | React Leaflet | Latest | Interactive station location maps |
-| **QR Scanning** | ZXing | Latest | QR code scanning for charger access |
-| **Icons** | Lucide React | Latest | Consistent icon library |
+| **State Management** | TanStack Query | 5.81.2 | Server state management and caching |
+| **Authentication** | Clerk React | 6.29.0 | Client-side authentication |
+| **Maps** | React Leaflet | 5.0.0 | Interactive station location maps |
+| **QR Scanning** | ZXing | 0.21.3 | QR code scanning for charger access |
+| **Charts** | Recharts | 3.2.1 | Energy consumption visualization |
+| **Icons** | Lucide React | 0.523.0 | Consistent icon library |
+| **Notifications** | Sonner | 2.0.5 | Toast notifications |
 
 ### Infrastructure & DevOps
 - **Database**: PostgreSQL with SSL (Tortoise ORM, AsyncPG driver)
@@ -221,6 +228,9 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 - User profile management with transaction history
 - Wallet balance and transaction tracking
 - Admin-only user management capabilities
+- **NEW**: User transaction pages with pagination
+- **NEW**: Wallet transaction history with running balance
+- **NEW**: Transaction summary statistics
 
 #### Webhook Handler (`backend/routers/webhooks.py`)
 **Endpoints**: `/webhooks/*`
@@ -238,11 +248,19 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 - Wallet balance validation and deduction
 - Automated retry mechanism for failed billing
 - Integration with payment gateways
+- **NEW: Zero energy consumption handling** - No billing for 0 kWh transactions
 
 **Methods**:
-- `process_transaction_billing()`: Main billing workflow
-- `calculate_billing_amount()`: Energy-based cost calculation
-- `deduct_from_wallet()`: Secure balance deduction
+- `process_transaction_billing()`: Main billing workflow with atomic database transactions
+- `calculate_billing_amount()`: Energy-based cost calculation (energy_kwh × rate_per_kwh)
+- `deduct_from_wallet()`: Secure balance deduction with SELECT FOR UPDATE locking
+
+**Billing Logic**:
+```python
+if energy_consumed_kwh == 0:
+    return (True, "No energy consumed", Decimal('0.00'))
+# Proceed with normal billing for energy > 0
+```
 
 #### Billing Retry Service (`backend/services/billing_retry_service.py`)
 **Purpose**: Background service for recovering failed transactions
@@ -252,6 +270,12 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 - Exponential backoff strategy
 - Persistent retry state management
 - Comprehensive error logging
+
+**Recent Enhancement**: Zero Charged Transaction Handling
+- Transactions with 0 kWh energy consumption are now handled gracefully
+- No wallet deduction for zero-energy sessions
+- Transaction status: COMPLETED (not BILLING_FAILED)
+- Handles test/aborted sessions without billing errors
 
 ### Infrastructure Components
 
@@ -296,8 +320,16 @@ frontend/
 │   ├── page.tsx           # Role-based dashboard
 │   ├── auth/              # Authentication pages
 │   ├── admin/             # Admin-only pages
+│   │   ├── chargers/      # Charger management
+│   │   ├── stations/      # Station management
+│   │   └── users/         # User management
+│   │       └── [id]/      # User detail pages
+│   │           ├── page.tsx            # User profile
+│   │           ├── transactions/       # **NEW** Charging transactions
+│   │           └── wallet/             # **NEW** Wallet history
 │   ├── stations/          # Station finder and maps
 │   ├── scanner/           # QR code scanning
+│   ├── my-sessions/       # **NEW** User's sessions & wallet
 │   └── charge/            # Individual charger pages
 ├── components/            # Reusable React components
 │   ├── ui/               # Shadcn/ui components
@@ -375,6 +407,26 @@ frontend/
 - Wallet balance and transaction management
 - Admin override capabilities
 
+##### **NEW**: User Transaction Pages (`app/admin/users/[id]/transactions/page.tsx`)
+**Purpose**: View all charging transactions for a specific user
+**Features**:
+- Paginated list of all user charging sessions
+- Transaction status badges (Completed, Failed, Running, Billing Failed)
+- Energy consumption and duration display
+- Start/end timestamps
+- Links to detailed transaction view
+- Filter and search capabilities
+
+##### **NEW**: User Wallet History (`app/admin/users/[id]/wallet/page.tsx`)
+**Purpose**: Complete wallet transaction history for a user
+**Features**:
+- All wallet transactions (TOP_UP and CHARGE_DEDUCT)
+- **Running balance calculation** - Shows balance after each transaction
+- Type-based color coding (green for credit, red for debit)
+- Payment metadata display
+- Pagination (15 transactions per page)
+- Transaction descriptions and timestamps
+
 #### User Experience Features
 
 ##### QR Code Scanner (`app/scanner/page.tsx`)
@@ -392,6 +444,18 @@ frontend/
 - Remote start/stop capabilities (if authorized)
 - Live energy consumption monitoring
 - Session progress tracking
+
+##### **NEW**: My Sessions Page (`app/my-sessions/page.tsx`)
+**Purpose**: Combined view of user's charging and wallet activity
+**Features**:
+- Current wallet balance display with auto-refresh
+- Dual-tab or unified timeline view:
+  - **Charging Sessions**: All charging transactions with duration, energy, and charger info
+  - **Wallet Transactions**: All wallet activity with amounts and descriptions
+- Real-time balance updates (30-second refresh interval)
+- Transaction status indicators
+- Mobile-responsive design
+- Quick access to transaction details
 
 ### State Management & Data Flow
 
@@ -1146,6 +1210,89 @@ Response:
   "total": 1,
   "page": 1,
   "limit": 20
+}
+```
+
+##### **NEW**: User Transaction History
+```http
+GET /users/{id}/transactions
+Authorization: Bearer {jwt_token}
+Query Parameters:
+  - page: int = 1
+  - limit: int = 10
+  - status: TransactionStatusEnum (optional)
+
+Response:
+{
+  "data": [
+    {
+      "id": 1,
+      "start_time": "2025-01-22T10:00:00Z",
+      "end_time": "2025-01-22T12:30:00Z",
+      "energy_consumed_kwh": 25.3,
+      "transaction_status": "COMPLETED",
+      "charger": {
+        "id": 1,
+        "charge_point_string_id": "CP001",
+        "name": "Fast Charger 1"
+      }
+    }
+  ],
+  "total": 15,
+  "page": 1,
+  "limit": 10
+}
+```
+
+##### **NEW**: User Wallet Transaction History
+```http
+GET /users/{id}/wallet-transactions
+Authorization: Bearer {jwt_token}
+Query Parameters:
+  - page: int = 1
+  - limit: int = 15
+
+Response:
+{
+  "data": [
+    {
+      "id": 1,
+      "amount": -25.30,
+      "type": "CHARGE_DEDUCT",
+      "description": "Charging session at CP001",
+      "payment_metadata": {"transaction_id": 123},
+      "created_at": "2025-01-22T12:30:00Z",
+      "running_balance": 124.70
+    },
+    {
+      "id": 2,
+      "amount": 150.00,
+      "type": "TOP_UP",
+      "description": "Wallet top-up",
+      "created_at": "2025-01-22T08:00:00Z",
+      "running_balance": 150.00
+    }
+  ],
+  "wallet_balance": 124.70,
+  "total": 2,
+  "page": 1,
+  "limit": 15
+}
+```
+
+##### **NEW**: Transaction Summary Statistics
+```http
+GET /users/{id}/transactions-summary
+Authorization: Bearer {jwt_token}
+
+Response:
+{
+  "total_transactions": 15,
+  "completed_transactions": 12,
+  "failed_transactions": 1,
+  "total_energy_kwh": 378.5,
+  "total_spent": 1892.50,
+  "currency": "INR"
 }
 ```
 
@@ -2627,6 +2774,114 @@ CORS_ORIGINS = [
 - **RPO (Recovery Point Objective)**: Maximum 1 hour data loss
 - **Monitoring**: Real-time alerting for critical service failures
 - **Communication**: Status page for user communication during outages
+
+---
+
+## Recent Changes & Updates
+
+### Latest Release - January 2025 (Branch: 39-feature---user-transaction-pages-zero-charged-transactions)
+
+#### New Features Implemented
+
+**1. Zero Charged Transaction Handling** (Commit: e3f6b38)
+- **Feature**: Graceful handling of transactions with 0 kWh energy consumption
+- **Implementation**:
+  - Modified `WalletService.process_transaction_billing()` to detect zero energy
+  - Returns success without wallet deduction
+  - Transaction status set to COMPLETED (not BILLING_FAILED)
+- **Use Case**: Handles test sessions, aborted charging, or diagnostic transactions
+- **Files Modified**: `backend/services/wallet_service.py`
+
+**2. User Transaction Pages** (Commit: e3f6b38)
+- **Admin Views**:
+  - `/admin/users/[id]/transactions` - Paginated charging transaction history
+  - `/admin/users/[id]/wallet` - Wallet transaction history with running balance
+- **Features**:
+  - Transaction status badges with color coding
+  - Energy consumption and duration display
+  - Running balance calculation for wallet transactions
+  - Pagination (10 charging transactions, 15 wallet transactions per page)
+  - Filter and search capabilities
+- **Files Added**:
+  - `frontend/app/admin/users/[id]/transactions/page.tsx`
+  - `frontend/app/admin/users/[id]/wallet/page.tsx`
+
+**3. My Sessions Page** (Commit: e3f6b38)
+- **User View**: `/my-sessions` - Combined charging and wallet activity
+- **Features**:
+  - Current wallet balance with 30-second auto-refresh
+  - Unified timeline of all user transactions
+  - Mobile-responsive design
+  - Quick access to transaction details
+- **Files Added**: `frontend/app/my-sessions/page.tsx`
+
+**4. Running Balance Calculation**
+- **Feature**: Real-time balance calculation for wallet transaction history
+- **Implementation**: Frontend calculates cumulative balance after each transaction
+- **Display**: Shows balance progression over time for better transparency
+
+#### Backend Improvements
+
+**1. WebSocket Connection Management** (Commits: b385b61, 9fe8f2f)
+- Enhanced debugging for WebSocket disconnections
+- Improved ghost session cleanup
+- Natural disconnect handling improvements
+- Connection state logging enhancements
+
+**2. Timing Adjustments** (Commit: c42f1fc)
+- Heartbeat timeout: 90 seconds (configurable)
+- Periodic cleanup: 5 minutes
+- Stale connection threshold: 90 seconds
+- Improved connection reliability
+
+**3. Energy Display Improvements** (Commit: 38816d3)
+- Fixed decimal precision in energy display (shows 0.01 kWh accuracy)
+- Chart downloadable functionality (CSV export)
+- Improved chart scales for readability
+- Better meter value visualization
+
+#### API Enhancements
+
+**New Endpoints Added**:
+```
+GET /users/{id}/transactions          # User charging transaction list
+GET /users/{id}/transactions-summary  # Transaction summary statistics
+GET /users/{id}/wallet-transactions   # Wallet transaction history
+GET /users/my-sessions                # Current user's all transactions
+```
+
+**Improved Endpoints**:
+- Enhanced transaction queries with better pagination
+- Wallet balance queries with running balance calculation
+- Transaction summary with energy and cost aggregations
+
+#### Frontend Improvements
+
+**1. TanStack Query Integration**
+- New query hooks for user transactions: `useUserTransactions()`
+- New query hooks for wallet transactions: `useUserWalletTransactions()`
+- Optimized caching strategies for transaction data
+- Auto-refresh intervals for real-time updates
+
+**2. Component Updates**
+- Transaction status badge component with color coding
+- Wallet transaction display with type indicators
+- Running balance display in transaction history
+- Mobile-responsive transaction tables
+
+### Recent Bug Fixes
+
+1. **Zero Energy Billing** - Fixed billing failures for 0 kWh transactions
+2. **Decimal Precision** - Fixed energy display to show proper decimal places
+3. **Chart Scaling** - Improved chart readability with better axis scaling
+4. **Connection Cleanup** - Fixed ghost session issues in WebSocket connections
+
+### Performance Improvements
+
+1. **Database Queries**: Optimized user transaction queries with proper indexing
+2. **Frontend Bundle**: Improved code splitting for user transaction pages
+3. **API Response Times**: Reduced response times for wallet transaction queries
+4. **Real-time Updates**: Implemented efficient polling strategies (30s for balance, 10s for active sessions)
 
 ---
 

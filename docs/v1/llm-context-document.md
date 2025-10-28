@@ -12,9 +12,14 @@ This document provides context for Large Language Models (LLMs) like Claude to u
 
 **Current Status**: Actively deployed on Render (backend) and Vercel (frontend) with Clerk authentication, handling real-world charging stations with WebSocket OCPP communication.
 
-**Key Capabilities**: 
+**Version**: 2.1 (January 2025)
+**Current Branch**: 39-feature---user-transaction-pages-zero-charged-transactions
+
+**Key Capabilities**:
 - Real-time OCPP 1.6 communication with charging stations
 - Complete transaction lifecycle management with automated billing
+- **NEW**: Zero energy transaction handling (no billing for 0 kWh sessions)
+- **NEW**: User transaction history pages with running balance
 - Role-based admin dashboard and user interfaces
 - Interactive station maps and QR code scanning for users
 - Remote charging control (start/stop, availability)
@@ -30,11 +35,12 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
           WebSocket /ocpp/     PostgreSQL + Redis          Clerk Authentication
 ```
 
-**Backend**: Python FastAPI with Tortoise ORM, Redis for connection state, Clerk JWT authentication  
-**Frontend**: Next.js 15 with TypeScript, TanStack Query for state, role-based UI (Admin/User)  
-**Database**: PostgreSQL with comprehensive schema for charging infrastructure  
-**Protocol**: OCPP 1.6 via WebSocket with full message support  
-**Authentication**: Clerk-powered JWT with role-based access control
+**Backend**: Python FastAPI 0.115.12 with Tortoise ORM 0.25.1, Redis for connection state, Clerk JWT authentication
+**Frontend**: Next.js 15.3.4 with TypeScript 5.x, React 19, TanStack Query 5.81.2 for state, role-based UI (Admin/User)
+**Database**: PostgreSQL with comprehensive schema for charging infrastructure
+**Protocol**: OCPP 1.6 via WebSocket with full message support
+**Authentication**: Clerk 6.29.0-powered JWT with role-based access control
+**Testing**: Pytest 8.3.4 with async support
 
 ---
 
@@ -56,20 +62,29 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
 
 ### Business Services (`/backend/services/`)
 - **`wallet_service.py`** - Billing calculations and automated payment processing
+  - **NEW**: Zero energy transaction handling (no billing for 0 kWh)
+  - Atomic transaction processing with SELECT FOR UPDATE
+  - Tariff-based billing calculation
 - **`billing_retry_service.py`** - Background service for failed transaction recovery
 
 ### Frontend Core (`/frontend/`)
 - **`app/page.tsx`** - Role-based dashboard (different for ADMIN vs USER)
 - **`app/admin/`** - Complete admin interface for station/charger/user management
-- **`app/stations/page.tsx`** - Interactive map with React Leaflet for station discovery
-- **`app/scanner/page.tsx`** - QR code scanner using ZXing library
+  - **`app/admin/users/[id]/transactions/page.tsx`** - **NEW** User charging transaction history
+  - **`app/admin/users/[id]/wallet/page.tsx`** - **NEW** Wallet transaction history with running balance
+- **`app/stations/page.tsx`** - Interactive map with React Leaflet 5.0.0 for station discovery
+- **`app/scanner/page.tsx`** - QR code scanner using ZXing 0.21.3
+- **`app/my-sessions/page.tsx`** - **NEW** Combined user sessions (charging + wallet)
 - **`middleware.ts`** - Route protection and role-based redirects
 - **`components/RoleWrapper.tsx`** - RBAC components (AdminOnly, UserOnly, AuthenticatedOnly)
+- **`components/MeterValuesChart.tsx`** - Energy visualization with Recharts 3.2.1
 
 ### API Integration (`/frontend/lib/`)
 - **`api-client.ts`** - Base HTTP client with automatic Clerk JWT injection
 - **`api-services.ts`** - Domain-specific services (stations, chargers, users, transactions)
 - **`queries/`** - TanStack Query hooks with optimized caching strategies
+  - **`users.ts`** - **NEW** User transaction and wallet query hooks
+- **`csv-export.ts`** - CSV export utility for transaction data
 
 ### Key Configuration
 - **`backend/requirements.txt`** - Python dependencies (FastAPI, python-ocpp, Tortoise ORM, etc.)
@@ -176,11 +191,11 @@ Stations:
 GET/POST /stations - List/create stations with geographic data
 GET/PUT/DELETE /stations/{id} - Individual station operations
 
-Chargers:  
+Chargers:
 GET/POST /chargers - List/create chargers with real-time connection status
 GET/PUT/DELETE /chargers/{id} - Individual charger operations
 POST /chargers/{id}/remote-start - Send RemoteStartTransaction OCPP command
-POST /chargers/{id}/remote-stop - Send RemoteStopTransaction OCPP command  
+POST /chargers/{id}/remote-stop - Send RemoteStopTransaction OCPP command
 POST /chargers/{id}/change-availability - Send ChangeAvailability OCPP command
 
 Transactions:
@@ -191,9 +206,21 @@ GET /transactions/{id}/meter-values - Energy consumption data with chart data
 
 ### User APIs
 ```
+GET /api/auth/me - Current user info from JWT
 GET /auth/profile - User profile with role information
-GET /users - List users (admin only) or current user profile
-GET /users/{id} - User details with transaction history and wallet info
+
+# Admin User Management
+GET /users - List users (admin only) with pagination
+GET /users/{id} - User profile details
+GET /users/{id}/transactions - **NEW** User charging transactions (paginated)
+GET /users/{id}/transactions-summary - **NEW** Transaction summary stats
+GET /users/{id}/wallet - User wallet balance
+GET /users/{id}/wallet-transactions - **NEW** Wallet transaction history with running balance
+POST /users/{id}/deactivate - Soft delete user
+
+# Current User APIs
+GET /users/my-wallet - Current user's wallet balance
+GET /users/my-sessions - **NEW** Current user's all transactions
 ```
 
 ### Legacy APIs (Backward Compatibility)
@@ -206,13 +233,37 @@ GET /api/logs/{charge_point_id} - Logs for specific charger
 
 ---
 
-## Current State & Recent Architecture
+## Current State & Recent Updates
 
-### Technology Stack Updates
-**Authentication**: Migrated from Supabase to Clerk for better JWT and role management
-**Database**: Using Tortoise ORM (async) with PostgreSQL and SSL in production
-**Frontend**: Next.js 15 with App Router, TypeScript, TanStack Query, Shadcn/ui
+### Latest Changes (January 2025)
+
+**Recent Features**:
+1. **Zero Charged Transaction Handling** - Gracefully handles 0 kWh transactions without billing errors
+2. **User Transaction Pages** - New admin views for user transaction and wallet history
+3. **My Sessions Page** - Combined user view of charging and wallet activity
+4. **Running Balance Display** - Shows balance progression in wallet history
+
+**Recent Bug Fixes**:
+- Fixed decimal precision in energy display (now shows 0.01 kWh accuracy)
+- Fixed chart scaling for better readability
+- Improved WebSocket connection cleanup (ghost session fixes)
+- Enhanced natural disconnect handling
+
+**Recent Commits** (Branch: 39-feature---user-transaction-pages-zero-charged-transactions):
+- e3f6b38: "wallet balance and zero charge transaction"
+- b385b61: "#36 investigation - websocket debug"
+- 9fe8f2f: "Debug code for natural web disconnect"
+- c42f1fc: "Changed timings" (heartbeat: 90s, cleanup: 5min)
+- 38816d3: "#29 bug - energy decimals, chart downloadable, scales readable"
+
+### Technology Stack
+**Authentication**: Clerk 6.29.0 for JWT and role management
+**Database**: Tortoise ORM 0.25.1 (async) with PostgreSQL and SSL in production
+**Frontend**: Next.js 15.3.4 with App Router, TypeScript 5.x, React 19, TanStack Query 5.81.2, Shadcn/ui
+**Backend**: FastAPI 0.115.12 with Uvicorn 0.34.3, Python-OCPP 2.0.0
 **Real-time**: Redis for connection state, TanStack Query polling for frontend updates
+**Charts**: Recharts 3.2.1 for energy visualization
+**Testing**: Pytest 8.3.4 with async support
 
 ### Current Production Deployment  
 - **Backend**: Render.com with environment variables for DB, Redis, Clerk credentials
@@ -221,16 +272,21 @@ GET /api/logs/{charge_point_id} - Logs for specific charger
 - **Monitoring**: Structured logging with correlation IDs, health check endpoints
 
 ### Known Working Features
-✅ Complete OCPP 1.6 message handling with all core messages  
-✅ Real-time charger status monitoring with Redis-backed connection tracking  
-✅ Transaction lifecycle management with automated billing and retry logic  
-✅ Remote start/stop charging with immediate OCPP command execution  
-✅ Availability control for chargers (Operative/Inoperative)  
-✅ Role-based admin dashboard with comprehensive management tools  
-✅ User-friendly interfaces with interactive maps and QR scanning  
-✅ Wallet system with automatic billing on transaction completion  
-✅ Connection state tracking with automatic cleanup of dead connections  
-✅ Comprehensive logging system for OCPP compliance and debugging  
+✅ Complete OCPP 1.6 message handling with all core messages
+✅ Real-time charger status monitoring with Redis-backed connection tracking
+✅ Transaction lifecycle management with automated billing and retry logic
+✅ **NEW**: Zero energy transaction handling (no billing for 0 kWh)
+✅ **NEW**: User transaction history pages with pagination and filtering
+✅ **NEW**: Wallet transaction history with running balance calculation
+✅ **NEW**: My Sessions page for unified user transaction view
+✅ Remote start/stop charging with immediate OCPP command execution
+✅ Availability control for chargers (Operative/Inoperative)
+✅ Role-based admin dashboard with comprehensive management tools
+✅ User-friendly interfaces with interactive maps (React Leaflet 5.0.0) and QR scanning (ZXing 0.21.3)
+✅ Wallet system with automatic billing on transaction completion
+✅ Connection state tracking with automatic cleanup of dead connections
+✅ Comprehensive logging system for OCPP compliance and debugging
+✅ Energy chart visualization with CSV export (Recharts 3.2.1)  
 
 ---
 
@@ -253,17 +309,21 @@ await redis_manager.add_connected_charger(charger_id, connection_data)
 is_connected = await redis_manager.is_charger_connected(charger_id)
 ```
 
-### Frontend Patterns  
+### Frontend Patterns
 ```typescript
 // TanStack Query for data fetching with role-based optimization
 const { data: chargers } = useChargers({ refetchInterval: 10000 }); // Admin real-time
 const { data: stations } = useStations({ staleTime: 2 * 60 * 1000 }); // User longer cache
 
+// NEW: User transaction queries with pagination
+const { data: transactions } = useUserTransactions(userId, { page: 1, limit: 10 });
+const { data: walletTxns } = useUserWalletTransactions(userId, { page: 1, limit: 15 });
+
 // Role-based component rendering
 const Dashboard = () => {
   const { user } = useUser();
   const isAdmin = user?.publicMetadata?.role === 'ADMIN';
-  
+
   return isAdmin ? <AdminDashboard /> : <UserDashboard />;
 };
 
@@ -336,10 +396,17 @@ pytest -m infrastructure # Database/Redis tests (~5 seconds) - external dependen
 ## Technical Debt & Known Issues
 
 ### Critical Issue: Boot Notification Transaction Handling
-**Location**: `backend/main.py:69-94`  
-**Problem**: BootNotification handler immediately fails all ongoing transactions with status FAILED  
-**Impact**: Users lose active charging sessions when chargers reboot  
-**Solution Required**: Implement transaction reconciliation with PENDING_RECONCILIATION status  
+**Location**: `backend/main.py:69-94`
+**Problem**: BootNotification handler immediately fails all ongoing transactions with status FAILED
+**Impact**: Users lose active charging sessions when chargers reboot
+**Solution Required**: Implement transaction reconciliation with PENDING_RECONCILIATION status
+**Status**: **Still open** - Requires implementation of reconciliation logic
+
+### Recently Fixed Issues
+✅ **Zero Energy Billing** - Fixed in commit e3f6b38 (now handles 0 kWh gracefully)
+✅ **Decimal Precision** - Fixed in commit 38816d3 (shows 0.01 kWh accuracy)
+✅ **Chart Scaling** - Fixed in commit 38816d3 (improved readability)
+✅ **Ghost Sessions** - Fixed in commits b385b61, 9fe8f2f (improved cleanup)  
 
 ### Performance Optimization Opportunities
 1. **N+1 Queries**: Some charger list operations could use bulk Redis operations
