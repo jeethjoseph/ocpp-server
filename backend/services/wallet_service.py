@@ -7,7 +7,7 @@ import logging
 
 from models import (
     Wallet, WalletTransaction, Transaction, Tariff, User,
-    TransactionTypeEnum, TransactionStatusEnum
+    TransactionTypeEnum, TransactionStatusEnum, PaymentStatusEnum
 )
 
 logger = logging.getLogger(__name__)
@@ -181,5 +181,104 @@ class WalletService:
         failed_transactions = await Transaction.filter(
             transaction_status=TransactionStatusEnum.BILLING_FAILED
         ).all()
-        
+
         return [{"id": t.id, "user_id": t.user_id, "energy_kwh": t.energy_consumed_kwh} for t in failed_transactions]
+
+    @staticmethod
+    @atomic()
+    async def process_wallet_topup(
+        wallet_transaction_id: int,
+        razorpay_payment_id: str,
+        razorpay_signature: str
+    ) -> Tuple[bool, str, Optional[Decimal]]:
+        """
+        Process wallet top-up after payment verification
+
+        Args:
+            wallet_transaction_id: ID of the pending wallet transaction
+            razorpay_payment_id: Payment ID from Razorpay
+            razorpay_signature: Signature from Razorpay
+
+        Returns:
+            (success: bool, message: str, new_balance: Optional[Decimal])
+        """
+        try:
+            # Get wallet transaction with lock
+            wallet_txn = await WalletTransaction.filter(
+                id=wallet_transaction_id
+            ).select_for_update().first()
+
+            if not wallet_txn:
+                return False, f"Wallet transaction {wallet_transaction_id} not found", None
+
+            # Check if already completed (idempotency)
+            current_status = wallet_txn.payment_metadata.get("status")
+            if current_status == PaymentStatusEnum.COMPLETED.value:
+                wallet = await wallet_txn.wallet
+                logger.info(f"Wallet transaction {wallet_transaction_id} already completed, returning current balance")
+                return True, "Payment already processed", wallet.balance
+
+            # Get wallet with lock
+            wallet = await Wallet.filter(id=wallet_txn.wallet_id).select_for_update().first()
+            if not wallet:
+                return False, "Wallet not found", None
+
+            # Get current balance (allowing None)
+            current_balance = wallet.balance or Decimal('0.00')
+            top_up_amount = wallet_txn.amount
+            new_balance = current_balance + top_up_amount
+
+            logger.info(
+                f"Processing wallet top-up: "
+                f"Transaction {wallet_transaction_id}, "
+                f"₹{current_balance} + ₹{top_up_amount} = ₹{new_balance}"
+            )
+
+            # Update wallet balance
+            await Wallet.filter(id=wallet.id).update(balance=new_balance)
+
+            # Update wallet transaction metadata
+            updated_metadata = wallet_txn.payment_metadata or {}
+            updated_metadata.update({
+                "status": PaymentStatusEnum.COMPLETED.value,
+                "razorpay_payment_id": razorpay_payment_id,
+                "razorpay_signature": razorpay_signature,
+                "completed_at": int(__import__('time').time()),
+                "previous_balance": float(current_balance),
+                "new_balance": float(new_balance)
+            })
+
+            await WalletTransaction.filter(id=wallet_transaction_id).update(
+                description=f"Wallet recharge - ₹{top_up_amount} (Completed)",
+                payment_metadata=updated_metadata
+            )
+
+            logger.info(
+                f"✅ Successfully processed wallet top-up: "
+                f"Transaction {wallet_transaction_id}, "
+                f"Amount ₹{top_up_amount}, "
+                f"New balance ₹{new_balance}"
+            )
+
+            return True, f"Successfully added ₹{top_up_amount} to wallet", new_balance
+
+        except Exception as e:
+            logger.error(
+                f"❌ Error processing wallet top-up for transaction {wallet_transaction_id}: {e}",
+                exc_info=True
+            )
+
+            # Mark transaction as failed
+            try:
+                wallet_txn = await WalletTransaction.get(id=wallet_transaction_id)
+                updated_metadata = wallet_txn.payment_metadata or {}
+                updated_metadata["status"] = PaymentStatusEnum.FAILED.value
+                updated_metadata["error"] = str(e)
+                await WalletTransaction.filter(id=wallet_transaction_id).update(
+                    description=f"Wallet recharge - ₹{wallet_txn.amount} (Failed)",
+                    payment_metadata=updated_metadata
+                )
+            except Exception as update_error:
+                logger.error(f"Failed to update transaction status: {update_error}")
+
+            return False, f"Top-up failed: {str(e)}", None

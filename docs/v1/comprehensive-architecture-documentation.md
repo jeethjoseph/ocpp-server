@@ -74,6 +74,7 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 | **OCPP Library** | python-ocpp | 2.0.0 | OCPP 1.6 protocol implementation |
 | **Database ORM** | Tortoise ORM | 0.25.1 | Async database operations with PostgreSQL |
 | **Authentication** | Clerk SDK | Latest | JWT validation and webhook handling |
+| **Payment Gateway** | Razorpay SDK | 2.0.0 | **NEW** - Payment processing for wallet recharge |
 | **Message Queue** | Redis | Latest | Connection state management and caching |
 | **WebSocket** | Native FastAPI | - | Real-time OCPP communication |
 | **Testing** | Pytest | 8.3.4 | Comprehensive test framework with async support |
@@ -91,6 +92,7 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 | **UI Library** | Shadcn/ui | Latest | Radix UI-based component system |
 | **State Management** | TanStack Query | 5.81.2 | Server state management and caching |
 | **Authentication** | Clerk React | 6.29.0 | Client-side authentication |
+| **Payment UI** | Razorpay Checkout.js | Latest (CDN) | **NEW** - Secure payment modal for wallet recharge |
 | **Maps** | React Leaflet | 5.0.0 | Interactive station location maps |
 | **QR Scanning** | ZXing | 0.21.3 | QR code scanning for charger access |
 | **Charts** | Recharts | 3.2.1 | Energy consumption visualization |
@@ -247,13 +249,15 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 - Transaction billing calculation based on energy consumption
 - Wallet balance validation and deduction
 - Automated retry mechanism for failed billing
-- Integration with payment gateways
+- Integration with payment gateways (Razorpay)
 - **NEW: Zero energy consumption handling** - No billing for 0 kWh transactions
+- Wallet top-up processing with idempotency checks
 
 **Methods**:
 - `process_transaction_billing()`: Main billing workflow with atomic database transactions
 - `calculate_billing_amount()`: Energy-based cost calculation (energy_kwh × rate_per_kwh)
 - `deduct_from_wallet()`: Secure balance deduction with SELECT FOR UPDATE locking
+- `process_wallet_topup()`: **NEW** - Handle wallet recharge from payment gateway
 
 **Billing Logic**:
 ```python
@@ -276,6 +280,59 @@ if energy_consumed_kwh == 0:
 - No wallet deduction for zero-energy sessions
 - Transaction status: COMPLETED (not BILLING_FAILED)
 - Handles test/aborted sessions without billing errors
+
+#### Razorpay Payment Service (`backend/services/razorpay_service.py`)
+**Purpose**: **NEW** - Razorpay payment gateway integration for wallet recharge
+
+**Key Features**:
+- Secure payment order creation
+- Payment signature verification (frontend callback)
+- Webhook signature verification (server-to-server)
+- Payment and order data fetching
+- Refund support (future enhancement)
+- Environment-based configuration (test/live mode)
+
+**Security Features**:
+- HMAC SHA256 signature verification
+- Constant-time comparison to prevent timing attacks
+- Raw payload validation for webhooks
+- Idempotent payment processing
+
+**Methods**:
+```python
+class RazorpayService:
+    def create_order(amount: Decimal, receipt: str, notes: Dict) -> Dict
+        """Create Razorpay order for wallet recharge"""
+
+    def verify_payment_signature(order_id, payment_id, signature) -> bool
+        """Verify payment authenticity using SDK"""
+
+    def verify_webhook_signature(payload: bytes, signature: str) -> bool
+        """Verify webhook events from Razorpay"""
+
+    def fetch_payment(payment_id: str) -> Optional[Dict]
+        """Get payment details for reconciliation"""
+```
+
+**Integration Points**:
+- `/api/wallet/create-recharge`: Create payment order
+- `/api/wallet/verify-payment`: Verify payment from frontend
+- `/webhooks/razorpay`: Handle payment webhooks (primary source of truth)
+
+**Payment Flow**:
+```
+User → Frontend Modal → Create Order → Razorpay Checkout → Payment
+                                                              ↓
+                                    ┌─────────────────────────┴──────────┐
+                                    ▼                                    ▼
+                          Frontend Verification                  Webhook Event
+                          (Immediate feedback)                (Primary verification)
+                                    │                                    │
+                                    └──────────→ Wallet Credit ←─────────┘
+                                              (Idempotent processing)
+```
+
+**Documentation**: See `/backend/docs/RAZORPAY_IMPLEMENTATION.md` for comprehensive details
 
 ### Infrastructure Components
 
@@ -449,6 +506,7 @@ frontend/
 **Purpose**: Combined view of user's charging and wallet activity
 **Features**:
 - Current wallet balance display with auto-refresh
+- **NEW**: Wallet recharge button with Razorpay integration
 - Dual-tab or unified timeline view:
   - **Charging Sessions**: All charging transactions with duration, energy, and charger info
   - **Wallet Transactions**: All wallet activity with amounts and descriptions
@@ -456,6 +514,44 @@ frontend/
 - Transaction status indicators
 - Mobile-responsive design
 - Quick access to transaction details
+
+##### **NEW**: Wallet Recharge Modal (`components/WalletRechargeModal.tsx`)
+**Purpose**: Secure wallet recharge interface with Razorpay payment integration
+**Technology**: Razorpay Checkout.js loaded dynamically from CDN
+
+**Features**:
+- Amount input with validation (₹1 - ₹1,00,000)
+- Quick amount buttons (₹100, ₹200, ₹500, ₹1000)
+- Real-time amount validation (decimal support, positive values only)
+- Razorpay Checkout modal integration
+- Payment status feedback with toast notifications
+- Automatic wallet balance refresh on success
+- Loading states during payment processing
+- Error handling for failed payments
+
+**Payment Flow**:
+```typescript
+1. User enters amount → Validation
+2. Click "Recharge" → Create order on backend
+3. Load Razorpay script (if not loaded)
+4. Open Razorpay Checkout modal
+5. User completes payment → Razorpay callback
+6. Verify payment on backend → Update wallet
+7. Show success toast → Refresh balance
+```
+
+**Security**:
+- Order creation on secure backend
+- Payment signature verification
+- Webhook backup for reliability
+- No payment credentials stored on frontend
+
+**User Experience**:
+- Seamless payment modal integration
+- Instant balance updates on success
+- Clear error messages on failure
+- Mobile-responsive design
+- Accessibility features (keyboard navigation, ARIA labels)
 
 ### State Management & Data Flow
 

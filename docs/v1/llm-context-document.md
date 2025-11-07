@@ -20,6 +20,7 @@ This document provides context for Large Language Models (LLMs) like Claude to u
 - Complete transaction lifecycle management with automated billing
 - **NEW**: Zero energy transaction handling (no billing for 0 kWh sessions)
 - **NEW**: User transaction history pages with running balance
+- **NEW**: Razorpay payment gateway integration for wallet recharge
 - Role-based admin dashboard and user interfaces
 - Interactive station maps and QR code scanning for users
 - Remote charging control (start/stop, availability)
@@ -58,14 +59,21 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
 - **`chargers.py`** - OCPP charger management with remote commands (`/api/admin/chargers/*`)
 - **`transactions.py`** - Transaction tracking with meter values (`/api/admin/transactions/*`)
 - **`users.py`** - User management with wallet operations (`/users/*`)
-- **`webhooks.py`** - Clerk webhook processing for user lifecycle (`/webhooks/*`)
+- **`webhooks.py`** - Clerk webhook processing for user lifecycle (`/webhooks/clerk`) + **NEW**: Razorpay webhook handler (`/webhooks/razorpay`)
+- **`wallet_payments.py`** - **NEW**: Razorpay payment integration for wallet recharge (`/api/wallet/*`)
 
 ### Business Services (`/backend/services/`)
 - **`wallet_service.py`** - Billing calculations and automated payment processing
   - **NEW**: Zero energy transaction handling (no billing for 0 kWh)
+  - **NEW**: Wallet top-up processing with idempotency (`process_wallet_topup()`)
   - Atomic transaction processing with SELECT FOR UPDATE
   - Tariff-based billing calculation
 - **`billing_retry_service.py`** - Background service for failed transaction recovery
+- **`razorpay_service.py`** - **NEW**: Razorpay payment gateway integration
+  - Order creation and payment verification
+  - Webhook signature verification
+  - HMAC SHA256 security
+  - Test/Live mode support
 
 ### Frontend Core (`/frontend/`)
 - **`app/page.tsx`** - Role-based dashboard (different for ADMIN vs USER)
@@ -74,14 +82,20 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
   - **`app/admin/users/[id]/wallet/page.tsx`** - **NEW** Wallet transaction history with running balance
 - **`app/stations/page.tsx`** - Interactive map with React Leaflet 5.0.0 for station discovery
 - **`app/scanner/page.tsx`** - QR code scanner using ZXing 0.21.3
-- **`app/my-sessions/page.tsx`** - **NEW** Combined user sessions (charging + wallet)
+- **`app/my-sessions/page.tsx`** - **NEW** Combined user sessions (charging + wallet) with recharge button
 - **`middleware.ts`** - Route protection and role-based redirects
 - **`components/RoleWrapper.tsx`** - RBAC components (AdminOnly, UserOnly, AuthenticatedOnly)
 - **`components/MeterValuesChart.tsx`** - Energy visualization with Recharts 3.2.1
+- **`components/WalletRechargeModal.tsx`** - **NEW** Razorpay payment integration for wallet recharge
 
 ### API Integration (`/frontend/lib/`)
 - **`api-client.ts`** - Base HTTP client with automatic Clerk JWT injection
-- **`api-services.ts`** - Domain-specific services (stations, chargers, users, transactions)
+- **`api-services.ts`** - Domain-specific services (stations, chargers, users, transactions, **wallet payments**)
+  - **`walletPaymentService`** - **NEW** Razorpay payment API methods
+    - `createRechargeOrder()` - Create payment order
+    - `verifyPayment()` - Verify payment completion
+    - `getPaymentStatus()` - Check payment status
+    - `getRechargeHistory()` - Get recharge history
 - **`queries/`** - TanStack Query hooks with optimized caching strategies
   - **`users.ts`** - **NEW** User transaction and wallet query hooks
 - **`csv-export.ts`** - CSV export utility for transaction data
@@ -223,6 +237,30 @@ GET /users/my-wallet - Current user's wallet balance
 GET /users/my-sessions - **NEW** Current user's all transactions
 ```
 
+### **NEW**: Wallet Payment APIs (`/api/wallet/`)
+```
+POST /wallet/create-recharge - Create Razorpay order for wallet recharge
+  Request: { "amount": 500.00 }
+  Response: { "order_id", "amount", "currency", "key_id", "wallet_transaction_id" }
+
+POST /wallet/verify-payment - Verify payment from frontend callback
+  Request: { "razorpay_order_id", "razorpay_payment_id", "razorpay_signature" }
+  Response: { "success", "message", "wallet_balance", "transaction_id" }
+
+GET /wallet/payment-status/{transaction_id} - Get payment transaction status
+  Response: { "transaction_id", "amount", "status", "razorpay_order_id", ... }
+
+GET /wallet/recharge-history - Get user's wallet recharge history
+  Response: { "data": [...transactions], "total": N }
+```
+
+### Webhook APIs (`/webhooks/`)
+```
+POST /webhooks/clerk - Clerk user lifecycle events (signature verified)
+POST /webhooks/razorpay - **NEW** Razorpay payment events (signature verified)
+  Events: payment.captured, payment.failed, order.paid
+```
+
 ### Legacy APIs (Backward Compatibility)
 ```
 GET /api/charge-points - Connected charger list
@@ -238,10 +276,15 @@ GET /api/logs/{charge_point_id} - Logs for specific charger
 ### Latest Changes (January 2025)
 
 **Recent Features**:
-1. **Zero Charged Transaction Handling** - Gracefully handles 0 kWh transactions without billing errors
-2. **User Transaction Pages** - New admin views for user transaction and wallet history
-3. **My Sessions Page** - Combined user view of charging and wallet activity
-4. **Running Balance Display** - Shows balance progression in wallet history
+1. **Razorpay Payment Integration** - Secure wallet recharge with payment gateway integration
+   - Dual verification (frontend callback + webhook)
+   - Idempotent payment processing
+   - HMAC SHA256 signature verification
+   - Test/Live mode support
+2. **Zero Charged Transaction Handling** - Gracefully handles 0 kWh transactions without billing errors
+3. **User Transaction Pages** - New admin views for user transaction and wallet history
+4. **My Sessions Page** - Combined user view of charging and wallet activity with recharge button
+5. **Running Balance Display** - Shows balance progression in wallet history
 
 **Recent Bug Fixes**:
 - Fixed decimal precision in energy display (now shows 0.01 kWh accuracy)
@@ -258,6 +301,7 @@ GET /api/logs/{charge_point_id} - Logs for specific charger
 
 ### Technology Stack
 **Authentication**: Clerk 6.29.0 for JWT and role management
+**Payment Gateway**: Razorpay SDK 2.0.0 for wallet recharge (backend) + Razorpay Checkout.js (frontend)
 **Database**: Tortoise ORM 0.25.1 (async) with PostgreSQL and SSL in production
 **Frontend**: Next.js 15.3.4 with App Router, TypeScript 5.x, React 19, TanStack Query 5.81.2, Shadcn/ui
 **Backend**: FastAPI 0.115.12 with Uvicorn 0.34.3, Python-OCPP 2.0.0
@@ -275,10 +319,15 @@ GET /api/logs/{charge_point_id} - Logs for specific charger
 ✅ Complete OCPP 1.6 message handling with all core messages
 ✅ Real-time charger status monitoring with Redis-backed connection tracking
 ✅ Transaction lifecycle management with automated billing and retry logic
+✅ **NEW**: Razorpay payment integration for wallet recharge
+  - Secure order creation and payment verification
+  - Webhook integration for reliability
+  - Idempotent processing to prevent double-crediting
+  - Complete payment history tracking
 ✅ **NEW**: Zero energy transaction handling (no billing for 0 kWh)
 ✅ **NEW**: User transaction history pages with pagination and filtering
 ✅ **NEW**: Wallet transaction history with running balance calculation
-✅ **NEW**: My Sessions page for unified user transaction view
+✅ **NEW**: My Sessions page for unified user transaction view with recharge capability
 ✅ Remote start/stop charging with immediate OCPP command execution
 ✅ Availability control for chargers (Operative/Inoperative)
 ✅ Role-based admin dashboard with comprehensive management tools
