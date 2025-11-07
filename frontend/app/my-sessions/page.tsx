@@ -15,9 +15,11 @@ import {
   Battery,
   RefreshCw,
   Wallet,
-  Info
+  Info,
+  Plus
 } from "lucide-react";
 import { api } from "@/lib/api-client";
+import { WalletRechargeModal } from "@/components/WalletRechargeModal";
 
 interface WalletTransactionDetail {
   id: number;
@@ -69,6 +71,7 @@ const getSessionService = {
 export default function MySessionsPage() {
   const [page, setPage] = useState(1);
   const limit = 20;
+  const [showRechargeModal, setShowRechargeModal] = useState(false);
 
   const { data: sessionsData, isLoading, error, refetch } = useQuery({
     queryKey: ["my-sessions", page],
@@ -106,11 +109,16 @@ export default function MySessionsPage() {
 
   const getTransactionTypeColor = (type: string) => {
     switch (type?.toLowerCase()) {
-      case 'topup': return 'bg-green-100 text-green-800';
-      case 'charge': return 'bg-red-100 text-red-800';
-      case 'charge_deduct': return 'bg-red-100 text-red-800';
-      case 'refund': return 'bg-orange-100 text-orange-800';
-      default: return 'bg-gray-100 text-gray-800';
+      case 'top_up':
+      case 'topup':
+        return 'bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400';
+      case 'charge':
+      case 'charge_deduct':
+        return 'bg-red-100 text-red-800 dark:bg-red-900/20 dark:text-red-400';
+      case 'refund':
+        return 'bg-orange-100 text-orange-800 dark:bg-orange-900/20 dark:text-orange-400';
+      default:
+        return 'bg-gray-100 text-gray-800 dark:bg-gray-900/20 dark:text-gray-400';
     }
   };
 
@@ -169,9 +177,27 @@ export default function MySessionsPage() {
                 </p>
               </div>
             </div>
+            <Button
+              onClick={() => setShowRechargeModal(true)}
+              size="lg"
+              className="bg-green-600 hover:bg-green-700"
+            >
+              <Plus className="h-5 w-5 mr-2" />
+              Recharge Wallet
+            </Button>
           </div>
         </CardContent>
       </Card>
+
+      {/* Recharge Modal */}
+      <WalletRechargeModal
+        open={showRechargeModal}
+        onOpenChange={setShowRechargeModal}
+        onSuccess={() => {
+          refetchWallet();
+          refetch();
+        }}
+      />
 
       {transactions.length === 0 ? (
         <Card>
@@ -266,42 +292,59 @@ export default function MySessionsPage() {
                   <div className="flex items-start justify-between">
                     <div className="flex items-start space-x-4">
                       <div className={`p-2 rounded-lg ${
-                        transaction.transaction_type === 'TOPUP' ? 'bg-green-100' : 'bg-red-100'
+                        transaction.transaction_type === 'TOP_UP' ? 'bg-green-100 dark:bg-green-900/20' : 'bg-red-100 dark:bg-red-900/20'
                       }`}>
-                        {transaction.transaction_type === 'TOPUP' ? (
-                          <ArrowUpCircle className="h-5 w-5 text-green-600" />
+                        {transaction.transaction_type === 'TOP_UP' ? (
+                          <ArrowUpCircle className="h-5 w-5 text-green-600 dark:text-green-400" />
                         ) : (
-                          <ArrowDownCircle className="h-5 w-5 text-red-600" />
+                          <ArrowDownCircle className="h-5 w-5 text-red-600 dark:text-red-400" />
                         )}
                       </div>
                       <div className="flex-1">
                         <div className="flex items-center space-x-2 mb-1">
                           <h3 className="font-medium text-foreground">
-                            {transaction.transaction_type === 'TOPUP' ? 'Wallet Top-up' : 'Charging Payment'}
+                            {transaction.transaction_type === 'TOP_UP' ? 'Wallet Recharge' : 'Charging Payment'}
                           </h3>
                           <Badge className={getTransactionTypeColor(transaction.transaction_type || '')}>
-                            {transaction.transaction_type === 'CHARGE_DEDUCT' ? 'CHARGE' : transaction.transaction_type}
+                            {transaction.transaction_type === 'TOP_UP' ? 'RECHARGE' :
+                             transaction.transaction_type === 'CHARGE_DEDUCT' ? 'DEDUCTED' :
+                             transaction.transaction_type}
                           </Badge>
                         </div>
-                        
+
                         <div className="space-y-1 text-sm text-muted-foreground">
                           {transaction.description && (
                             <p>{transaction.description}</p>
                           )}
-                          {transaction.payment_metadata && transaction.payment_metadata.payment_id && transaction.payment_metadata.payment_id !== 'N/A' && (
-                            <div className="text-xs text-muted-foreground">
-                              Payment ID: {transaction.payment_metadata.payment_id}
-                            </div>
+                          {transaction.payment_metadata && (
+                            <>
+                              {transaction.payment_metadata.razorpay_payment_id && (
+                                <div className="text-xs text-muted-foreground">
+                                  Payment ID: {transaction.payment_metadata.razorpay_payment_id}
+                                </div>
+                              )}
+                              {transaction.payment_metadata.status && (
+                                <div className="text-xs">
+                                  <Badge variant="outline" className={
+                                    transaction.payment_metadata.status === 'COMPLETED' ? 'bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400' :
+                                    transaction.payment_metadata.status === 'PENDING' ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-400' :
+                                    'bg-gray-100 text-gray-800 dark:bg-gray-900/20 dark:text-gray-400'
+                                  }>
+                                    {transaction.payment_metadata.status}
+                                  </Badge>
+                                </div>
+                              )}
+                            </>
                           )}
                         </div>
                       </div>
                     </div>
-                    
+
                     <div className="text-right">
                       <div className={`text-lg font-semibold ${
-                        transaction.transaction_type === 'TOPUP' ? 'text-green-400' : 'text-red-400'
+                        transaction.transaction_type === 'TOP_UP' ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'
                       }`}>
-                        {transaction.transaction_type === 'TOPUP' ? '+' : ''}
+                        {transaction.transaction_type === 'TOP_UP' ? '+' : '-'}
                         {formatCurrency(Math.abs(transaction.amount || 0))}
                       </div>
                       <div className="text-xs text-muted-foreground">

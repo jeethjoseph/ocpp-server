@@ -238,3 +238,51 @@ export interface UserWalletTransactionsResponse {
   limit: number;
   total_pages: number;
 }
+
+// Wallet Payment Types
+export interface CreateRechargeRequest {
+  amount: number;
+}
+
+export interface CreateRechargeResponse {
+  order_id: string;
+  amount: number;
+  currency: string;
+  key_id: string;
+  wallet_transaction_id: number;
+}
+
+export interface VerifyPaymentRequest {
+  razorpay_order_id: string;
+  razorpay_payment_id: string;
+  razorpay_signature: string;
+}
+
+export interface VerifyPaymentResponse {
+  success: boolean;
+  message: string;
+  wallet_balance: number;
+  transaction_id: number;
+}
+
+export interface PaymentStatusResponse {
+  transaction_id: number;
+  amount: number;
+  status: string;
+  razorpay_order_id?: string;
+  razorpay_payment_id?: string;
+  created_at: string;
+}
+
+export interface RechargeHistoryResponse {
+  data: Array<{
+    id: number;
+    amount: number;
+    status: string;
+    razorpay_order_id?: string;
+    razorpay_payment_id?: string;
+    description?: string;
+    created_at: string;
+  }>;
+  total: number;
+}

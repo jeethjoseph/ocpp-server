@@ -258,3 +258,40 @@ export const logService = {
   getChargerLogSummary: (chargePointId: string) =>
     api.get<LogSummary>(`/api/admin/logs/charger/${chargePointId}/summary`),
 };
+
+// Wallet Payment Service
+export const walletPaymentService = {
+  /**
+   * Create a Razorpay order for wallet recharge
+   */
+  createRechargeOrder: (amount: number) =>
+    api.post<import("@/types/api").CreateRechargeResponse>(
+      "/api/wallet/create-recharge",
+      { amount }
+    ),
+
+  /**
+   * Verify payment after Razorpay checkout completion
+   */
+  verifyPayment: (paymentDetails: import("@/types/api").VerifyPaymentRequest) =>
+    api.post<import("@/types/api").VerifyPaymentResponse>(
+      "/api/wallet/verify-payment",
+      paymentDetails
+    ),
+
+  /**
+   * Get payment status by transaction ID
+   */
+  getPaymentStatus: (transactionId: number) =>
+    api.get<import("@/types/api").PaymentStatusResponse>(
+      `/api/wallet/payment-status/${transactionId}`
+    ),
+
+  /**
+   * Get user's recharge history
+   */
+  getRechargeHistory: () =>
+    api.get<import("@/types/api").RechargeHistoryResponse>(
+      "/api/wallet/recharge-history"
+    ),
+};

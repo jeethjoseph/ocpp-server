@@ -9,6 +9,12 @@ class TransactionTypeEnum(str, enum.Enum):
     TOP_UP = "TOP_UP"
     CHARGE_DEDUCT = "CHARGE_DEDUCT"
 
+class PaymentStatusEnum(str, enum.Enum):
+    PENDING = "PENDING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    REFUNDED = "REFUNDED"
+
 class ChargerStatusEnum(str, enum.Enum):
     AVAILABLE = "Available"
     PREPARING = "Preparing"
