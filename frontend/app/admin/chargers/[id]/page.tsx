@@ -5,10 +5,26 @@ import { useEffect, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Zap, Play, Square, Activity, Clock, MapPin, X, CreditCard } from "lucide-react";
+import { Zap, Play, Square, Activity, Clock, MapPin, X, CreditCard, Download } from "lucide-react";
 import { AdminOnly } from "@/components/RoleWrapper";
 import ChargerLogs from "@/components/ChargerLogs";
 import MeterValuesChart from "@/components/MeterValuesChart";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   useCharger,
   useRemoteStart,
@@ -18,6 +34,11 @@ import {
   useAdminTransaction,
   useAdminTransactionMeterValues,
 } from "@/lib/queries/transactions";
+import {
+  useFirmwareFiles,
+  useTriggerUpdate,
+  useFirmwareHistory,
+} from "@/lib/queries/firmware";
 
 // Transaction data comes exclusively from transaction API
 
@@ -30,6 +51,10 @@ export default function ChargerDetailPage() {
     null
   );
 
+  // Firmware update dialog state
+  const [showFirmwareDialog, setShowFirmwareDialog] = useState(false);
+  const [selectedFirmwareId, setSelectedFirmwareId] = useState<string>("");
+
   // TanStack Query hooks
   const {
     data: chargerData,
@@ -38,6 +63,11 @@ export default function ChargerDetailPage() {
   } = useCharger(chargerId);
   const remoteStartMutation = useRemoteStart();
   const remoteStopMutation = useRemoteStop();
+
+  // Firmware queries
+  const { data: firmwareData } = useFirmwareFiles({ is_active: true });
+  const { data: firmwareHistoryData } = useFirmwareHistory(chargerId);
+  const triggerUpdateMutation = useTriggerUpdate();
 
   // Extract data from charger query
   const charger = chargerData?.charger;
@@ -90,10 +120,22 @@ export default function ChargerDetailPage() {
 
   const handleRemoteStop = () => {
     if (!charger || !currentTransactionId) return;
-    remoteStopMutation.mutate({ 
+    remoteStopMutation.mutate({
       id: chargerId,
       reason: "Remote"
     });
+  };
+
+  const handleFirmwareUpdate = async () => {
+    if (!selectedFirmwareId) return;
+
+    await triggerUpdateMutation.mutateAsync({
+      chargerId: chargerId,
+      firmwareFileId: parseInt(selectedFirmwareId),
+    });
+
+    setShowFirmwareDialog(false);
+    setSelectedFirmwareId("");
   };
 
   const getStatusColor = (status: string) => {
@@ -194,7 +236,7 @@ export default function ChargerDetailPage() {
         </div>
 
         {/* Status and Controls */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
           {/* Status Card */}
           <Card>
             <CardHeader>
@@ -274,7 +316,124 @@ export default function ChargerDetailPage() {
               </div>
             </CardContent>
           </Card>
+
+          {/* Firmware Update Card */}
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Download className="h-5 w-5" />
+                Firmware Update
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="space-y-2">
+                <div className="flex justify-between items-center">
+                  <span className="text-sm font-medium">Current Version:</span>
+                  <Badge variant="outline">
+                    {charger.firmware_version || "Unknown"}
+                  </Badge>
+                </div>
+              </div>
+
+              <Button
+                onClick={() => setShowFirmwareDialog(true)}
+                disabled={!charger.connection_status}
+                className="w-full"
+                variant="secondary">
+                <Download className="h-4 w-4 mr-2" />
+                Update Firmware
+              </Button>
+
+              {!charger.connection_status && (
+                <p className="text-sm text-muted-foreground text-center">
+                  Charger must be online to update
+                </p>
+              )}
+
+              {/* Recent Update History */}
+              {firmwareHistoryData && firmwareHistoryData.data.length > 0 && (
+                <div className="mt-4 pt-4 border-t">
+                  <p className="text-sm font-medium mb-2">Recent Updates:</p>
+                  <div className="space-y-2">
+                    {firmwareHistoryData.data.slice(0, 3).map((update) => (
+                      <div key={update.id} className="text-xs">
+                        <Badge
+                          variant={
+                            update.status === "INSTALLED"
+                              ? "outline"
+                              : update.status.includes("FAILED")
+                              ? "destructive"
+                              : "default"
+                          }
+                          className="text-xs">
+                          {update.status}
+                        </Badge>
+                        <span className="ml-2 text-muted-foreground">
+                          {new Date(update.initiated_at).toLocaleDateString()}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </CardContent>
+          </Card>
         </div>
+
+        {/* Firmware Update Dialog */}
+        <Dialog open={showFirmwareDialog} onOpenChange={setShowFirmwareDialog}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Update Firmware</DialogTitle>
+              <DialogDescription>
+                Select a firmware version to install on {charger.name}
+              </DialogDescription>
+            </DialogHeader>
+
+            <div className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="firmware-select">Firmware Version</Label>
+                <Select value={selectedFirmwareId} onValueChange={setSelectedFirmwareId}>
+                  <SelectTrigger id="firmware-select">
+                    <SelectValue placeholder="Select firmware version" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {firmwareData?.data.map((firmware) => (
+                      <SelectItem key={firmware.id} value={firmware.id.toString()}>
+                        {firmware.version} - {firmware.filename}
+                        {firmware.version === charger.firmware_version && " (Current)"}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="bg-yellow-50 dark:bg-yellow-900/20 p-3 rounded-lg text-sm">
+                <p className="font-medium mb-1">Safety Checks:</p>
+                <ul className="list-disc list-inside space-y-1 text-muted-foreground">
+                  <li>Charger must be online</li>
+                  <li>No active charging session</li>
+                  <li>Update will be sent immediately via OCPP</li>
+                </ul>
+              </div>
+            </div>
+
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setShowFirmwareDialog(false)}>
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                onClick={handleFirmwareUpdate}
+                disabled={!selectedFirmwareId || triggerUpdateMutation.isPending}>
+                {triggerUpdateMutation.isPending ? "Sending..." : "Update Firmware"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
 
         {/* Current Transaction */}
         {transaction && (

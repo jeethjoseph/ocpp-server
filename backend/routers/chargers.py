@@ -40,12 +40,13 @@ class ChargerResponse(BaseModel):
     model: Optional[str]
     vendor: Optional[str]
     serial_number: Optional[str]
+    firmware_version: Optional[str]
     latest_status: str
     last_heart_beat_time: Optional[datetime]
     connection_status: bool
     created_at: datetime
     updated_at: datetime
-    
+
     class Config:
         from_attributes = True
 
@@ -152,6 +153,7 @@ def charger_to_response(charger: Charger, connection_status: bool) -> ChargerRes
         model=charger.model,
         vendor=charger.vendor,
         serial_number=charger.serial_number,
+        firmware_version=charger.firmware_version,
         latest_status=charger.latest_status,
         last_heart_beat_time=charger.last_heart_beat_time,
         created_at=charger.created_at,

@@ -19,6 +19,7 @@ const adminNavigation = [
   { name: 'Admin Dashboard', href: '/admin' },
   { name: 'Stations', href: '/admin/stations' },
   { name: 'Chargers', href: '/admin/chargers' },
+  { name: 'Firmware', href: '/admin/firmware' },
   { name: 'Users', href: '/admin/users' },
 ];
 

@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useMemo } from "react";
+import React, { useMemo, useState } from "react";
 import {
   LineChart,
   Line,
@@ -12,7 +12,8 @@ import {
   ResponsiveContainer,
 } from "recharts";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Activity } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Activity, ChevronLeft, ChevronRight, Zap, Gauge, Power, Battery } from "lucide-react";
 import { MeterValue } from "@/types/api";
 
 interface MeterValuesChartProps {
@@ -20,9 +21,50 @@ interface MeterValuesChartProps {
   transactionId?: number;
 }
 
+type ChartView = 'energy' | 'current' | 'voltage' | 'power';
 
+const CHART_CONFIGS = {
+  energy: {
+    title: 'Energy Consumption',
+    icon: Battery,
+    dataKey: 'reading_kwh',
+    color: '#3b82f6',
+    unit: 'kWh',
+    label: 'Energy (kWh)',
+    description: 'Total energy consumed over time',
+  },
+  current: {
+    title: 'Current',
+    icon: Zap,
+    dataKey: 'current',
+    color: '#10b981',
+    unit: 'A',
+    label: 'Current (A)',
+    description: 'Electrical current flowing through the charger',
+  },
+  voltage: {
+    title: 'Voltage',
+    icon: Gauge,
+    dataKey: 'voltage',
+    color: '#f59e0b',
+    unit: 'V',
+    label: 'Voltage (V)',
+    description: 'Supply voltage level',
+  },
+  power: {
+    title: 'Power',
+    icon: Power,
+    dataKey: 'power_kw',
+    color: '#ef4444',
+    unit: 'kW',
+    label: 'Power (kW)',
+    description: 'Instantaneous power consumption',
+  },
+};
 
 export default function MeterValuesChart({ meterValues, transactionId }: MeterValuesChartProps) {
+  const [currentView, setCurrentView] = useState<ChartView>('energy');
+
   const chartData = useMemo(() => {
     if (!meterValues || meterValues.length === 0) return [];
 
@@ -54,34 +96,60 @@ export default function MeterValuesChart({ meterValues, transactionId }: MeterVa
         current: mv.current,
         voltage: mv.voltage,
         power_kw: mv.power_kw,
-        energy_delta: energy_delta > 0 ? energy_delta : undefined, // Only show positive deltas
+        energy_delta: energy_delta > 0 ? energy_delta : undefined,
       };
     });
   }, [meterValues]);
 
+  // Check which metrics have data
+  const availableMetrics = useMemo(() => {
+    return {
+      energy: chartData.length > 0,
+      current: chartData.some(d => d.current !== null && d.current !== undefined),
+      voltage: chartData.some(d => d.voltage !== null && d.voltage !== undefined),
+      power: chartData.some(d => d.power_kw !== null && d.power_kw !== undefined),
+    };
+  }, [chartData]);
+
+  const currentConfig = CHART_CONFIGS[currentView];
+  const Icon = currentConfig.icon;
+
+  // Get ordered views that have data
+  const viewOrder: ChartView[] = ['energy', 'current', 'voltage', 'power'];
+  const availableViews = viewOrder.filter(view => availableMetrics[view]);
+
+  const currentIndex = availableViews.indexOf(currentView);
+
+  const goToPrevious = () => {
+    const newIndex = currentIndex > 0 ? currentIndex - 1 : availableViews.length - 1;
+    setCurrentView(availableViews[newIndex]);
+  };
+
+  const goToNext = () => {
+    const newIndex = currentIndex < availableViews.length - 1 ? currentIndex + 1 : 0;
+    setCurrentView(availableViews[newIndex]);
+  };
+
   // Custom tooltip formatter
   //eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const formatTooltipValue = (value: any, name: string) => {
-    if (value === null || value === undefined) return ['--', name];
+  const formatTooltipValue = (value: any) => {
+    if (value === null || value === undefined) return '--';
 
-    switch (name) {
-      case 'reading_kwh':
-        return [`${Number(value).toFixed(3)} kWh`, 'Energy Reading'];
+    switch (currentView) {
+      case 'energy':
+        return `${Number(value).toFixed(3)} kWh`;
       case 'current':
-        return [`${Number(value).toFixed(1)} A`, 'Current'];
+        return `${Number(value).toFixed(1)} A`;
       case 'voltage':
-        return [`${Number(value).toFixed(1)} V`, 'Voltage'];
-      case 'power_kw':
-        return [`${Number(value).toFixed(2)} kW`, 'Power'];
-      case 'energy_delta':
-        return [`+${Number(value).toFixed(3)} kWh`, 'Energy Consumed'];
+        return `${Number(value).toFixed(1)} V`;
+      case 'power':
+        return `${Number(value).toFixed(2)} kW`;
       default:
-        return [value, name];
+        return value;
     }
   };
 
   const formatTooltipLabel = (label: string) => {
-    // The label comes from timeDisplay, not timestamp, so we need to find the actual timestamp
     const dataPoint = chartData.find(d => d.timeDisplay === label);
     if (!dataPoint) return label;
 
@@ -98,6 +166,25 @@ export default function MeterValuesChart({ meterValues, transactionId }: MeterVa
       second: '2-digit'
     });
   };
+
+  // Calculate statistics for current view
+  const stats = useMemo(() => {
+    if (chartData.length === 0) return null;
+
+    const dataKey = currentConfig.dataKey as keyof typeof chartData[0];
+    const values = chartData
+      .map(d => d[dataKey])
+      .filter(v => v !== null && v !== undefined) as number[];
+
+    if (values.length === 0) return null;
+
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const avg = values.reduce((sum, v) => sum + v, 0) / values.length;
+    const latest = values[values.length - 1];
+
+    return { min, max, avg, latest };
+  }, [chartData, currentConfig.dataKey]);
 
   if (!chartData || chartData.length === 0) {
     return (
@@ -120,19 +207,93 @@ export default function MeterValuesChart({ meterValues, transactionId }: MeterVa
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Activity className="w-5 h-5" />
-          Meter Values Chart
-          {transactionId && (
-            <span className="text-sm font-normal text-muted-foreground">
-              (Transaction #{transactionId})
-            </span>
-          )}
-        </CardTitle>
-        <p className="text-sm text-muted-foreground">
-          Real-time meter readings showing energy consumption, current, voltage, and power over time
-        </p>
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Icon className="w-5 h-5" />
+            <div>
+              <CardTitle className="flex items-center gap-2">
+                {currentConfig.title}
+                {transactionId && (
+                  <span className="text-sm font-normal text-muted-foreground">
+                    (Transaction #{transactionId})
+                  </span>
+                )}
+              </CardTitle>
+              <p className="text-sm text-muted-foreground mt-1">
+                {currentConfig.description}
+              </p>
+            </div>
+          </div>
+
+          {/* Navigation controls */}
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={goToPrevious}
+              disabled={availableViews.length <= 1}
+            >
+              <ChevronLeft className="h-4 w-4" />
+            </Button>
+
+            {/* View indicators */}
+            <div className="flex gap-1.5">
+              {availableViews.map((view) => (
+                <button
+                  key={view}
+                  onClick={() => setCurrentView(view)}
+                  className={`w-2 h-2 rounded-full transition-all ${
+                    view === currentView
+                      ? 'bg-primary w-6'
+                      : 'bg-muted hover:bg-muted-foreground/30'
+                  }`}
+                  title={CHART_CONFIGS[view].title}
+                />
+              ))}
+            </div>
+
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={goToNext}
+              disabled={availableViews.length <= 1}
+            >
+              <ChevronRight className="h-4 w-4" />
+            </Button>
+          </div>
+        </div>
+
+        {/* Statistics */}
+        {stats && (
+          <div className="grid grid-cols-4 gap-4 mt-4">
+            <div className="text-center">
+              <div className="text-xs text-muted-foreground">Latest</div>
+              <div className="text-lg font-semibold" style={{ color: currentConfig.color }}>
+                {formatTooltipValue(stats.latest)}
+              </div>
+            </div>
+            <div className="text-center">
+              <div className="text-xs text-muted-foreground">Average</div>
+              <div className="text-lg font-semibold">
+                {formatTooltipValue(stats.avg)}
+              </div>
+            </div>
+            <div className="text-center">
+              <div className="text-xs text-muted-foreground">Min</div>
+              <div className="text-lg font-semibold">
+                {formatTooltipValue(stats.min)}
+              </div>
+            </div>
+            <div className="text-center">
+              <div className="text-xs text-muted-foreground">Max</div>
+              <div className="text-lg font-semibold">
+                {formatTooltipValue(stats.max)}
+              </div>
+            </div>
+          </div>
+        )}
       </CardHeader>
+
       <CardContent>
         <div className="h-96 w-full">
           <ResponsiveContainer width="100%" height="100%">
@@ -147,16 +308,8 @@ export default function MeterValuesChart({ meterValues, transactionId }: MeterVa
                 interval="preserveStartEnd"
               />
               <YAxis
-                yAxisId="energy"
-                orientation="left"
                 fontSize={12}
-                label={{ value: 'Energy (kWh)', angle: -90, position: 'insideLeft' }}
-              />
-              <YAxis
-                yAxisId="electrical"
-                orientation="right"
-                fontSize={12}
-                label={{ value: 'Current (A) / Voltage (V) / Power (kW)', angle: 90, position: 'insideRight' }}
+                label={{ value: currentConfig.label, angle: -90, position: 'insideLeft' }}
               />
               <Tooltip
                 formatter={formatTooltipValue}
@@ -169,63 +322,18 @@ export default function MeterValuesChart({ meterValues, transactionId }: MeterVa
               />
               <Legend />
 
-              {/* Energy reading - primary axis */}
               <Line
-                yAxisId="energy"
                 type="monotone"
-                dataKey="reading_kwh"
-                stroke="#3b82f6"
+                dataKey={currentConfig.dataKey}
+                stroke={currentConfig.color}
                 strokeWidth={3}
-                dot={{ fill: '#3b82f6', strokeWidth: 2, r: 4 }}
-                name="Energy Reading"
+                dot={{ fill: currentConfig.color, strokeWidth: 2, r: 4 }}
+                connectNulls={false}
+                name={currentConfig.title}
               />
-
-              {/* Current */}
-              {chartData.some(d => d.current !== null && d.current !== undefined) && (
-                <Line
-                  yAxisId="electrical"
-                  type="monotone"
-                  dataKey="current"
-                  stroke="#10b981"
-                  strokeWidth={1.5}
-                  dot={{ fill: '#10b981', strokeWidth: 1, r: 3 }}
-                  connectNulls={false}
-                  name="Current (A)"
-                />
-              )}
-
-              {/* Voltage */}
-              {chartData.some(d => d.voltage !== null && d.voltage !== undefined) && (
-                <Line
-                  yAxisId="electrical"
-                  type="monotone"
-                  dataKey="voltage"
-                  stroke="#f59e0b"
-                  strokeWidth={1.5}
-                  dot={{ fill: '#f59e0b', strokeWidth: 1, r: 3 }}
-                  connectNulls={false}
-                  name="Voltage (V)"
-                />
-              )}
-
-              {/* Power */}
-              {chartData.some(d => d.power_kw !== null && d.power_kw !== undefined) && (
-                <Line
-                  yAxisId="electrical"
-                  type="monotone"
-                  dataKey="power_kw"
-                  stroke="#ef4444"
-                  strokeWidth={1.5}
-                  dot={{ fill: '#ef4444', strokeWidth: 1, r: 3 }}
-                  connectNulls={false}
-                  name="Power (kW)"
-                />
-              )}
-
             </LineChart>
           </ResponsiveContainer>
         </div>
-
       </CardContent>
     </Card>
   );

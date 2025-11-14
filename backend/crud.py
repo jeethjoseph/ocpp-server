@@ -42,25 +42,24 @@ async def get_logs_by_charge_point(charge_point_id: str, limit: int = 100) -> Li
 ###
 
 async def validate_and_connect_charger(
-    charge_point_id: str, 
+    charge_point_id: str,
     connected_charge_points: dict
 ) -> Tuple[bool, str]:
     """
     Validate if charger is registered and can connect.
     Returns (is_valid, message)
+
+    Note: Does NOT check if already connected - that's handled in main.py
+    to allow force disconnecting stale connections.
     """
     # Check if charger exists in database
     charger = await Charger.filter(
         charge_point_string_id=charge_point_id
     ).first()
-    
+
     if not charger:
         return False, f"Charger {charge_point_id} not registered in system"
-    
-    # Check if already connected
-    if charge_point_id in connected_charge_points:
-        return False, f"Charger {charge_point_id} is already connected"
-    
+
     return True, "Valid charger"
 
 ###

@@ -29,6 +29,11 @@ dump.rdb
 *.log
 logs/
 
+# Firmware files
+backend/firmware_files/*.bin
+backend/firmware_files/*.hex
+backend/firmware_files/*.fw
+
 # Node.js (for frontend)
 node_modules/
 npm-debug.log
