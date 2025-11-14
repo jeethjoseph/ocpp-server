@@ -146,9 +146,10 @@ class OCPPChargerSimulator:
         """Send BootNotification and handle clock reset"""
         payload = {
             "chargePointModel": "SimulatorModel",
-            "chargePointVendor": "SimulatorVendor"
+            "chargePointVendor": "SimulatorVendor",
+            "firmwareVersion": "1.0.0"
         }
-        
+
         response = self._send_message("BootNotification", payload)
         
         if "currentTime" in response:

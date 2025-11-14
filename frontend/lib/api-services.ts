@@ -186,7 +186,8 @@ export interface PublicStationResponse {
   connector_details: Array<{
     connector_type: string;
     max_power_kw: number | null;
-    count: number;
+    available_count: number;
+    total_count: number;
   }>;
   price_per_kwh: number | null;
 }
@@ -293,5 +294,105 @@ export const walletPaymentService = {
   getRechargeHistory: () =>
     api.get<import("@/types/api").RechargeHistoryResponse>(
       "/api/wallet/recharge-history"
+    ),
+};
+
+/**
+ * Firmware Update Service
+ * Handles OTA firmware updates for chargers
+ */
+export const firmwareService = {
+  /**
+   * Upload a new firmware file
+   * Note: Uses custom fetch to handle FormData with auth token
+   */
+  uploadFirmware: async (file: File, version: string, getToken: () => Promise<string | null>, description?: string) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('version', version);
+    if (description) {
+      formData.append('description', description);
+    }
+
+    const token = await getToken();
+    if (!token) {
+      throw new Error('Authentication token not available');
+    }
+
+    const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/admin/firmware/upload`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+      },
+      body: formData,
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.detail || 'Failed to upload firmware');
+    }
+
+    return response.json();
+  },
+
+  /**
+   * Get list of all firmware files
+   */
+  getFirmwareFiles: (params?: { page?: number; limit?: number; is_active?: boolean }) => {
+    const searchParams = new URLSearchParams();
+    if (params?.page) searchParams.set("page", params.page.toString());
+    if (params?.limit) searchParams.set("limit", params.limit.toString());
+    if (params?.is_active !== undefined) searchParams.set("is_active", params.is_active.toString());
+
+    const query = searchParams.toString();
+    return api.get<import("@/types/api").FirmwareFileListResponse>(
+      `/api/admin/firmware${query ? `?${query}` : ""}`
+    );
+  },
+
+  /**
+   * Delete (soft delete) a firmware file
+   */
+  deleteFirmwareFile: (firmwareId: number) =>
+    api.delete(`/api/admin/firmware/${firmwareId}`),
+
+  /**
+   * Trigger firmware update for a single charger
+   */
+  triggerUpdate: (chargerId: number, firmwareFileId: number) =>
+    api.post<import("@/types/api").FirmwareUpdate>(
+      `/api/admin/firmware/chargers/${chargerId}/update`,
+      { firmware_file_id: firmwareFileId }
+    ),
+
+  /**
+   * Trigger bulk firmware update for multiple chargers
+   */
+  bulkUpdate: (request: import("@/types/api").BulkFirmwareUpdateRequest) =>
+    api.post<import("@/types/api").BulkUpdateResult>(
+      "/api/admin/firmware/bulk-update",
+      request
+    ),
+
+  /**
+   * Get firmware update history for a charger
+   */
+  getFirmwareHistory: (chargerId: number, params?: { page?: number; limit?: number }) => {
+    const searchParams = new URLSearchParams();
+    if (params?.page) searchParams.set("page", params.page.toString());
+    if (params?.limit) searchParams.set("limit", params.limit.toString());
+
+    const query = searchParams.toString();
+    return api.get<import("@/types/api").FirmwareHistoryResponse>(
+      `/api/admin/firmware/chargers/${chargerId}/history${query ? `?${query}` : ""}`
+    );
+  },
+
+  /**
+   * Get dashboard status of all firmware updates
+   */
+  getUpdateStatus: () =>
+    api.get<import("@/types/api").UpdateStatusDashboard>(
+      "/api/admin/firmware/updates/status"
     ),
 };
