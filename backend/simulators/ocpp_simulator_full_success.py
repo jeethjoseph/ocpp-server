@@ -5,11 +5,12 @@ OCPP 1.6 Charger Simulator for Real-World Testing
 This simulator acts like a real charging station:
 1. Connects to OCPP server
 2. Sends boot notification with clock reset
-3. Sends regular heartbeats every 10 seconds  
+3. Sends regular heartbeats every 10 seconds
 4. Waits for remote start transaction commands
 5. Sends meter values every 30 seconds during charging
 6. Waits for remote stop transaction commands
-7. Demonstrates complete OCPP success cycle
+7. Handles reset commands (Hard/Soft) with simulated reboot
+8. Demonstrates complete OCPP success cycle
 
 Usage:
     python ocpp_simulator.py --charger-id f87a48bc-532e-4aed-862c-c6846dd278f9
@@ -44,10 +45,12 @@ class OCPPChargerSimulator:
         # Timing intervals (in seconds)
         self.heartbeat_interval = 10
         self.meter_value_interval = 30
-        
+        self.signal_quality_interval = 60  # Send signal quality every 60 seconds
+
         # Background tasks
         self.heartbeat_task = None
         self.meter_value_task = None
+        self.signal_quality_task = None
         
         # Development features
         self.auto_start = False
@@ -137,6 +140,8 @@ class OCPPChargerSimulator:
             self.heartbeat_task.cancel()
         if self.meter_value_task:
             self.meter_value_task.cancel()
+        if self.signal_quality_task:
+            self.signal_quality_task.cancel()
         if self.ws:
             self.ws.close()
             self.is_connected = False
@@ -146,9 +151,10 @@ class OCPPChargerSimulator:
         """Send BootNotification and handle clock reset"""
         payload = {
             "chargePointModel": "SimulatorModel",
-            "chargePointVendor": "SimulatorVendor"
+            "chargePointVendor": "SimulatorVendor",
+            "firmwareVersion": "1.0.0"
         }
-        
+
         response = self._send_message("BootNotification", payload)
         
         if "currentTime" in response:
@@ -317,7 +323,65 @@ class OCPPChargerSimulator:
         print(f"⚡ [{self.charge_point_id}] Meter values sent: "
               f"{current_energy:.1f} Wh ({current_energy/1000:.2f} kWh), {current_amps:.1f}A, {voltage_volts:.1f}V, {power_watts/1000:.1f}kW")
         return response
-    
+
+    def send_data_transfer_signal_quality(self) -> dict:
+        """Send signal quality data via DataTransfer message"""
+        import random
+
+        # Simulate realistic signal variations
+        # Most of the time: good signal (RSSI 18-25)
+        # Occasionally: fair signal (RSSI 8-12) - 10% of the time
+        # Rarely: poor signal (RSSI 3-7) - 2% of the time
+        rand_val = random.random()
+        if rand_val < 0.02:  # 2% poor signal
+            base_rssi = random.randint(3, 7)
+        elif rand_val < 0.12:  # 10% fair signal
+            base_rssi = random.randint(8, 12)
+        else:  # 88% good signal
+            base_rssi = random.randint(18, 25)
+
+        # Add small random variation
+        variation = random.randint(-2, 2)
+        rssi = max(0, min(31, base_rssi + variation))
+
+        # BER (Bit Error Rate)
+        # 99 = not detectable (good connection)
+        # 0-7 = increasing error rates (poor connection)
+        if rssi >= 15:
+            ber = 99  # Good signal, no detectable errors
+        elif rssi >= 10:
+            ber = random.choice([99, 0, 1])  # Mostly good, occasional errors
+        else:
+            ber = random.randint(0, 3)  # Degraded signal quality
+
+        # Timestamp: uptime in seconds
+        timestamp = str(int(time.time() - self.statistics.get("start_time", time.time())))
+
+        payload = {
+            "vendorId": "JET_EV1",
+            "messageId": "SignalQuality",
+            "data": json.dumps({
+                "rssi": rssi,
+                "ber": ber,
+                "timestamp": timestamp
+            })
+        }
+
+        response = self._send_message("DataTransfer", payload)
+
+        # Categorize signal quality for logging
+        if rssi >= 10:
+            signal_label = "Good"
+        elif rssi >= 5:
+            signal_label = "Fair"
+        elif rssi > 0:
+            signal_label = "Poor"
+        else:
+            signal_label = "Unknown"
+
+        print(f"📶 [{self.charge_point_id}] Signal quality sent: RSSI={rssi} ({signal_label}), BER={ber}")
+        return response
+
     def handle_remote_start_transaction(self, message_id: str, payload: dict) -> bool:
         """Handle RemoteStartTransaction from server"""
         connector_id = payload.get("connectorId", 1)
@@ -340,24 +404,87 @@ class OCPPChargerSimulator:
         # Send confirmation
         self._send_call_result(message_id, {"status": "Accepted"})
         print(f"✅ [{self.charge_point_id}] ⭐ REMOTE STOP TRANSACTION ACCEPTED ⭐")
-        
+
         # Change status to finishing
         self.send_status_notification("Finishing")
-        
+
         # Stop transaction (meter values will stop automatically)
         self.send_stop_transaction("Remote")
-        
+
         # Return to available briefly, then back to preparing for next cycle
         self.send_status_notification("Available")
-        
+
         # After a short delay, go back to preparing state for next transaction
         import time
         time.sleep(2)
         self.send_status_notification("Preparing")
         print(f"🔄 [{self.charge_point_id}] Ready for next transaction cycle")
-        
+
         return True
-    
+
+    def handle_reset(self, message_id: str, payload: dict) -> bool:
+        """Handle Reset command from server"""
+        reset_type = payload.get("type", "Hard")
+
+        # Send confirmation
+        self._send_call_result(message_id, {"status": "Accepted"})
+        print(f"✅ [{self.charge_point_id}] ⭐ RESET ({reset_type}) ACCEPTED ⭐")
+
+        # If there's an active transaction during Hard reset, stop it
+        if reset_type == "Hard" and self.transaction_id:
+            print(f"⚠️  [{self.charge_point_id}] Hard reset during transaction - stopping transaction")
+            self.send_status_notification("Finishing")
+            import time
+            time.sleep(1)
+            self.send_stop_transaction("HardReset")
+
+        # Simulate reset: disconnect and reconnect
+        print(f"🔄 [{self.charge_point_id}] Simulating {reset_type} reset - rebooting...")
+
+        # Stop background tasks
+        if self.heartbeat_task:
+            self.heartbeat_task.cancel()
+            self.heartbeat_task = None
+        if self.meter_value_task:
+            self.meter_value_task.cancel()
+            self.meter_value_task = None
+        if self.signal_quality_task:
+            self.signal_quality_task.cancel()
+            self.signal_quality_task = None
+
+        # Close WebSocket connection
+        if self.ws:
+            self.ws.close()
+            print(f"🔌 [{self.charge_point_id}] Disconnected for reset")
+
+        # Wait for simulated reboot time
+        import time
+        reboot_time = 3 if reset_type == "Soft" else 5
+        print(f"⏰ [{self.charge_point_id}] Rebooting ({reboot_time} seconds)...")
+        time.sleep(reboot_time)
+
+        # Reconnect and send BootNotification (as per OCPP spec)
+        print(f"🔌 [{self.charge_point_id}] Reconnecting after reset...")
+        self.connect()
+
+        # Send BootNotification after reset (required by OCPP)
+        boot_response = self.send_boot_notification()
+        print(f"🚀 [{self.charge_point_id}] ⭐ RESET COMPLETE - Boot notification sent ⭐")
+
+        # Restart background tasks
+        self.start_heartbeat_task()
+        self.start_signal_quality_task()
+
+        # Send initial status
+        self.send_status_notification("Available")
+
+        # After a short delay, go to preparing state
+        time.sleep(2)
+        self.send_status_notification("Preparing")
+        print(f"✅ [{self.charge_point_id}] Reset complete - Ready for operations")
+
+        return True
+
     def process_incoming_messages(self, timeout: float = 0.1):
         """Process any incoming messages from server"""
         try:
@@ -371,7 +498,9 @@ class OCPPChargerSimulator:
                     return self.handle_remote_start_transaction(message["message_id"], message["payload"])
                 elif action == "RemoteStopTransaction":
                     return self.handle_remote_stop_transaction(message["message_id"], message["payload"])
-                    
+                elif action == "Reset":
+                    return self.handle_reset(message["message_id"], message["payload"])
+
         except websocket.WebSocketTimeoutException:
             pass
         except Exception as e:
@@ -405,16 +534,35 @@ class OCPPChargerSimulator:
                 break
             except Exception as e:
                 print(f"❌ [{self.charge_point_id}] Meter value error: {e}")
-    
+
+    async def signal_quality_loop(self):
+        """Send signal quality data every 60 seconds"""
+        while self.running:
+            try:
+                await asyncio.sleep(self.signal_quality_interval)
+                if self.running:
+                    self.send_data_transfer_signal_quality()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"❌ [{self.charge_point_id}] Signal quality error: {e}")
+                # Continue running instead of crashing on signal quality errors
+                await asyncio.sleep(30)  # Wait 30 seconds before trying again
+
     def start_heartbeat_task(self):
         """Start heartbeat background task"""
         if not self.heartbeat_task:
             self.heartbeat_task = asyncio.create_task(self.heartbeat_loop())
-    
+
     def start_meter_value_task(self):
         """Start meter value background task"""
         if not self.meter_value_task:
             self.meter_value_task = asyncio.create_task(self.meter_value_loop())
+
+    def start_signal_quality_task(self):
+        """Start signal quality background task"""
+        if not self.signal_quality_task:
+            self.signal_quality_task = asyncio.create_task(self.signal_quality_loop())
     
     def print_statistics(self):
         """Print current statistics"""
@@ -492,7 +640,10 @@ class OCPPChargerSimulator:
             
             # Step 3: Start heartbeat loop immediately after boot notification
             self.start_heartbeat_task()
-            
+
+            # Step 3.5: Start signal quality loop
+            self.start_signal_quality_task()
+
             # Step 4: Send initial status notification
             self.send_status_notification("Available")
             
@@ -508,8 +659,9 @@ class OCPPChargerSimulator:
             print(f"   1. Send RemoteStartTransaction via API or admin panel")
             print(f"   2. Watch the charging simulation with meter values")
             print(f"   3. Send RemoteStopTransaction to complete the cycle")
-            print(f"   4. Press 's' + Enter to show statistics")
-            print(f"   5. Press Ctrl+C to stop the simulator")
+            print(f"   4. Send Reset (Hard/Soft) to simulate charger reboot")
+            print(f"   5. Press 's' + Enter to show statistics")
+            print(f"   6. Press Ctrl+C to stop the simulator")
             print(f"\n⏰ Heartbeats every {self.heartbeat_interval}s, Meter values every {self.meter_value_interval}s")
             print(f"{'='*80}\n")
             

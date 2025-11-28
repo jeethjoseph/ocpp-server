@@ -21,6 +21,9 @@ env/
 test.html
 dump.rdb
 
+# Claude Code plans (local development artifacts)
+.claude/plans/
+
 # Database (PostgreSQL dumps and backups)
 *.sql
 *.dump
@@ -28,6 +31,11 @@ dump.rdb
 # Logs
 *.log
 logs/
+
+# Firmware files
+backend/firmware_files/*.bin
+backend/firmware_files/*.hex
+backend/firmware_files/*.fw
 
 # Node.js (for frontend)
 node_modules/

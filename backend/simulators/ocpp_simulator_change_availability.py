@@ -129,9 +129,10 @@ class OCPPChangeAvailabilitySimulator:
         """Send BootNotification"""
         payload = {
             "chargePointModel": "AvailSimulator",
-            "chargePointVendor": "TestVendor"
+            "chargePointVendor": "TestVendor",
+            "firmwareVersion": "1.0.0"
         }
-        
+
         response = self._send_message("BootNotification", payload)
         
         if "currentTime" in response:

@@ -2,6 +2,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { stationService } from "@/lib/api-services";
 import { StationListResponse, StationCreate, StationUpdate } from "@/types/api";
 import { toast } from "sonner";
+import { useAuth } from "@/contexts/AuthContext";
 
 // Query Keys
 export const stationKeys = {
@@ -19,20 +20,25 @@ export function useStations(params: {
   search?: string;
   sort?: string;
 } = {}) {
+  const { isAuthReady } = useAuth();
+
   return useQuery({
     queryKey: stationKeys.list(params),
     queryFn: () => stationService.getAll(params),
     staleTime: 1000 * 60 * 2, // 2 minutes - stations don't change often
     refetchOnWindowFocus: true, // Refresh when user returns to the page
+    enabled: isAuthReady,
   });
 }
 
 // Individual Station Query Hook
 export function useStation(id: number) {
+  const { isAuthReady } = useAuth();
+
   return useQuery({
     queryKey: stationKeys.detail(id),
     queryFn: () => stationService.getById(id),
-    enabled: !!id,
+    enabled: isAuthReady && !!id,
   });
 }
 

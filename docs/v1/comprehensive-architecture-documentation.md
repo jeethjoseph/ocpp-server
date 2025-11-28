@@ -234,6 +234,43 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 - **NEW**: Wallet transaction history with running balance
 - **NEW**: Transaction summary statistics
 
+#### Firmware Management (`backend/routers/firmware.py`)
+**Endpoints**: `/api/admin/firmware/*` (admin) and `/api/firmware/*` (public)
+**Purpose**: Complete firmware update lifecycle for OCPP and non-OCPP charge points
+
+**Admin Endpoints**:
+- `POST /api/admin/firmware/upload` - Upload new firmware files (.bin, .hex, .fw)
+- `GET /api/admin/firmware` - List all firmware with pagination and filtering
+- `DELETE /api/admin/firmware/{id}` - Soft delete firmware (sets is_active=False)
+- `POST /api/admin/firmware/chargers/{id}/update` - Trigger OCPP firmware update for single charger
+- `POST /api/admin/firmware/bulk-update` - Trigger updates for multiple chargers
+- `GET /api/admin/firmware/chargers/{id}/history` - Get firmware update history
+- `GET /api/admin/firmware/updates/status` - Real-time dashboard of all firmware updates
+
+**Public Endpoints**:
+- `GET /api/firmware/latest` - **NEW** - Public API for non-OCPP charge points to discover latest firmware
+
+**Key Features**:
+- OCPP 1.6 UpdateFirmware command integration
+- FirmwareStatusNotification handling with status tracking
+- Pre-update safety validation (online check, no active transactions)
+- MD5 checksum verification for file integrity
+- Real-time progress monitoring with dashboard
+- File storage with static serving via `/firmware/{filename}`
+- Supports OCPP (UpdateFirmware) and non-OCPP (API discovery) devices
+
+**OCPP Flow**:
+1. Admin triggers update → Sends OCPP UpdateFirmware command
+2. Charger downloads firmware from provided URL
+3. Charger sends FirmwareStatusNotification updates (Downloading → Downloaded → Installing → Installed)
+4. Server updates FirmwareUpdate status and charger.firmware_version
+
+**Non-OCPP Flow**:
+1. Device calls `GET /api/firmware/latest`
+2. Receives version, download URL, checksum, file size
+3. Downloads and verifies firmware
+4. Installs and reboots with new version
+
 #### Webhook Handler (`backend/routers/webhooks.py`)
 **Endpoints**: `/webhooks/*`
 **Purpose**: Clerk webhook processing for user lifecycle events
@@ -333,6 +370,72 @@ User → Frontend Modal → Create Order → Razorpay Checkout → Payment
 ```
 
 **Documentation**: See `/backend/docs/RAZORPAY_IMPLEMENTATION.md` for comprehensive details
+
+#### Firmware Storage Service (`backend/services/storage_service.py`)
+**Purpose**: Local filesystem storage for firmware files
+
+**Key Features**:
+- Firmware file upload and storage in `/backend/firmware_files/`
+- MD5 checksum calculation for integrity verification
+- Download URL generation for OCPP UpdateFirmware commands
+- File naming convention: `{version}_{original_filename}`
+- Static file serving via `/firmware/{filename}` endpoint
+
+**Methods**:
+```python
+async def save_firmware_file(file: UploadFile, version: str) -> dict:
+    """Save uploaded firmware with checksum calculation"""
+
+def get_firmware_download_url(filename: str, base_url: str) -> str:
+    """Generate public download URL for chargers"""
+
+def calculate_checksum(file_path: str) -> str:
+    """Calculate MD5 hash in chunks for large files"""
+
+def delete_firmware_file(file_path: str) -> bool:
+    """Remove physical firmware file from filesystem"""
+
+def file_exists(file_path: str) -> bool:
+    """Check if firmware file exists on disk"""
+```
+
+**File Security**:
+- Extension whitelist: `.bin`, `.hex`, `.fw`
+- Maximum file size: 100MB
+- Unique version enforcement
+- Soft deletion (keeps physical files after database soft delete)
+
+**Static File Configuration** (`main.py`):
+```python
+FIRMWARE_DIR = os.path.join(os.path.dirname(__file__), "firmware_files")
+app.mount("/firmware", StaticFiles(directory=FIRMWARE_DIR), name="firmware")
+```
+
+#### Data Retention Service (`backend/services/data_retention_service.py`)
+**Purpose**: Background service for automated cleanup of old telemetry and log data
+
+**Key Features**:
+- Periodic cleanup of old signal quality data (default: 90 days retention)
+- OCPP log cleanup (default: 90 days retention)
+- Runs on configurable interval (default: every 24 hours)
+- Graceful start/stop with async task management
+
+**Configuration**:
+```python
+await start_data_retention_service(
+    retention_days=90,           # Days to retain data
+    cleanup_interval_hours=24    # Cleanup frequency
+)
+```
+
+**Cleanup Targets**:
+1. **Signal Quality Data**: Deletes `signal_quality` records older than retention period
+2. **OCPP Logs**: Deletes `log` (OCPPLog) records older than retention period
+
+**Monitoring**:
+- Logs cleanup operations with record counts
+- Error handling with retry logic (1 hour retry interval on failure)
+- Graceful shutdown on service stop
 
 ### Infrastructure Components
 
@@ -698,6 +801,75 @@ CREATE TABLE charger (
 );
 ```
 
+#### Firmware Management Tables
+```sql
+-- Firmware file metadata
+-- Defined in: backend/models.py:292-309
+CREATE TABLE firmware_file (
+    id SERIAL PRIMARY KEY,
+    version VARCHAR(50) UNIQUE NOT NULL,  -- Unique version identifier
+    filename VARCHAR(255) NOT NULL,       -- Safe filename: {version}_{original}
+    file_path VARCHAR(500) NOT NULL,      -- Absolute path on filesystem
+    file_size BIGINT NOT NULL,            -- File size in bytes
+    checksum VARCHAR(64) NOT NULL,        -- MD5 hash for integrity
+    description TEXT,                     -- Release notes
+    uploaded_by_id INTEGER REFERENCES app_user(id) ON DELETE CASCADE,
+    is_active BOOLEAN DEFAULT TRUE,       -- Soft delete flag
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX idx_firmware_file_version ON firmware_file(version);
+
+-- Firmware update tracking per charger
+-- Defined in: backend/models.py:311-326
+CREATE TABLE firmware_update (
+    id SERIAL PRIMARY KEY,
+    charger_id INTEGER REFERENCES charger(id) ON DELETE CASCADE,
+    firmware_file_id INTEGER REFERENCES firmware_file(id) ON DELETE CASCADE,
+    status VARCHAR(19) NOT NULL DEFAULT 'PENDING',  -- FirmwareUpdateStatusEnum
+    initiated_by_id INTEGER REFERENCES app_user(id) ON DELETE CASCADE,
+    initiated_at TIMESTAMP DEFAULT NOW(),
+    download_url VARCHAR(500) NOT NULL,  -- URL for charger to download from
+    started_at TIMESTAMP,                -- When download began
+    completed_at TIMESTAMP,              -- When update completed/failed
+    error_message TEXT,                  -- Failure details
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX idx_firmware_update_charger ON firmware_update(charger_id);
+CREATE INDEX idx_firmware_update_status ON firmware_update(status);
+```
+
+**FirmwareUpdateStatusEnum Values**:
+- `PENDING` - Update queued, awaiting OCPP command acknowledgment
+- `DOWNLOADING` - Charger actively downloading firmware
+- `DOWNLOADED` - Download complete, awaiting installation
+- `INSTALLING` - Firmware installation in progress
+- `INSTALLED` - Update successful (charger.firmware_version updated)
+- `DOWNLOAD_FAILED` - Network/file download error
+- `INSTALLATION_FAILED` - Installation or verification error
+
+#### Signal Quality Monitoring Table
+```sql
+-- Cellular signal quality metrics from charge points
+-- Defined in: backend/models.py:328-342
+CREATE TABLE signal_quality (
+    id SERIAL PRIMARY KEY,
+    charger_id INTEGER REFERENCES charger(id) ON DELETE CASCADE,
+    rssi INTEGER NOT NULL,      -- Received Signal Strength Indicator (0-31 for GSM, 99=unknown)
+    ber INTEGER NOT NULL,        -- Bit Error Rate (0-7 for GSM, 99=unknown/not detectable)
+    timestamp VARCHAR(50) NOT NULL,  -- Timestamp from charger
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_signal_quality_created ON signal_quality(created_at);
+CREATE INDEX idx_signal_quality_charger ON signal_quality(charger_id);
+```
+
+**Data Source**: OCPP DataTransfer messages from JET_EV1 chargers
+
+**Data Retention**: Records older than 90 days are automatically deleted by the data retention service
+
 #### Transaction Management
 ```sql
 -- OCPP charging transactions
@@ -869,6 +1041,68 @@ async def on_meter_values(self, connector_id, meter_value, transaction_id=None, 
 - Database persistence for energy analytics
 - Transaction association validation
 
+#### 7. FirmwareStatusNotification Handler
+```python
+# Implementation: backend/main.py:522-597
+@on('FirmwareStatusNotification')
+async def on_firmware_status_notification(self, status, **kwargs):
+```
+
+**OCPP 1.6 Firmware Status Support**:
+- `Idle`: No update in progress
+- `Downloading`: Firmware download active
+- `Downloaded`: Download complete, awaiting installation
+- `Installing`: Installation in progress
+- `Installed`: Update successful ✅
+- `DownloadFailed`: Download error ❌
+- `InstallationFailed`: Installation error ❌
+- `InstallVerificationFailed`: Verification error ❌
+
+**Business Logic**:
+- Finds active FirmwareUpdate record for charger
+- Maps OCPP status to database FirmwareUpdateStatusEnum
+- Tracks timestamps: `started_at` (when downloading), `completed_at` (when finished/failed)
+- **On SUCCESS (Installed)**: Updates `charger.firmware_version` to new version
+- **On FAILURE**: Stores error message in FirmwareUpdate record
+- Complete audit logging to OCPPLog table
+
+**Status Workflow**:
+```
+PENDING → Downloading → Downloaded → Installing → Installed
+                ↓              ↓            ↓
+         DownloadFailed  (skip)  InstallationFailed
+```
+
+#### 8. DataTransfer Handler
+```python
+# Implementation: backend/main.py:599-668
+@on('DataTransfer')
+async def on_data_transfer(self, vendor_id: str, message_id: str = None, data: str = None, **kwargs):
+```
+
+**Purpose**: Handle vendor-specific data messages from charge points
+
+**Vendor Support**:
+- **JET_EV1**: Signal quality data (RSSI, BER)
+
+**JET_EV1 Signal Quality Data Format**:
+```json
+{
+  "rssi": 22,   // Received Signal Strength Indicator (0-31 for GSM, 99=unknown)
+  "ber": 99,    // Bit Error Rate (0-7 for GSM, 99=unknown/not detectable)
+  "timestamp": "86"
+}
+```
+
+**Business Logic**:
+- Routes to vendor-specific handlers based on `vendor_id`
+- Validates required fields (rssi, ber)
+- Range validation: RSSI (0-31 or 99), BER (0-7 or 99)
+- Stores in `SignalQuality` database table
+- Returns status: Accepted, UnknownVendorId, UnknownMessageId, or Rejected
+
+**Use Case**: Monitoring cellular signal strength for charge points with modem connectivity
+
 ### Remote Commands (Central System → Charge Point)
 
 #### 1. RemoteStartTransaction
@@ -903,6 +1137,50 @@ async def on_meter_values(self, connector_id, meter_value, transaction_id=None, 
 - `Operative`: Enable charging functionality
 - `Inoperative`: Disable charging functionality
 - Connector-specific or entire charge point control
+
+#### 4. UpdateFirmware
+```python
+# Implementation: backend/main.py:809-813
+# API Integration: backend/routers/firmware.py:270-350 (single), 353-449 (bulk)
+```
+
+**Purpose**: Trigger firmware over-the-air (OTA) update on OCPP charge points
+
+**Payload**:
+```python
+{
+    "location": "https://server.com/firmware/1.0.0_firmware.bin",  # Download URL
+    "retrieve_date": "2025-11-28T12:00:00.000Z",                   # ISO 8601
+    "retries": 3,                                                   # Retry attempts
+    "retry_interval": 300                                           # Seconds between retries
+}
+```
+
+**Pre-Update Safety Checks** (`routers/firmware.py:236-267`):
+1. **Online Validation**: Heartbeat within 90 seconds
+2. **Transaction Check**: No active charging sessions (STARTED, PENDING_START, RUNNING)
+3. **Version Warning**: Alert if updating to same version
+
+**Update Flow**:
+1. Admin triggers via `/api/admin/firmware/chargers/{id}/update`
+2. Server validates charger state
+3. Creates FirmwareUpdate database record (PENDING status)
+4. Sends OCPP UpdateFirmware command with download URL
+5. Charger downloads firmware and sends FirmwareStatusNotification updates
+6. Server tracks progress via FirmwareStatusNotification handler
+7. On success: Updates charger.firmware_version
+
+**Monitoring**:
+- Real-time dashboard: `GET /api/admin/firmware/updates/status`
+- Per-charger history: `GET /api/admin/firmware/chargers/{id}/history`
+- Frontend auto-refresh: 10-second polling interval
+
+**Non-OCPP Alternative**:
+For charge points without OCPP support, use public API:
+```bash
+curl https://server.com/api/firmware/latest
+# Returns: {version, filename, download_url, checksum, file_size}
+```
 
 ### Connection Management Architecture
 
@@ -1391,6 +1669,294 @@ Response:
   "currency": "INR"
 }
 ```
+
+#### Firmware Management (`backend/routers/firmware.py`)
+
+##### Upload Firmware File
+```http
+POST /api/admin/firmware/upload
+Authorization: Bearer {jwt_token}
+Content-Type: multipart/form-data
+
+FormData:
+  - file: File (.bin, .hex, .fw)
+  - version: string (required, unique)
+  - description: string (optional, release notes)
+
+Response: 200 OK
+{
+  "id": 1,
+  "version": "1.0.0",
+  "filename": "1.0.0_simple_ota.bin",
+  "file_size": 912160,
+  "checksum": "d0fd2e471c76287adab65cba424630fa",
+  "description": "Initial firmware release",
+  "uploaded_by_id": 1,
+  "created_at": "2025-01-22T10:00:00Z",
+  "is_active": true
+}
+```
+
+##### List Firmware Files
+```http
+GET /api/admin/firmware
+Authorization: Bearer {jwt_token}
+Query Parameters:
+  - page: int = 1
+  - limit: int = 20
+  - is_active: bool = true
+
+Response:
+{
+  "data": [
+    {
+      "id": 1,
+      "version": "1.0.0",
+      "filename": "1.0.0_simple_ota.bin",
+      "file_size": 912160,
+      "checksum": "d0fd2e471c76287...",
+      "description": "Initial firmware release",
+      "uploaded_by_id": 1,
+      "created_at": "2025-01-22T10:00:00Z",
+      "is_active": true
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "limit": 20
+}
+```
+
+##### Trigger Firmware Update (Single Charger)
+```http
+POST /api/admin/firmware/chargers/{charger_id}/update
+Authorization: Bearer {jwt_token}
+Content-Type: application/json
+
+{
+  "firmware_file_id": 1
+}
+
+Response: 200 OK
+{
+  "id": 1,
+  "charger_id": 5,
+  "firmware_file_id": 1,
+  "status": "PENDING",
+  "download_url": "https://lyncpower.com/firmware/1.0.0_simple_ota.bin",
+  "initiated_at": "2025-01-22T14:00:00Z",
+  "started_at": null,
+  "completed_at": null,
+  "error_message": null
+}
+
+Errors:
+  - 400: Charger offline, active transaction, or same version
+  - 404: Charger or firmware not found
+  - 500: OCPP command failed
+```
+
+##### Bulk Firmware Update
+```http
+POST /api/admin/firmware/bulk-update
+Authorization: Bearer {jwt_token}
+Content-Type: application/json
+
+{
+  "firmware_file_id": 1,
+  "charger_ids": [1, 2, 3, 4, 5]
+}
+
+Response: 200 OK
+{
+  "success": [
+    {
+      "charger_id": 1,
+      "charger_name": "CP001",
+      "update_id": 1
+    },
+    {
+      "charger_id": 2,
+      "charger_name": "CP002",
+      "update_id": 2
+    }
+  ],
+  "failed": [
+    {
+      "charger_id": 3,
+      "charger_name": "CP003",
+      "reason": "Charger is offline"
+    },
+    {
+      "charger_id": 4,
+      "charger_name": "CP004",
+      "reason": "Charger has an active charging session"
+    }
+  ]
+}
+```
+
+##### Get Firmware Update History
+```http
+GET /api/admin/firmware/chargers/{charger_id}/history
+Authorization: Bearer {jwt_token}
+Query Parameters:
+  - page: int = 1
+  - limit: int = 10
+
+Response:
+{
+  "data": [
+    {
+      "id": 1,
+      "charger_id": 5,
+      "firmware_file_id": 1,
+      "status": "INSTALLED",
+      "download_url": "https://lyncpower.com/firmware/1.0.0_simple_ota.bin",
+      "initiated_at": "2025-01-22T14:00:00Z",
+      "started_at": "2025-01-22T14:01:00Z",
+      "completed_at": "2025-01-22T14:05:30Z",
+      "error_message": null
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "limit": 10
+}
+```
+
+##### Get Firmware Update Dashboard Status
+```http
+GET /api/admin/firmware/updates/status
+Authorization: Bearer {jwt_token}
+
+Response:
+{
+  "in_progress": [
+    {
+      "update_id": 2,
+      "charger_id": 6,
+      "charger_name": "Fast Charger 2",
+      "charge_point_id": "CP002",
+      "firmware_version": "1.0.0",
+      "status": "DOWNLOADING",
+      "started_at": "2025-01-22T15:00:00Z",
+      "initiated_at": "2025-01-22T14:59:00Z"
+    }
+  ],
+  "summary": {
+    "pending": 3,
+    "downloading": 1,
+    "installing": 0,
+    "completed_today": 5,
+    "failed_today": 1
+  }
+}
+```
+
+##### **NEW**: Get Latest Firmware (Public API)
+```http
+GET /api/firmware/latest
+No Authentication Required
+
+Response: 200 OK
+{
+  "version": "1.0.0",
+  "filename": "1.0.0_simple_ota.bin",
+  "download_url": "https://lyncpower.com/firmware/1.0.0_simple_ota.bin",
+  "checksum": "d0fd2e471c76287adab65cba424630fa",
+  "file_size": 912160
+}
+
+Response: 404 Not Found
+{
+  "detail": "No firmware files available"
+}
+```
+
+**Use Case**: Non-OCPP charge points can poll this endpoint to discover firmware updates.
+
+**Integration Example**:
+```c
+// ESP32 Example
+void checkForFirmwareUpdate() {
+    HTTPClient http;
+    http.begin("https://lyncpower.com/api/firmware/latest");
+
+    if (http.GET() == 200) {
+        // Parse JSON and compare version
+        // Download from download_url
+        // Verify checksum
+        // Install and reboot
+    }
+}
+```
+
+**Documentation**: See `/backend/docs/FIRMWARE_API.md` for comprehensive integration guide
+
+#### Signal Quality Monitoring (`backend/routers/chargers.py`)
+
+##### Get Signal Quality History
+```http
+GET /api/admin/chargers/{charger_id}/signal-quality
+Authorization: Bearer {jwt_token}
+Query Parameters:
+  - page: int = 1
+  - limit: int = 20 (max 100)
+  - hours: int = 24 (max 720 for 30 days)
+
+Response: 200 OK
+{
+  "data": [
+    {
+      "id": 1,
+      "charger_id": 5,
+      "rssi": 22,  // Received Signal Strength Indicator
+      "ber": 99,   // Bit Error Rate
+      "timestamp": "86",
+      "created_at": "2025-01-22T14:00:00Z"
+    }
+  ],
+  "total": 50,
+  "page": 1,
+  "limit": 20,
+  "charger_id": 5,
+  "latest_rssi": 22,
+  "latest_ber": 99
+}
+```
+
+**Signal Strength Interpretation**:
+- **Good**: RSSI ≥ 10 (green badge)
+- **Fair**: RSSI 5-9 (yellow badge)
+- **Poor**: RSSI 0-4 (red badge)
+- **Unknown**: RSSI = 99 or null (gray badge)
+
+##### Get Latest Signal Quality
+```http
+GET /api/admin/chargers/{charger_id}/signal-quality/latest
+Authorization: Bearer {jwt_token}
+
+Response: 200 OK
+{
+  "id": 50,
+  "charger_id": 5,
+  "rssi": 22,
+  "ber": 99,
+  "timestamp": "86",
+  "created_at": "2025-01-22T15:00:00Z"
+}
+
+Response: 200 OK (no data)
+null
+```
+
+**Use Cases**:
+- Real-time signal strength monitoring on charger detail page
+- Historical signal quality analysis
+- Connectivity troubleshooting for remote charge points
+
+**Data Retention**: Signal quality data older than 90 days is automatically cleaned up by the data retention service
 
 ### Legacy OCPP APIs (Backward Compatibility)
 **Location**: `backend/main.py:657-725`

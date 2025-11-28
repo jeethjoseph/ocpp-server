@@ -1,8 +1,9 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { chargerService, stationService } from "@/lib/api-services";
+import { chargerService, stationService, signalQualityService } from "@/lib/api-services";
 import { ChargerListResponse } from "@/types/api";
 import { toast } from "sonner";
 import { transactionKeys } from "./transactions";
+import { useAuth } from "@/contexts/AuthContext";
 
 // Query Keys
 export const chargerKeys = {
@@ -11,6 +12,8 @@ export const chargerKeys = {
   list: (params: Record<string, unknown>) => [...chargerKeys.lists(), params] as const,
   details: () => [...chargerKeys.all, "detail"] as const,
   detail: (id: number) => [...chargerKeys.details(), id] as const,
+  signalQuality: (chargerId: number, hours: number) => [...chargerKeys.all, "signal-quality", chargerId, hours] as const,
+  signalQualityLatest: (chargerId: number) => [...chargerKeys.all, "signal-quality-latest", chargerId] as const,
 };
 
 export const stationKeys = {
@@ -28,29 +31,37 @@ export function useChargers(params: {
   search?: string;
   sort?: string;
 }) {
+  const { isAuthReady } = useAuth();
+
   return useQuery({
     queryKey: chargerKeys.list(params),
     queryFn: () => chargerService.getAll(params),
     staleTime: 1000 * 3, // 3 seconds - frequent updates for OCPP status
     refetchInterval: 1000 * 3, // Auto-refresh every 3 seconds for real-time status
+    enabled: isAuthReady, // Wait for auth to be ready
   });
 }
 
 // Stations Query Hook (for dropdown/filters)
 export function useStations(params: { limit?: number } = {}) {
+  const { isAuthReady } = useAuth();
+
   return useQuery({
     queryKey: stationKeys.list(params),
     queryFn: () => stationService.getAll(params),
     staleTime: 1000 * 60 * 5, // 5 minutes - stations don't change often
+    enabled: isAuthReady, // Wait for auth to be ready
   });
 }
 
 // Individual Charger Query Hook
 export function useCharger(id: number, hasActiveTransaction?: boolean) {
+  const { isAuthReady } = useAuth();
+
   return useQuery({
     queryKey: chargerKeys.detail(id),
     queryFn: () => chargerService.getById(id),
-    enabled: !!id,
+    enabled: isAuthReady && !!id, // Wait for auth and valid id
     staleTime: hasActiveTransaction ? 1000 * 2 : 1000 * 3, // 2s during active session, 3s otherwise
     refetchInterval: hasActiveTransaction ? 1000 * 2 : 1000 * 3, // More frequent polling during active sessions
   });
@@ -205,6 +216,20 @@ export function useRemoteStop() {
   });
 }
 
+// Reset Charger Mutation Hook
+export function useResetCharger() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ chargerId, type }: { chargerId: number; type: 'Hard' | 'Soft' }) =>
+      chargerService.reset(chargerId, type),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: chargerKeys.detail(variables.chargerId) });
+      queryClient.invalidateQueries({ queryKey: chargerKeys.all });
+    },
+  });
+}
+
 // Delete Charger Mutation Hook
 export function useDeleteCharger() {
   const queryClient = useQueryClient();
@@ -221,5 +246,40 @@ export function useDeleteCharger() {
       console.error("Delete charger error:", errorMessage);
       toast.error("Failed to delete charger");
     },
+  });
+}
+
+// Signal Quality Query Hooks
+
+/**
+ * Hook to fetch signal quality history for a charger
+ * @param chargerId - The charger ID
+ * @param hours - Number of hours of history to fetch (default: 24)
+ */
+export function useSignalQuality(chargerId: number, hours: number = 24) {
+  const { isAuthReady } = useAuth();
+
+  return useQuery({
+    queryKey: chargerKeys.signalQuality(chargerId, hours),
+    queryFn: () => signalQualityService.getSignalQuality(chargerId, { hours, limit: 100 }),
+    enabled: isAuthReady && !!chargerId, // Wait for auth and valid id
+    staleTime: 1000 * 10, // 10 seconds
+    refetchInterval: 1000 * 10, // Auto-refresh every 10 seconds
+  });
+}
+
+/**
+ * Hook to fetch the latest signal quality reading for a charger
+ * @param chargerId - The charger ID
+ */
+export function useLatestSignalQuality(chargerId: number) {
+  const { isAuthReady } = useAuth();
+
+  return useQuery({
+    queryKey: chargerKeys.signalQualityLatest(chargerId),
+    queryFn: () => signalQualityService.getLatestSignalQuality(chargerId),
+    enabled: isAuthReady && !!chargerId, // Wait for auth and valid id
+    staleTime: 1000 * 5, // 5 seconds
+    refetchInterval: 1000 * 5, // Auto-refresh every 5 seconds for real-time monitoring
   });
 }

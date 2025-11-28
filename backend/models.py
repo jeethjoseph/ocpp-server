@@ -41,6 +41,15 @@ class MessageDirectionEnum(str, enum.Enum):
     INBOUND = "IN"
     OUTBOUND = "OUT"
 
+class FirmwareUpdateStatusEnum(str, enum.Enum):
+    PENDING = "PENDING"
+    DOWNLOADING = "DOWNLOADING"
+    DOWNLOADED = "DOWNLOADED"
+    INSTALLING = "INSTALLING"
+    INSTALLED = "INSTALLED"
+    DOWNLOAD_FAILED = "DOWNLOAD_FAILED"
+    INSTALLATION_FAILED = "INSTALLATION_FAILED"
+
 # Authentication enums
 class UserRoleEnum(str, enum.Enum):
     ADMIN = "ADMIN"
@@ -280,8 +289,61 @@ class OCPPLog(Model):
     class Meta:
         table = "log"
 
-# Pydantic models for API serialization 
+class FirmwareFile(Model):
+    id = fields.IntField(pk=True)
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+    version = fields.CharField(max_length=50, unique=True, index=True)
+    filename = fields.CharField(max_length=255)
+    file_path = fields.CharField(max_length=500)
+    file_size = fields.BigIntField()
+    checksum = fields.CharField(max_length=64)
+    description = fields.TextField(null=True)
+    uploaded_by = fields.ForeignKeyField("models.User", related_name="uploaded_firmwares")
+    is_active = fields.BooleanField(default=True)
+
+    # Relationships
+    firmware_updates: fields.ReverseRelation["FirmwareUpdate"]
+
+    class Meta:
+        table = "firmware_file"
+
+class FirmwareUpdate(Model):
+    id = fields.IntField(pk=True)
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+    charger = fields.ForeignKeyField("models.Charger", related_name="firmware_updates", index=True)
+    firmware_file = fields.ForeignKeyField("models.FirmwareFile", related_name="firmware_updates")
+    status = fields.CharEnumField(FirmwareUpdateStatusEnum, default=FirmwareUpdateStatusEnum.PENDING, index=True)
+    initiated_by = fields.ForeignKeyField("models.User", related_name="initiated_updates")
+    initiated_at = fields.DatetimeField(auto_now_add=True)
+    download_url = fields.CharField(max_length=500)
+    started_at = fields.DatetimeField(null=True)
+    completed_at = fields.DatetimeField(null=True)
+    error_message = fields.TextField(null=True)
+
+    class Meta:
+        table = "firmware_update"
+
+class SignalQuality(Model):
+    """
+    Stores cellular signal quality metrics from charge points.
+    Data received via OCPP DataTransfer messages from JET_EV1 chargers.
+    """
+    id = fields.IntField(pk=True)
+    created_at = fields.DatetimeField(auto_now_add=True, index=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+    charger = fields.ForeignKeyField("models.Charger", related_name="signal_quality_data", index=True)
+    rssi = fields.IntField()  # Received Signal Strength Indicator (0-31 typical for GSM, 99=unknown)
+    ber = fields.IntField()   # Bit Error Rate (0-7 for GSM, 99=unknown/not detectable)
+    timestamp = fields.CharField(max_length=50)  # Timestamp from charger
+
+    class Meta:
+        table = "signal_quality"
+
+# Pydantic models for API serialization
 User_Pydantic = pydantic_model_creator(User, name="User")
 UserIn_Pydantic = pydantic_model_creator(User, name="UserIn", exclude_readonly=True)
 Charger_Pydantic = pydantic_model_creator(Charger, name="Charger")
 OCPPLog_Pydantic = pydantic_model_creator(OCPPLog, name="OCPPLog")
+SignalQuality_Pydantic = pydantic_model_creator(SignalQuality, name="SignalQuality")

@@ -37,6 +37,7 @@ export interface Charger {
   model?: string;
   vendor?: string;
   serial_number?: string;
+  firmware_version?: string;
   latest_status: string;
   last_heart_beat_time?: string;
   connection_status: boolean;
@@ -285,4 +286,115 @@ export interface RechargeHistoryResponse {
     created_at: string;
   }>;
   total: number;
+}
+
+// Firmware Update Types
+export interface FirmwareFile {
+  id: number;
+  version: string;
+  filename: string;
+  file_size: number;
+  checksum: string;
+  description?: string;
+  uploaded_by_id: number;
+  created_at: string;
+  is_active: boolean;
+}
+
+export interface FirmwareFileListResponse {
+  data: FirmwareFile[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+export type FirmwareUpdateStatus =
+  | 'PENDING'
+  | 'DOWNLOADING'
+  | 'DOWNLOADED'
+  | 'INSTALLING'
+  | 'INSTALLED'
+  | 'DOWNLOAD_FAILED'
+  | 'INSTALLATION_FAILED';
+
+export interface FirmwareUpdate {
+  id: number;
+  charger_id: number;
+  firmware_file_id: number;
+  status: FirmwareUpdateStatus;
+  download_url: string;
+  initiated_at: string;
+  started_at?: string;
+  completed_at?: string;
+  error_message?: string;
+}
+
+export interface FirmwareHistoryResponse {
+  data: FirmwareUpdate[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+export interface FirmwareUpdateRequest {
+  firmware_file_id: number;
+}
+
+export interface BulkFirmwareUpdateRequest {
+  firmware_file_id: number;
+  charger_ids: number[];
+}
+
+export interface BulkUpdateResult {
+  success: Array<{
+    charger_id: number;
+    charger_name: string;
+    update_id: number;
+  }>;
+  failed: Array<{
+    charger_id: number;
+    charger_name?: string;
+    reason: string;
+  }>;
+}
+
+export interface UpdateStatusSummary {
+  pending: number;
+  downloading: number;
+  installing: number;
+  completed_today: number;
+  failed_today: number;
+}
+
+export interface UpdateStatusDashboard {
+  in_progress: Array<{
+    update_id: number;
+    charger_id: number;
+    charger_name: string;
+    charge_point_id: string;
+    firmware_version: string;
+    status: FirmwareUpdateStatus;
+    started_at?: string;
+    initiated_at: string;
+  }>;
+  summary: UpdateStatusSummary;
+}
+// Signal Quality Types
+export interface SignalQuality {
+  id: number;
+  charger_id: number;
+  rssi: number;  // Received Signal Strength Indicator (0-31 for GSM, 99=unknown)
+  ber: number;   // Bit Error Rate (0-7 for GSM, 99=unknown/not detectable)
+  timestamp: string;
+  created_at: string;
+}
+
+export interface SignalQualityListResponse {
+  data: SignalQuality[];
+  total: number;
+  page: number;
+  limit: number;
+  charger_id: number;
+  latest_rssi?: number;
+  latest_ber?: number;
 }

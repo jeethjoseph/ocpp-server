@@ -22,12 +22,12 @@ export default function Dashboard() {
 
         {/* Role-based content */}
         {isUser && (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             <Card className="p-6">
               <h3 className="text-lg font-semibold mb-2">My Charging Sessions</h3>
-              <p className="text-gray-600 mb-4">View your recent charging history</p>
-              <Link 
-                href="/my-sessions" 
+              <p className="text-gray-600 mb-4">View your recent charging history and wallet balance</p>
+              <Link
+                href="/my-sessions"
                 className="text-blue-600 hover:text-blue-800 font-medium"
               >
                 View Sessions →
@@ -37,22 +37,11 @@ export default function Dashboard() {
             <Card className="p-6">
               <h3 className="text-lg font-semibold mb-2">Find Chargers</h3>
               <p className="text-gray-600 mb-4">Locate available charging stations</p>
-              <Link 
-                href="/stations" 
+              <Link
+                href="/stations"
                 className="text-blue-600 hover:text-blue-800 font-medium"
               >
                 Find Stations →
-              </Link>
-            </Card>
-
-            <Card className="p-6">
-              <h3 className="text-lg font-semibold mb-2">My Wallet</h3>
-              <p className="text-gray-600 mb-4">Check your balance and top up</p>
-              <Link 
-                href="/wallet" 
-                className="text-blue-600 hover:text-blue-800 font-medium"
-              >
-                Manage Wallet →
               </Link>
             </Card>
           </div>

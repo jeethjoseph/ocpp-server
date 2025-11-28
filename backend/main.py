@@ -5,6 +5,7 @@ import datetime
 from typing import Dict, List
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from database import init_db, close_db
 from schemas import OCPPCommand, OCPPResponse, MessageLogResponse, ChargePointStatus
@@ -28,7 +29,7 @@ import logging
 import json
 
 # Import routers
-from routers import stations, chargers, transactions, auth, webhooks, users, public_stations, logs, wallet_payments
+from routers import stations, chargers, transactions, auth, webhooks, users, public_stations, logs, wallet_payments, firmware
 
 # Configure logging
 logging.basicConfig(
@@ -105,6 +106,11 @@ class OptionsMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(OptionsMiddleware)
 
+# Mount firmware files as static files
+FIRMWARE_DIR = os.path.join(os.path.dirname(__file__), "firmware_files")
+os.makedirs(FIRMWARE_DIR, exist_ok=True)
+app.mount("/firmware", StaticFiles(directory=FIRMWARE_DIR), name="firmware")
+
 # Store connected charge points with metadata (now moved to Redis)
 # Keep this for backward compatibility but will be deprecated
 connected_charge_points: Dict[str, Dict] = {}
@@ -123,13 +129,49 @@ cleanup_task = None
 class ChargePoint(OcppChargePoint):
     @on('BootNotification')
     async def on_boot_notification(self, charge_point_vendor, charge_point_model, **kwargs):
-        logger.info(f"BootNotification from {self.id}: vendor={charge_point_vendor}, model={charge_point_model}")
-        
+        # Extract optional fields from kwargs
+        firmware_version = kwargs.get('firmware_version')
+        charge_point_serial_number = kwargs.get('charge_point_serial_number')
+        iccid = kwargs.get('iccid')
+        imsi = kwargs.get('imsi')
+        meter_type = kwargs.get('meter_type')
+        meter_serial_number = kwargs.get('meter_serial_number')
+
+        logger.info(f"BootNotification from {self.id}: vendor={charge_point_vendor}, model={charge_point_model}, firmware={firmware_version}")
+
+        # Update charger information in database
+        from models import Charger
+        try:
+            charger = await Charger.get(charge_point_string_id=self.id)
+
+            # Update charger fields if provided
+            if charge_point_vendor:
+                charger.vendor = charge_point_vendor
+            if charge_point_model:
+                charger.model = charge_point_model
+            if firmware_version:
+                charger.firmware_version = firmware_version
+                logger.info(f"📦 Updated firmware version for {self.id}: {firmware_version}")
+            if charge_point_serial_number:
+                charger.serial_number = charge_point_serial_number
+            if iccid:
+                charger.iccid = iccid
+            if imsi:
+                charger.imsi = imsi
+            if meter_type:
+                charger.meter_type = meter_type
+            if meter_serial_number:
+                charger.meter_serial_number = meter_serial_number
+
+            await charger.save()
+        except Exception as e:
+            logger.error(f"❌ Error updating charger info from BootNotification: {e}")
+
         # Don't automatically fail transactions on reboot - let StatusNotification handle actual status
         # The charger will send StatusNotification after boot which will determine if transactions should fail
-        
+
         # Don't assume status - wait for StatusNotification from charge point
-        
+
         return call_result.BootNotification(
             current_time=datetime.datetime.utcnow().isoformat() + "Z",
             interval=300,
@@ -477,6 +519,167 @@ class ChargePoint(OcppChargePoint):
             logger.error(f"🔋 ❌ FATAL ERROR processing meter values for {self.id}: {e}", exc_info=True)
             return call_result.MeterValues()
 
+    @on('FirmwareStatusNotification')
+    async def on_firmware_status_notification(self, status: str, **kwargs):
+        """
+        OCPP 1.6 FirmwareStatusNotification handler
+        Charger sends this to report firmware update progress
+        """
+        logger.info(f"📦 FirmwareStatusNotification from {self.id}: status={status}")
+
+        from models import Charger, FirmwareUpdate, FirmwareFile
+
+        try:
+            # Get charger from database
+            charger = await Charger.get(charge_point_string_id=self.id)
+
+            # Find the most recent pending/in-progress update for this charger
+            firmware_update = await FirmwareUpdate.filter(
+                charger_id=charger.id,
+                status__in=["PENDING", "DOWNLOADING", "DOWNLOADED", "INSTALLING"]
+            ).order_by('-initiated_at').first()
+
+            if not firmware_update:
+                logger.warning(f"📦 No active firmware update found for {self.id}, but received status: {status}")
+                return call_result.FirmwareStatusNotification()
+
+            # Map OCPP status to our database status
+            status_mapping = {
+                "Idle": "PENDING",
+                "Downloading": "DOWNLOADING",
+                "Downloaded": "DOWNLOADED",
+                "Installing": "INSTALLING",
+                "Installed": "INSTALLED",
+                "DownloadFailed": "DOWNLOAD_FAILED",
+                "InstallationFailed": "INSTALLATION_FAILED",
+                "InstallVerificationFailed": "INSTALLATION_FAILED"
+            }
+
+            new_status = status_mapping.get(status, status)
+            firmware_update.status = new_status
+
+            # Track timestamps
+            if status == "Downloading" and not firmware_update.started_at:
+                firmware_update.started_at = datetime.datetime.utcnow()
+                logger.info(f"📦 ✅ Firmware download started for {self.id}")
+
+            elif status in ["Installed", "DownloadFailed", "InstallationFailed", "InstallVerificationFailed"]:
+                firmware_update.completed_at = datetime.datetime.utcnow()
+
+                if status == "Installed":
+                    # Update success - update charger's firmware version
+                    firmware_file = await firmware_update.firmware_file
+                    charger.firmware_version = firmware_file.version
+                    await charger.save()
+                    logger.info(f"📦 ✅ Firmware update completed for {self.id} - new version: {firmware_file.version}")
+                else:
+                    # Update failed
+                    firmware_update.error_message = f"Firmware update failed with status: {status}"
+                    logger.error(f"📦 ❌ Firmware update failed for {self.id} with status: {status}")
+
+            await firmware_update.save()
+
+            # Log to OCPP logs for audit trail
+            await OCPPLog.create(
+                charge_point_id=self.id,
+                message_type="FirmwareStatusNotification",
+                direction="IN",
+                payload={"status": status},
+                status="SUCCESS",
+                timestamp=datetime.datetime.utcnow()
+            )
+
+            logger.info(f"📦 Updated firmware_update ID={firmware_update.id} to status={new_status}")
+
+        except Exception as e:
+            logger.error(f"📦 ❌ Error processing FirmwareStatusNotification from {self.id}: {e}", exc_info=True)
+
+        return call_result.FirmwareStatusNotification()
+
+    @on('DataTransfer')
+    async def on_data_transfer(self, vendor_id: str, message_id: str = None, data: str = None, **kwargs):
+        """
+        OCPP 1.6 DataTransfer handler
+        Handles vendor-specific data messages from chargers
+        Currently supports: JET_EV1 Signal Quality data
+        """
+        logger.info(f"📡 DataTransfer from {self.id}: vendorId={vendor_id}, messageId={message_id}")
+
+        from models import Charger, SignalQuality, OCPPLog
+        import json
+
+        try:
+            # Route to vendor-specific handlers
+            if vendor_id == "JET_EV1":
+                if message_id == "SignalQuality":
+                    return await self._handle_jet_ev1_signal_quality(data)
+                else:
+                    logger.warning(f"📡 Unknown messageId for JET_EV1: {message_id}")
+                    return call_result.DataTransfer(status="UnknownMessageId")
+            else:
+                logger.warning(f"📡 Unknown vendorId: {vendor_id}")
+                return call_result.DataTransfer(status="UnknownVendorId")
+
+        except Exception as e:
+            logger.error(f"📡 ❌ Error processing DataTransfer from {self.id}: {e}", exc_info=True)
+            return call_result.DataTransfer(status="Rejected")
+
+    async def _handle_jet_ev1_signal_quality(self, data: str):
+        """
+        Handle JET_EV1 SignalQuality messages
+        Data format: {"rssi":22,"ber":99,"timestamp":"86"}
+        """
+        from models import Charger, SignalQuality
+        import json
+
+        try:
+            # Parse JSON data
+            if not data:
+                logger.error(f"📡 ❌ No data provided in SignalQuality message from {self.id}")
+                return call_result.DataTransfer(status="Rejected")
+
+            payload = json.loads(data)
+            rssi = payload.get("rssi")
+            ber = payload.get("ber")
+            timestamp = payload.get("timestamp")
+
+            # Validate required fields
+            if rssi is None or ber is None:
+                logger.error(f"📡 ❌ Missing required fields (rssi/ber) in SignalQuality data from {self.id}")
+                return call_result.DataTransfer(status="Rejected")
+
+            # Validate RSSI range (0-31 for GSM, 99 for unknown)
+            if not (0 <= rssi <= 31 or rssi == 99):
+                logger.warning(f"📡 ⚠️  RSSI value {rssi} out of typical range for {self.id}")
+
+            # Validate BER range (0-7 for GSM, 99 for unknown/not detectable)
+            if not (0 <= ber <= 7 or ber == 99):
+                logger.warning(f"📡 ⚠️  BER value {ber} out of typical range for {self.id}")
+
+            # Get charger
+            charger = await Charger.get(charge_point_string_id=self.id)
+
+            # Store signal quality data
+            await SignalQuality.create(
+                charger=charger,
+                rssi=rssi,
+                ber=ber,
+                timestamp=str(timestamp) if timestamp is not None else ""
+            )
+
+            # Log success
+            signal_strength = "Good" if rssi >= 10 else "Fair" if rssi >= 5 else "Poor" if rssi > 0 else "Unknown"
+            logger.info(f"📶 Stored signal quality for {self.id}: RSSI={rssi} ({signal_strength}), BER={ber}")
+
+            return call_result.DataTransfer(status="Accepted")
+
+        except json.JSONDecodeError as e:
+            logger.error(f"📡 ❌ Invalid JSON in SignalQuality data from {self.id}: {e}")
+            return call_result.DataTransfer(status="Rejected")
+        except Exception as e:
+            logger.error(f"📡 ❌ Error storing SignalQuality for {self.id}: {e}", exc_info=True)
+            return call_result.DataTransfer(status="Rejected")
+
 # Adapter to make FastAPI's WebSocket compatible with python-ocpp
 class FastAPIWebSocketAdapter:
     def __init__(self, websocket: WebSocket):
@@ -602,6 +805,16 @@ async def send_ocpp_request(charge_point_id: str, action: str, payload: Dict = N
             req = call.ChangeAvailability(**(payload or {}))
             response = await cp.call(req)
             logger.info(f"Sent {action} request to {charge_point_id}")
+            return True, response
+        elif action == "UpdateFirmware":
+            req = call.UpdateFirmware(**(payload or {}))
+            response = await cp.call(req)
+            logger.info(f"📦 Sent {action} request to {charge_point_id}: {payload.get('location')}")
+            return True, response
+        elif action == "Reset":
+            req = call.Reset(**(payload or {}))
+            response = await cp.call(req)
+            logger.info(f"🔄 Sent {action} request to {charge_point_id}: type={payload.get('type', 'Hard')}")
             return True, response
         else:
             logger.warning(f"Action {action} not implemented in send_ocpp_request")
@@ -756,6 +969,8 @@ app.include_router(wallet_payments.router)
 app.include_router(users.router)
 app.include_router(public_stations.router)
 app.include_router(logs.router)
+app.include_router(firmware.router)
+app.include_router(firmware.public_router)
 
 # ============ OCPP WebSocket Endpoint ============
 @app.websocket("/ocpp/{charge_point_id}")
@@ -783,6 +998,11 @@ async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
             # Tombstone expired, remove it
             logger.info(f"[CONNECTION ATTEMPT] {charge_point_id} tombstone expired, allowing reconnection")
             del recently_disconnected[charge_point_id]
+
+    # If charger already connected, force disconnect old connection (handles reconnection after reboot)
+    if charge_point_id in connected_charge_points:
+        logger.warning(f"[CONNECTION ATTEMPT] {charge_point_id} already connected - forcing disconnect of stale connection")
+        await force_disconnect(charge_point_id, "New connection attempt - replacing stale connection")
 
     # Validate charger before connecting
     is_valid, message = await validate_and_connect_charger(charge_point_id, connected_charge_points)
@@ -933,14 +1153,18 @@ async def startup_event():
     global cleanup_task
     await init_db()
     await redis_manager.connect()
-    
-    # Start periodic cleanup task
+
+    # Start periodic cleanup task for stale connections
     cleanup_task = asyncio.create_task(periodic_cleanup())
-    
+
     # Start billing retry service
     from services.billing_retry_service import start_billing_retry_service
     await start_billing_retry_service()
-    
+
+    # Start data retention service (cleanup old signal quality data & OCPP logs)
+    from services.data_retention_service import start_data_retention_service
+    await start_data_retention_service(retention_days=90, cleanup_interval_hours=24)
+
     logger.info("Database initialized with Tortoise ORM")
     logger.info("Redis connection established")
     logger.info("Periodic cleanup task started")
@@ -965,7 +1189,11 @@ async def shutdown_event():
     # Stop billing retry service
     from services.billing_retry_service import stop_billing_retry_service
     await stop_billing_retry_service()
-    
+
+    # Stop data retention service
+    from services.data_retention_service import stop_data_retention_service
+    await stop_data_retention_service()
+
     await close_db()
     await redis_manager.disconnect()
     logger.info("Database and Redis connections closed")

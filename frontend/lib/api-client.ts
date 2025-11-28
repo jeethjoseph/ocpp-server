@@ -1,6 +1,8 @@
 // Streamlined API client for TanStack Query
 'use client';
 
+import { getGlobalGetToken } from '@/contexts/AuthContext';
+
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 export class ApiError extends Error {
@@ -19,31 +21,25 @@ async function apiRequest<T>(
   options: RequestInit = {}
 ): Promise<T> {
   const url = `${API_BASE_URL}${endpoint}`;
-  
-  // Get current auth token from Clerk
+
+  // Get current auth token using the abstraction layer
   let token: string | null = null;
-  
-  // Client-side: get token from window.Clerk
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  if (typeof window !== 'undefined' && (window as any).Clerk) {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const clerk = (window as any).Clerk;
-    
-    
-    if (clerk.session) {
+
+  // Client-side: get token from auth abstraction
+  if (typeof window !== 'undefined') {
+    const getToken = getGlobalGetToken();
+
+    if (getToken) {
       try {
-        token = await clerk.session.getToken();
-        
+        token = await getToken();
       } catch (error) {
-        console.error('❌ Failed to get Clerk token:', error);
+        console.error('❌ Failed to get auth token:', error);
       }
     } else {
-      console.warn('⚠️ No Clerk session found');
+      console.warn('⚠️ Auth not initialized yet');
     }
-  } else {
-    console.warn('⚠️ Clerk not available on window object');
   }
-  
+
   const config: RequestInit = {
     headers: {
       "Content-Type": "application/json",
@@ -55,7 +51,6 @@ async function apiRequest<T>(
     ...options,
   };
 
-
   const response = await fetch(url, config);
 
   if (!response.ok) {
@@ -66,7 +61,7 @@ async function apiRequest<T>(
     } catch (e) {
       console.error('Failed to read error response:', e);
     }
-    
+
     throw new ApiError(
       response.status,
       response.statusText,

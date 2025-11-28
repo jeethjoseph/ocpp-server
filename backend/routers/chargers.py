@@ -40,12 +40,13 @@ class ChargerResponse(BaseModel):
     model: Optional[str]
     vendor: Optional[str]
     serial_number: Optional[str]
+    firmware_version: Optional[str]
     latest_status: str
     last_heart_beat_time: Optional[datetime]
     connection_status: bool
     created_at: datetime
     updated_at: datetime
-    
+
     class Config:
         from_attributes = True
 
@@ -152,6 +153,7 @@ def charger_to_response(charger: Charger, connection_status: bool) -> ChargerRes
         model=charger.model,
         vendor=charger.vendor,
         serial_number=charger.serial_number,
+        firmware_version=charger.firmware_version,
         latest_status=charger.latest_status,
         last_heart_beat_time=charger.last_heart_beat_time,
         created_at=charger.created_at,
@@ -531,6 +533,64 @@ async def change_charger_availability(
     else:
         raise HTTPException(status_code=500, detail=f"Failed to change availability: {response}")
 
+@router.post("/{charger_id}/reset", response_model=dict)
+async def reset_charger(
+    charger_id: int,
+    type: str = Query("Hard", regex="^(Hard|Soft)$"),
+    admin_user: User = Depends(require_admin())
+):
+    """
+    Reset charger remotely - OCPP 1.6 compliant
+
+    - Hard: Complete reboot of the charger (stops active transactions)
+    - Soft: Graceful restart (may continue operating or restart gracefully)
+
+    Hard reset is blocked if there's an active charging session.
+    """
+
+    charger = await Charger.filter(id=charger_id).first()
+    if not charger:
+        raise HTTPException(status_code=404, detail="Charger not found")
+
+    # Check for active transactions if Hard reset
+    if type == "Hard":
+        active_transaction = await Transaction.filter(
+            charger_id=charger_id,
+            transaction_status__in=["RUNNING", "STARTED", "PENDING_START"]
+        ).first()
+
+        if active_transaction:
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot perform Hard reset while charging is active. Please stop the transaction first or use Soft reset."
+            )
+
+    # Get connected charge points
+    connected_cps = get_connected_charge_points()
+
+    if charger.charge_point_string_id not in connected_cps:
+        raise HTTPException(status_code=409, detail="Charger is not connected")
+
+    # Import and use the send_ocpp_request function
+    from main import send_ocpp_request
+
+    # Send Reset command
+    success, response = await send_ocpp_request(
+        charger.charge_point_string_id,
+        "Reset",
+        {"type": type}
+    )
+
+    if success:
+        return {
+            "success": True,
+            "message": f"{type} reset command sent successfully",
+            "reset_type": type,
+            "charger_id": charger_id
+        }
+    else:
+        raise HTTPException(status_code=500, detail=f"Failed to send reset command: {response}")
+
 @router.get("/{charger_id}/logs", response_model=LogsListResponse)
 async def get_charger_logs(
     charger_id: int,
@@ -565,10 +625,115 @@ async def get_charger_logs(
     logs = await query.order_by("-timestamp").offset(offset).limit(limit)
     
     log_responses = [OCPPLogResponse.model_validate(log, from_attributes=True) for log in logs]
-    
+
     return LogsListResponse(
         data=log_responses,
         total=total,
         page=page,
         limit=limit
     )
+
+# ============ Signal Quality Endpoints ============
+
+class SignalQualityResponse(BaseModel):
+    """Response schema for signal quality data point"""
+    id: int
+    charger_id: int
+    rssi: int  # Received Signal Strength Indicator (0-31 for GSM, 99=unknown)
+    ber: int   # Bit Error Rate (0-7 for GSM, 99=unknown/not detectable)
+    timestamp: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class SignalQualityListResponse(BaseModel):
+    """Response schema for list of signal quality data"""
+    data: List[SignalQualityResponse]
+    total: int
+    page: int
+    limit: int
+    charger_id: int
+    latest_rssi: Optional[int] = None
+    latest_ber: Optional[int] = None
+
+@router.get("/{charger_id}/signal-quality", response_model=SignalQualityListResponse)
+async def get_charger_signal_quality(
+    charger_id: int,
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=100, description="Items per page"),
+    hours: int = Query(24, ge=1, le=720, description="Number of hours of history to retrieve (max 30 days)"),
+    admin_user: User = Depends(require_admin())
+):
+    """
+    Get signal quality history for a specific charger (Admin only)
+
+    Returns paginated signal quality data for the specified charger.
+    Data includes RSSI (signal strength) and BER (bit error rate) metrics.
+    """
+    from models import SignalQuality
+    from datetime import datetime, timedelta
+
+    # Verify charger exists
+    charger = await Charger.get_or_none(id=charger_id)
+    if not charger:
+        raise HTTPException(status_code=404, detail="Charger not found")
+
+    # Calculate cutoff time
+    cutoff_time = datetime.utcnow() - timedelta(hours=hours)
+
+    # Build query
+    query = SignalQuality.filter(
+        charger_id=charger_id,
+        created_at__gte=cutoff_time
+    )
+
+    # Get total count
+    total = await query.count()
+
+    # Apply pagination
+    offset = (page - 1) * limit
+    signal_data = await query.order_by("-created_at").offset(offset).limit(limit)
+
+    # Get latest values (most recent record)
+    latest = await SignalQuality.filter(charger_id=charger_id).order_by("-created_at").first()
+    latest_rssi = latest.rssi if latest else None
+    latest_ber = latest.ber if latest else None
+
+    # Convert to response models
+    data_responses = [SignalQualityResponse.model_validate(d, from_attributes=True) for d in signal_data]
+
+    return SignalQualityListResponse(
+        data=data_responses,
+        total=total,
+        page=page,
+        limit=limit,
+        charger_id=charger_id,
+        latest_rssi=latest_rssi,
+        latest_ber=latest_ber
+    )
+
+@router.get("/{charger_id}/signal-quality/latest", response_model=Optional[SignalQualityResponse])
+async def get_charger_latest_signal_quality(
+    charger_id: int,
+    admin_user: User = Depends(require_admin())
+):
+    """
+    Get the most recent signal quality reading for a specific charger (Admin only)
+
+    Returns the latest RSSI and BER values, or null if no data available.
+    """
+    from models import SignalQuality
+
+    # Verify charger exists
+    charger = await Charger.get_or_none(id=charger_id)
+    if not charger:
+        raise HTTPException(status_code=404, detail="Charger not found")
+
+    # Get most recent signal quality record
+    latest = await SignalQuality.filter(charger_id=charger_id).order_by("-created_at").first()
+
+    if not latest:
+        return None
+
+    return SignalQualityResponse.model_validate(latest, from_attributes=True)
