@@ -12,6 +12,8 @@ import {
   MeterValue,
   TransactionDetail,
   ApiResponse,
+  SignalQuality,
+  SignalQualityListResponse,
 } from "@/types/api";
 
 export const stationService = {
@@ -116,6 +118,11 @@ export const chargerService = {
       connector_id: connectorId,
       id_tag: idTag,
     }),
+
+  reset: (chargerId: number, type: 'Hard' | 'Soft' = 'Hard') =>
+    api.post<{ success: boolean; message: string; reset_type: string; charger_id: number }>(
+      `/api/admin/chargers/${chargerId}/reset?type=${type}`
+    ),
 };
 
 export const transactionService = {
@@ -324,6 +331,7 @@ export const firmwareService = {
       headers: {
         'Authorization': `Bearer ${token}`,
       },
+      credentials: 'include',
       body: formData,
     });
 
@@ -394,5 +402,40 @@ export const firmwareService = {
   getUpdateStatus: () =>
     api.get<import("@/types/api").UpdateStatusDashboard>(
       "/api/admin/firmware/updates/status"
+    ),
+};
+
+/**
+ * Signal Quality Service
+ * Handles charger cellular signal quality data (RSSI, BER)
+ */
+export const signalQualityService = {
+  /**
+   * Get signal quality history for a charger
+   * @param chargerId - The charger ID
+   * @param params - Query parameters (page, limit, hours)
+   */
+  getSignalQuality: (
+    chargerId: number,
+    params?: { page?: number; limit?: number; hours?: number }
+  ) => {
+    const searchParams = new URLSearchParams();
+    if (params?.page) searchParams.set("page", params.page.toString());
+    if (params?.limit) searchParams.set("limit", params.limit.toString());
+    if (params?.hours) searchParams.set("hours", params.hours.toString());
+
+    const query = searchParams.toString();
+    return api.get<SignalQualityListResponse>(
+      `/api/admin/chargers/${chargerId}/signal-quality${query ? `?${query}` : ""}`
+    );
+  },
+
+  /**
+   * Get the most recent signal quality reading for a charger
+   * @param chargerId - The charger ID
+   */
+  getLatestSignalQuality: (chargerId: number) =>
+    api.get<SignalQuality | null>(
+      `/api/admin/chargers/${chargerId}/signal-quality/latest`
     ),
 };

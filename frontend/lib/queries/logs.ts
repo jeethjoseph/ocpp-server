@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { logService } from "../api-services";
+import { useAuth } from "@/contexts/AuthContext";
 
 export const useChargerLogs = (
   chargePointId: string,
@@ -9,10 +10,12 @@ export const useChargerLogs = (
     limit?: number;
   }
 ) => {
+  const { isAuthReady } = useAuth();
+
   return useQuery({
     queryKey: ["chargerLogs", chargePointId, params],
     queryFn: () => logService.getChargerLogs(chargePointId, params),
-    enabled: !!chargePointId,
+    enabled: isAuthReady && !!chargePointId,
     staleTime: Infinity, // Historical data never changes
     gcTime: 10 * 60 * 1000, // Keep in cache for 10 minutes
     refetchOnWindowFocus: false, // No need to refetch historical data
@@ -21,10 +24,12 @@ export const useChargerLogs = (
 };
 
 export const useChargerLogSummary = (chargePointId: string) => {
+  const { isAuthReady } = useAuth();
+
   return useQuery({
     queryKey: ["chargerLogSummary", chargePointId],
     queryFn: () => logService.getChargerLogSummary(chargePointId),
-    enabled: !!chargePointId,
+    enabled: isAuthReady && !!chargePointId,
     staleTime: Infinity, // Summary of historical data doesn't change
     gcTime: 30 * 60 * 1000, // Keep in cache for 30 minutes
     refetchOnWindowFocus: false,

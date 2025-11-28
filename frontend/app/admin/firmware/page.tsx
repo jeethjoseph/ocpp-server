@@ -24,7 +24,7 @@ import {
   useUpdateStatus,
 } from "@/lib/queries/firmware";
 import { Upload, Trash2, RefreshCw, AlertCircle, CheckCircle2, Clock, Download, XCircle } from "lucide-react";
-import { useAuth } from "@clerk/nextjs";
+import { useAuth } from "@/contexts/AuthContext";
 
 export default function AdminFirmwarePage() {
   const { getToken } = useAuth();
@@ -33,7 +33,7 @@ export default function AdminFirmwarePage() {
   const [uploadVersion, setUploadVersion] = useState("");
   const [uploadDescription, setUploadDescription] = useState("");
 
-  // Queries
+  // Queries - they will automatically wait for auth using isAuthReady from context
   const { data: firmwareData, isLoading: isLoadingFirmware } = useFirmwareFiles({ is_active: true });
   const { data: statusData } = useUpdateStatus();
 

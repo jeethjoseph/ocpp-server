@@ -5,6 +5,7 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { firmwareService } from "@/lib/api-services";
 import { toast } from "sonner";
+import { useAuth } from "@/contexts/AuthContext";
 
 // Query keys for cache management
 export const firmwareKeys = {
@@ -21,11 +22,14 @@ export const firmwareKeys = {
 /**
  * Get list of firmware files
  */
-export function useFirmwareFiles(params?: { page?: number; limit?: number; is_active?: boolean }) {
+export function useFirmwareFiles(params?: { page?: number; limit?: number; is_active?: boolean; enabled?: boolean }) {
+  const { isAuthReady } = useAuth();
+
   return useQuery({
     queryKey: firmwareKeys.list(params || {}),
     queryFn: () => firmwareService.getFirmwareFiles(params),
     staleTime: 1000 * 30, // 30 seconds
+    enabled: (params?.enabled ?? true) && isAuthReady, // Wait for auth and custom enabled flag
   });
 }
 
@@ -128,11 +132,13 @@ export function useBulkUpdate() {
  * Get firmware update history for a charger
  */
 export function useFirmwareHistory(chargerId: number, params?: { page?: number; limit?: number }) {
+  const { isAuthReady } = useAuth();
+
   return useQuery({
     queryKey: firmwareKeys.history(chargerId, params),
     queryFn: () => firmwareService.getFirmwareHistory(chargerId, params),
     staleTime: 1000 * 10, // 10 seconds
-    enabled: !!chargerId,
+    enabled: isAuthReady && !!chargerId, // Wait for auth and valid id
   });
 }
 
@@ -140,11 +146,14 @@ export function useFirmwareHistory(chargerId: number, params?: { page?: number; 
  * Get dashboard status of all firmware updates
  * Auto-refreshes every 10 seconds
  */
-export function useUpdateStatus() {
+export function useUpdateStatus(params?: { enabled?: boolean }) {
+  const { isAuthReady } = useAuth();
+
   return useQuery({
     queryKey: firmwareKeys.status(),
     queryFn: () => firmwareService.getUpdateStatus(),
     staleTime: 1000 * 5,  // 5 seconds
     refetchInterval: 1000 * 10,  // Refresh every 10 seconds for real-time monitoring
+    enabled: (params?.enabled ?? true) && isAuthReady, // Wait for auth and custom enabled flag
   });
 }

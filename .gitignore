@@ -21,6 +21,9 @@ env/
 test.html
 dump.rdb
 
+# Claude Code plans (local development artifacts)
+.claude/plans/
+
 # Database (PostgreSQL dumps and backups)
 *.sql
 *.dump

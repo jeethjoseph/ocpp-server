@@ -20,6 +20,7 @@ from services import storage_service
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/admin/firmware", tags=["firmware"])
+public_router = APIRouter(prefix="/api/firmware", tags=["firmware-public"])
 
 # Pydantic schemas
 class FirmwareFileResponse(BaseModel):
@@ -83,6 +84,16 @@ class UpdateStatusSummary(BaseModel):
 class UpdateStatusDashboardResponse(BaseModel):
     in_progress: List[dict]
     summary: UpdateStatusSummary
+
+class LatestFirmwareResponse(BaseModel):
+    version: str
+    filename: str
+    download_url: str
+    checksum: str
+    file_size: int
+
+    class Config:
+        from_attributes = True
 
 
 # ============ Firmware Management Endpoints ============
@@ -525,4 +536,47 @@ async def get_update_status_dashboard(
     return UpdateStatusDashboardResponse(
         in_progress=in_progress_list,
         summary=summary
+    )
+
+
+# ============ Public Firmware Discovery Endpoint ============
+
+@public_router.get("/latest", response_model=LatestFirmwareResponse)
+async def get_latest_firmware(request: Request):
+    """
+    Get the latest available firmware for non-OCPP charge points
+
+    Public endpoint - no authentication required.
+    Returns firmware info for charge points to download and install.
+
+    This endpoint is designed for charge points that do not support OCPP
+    and need to check for firmware updates programmatically.
+    """
+    # Query for latest active firmware
+    latest_firmware = await FirmwareFile.filter(is_active=True).order_by('-created_at').first()
+
+    if not latest_firmware:
+        raise HTTPException(
+            status_code=404,
+            detail="No firmware files available"
+        )
+
+    # Generate download URL
+    base_url = str(request.base_url).rstrip('/')
+    download_url = storage_service.get_firmware_download_url(
+        latest_firmware.filename,
+        base_url
+    )
+
+    logger.info(
+        f"📦 Latest firmware requested: version={latest_firmware.version}, "
+        f"filename={latest_firmware.filename}"
+    )
+
+    return LatestFirmwareResponse(
+        version=latest_firmware.version,
+        filename=latest_firmware.filename,
+        download_url=download_url,
+        checksum=latest_firmware.checksum,
+        file_size=latest_firmware.file_size
     )

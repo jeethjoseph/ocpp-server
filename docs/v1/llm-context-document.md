@@ -59,6 +59,11 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
 - **`chargers.py`** - OCPP charger management with remote commands (`/api/admin/chargers/*`)
 - **`transactions.py`** - Transaction tracking with meter values (`/api/admin/transactions/*`)
 - **`users.py`** - User management with wallet operations (`/users/*`)
+- **`firmware.py`** - **Firmware OTA update management** (`/api/admin/firmware/*` + `/api/firmware/*`)
+  - Admin: Upload, list, delete firmware files
+  - Admin: Trigger OCPP firmware updates (single/bulk)
+  - Admin: Monitor update progress with real-time dashboard
+  - Public: `/api/firmware/latest` for non-OCPP charge points
 - **`webhooks.py`** - Clerk webhook processing for user lifecycle (`/webhooks/clerk`) + **NEW**: Razorpay webhook handler (`/webhooks/razorpay`)
 - **`wallet_payments.py`** - **NEW**: Razorpay payment integration for wallet recharge (`/api/wallet/*`)
 
@@ -74,12 +79,35 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
   - Webhook signature verification
   - HMAC SHA256 security
   - Test/Live mode support
+- **`storage_service.py`** - **Firmware file storage and management**
+  - Local filesystem storage in `/backend/firmware_files/`
+  - MD5 checksum calculation for integrity
+  - Download URL generation for OCPP UpdateFirmware
+  - File naming: `{version}_{original_filename}`
+  - Static serving via `/firmware/{filename}` endpoint
+- **`data_retention_service.py`** - **Background data cleanup service**
+  - Automated cleanup of old signal quality data (90 days retention)
+  - OCPP log cleanup (90 days retention)
+  - Runs every 24 hours
+  - Configurable retention period and cleanup interval
 
 ### Frontend Core (`/frontend/`)
 - **`app/page.tsx`** - Role-based dashboard (different for ADMIN vs USER)
 - **`app/admin/`** - Complete admin interface for station/charger/user management
   - **`app/admin/users/[id]/transactions/page.tsx`** - **NEW** User charging transaction history
   - **`app/admin/users/[id]/wallet/page.tsx`** - **NEW** Wallet transaction history with running balance
+  - **`app/admin/firmware/page.tsx`** - **Firmware management dashboard**
+    - Upload firmware files with version and description
+    - Real-time update status monitoring (10s auto-refresh)
+    - Summary cards (pending, downloading, installing, completed, failed)
+    - Firmware library with delete capability
+  - **`app/admin/chargers/[id]/page.tsx`** - Charger detail with **firmware update & signal quality**
+    - Current firmware version display
+    - Update firmware button (disabled if offline)
+    - Firmware version selection dialog
+    - Recent update history (last 3 updates)
+    - **Real-time signal quality badge** (Good/Fair/Poor/Unknown)
+    - RSSI display with color-coding (auto-refresh every 5s)
 - **`app/stations/page.tsx`** - Interactive map with React Leaflet 5.0.0 for station discovery
 - **`app/scanner/page.tsx`** - QR code scanner using ZXing 0.21.3
 - **`app/my-sessions/page.tsx`** - **NEW** Combined user sessions (charging + wallet) with recharge button
@@ -90,14 +118,36 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
 
 ### API Integration (`/frontend/lib/`)
 - **`api-client.ts`** - Base HTTP client with automatic Clerk JWT injection
-- **`api-services.ts`** - Domain-specific services (stations, chargers, users, transactions, **wallet payments**)
+- **`api-services.ts`** - Domain-specific services (stations, chargers, users, transactions, **wallet payments, firmware**)
   - **`walletPaymentService`** - **NEW** Razorpay payment API methods
     - `createRechargeOrder()` - Create payment order
     - `verifyPayment()` - Verify payment completion
     - `getPaymentStatus()` - Check payment status
     - `getRechargeHistory()` - Get recharge history
+  - **`firmwareService`** - **Firmware management API methods**
+    - `uploadFirmware()` - Upload firmware file (FormData)
+    - `getFirmwareFiles()` - List firmware with pagination
+    - `deleteFirmwareFile()` - Soft delete firmware
+    - `triggerUpdate()` - Single charger update
+    - `bulkUpdate()` - Multiple chargers update
+    - `getFirmwareHistory()` - Update history per charger
+    - `getUpdateStatus()` - Real-time dashboard status
+  - **`signalQualityService`** - **Cellular signal quality monitoring**
+    - `getSignalQuality()` - Get history with time filtering
+    - `getLatestSignalQuality()` - Get most recent reading
 - **`queries/`** - TanStack Query hooks with optimized caching strategies
   - **`users.ts`** - **NEW** User transaction and wallet query hooks
+  - **`firmware.ts`** - **Firmware TanStack Query hooks**
+    - `useFirmwareFiles()` - Query firmware files (30s stale time)
+    - `useUploadFirmware()` - Upload mutation
+    - `useDeleteFirmware()` - Delete mutation
+    - `useTriggerUpdate()` - Single update mutation
+    - `useBulkUpdate()` - Bulk update mutation
+    - `useFirmwareHistory()` - Update history query (10s stale)
+    - `useUpdateStatus()` - Dashboard status (5s stale, **10s auto-refresh**)
+  - **`chargers.ts`** - **Signal quality hooks** (in charger queries file)
+    - `useSignalQuality()` - Signal history (10s stale, **10s auto-refresh**)
+    - `useLatestSignalQuality()` - Latest reading (5s stale, **5s auto-refresh**)
 - **`csv-export.ts`** - CSV export utility for transaction data
 
 ### Key Configuration
@@ -121,9 +171,16 @@ charging_station (id, name, latitude, longitude, address)
 charger (id, charge_point_string_id, station_id, vendor, model, latest_status, last_heart_beat_time)
 connector (id, charger_id, connector_id, connector_type, max_power_kw)
 
--- OCPP Transactions  
+-- OCPP Transactions
 transaction (id, user_id, charger_id, start_meter_kwh, end_meter_kwh, transaction_status)
 meter_value (id, transaction_id, reading_kwh, current, voltage, power_kw)
+
+-- Firmware Management
+firmware_file (id, version, filename, file_path, file_size, checksum, description, uploaded_by, is_active)
+firmware_update (id, charger_id, firmware_file_id, status, download_url, started_at, completed_at, error_message)
+
+-- Signal Quality Monitoring
+signal_quality (id, charger_id, rssi, ber, timestamp, created_at) -- Cellular signal metrics via DataTransfer
 
 -- System Logging
 log (id, charge_point_id, direction, payload, correlation_id) -- All OCPP messages
@@ -132,6 +189,7 @@ log (id, charge_point_id, direction, payload, correlation_id) -- All OCPP messag
 ### Important Enums
 - **`ChargerStatusEnum`**: OCPP 1.6 statuses (Available, Charging, Unavailable, Faulted, etc.)
 - **`TransactionStatusEnum`**: Complete lifecycle (RUNNING, COMPLETED, FAILED, BILLING_FAILED, etc.)
+- **`FirmwareUpdateStatusEnum`**: PENDING, DOWNLOADING, DOWNLOADED, INSTALLING, INSTALLED, DOWNLOAD_FAILED, INSTALLATION_FAILED
 - **`UserRoleEnum`**: USER and ADMIN for role-based access control
 
 ---
@@ -147,11 +205,27 @@ log (id, charge_point_id, direction, payload, correlation_id) -- All OCPP messag
 4. **StartTransaction** (`main.py:142-204`) - Creates Transaction with RUNNING status
 5. **StopTransaction** (`main.py:206-261`) - Finalizes transaction with automated billing via WalletService
 6. **MeterValues** (`main.py:263-387`) - Stores real-time energy data (kWh, current, voltage, power)
+7. **FirmwareStatusNotification** (`main.py:522-597`) - **Firmware update progress tracking**
+   - Maps OCPP status (Downloading → Downloaded → Installing → Installed) to database
+   - Updates FirmwareUpdate record with timestamps and status
+   - On success: Updates charger.firmware_version field
+   - On failure: Stores error message
+   - Complete audit logging for compliance
+8. **DataTransfer** (`main.py:599-668`) - **Vendor-specific data messages**
+   - Handles custom data from charge points (vendor-specific extensions)
+   - Currently supports: **JET_EV1 Signal Quality data**
+   - Validates and stores RSSI (signal strength) and BER (bit error rate)
+   - Range validation: RSSI (0-31, 99=unknown), BER (0-7, 99=unknown)
+   - Stores in `signal_quality` table for monitoring
 
 **Remote Commands Supported**:
 - `RemoteStartTransaction` (`main.py:480-484`) - Start charging remotely
-- `RemoteStopTransaction` (`main.py:485-489`) - Stop charging remotely  
+- `RemoteStopTransaction` (`main.py:485-489`) - Stop charging remotely
 - `ChangeAvailability` (`main.py:490-494`) - Set Operative/Inoperative
+- **`UpdateFirmware`** (`main.py:809-813`) - **Trigger OTA firmware update**
+  - Sends download URL, retrieve date, retries, retry interval
+  - Pre-validated: charger online, no active transaction
+  - Tracked via FirmwareUpdate database record
 
 ### WebSocket Endpoint
 - **URL**: `ws://localhost:8000/ocpp/{charge_point_id}` (development)
@@ -254,6 +328,50 @@ GET /wallet/recharge-history - Get user's wallet recharge history
   Response: { "data": [...transactions], "total": N }
 ```
 
+### **Firmware Management APIs** (`/api/admin/firmware/*` + `/api/firmware/*`)
+```
+# Admin Endpoints (require authentication)
+POST /api/admin/firmware/upload - Upload firmware file (.bin, .hex, .fw)
+  FormData: { file, version, description }
+  Response: { id, version, filename, file_size, checksum, is_active, ... }
+
+GET /api/admin/firmware - List firmware files with pagination
+  Params: { page?, limit?, is_active? }
+  Response: { data: [firmware_files], total, page, limit }
+
+DELETE /api/admin/firmware/{id} - Soft delete firmware (sets is_active=False)
+  Validation: Cannot delete if chargers using that version
+
+POST /api/admin/firmware/chargers/{id}/update - Trigger OCPP update (single)
+  Request: { "firmware_file_id": 1 }
+  Validation: Charger online, no active transaction
+  Response: FirmwareUpdate record (PENDING status)
+
+POST /api/admin/firmware/bulk-update - Trigger updates for multiple chargers
+  Request: { "firmware_file_id": 1, "charger_ids": [1,2,3] }
+  Response: { "success": [...], "failed": [...] }
+
+GET /api/admin/firmware/chargers/{id}/history - Get update history
+  Response: Paginated list of FirmwareUpdate records
+
+GET /api/admin/firmware/updates/status - Real-time dashboard
+  Response: { "in_progress": [...], "summary": { pending, downloading, installing, completed_today, failed_today } }
+
+# Public Endpoint (NO authentication)
+GET /api/firmware/latest - Get latest firmware for non-OCPP charge points
+  Response: { "version", "filename", "download_url", "checksum", "file_size" }
+  Response: 404 if no active firmware
+```
+
+**Firmware Static Files**:
+- `/firmware/{filename}` - Direct firmware download URL (static file serving)
+
+**Firmware Flow**:
+1. OCPP: Admin triggers → UpdateFirmware command → FirmwareStatusNotification tracking → charger.firmware_version updated
+2. Non-OCPP: Device polls `/api/firmware/latest` → downloads from URL → verifies checksum → installs
+
+**Documentation**: See `/backend/docs/FIRMWARE_API.md` for ESP32/Arduino integration examples
+
 ### Webhook APIs (`/webhooks/`)
 ```
 POST /webhooks/clerk - Clerk user lifecycle events (signature verified)
@@ -328,6 +446,24 @@ GET /api/logs/{charge_point_id} - Logs for specific charger
 ✅ **NEW**: User transaction history pages with pagination and filtering
 ✅ **NEW**: Wallet transaction history with running balance calculation
 ✅ **NEW**: My Sessions page for unified user transaction view with recharge capability
+✅ **Firmware OTA Update System** (complete implementation)
+  - Admin firmware file upload with version management
+  - OCPP UpdateFirmware command integration
+  - FirmwareStatusNotification progress tracking
+  - Real-time update dashboard with auto-refresh (10s polling)
+  - Safety validations (online check, no active transactions)
+  - Bulk update capability for multiple chargers
+  - **Public API for non-OCPP devices** (`GET /api/firmware/latest`)
+  - MD5 checksum verification for integrity
+  - Comprehensive update history tracking
+  - Static file serving for firmware downloads
+✅ **Signal Quality Monitoring** (via OCPP DataTransfer)
+  - Real-time cellular signal quality tracking (RSSI, BER)
+  - Vendor-specific DataTransfer handler (JET_EV1 chargers)
+  - Historical signal quality data with time-based filtering
+  - Color-coded signal strength display (Good/Fair/Poor/Unknown)
+  - Auto-refresh every 5 seconds on charger detail page
+  - Data retention service (90-day cleanup)
 ✅ Remote start/stop charging with immediate OCPP command execution
 ✅ Availability control for chargers (Operative/Inoperative)
 ✅ Role-based admin dashboard with comprehensive management tools
@@ -555,13 +691,14 @@ pytest -m infrastructure # Database/Redis tests (~5 seconds) - external dependen
 7. **`frontend/lib/api-client.ts`** - Frontend-backend integration with automatic JWT handling
 
 **For specific functionality**:
-- **OCPP message handling** → `main.py` (ChargePoint class with @on decorators)  
+- **OCPP message handling** → `main.py` (ChargePoint class with @on decorators)
 - **Database schema & relationships** → `models.py`
 - **Admin APIs & OCPP commands** → `routers/` directory
-- **User interfaces & role-based UI** → `frontend/app/` directory  
+- **User interfaces & role-based UI** → `frontend/app/` directory
 - **Real-time features & caching** → `redis_manager.py` + `lib/queries/` hooks
 - **Authentication & RBAC** → `auth_middleware.py` + `middleware.ts` + `RoleWrapper.tsx`
 - **Financial operations** → `services/wallet_service.py` + `services/billing_retry_service.py`
+- **Firmware OTA updates** → `routers/firmware.py` + `services/storage_service.py` + `app/admin/firmware/page.tsx` + `lib/queries/firmware.ts`
 
 **For troubleshooting**:
 - **OCPP communication issues** → Check `log` table and `redis_manager.py` connection state

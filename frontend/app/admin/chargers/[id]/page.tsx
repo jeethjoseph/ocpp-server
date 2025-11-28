@@ -5,8 +5,9 @@ import { useEffect, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Zap, Play, Square, Activity, Clock, MapPin, X, CreditCard, Download } from "lucide-react";
+import { Zap, Play, Square, Activity, Clock, MapPin, X, CreditCard, Download, Signal } from "lucide-react";
 import { AdminOnly } from "@/components/RoleWrapper";
+import { toast } from "sonner";
 import ChargerLogs from "@/components/ChargerLogs";
 import MeterValuesChart from "@/components/MeterValuesChart";
 import {
@@ -29,6 +30,8 @@ import {
   useCharger,
   useRemoteStart,
   useRemoteStop,
+  useResetCharger,
+  useLatestSignalQuality,
 } from "@/lib/queries/chargers";
 import {
   useAdminTransaction,
@@ -55,7 +58,11 @@ export default function ChargerDetailPage() {
   const [showFirmwareDialog, setShowFirmwareDialog] = useState(false);
   const [selectedFirmwareId, setSelectedFirmwareId] = useState<string>("");
 
-  // TanStack Query hooks
+  // Reset dialog state
+  const [showResetDialog, setShowResetDialog] = useState(false);
+  const [resetType, setResetType] = useState<'Hard' | 'Soft'>('Hard');
+
+  // TanStack Query hooks - they automatically wait for auth
   const {
     data: chargerData,
     isLoading: chargerLoading,
@@ -63,6 +70,10 @@ export default function ChargerDetailPage() {
   } = useCharger(chargerId);
   const remoteStartMutation = useRemoteStart();
   const remoteStopMutation = useRemoteStop();
+  const resetMutation = useResetCharger();
+
+  // Signal quality query
+  const { data: signalQuality } = useLatestSignalQuality(chargerId);
 
   // Firmware queries
   const { data: firmwareData } = useFirmwareFiles({ is_active: true });
@@ -138,6 +149,25 @@ export default function ChargerDetailPage() {
     setSelectedFirmwareId("");
   };
 
+  const handleReset = async () => {
+    if (!chargerData?.charger?.id) return;
+
+    try {
+      await resetMutation.mutateAsync({
+        chargerId: chargerData.charger.id,
+        type: resetType,
+      });
+
+      toast.success(`${resetType} reset command sent successfully. The charger will reboot shortly.`);
+      setShowResetDialog(false);
+    } catch (error) {
+      const errorMessage = error instanceof Error
+        ? error.message
+        : (error as { response?: { data?: { detail?: string } } })?.response?.data?.detail || "Failed to send reset command";
+      toast.error(errorMessage);
+    }
+  };
+
   const getStatusColor = (status: string) => {
     switch (status) {
       case "Available":
@@ -166,6 +196,31 @@ export default function ChargerDetailPage() {
     return connected
       ? "bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400"
       : "bg-red-100 text-red-800 dark:bg-red-900/20 dark:text-red-400";
+  };
+
+  const getSignalQualityInfo = (rssi?: number) => {
+    if (rssi === undefined || rssi === null || rssi === 99) {
+      return {
+        label: "Unknown",
+        color: "bg-gray-100 text-gray-800 dark:bg-gray-900/20 dark:text-gray-400",
+      };
+    }
+    if (rssi >= 10) {
+      return {
+        label: "Good",
+        color: "bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400",
+      };
+    }
+    if (rssi >= 5) {
+      return {
+        label: "Fair",
+        color: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-400",
+      };
+    }
+    return {
+      label: "Poor",
+      color: "bg-red-100 text-red-800 dark:bg-red-900/20 dark:text-red-400",
+    };
   };
 
   const canStartCharging = () => {
@@ -270,6 +325,20 @@ export default function ChargerDetailPage() {
                   </span>
                 </div>
               </div>
+              <div className="flex justify-between items-center">
+                <span className="text-sm font-medium">Signal Quality:</span>
+                <div className="flex items-center gap-2">
+                  <Signal className="h-4 w-4 text-muted-foreground" />
+                  <Badge className={getSignalQualityInfo(signalQuality?.rssi).color}>
+                    {getSignalQualityInfo(signalQuality?.rssi).label}
+                    {signalQuality?.rssi !== undefined && signalQuality?.rssi !== 99 && (
+                      <span className="ml-1 text-xs opacity-75">
+                        ({signalQuality.rssi})
+                      </span>
+                    )}
+                  </Badge>
+                </div>
+              </div>
             </CardContent>
           </Card>
 
@@ -298,6 +367,15 @@ export default function ChargerDetailPage() {
                 variant={canStopCharging() ? "destructive" : "secondary"}>
                 <Square className="h-4 w-4 mr-2" />
                 {remoteStopMutation.isPending ? "Stopping..." : "Stop Charging"}
+              </Button>
+
+              <Button
+                onClick={() => setShowResetDialog(true)}
+                disabled={!charger?.connection_status}
+                className="w-full"
+                variant="outline">
+                <Activity className="h-4 w-4 mr-2" />
+                Reset Charger
               </Button>
 
               {!canStartCharging() && !canStopCharging() && (
@@ -430,6 +508,71 @@ export default function ChargerDetailPage() {
                 onClick={handleFirmwareUpdate}
                 disabled={!selectedFirmwareId || triggerUpdateMutation.isPending}>
                 {triggerUpdateMutation.isPending ? "Sending..." : "Update Firmware"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        {/* Reset Dialog */}
+        <Dialog open={showResetDialog} onOpenChange={setShowResetDialog}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Reset Charger</DialogTitle>
+              <DialogDescription>
+                Choose the type of reset to perform on this charger.
+              </DialogDescription>
+            </DialogHeader>
+
+            <div className="space-y-4 py-4">
+              <div className="space-y-2">
+                <Label htmlFor="reset-type">Reset Type</Label>
+                <Select value={resetType} onValueChange={(value: 'Hard' | 'Soft') => setResetType(value)}>
+                  <SelectTrigger id="reset-type">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="Soft">
+                      <div className="flex flex-col items-start">
+                        <span className="font-medium">Soft Reset</span>
+                        <span className="text-xs text-muted-foreground">
+                          Graceful restart - may continue operating
+                        </span>
+                      </div>
+                    </SelectItem>
+                    <SelectItem value="Hard">
+                      <div className="flex flex-col items-start">
+                        <span className="font-medium">Hard Reset</span>
+                        <span className="text-xs text-muted-foreground">
+                          Complete reboot - stops all operations
+                        </span>
+                      </div>
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {resetType === 'Hard' && currentTransactionId && (
+                <div className="rounded-md bg-yellow-50 p-3 border border-yellow-200">
+                  <p className="text-sm text-yellow-800">
+                    ⚠️ Cannot perform Hard reset during active charging session.
+                    Please stop the transaction first or choose Soft reset.
+                  </p>
+                </div>
+              )}
+            </div>
+
+            <DialogFooter>
+              <Button
+                variant="outline"
+                onClick={() => setShowResetDialog(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                onClick={handleReset}
+                disabled={resetMutation.isPending || (resetType === 'Hard' && !!currentTransactionId)}
+              >
+                {resetMutation.isPending ? "Sending..." : `Send ${resetType} Reset`}
               </Button>
             </DialogFooter>
           </DialogContent>

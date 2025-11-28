@@ -596,6 +596,90 @@ class ChargePoint(OcppChargePoint):
 
         return call_result.FirmwareStatusNotification()
 
+    @on('DataTransfer')
+    async def on_data_transfer(self, vendor_id: str, message_id: str = None, data: str = None, **kwargs):
+        """
+        OCPP 1.6 DataTransfer handler
+        Handles vendor-specific data messages from chargers
+        Currently supports: JET_EV1 Signal Quality data
+        """
+        logger.info(f"📡 DataTransfer from {self.id}: vendorId={vendor_id}, messageId={message_id}")
+
+        from models import Charger, SignalQuality, OCPPLog
+        import json
+
+        try:
+            # Route to vendor-specific handlers
+            if vendor_id == "JET_EV1":
+                if message_id == "SignalQuality":
+                    return await self._handle_jet_ev1_signal_quality(data)
+                else:
+                    logger.warning(f"📡 Unknown messageId for JET_EV1: {message_id}")
+                    return call_result.DataTransfer(status="UnknownMessageId")
+            else:
+                logger.warning(f"📡 Unknown vendorId: {vendor_id}")
+                return call_result.DataTransfer(status="UnknownVendorId")
+
+        except Exception as e:
+            logger.error(f"📡 ❌ Error processing DataTransfer from {self.id}: {e}", exc_info=True)
+            return call_result.DataTransfer(status="Rejected")
+
+    async def _handle_jet_ev1_signal_quality(self, data: str):
+        """
+        Handle JET_EV1 SignalQuality messages
+        Data format: {"rssi":22,"ber":99,"timestamp":"86"}
+        """
+        from models import Charger, SignalQuality
+        import json
+
+        try:
+            # Parse JSON data
+            if not data:
+                logger.error(f"📡 ❌ No data provided in SignalQuality message from {self.id}")
+                return call_result.DataTransfer(status="Rejected")
+
+            payload = json.loads(data)
+            rssi = payload.get("rssi")
+            ber = payload.get("ber")
+            timestamp = payload.get("timestamp")
+
+            # Validate required fields
+            if rssi is None or ber is None:
+                logger.error(f"📡 ❌ Missing required fields (rssi/ber) in SignalQuality data from {self.id}")
+                return call_result.DataTransfer(status="Rejected")
+
+            # Validate RSSI range (0-31 for GSM, 99 for unknown)
+            if not (0 <= rssi <= 31 or rssi == 99):
+                logger.warning(f"📡 ⚠️  RSSI value {rssi} out of typical range for {self.id}")
+
+            # Validate BER range (0-7 for GSM, 99 for unknown/not detectable)
+            if not (0 <= ber <= 7 or ber == 99):
+                logger.warning(f"📡 ⚠️  BER value {ber} out of typical range for {self.id}")
+
+            # Get charger
+            charger = await Charger.get(charge_point_string_id=self.id)
+
+            # Store signal quality data
+            await SignalQuality.create(
+                charger=charger,
+                rssi=rssi,
+                ber=ber,
+                timestamp=str(timestamp) if timestamp is not None else ""
+            )
+
+            # Log success
+            signal_strength = "Good" if rssi >= 10 else "Fair" if rssi >= 5 else "Poor" if rssi > 0 else "Unknown"
+            logger.info(f"📶 Stored signal quality for {self.id}: RSSI={rssi} ({signal_strength}), BER={ber}")
+
+            return call_result.DataTransfer(status="Accepted")
+
+        except json.JSONDecodeError as e:
+            logger.error(f"📡 ❌ Invalid JSON in SignalQuality data from {self.id}: {e}")
+            return call_result.DataTransfer(status="Rejected")
+        except Exception as e:
+            logger.error(f"📡 ❌ Error storing SignalQuality for {self.id}: {e}", exc_info=True)
+            return call_result.DataTransfer(status="Rejected")
+
 # Adapter to make FastAPI's WebSocket compatible with python-ocpp
 class FastAPIWebSocketAdapter:
     def __init__(self, websocket: WebSocket):
@@ -726,6 +810,11 @@ async def send_ocpp_request(charge_point_id: str, action: str, payload: Dict = N
             req = call.UpdateFirmware(**(payload or {}))
             response = await cp.call(req)
             logger.info(f"📦 Sent {action} request to {charge_point_id}: {payload.get('location')}")
+            return True, response
+        elif action == "Reset":
+            req = call.Reset(**(payload or {}))
+            response = await cp.call(req)
+            logger.info(f"🔄 Sent {action} request to {charge_point_id}: type={payload.get('type', 'Hard')}")
             return True, response
         else:
             logger.warning(f"Action {action} not implemented in send_ocpp_request")
@@ -881,6 +970,7 @@ app.include_router(users.router)
 app.include_router(public_stations.router)
 app.include_router(logs.router)
 app.include_router(firmware.router)
+app.include_router(firmware.public_router)
 
 # ============ OCPP WebSocket Endpoint ============
 @app.websocket("/ocpp/{charge_point_id}")
@@ -1063,14 +1153,18 @@ async def startup_event():
     global cleanup_task
     await init_db()
     await redis_manager.connect()
-    
-    # Start periodic cleanup task
+
+    # Start periodic cleanup task for stale connections
     cleanup_task = asyncio.create_task(periodic_cleanup())
-    
+
     # Start billing retry service
     from services.billing_retry_service import start_billing_retry_service
     await start_billing_retry_service()
-    
+
+    # Start data retention service (cleanup old signal quality data & OCPP logs)
+    from services.data_retention_service import start_data_retention_service
+    await start_data_retention_service(retention_days=90, cleanup_interval_hours=24)
+
     logger.info("Database initialized with Tortoise ORM")
     logger.info("Redis connection established")
     logger.info("Periodic cleanup task started")
@@ -1095,7 +1189,11 @@ async def shutdown_event():
     # Stop billing retry service
     from services.billing_retry_service import stop_billing_retry_service
     await stop_billing_retry_service()
-    
+
+    # Stop data retention service
+    from services.data_retention_service import stop_data_retention_service
+    await stop_data_retention_service()
+
     await close_db()
     await redis_manager.disconnect()
     logger.info("Database and Redis connections closed")

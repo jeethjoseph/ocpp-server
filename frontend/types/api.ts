@@ -379,3 +379,22 @@ export interface UpdateStatusDashboard {
   }>;
   summary: UpdateStatusSummary;
 }
+// Signal Quality Types
+export interface SignalQuality {
+  id: number;
+  charger_id: number;
+  rssi: number;  // Received Signal Strength Indicator (0-31 for GSM, 99=unknown)
+  ber: number;   // Bit Error Rate (0-7 for GSM, 99=unknown/not detectable)
+  timestamp: string;
+  created_at: string;
+}
+
+export interface SignalQualityListResponse {
+  data: SignalQuality[];
+  total: number;
+  page: number;
+  limit: number;
+  charger_id: number;
+  latest_rssi?: number;
+  latest_ber?: number;
+}

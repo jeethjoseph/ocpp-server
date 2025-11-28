@@ -1,5 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { stationService, chargerService } from "@/lib/api-services";
+import { useAuth } from "@/contexts/AuthContext";
 
 // Query Keys
 export const dashboardKeys = {
@@ -9,6 +10,8 @@ export const dashboardKeys = {
 
 // Dashboard Stats Query Hook
 export function useDashboardStats() {
+  const { isAuthReady } = useAuth();
+
   return useQuery({
     queryKey: dashboardKeys.stats(),
     queryFn: async () => {
@@ -18,7 +21,7 @@ export function useDashboardStats() {
       ]);
 
       const chargers = chargersResponse.data;
-      
+
       return {
         totalStations: stationsResponse.total,
         totalChargers: chargers.length,
@@ -32,6 +35,7 @@ export function useDashboardStats() {
     },
     staleTime: 1000 * 10, // 10 seconds - dashboard should be very fresh
     refetchInterval: 1000 * 10, // Auto-refresh every 10 seconds
+    enabled: isAuthReady,
   });
 }
 
