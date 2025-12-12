@@ -54,7 +54,7 @@ export function useStations(params: { limit?: number } = {}) {
   });
 }
 
-// Individual Charger Query Hook
+// Individual Charger Query Hook (by numeric ID)
 export function useCharger(id: number, hasActiveTransaction?: boolean) {
   const { isAuthReady } = useAuth();
 
@@ -62,6 +62,19 @@ export function useCharger(id: number, hasActiveTransaction?: boolean) {
     queryKey: chargerKeys.detail(id),
     queryFn: () => chargerService.getById(id),
     enabled: isAuthReady && !!id, // Wait for auth and valid id
+    staleTime: hasActiveTransaction ? 1000 * 2 : 1000 * 3, // 2s during active session, 3s otherwise
+    refetchInterval: hasActiveTransaction ? 1000 * 2 : 1000 * 3, // More frequent polling during active sessions
+  });
+}
+
+// Individual Charger Query Hook (by string ID - for user-facing pages)
+export function useChargerByStringId(chargePointId: string, hasActiveTransaction?: boolean) {
+  const { isAuthReady } = useAuth();
+
+  return useQuery({
+    queryKey: [...chargerKeys.all, "detail-string", chargePointId] as const,
+    queryFn: () => chargerService.getByStringId(chargePointId),
+    enabled: isAuthReady && !!chargePointId, // Wait for auth and valid id
     staleTime: hasActiveTransaction ? 1000 * 2 : 1000 * 3, // 2s during active session, 3s otherwise
     refetchInterval: hasActiveTransaction ? 1000 * 2 : 1000 * 3, // More frequent polling during active sessions
   });
@@ -81,7 +94,7 @@ export function useRemoteStart() {
       connectorId?: number;
       idTag?: string;
     }) => {
-      
+
       try {
         const result = await chargerService.remoteStart(id, connectorId, idTag);
         return result;
@@ -92,6 +105,43 @@ export function useRemoteStart() {
     onSuccess: (_, variables) => {
       // Invalidate charger details to refetch latest status
       queryClient.invalidateQueries({ queryKey: chargerKeys.detail(variables.id) });
+      toast.success("Remote start command sent successfully. Waiting for charger to start charging...");
+    },
+    onError: (err) => {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      console.error("Remote start error:", errorMessage);
+      if (errorMessage.includes("409") || errorMessage.includes("not connected")) {
+        toast.error("Charger not connected or not in correct state");
+      } else {
+        toast.error("Failed to start charging");
+      }
+    },
+  });
+}
+
+// Remote Start Mutation Hook (by string ID - for user-facing pages)
+export function useRemoteStartByStringId() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({
+      chargePointId,
+      connectorId = 1,
+    }: {
+      chargePointId: string;
+      connectorId?: number;
+    }) => {
+
+      try {
+        const result = await chargerService.remoteStartByStringId(chargePointId, connectorId);
+        return result;
+      } catch (error) {
+        throw error;
+      }
+    },
+    onSuccess: () => {
+      // Invalidate all charger queries to refetch latest status
+      queryClient.invalidateQueries({ queryKey: chargerKeys.all });
       toast.success("Remote start command sent successfully. Waiting for charger to start charging...");
     },
     onError: (err) => {
@@ -192,7 +242,7 @@ export function useRemoteStop() {
       // Immediate invalidation
       queryClient.invalidateQueries({ queryKey: chargerKeys.all });
       queryClient.invalidateQueries({ queryKey: transactionKeys.all });
-      
+
       // More aggressive refetching for better UX
       const refetchDelays = [1000, 2000, 4000, 8000]; // 1s, 2s, 4s, 8s - faster initial checks
       refetchDelays.forEach((delay) => {
@@ -201,7 +251,49 @@ export function useRemoteStop() {
           queryClient.invalidateQueries({ queryKey: transactionKeys.all });
         }, delay);
       });
-      
+
+      toast.success("Remote stop initiated");
+    },
+    onError: (err) => {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      console.error("Remote stop error:", errorMessage);
+      if (errorMessage.includes("409") || errorMessage.includes("not connected")) {
+        toast.error("Charger not connected or no active session");
+      } else {
+        toast.error("Failed to initiate remote stop");
+      }
+    },
+  });
+}
+
+// Remote Stop Mutation Hook (by string ID - for user-facing pages)
+export function useRemoteStopByStringId() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({
+      chargePointId,
+      reason,
+    }: {
+      chargePointId: string;
+      reason?: string;
+    }) => {
+      return chargerService.remoteStopByStringId(chargePointId, reason);
+    },
+    onSuccess: () => {
+      // Immediate invalidation
+      queryClient.invalidateQueries({ queryKey: chargerKeys.all });
+      queryClient.invalidateQueries({ queryKey: transactionKeys.all });
+
+      // More aggressive refetching for better UX
+      const refetchDelays = [1000, 2000, 4000, 8000]; // 1s, 2s, 4s, 8s - faster initial checks
+      refetchDelays.forEach((delay) => {
+        setTimeout(() => {
+          queryClient.invalidateQueries({ queryKey: chargerKeys.all });
+          queryClient.invalidateQueries({ queryKey: transactionKeys.all });
+        }, delay);
+      });
+
       toast.success("Remote stop initiated");
     },
     onError: (err) => {

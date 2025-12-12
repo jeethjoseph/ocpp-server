@@ -4,13 +4,13 @@
 
 This document provides comprehensive technical documentation for a production-ready **Open Charge Point Protocol (OCPP) 1.6** compliant Charging Station Management System (CSMS). The system implements a full-stack solution for managing Electric Vehicle (EV) charging stations with real-time monitoring, remote control capabilities, role-based access control, and integrated financial management.
 
-**System Version**: 2.1
+**System Version**: 2.2
 **OCPP Compliance**: OCPP 1.6 Full Implementation
-**Architecture**: Modern async Python backend with React frontend
+**Architecture**: Modern async Python backend with React web frontend + Capacitor mobile apps
 **Authentication**: Clerk-powered JWT authentication with RBAC
-**Deployment**: Production-ready on Render (backend) + Vercel (frontend)
-**Current Branch**: 39-feature---user-transaction-pages-zero-charged-transactions
-**Last Updated**: January 2025  
+**Deployment**: Production-ready on Render (backend) + Vercel (web) + App Stores (mobile)
+**Current Branch**: 45-capacitor-app
+**Last Updated**: December 2024  
 
 ---
 
@@ -21,19 +21,20 @@ This document provides comprehensive technical documentation for a production-re
 3. [Architecture Design](#architecture-design)
 4. [Backend Components](#backend-components)
 5. [Frontend Components](#frontend-components)
-6. [Database Schema](#database-schema)
-7. [OCPP 1.6 Implementation](#ocpp-16-implementation)
-8. [Authentication & Authorization](#authentication--authorization)
-9. [API Documentation](#api-documentation)
-10. [Real-Time Features](#real-time-features)
-11. [User Experience Features](#user-experience-features)
-12. [Security & Compliance](#security--compliance)
-13. [Testing Framework](#testing-framework)
-14. [Performance & Scalability](#performance--scalability)
-15. [Technical Debt & Known Issues](#technical-debt--known-issues)
-16. [Deployment & Operations](#deployment--operations)
-17. [Recent Changes & Updates](#recent-changes--updates)
-18. [Future Roadmap](#future-roadmap)
+6. [**NEW**: Mobile App Components](#mobile-app-components)
+7. [Database Schema](#database-schema)
+8. [OCPP 1.6 Implementation](#ocpp-16-implementation)
+9. [Authentication & Authorization](#authentication--authorization)
+10. [API Documentation](#api-documentation)
+11. [Real-Time Features](#real-time-features)
+12. [User Experience Features](#user-experience-features)
+13. [Security & Compliance](#security--compliance)
+14. [Testing Framework](#testing-framework)
+15. [Performance & Scalability](#performance--scalability)
+16. [Technical Debt & Known Issues](#technical-debt--known-issues)
+17. [Deployment & Operations](#deployment--operations)
+18. [Recent Changes & Updates](#recent-changes--updates)
+19. [Future Roadmap](#future-roadmap)
 
 ---
 
@@ -707,6 +708,371 @@ frontend/
 - `AdminOnly`: Requires ADMIN role
 - `UserOnly`: Requires USER role
 - `RoleBasedContent`: Conditional rendering based on role
+
+---
+
+## Mobile App Components
+
+### Overview
+The mobile app (`/app/`) is a **complete native iOS and Android application** built with Capacitor 7.4.4, wrapping a React web app to provide native mobile experiences. It represents a parallel user-facing application alongside the web frontend, optimized specifically for mobile users with native device features.
+
+**Key Characteristics**:
+- **Framework**: Capacitor (web-to-native wrapper) + React 19 + Vite 7.2.4
+- **Platform Support**: iOS and Android with native builds
+- **Feature Complete**: 100% complete according to IMPLEMENTATION_STATUS.md
+- **Deployment Ready**: Configured for App Store and Google Play submission
+- **Code Size**: ~3K lines of source code + comprehensive component library
+- **App ID**: `com.lyncpower.user`
+
+### Mobile App Architecture
+
+```
+┌────────────────────────────────────────────────────────┐
+│                 Mobile App (Capacitor)                 │
+│                                                        │
+│  ┌──────────────┐  ┌──────────────┐  ┌─────────────┐ │
+│  │   React UI   │  │  Capacitor   │  │   Native    │ │
+│  │  Components  │◄─┤   Plugins    │◄─┤  iOS/Android│ │
+│  │  (TSX/TS)    │  │  (Bridge)    │  │   Features  │ │
+│  └──────────────┘  └──────────────┘  └─────────────┘ │
+│         │                  │                  │        │
+│         └─────── HTTP API ─┴──────────────────┘       │
+└────────────────────────────│───────────────────────────┘
+                             │
+                             ▼
+                    Backend FastAPI Server
+```
+
+### Directory Structure (`/app/`)
+
+```
+app/
+├── src/                          # React application source
+│   ├── screens/                  # 6 main screens
+│   │   ├── HomeScreen.tsx        # Welcome + quick actions
+│   │   ├── StationsScreen.tsx    # Interactive map
+│   │   ├── ScannerScreen.tsx     # QR code scanner
+│   │   ├── ChargeScreen.tsx      # Live charging session
+│   │   ├── SessionsScreen.tsx    # Transaction history
+│   │   └── SignInScreen.tsx      # Authentication
+│   ├── components/               # Reusable components
+│   │   ├── ErrorBoundary.tsx     # Error handling
+│   │   ├── Layout.tsx            # Bottom navigation
+│   │   ├── Modal.tsx             # Mobile modal
+│   │   ├── NetworkStatus.tsx     # Connectivity indicator
+│   │   ├── PullToRefresh.tsx     # Gesture handler
+│   │   └── *Skeleton.tsx         # Loading states
+│   ├── hooks/                    # Custom React hooks
+│   │   ├── useNetworkStatus.ts   # Network detection
+│   │   ├── usePullToRefresh.ts   # Pull-to-refresh
+│   │   └── useStatusBar.ts       # Status bar control
+│   ├── lib/                      # API integration
+│   │   ├── api-client.ts         # HTTP client
+│   │   └── api-services.ts       # User API methods
+│   ├── routes.tsx                # React Router setup
+│   └── App.tsx                   # App entry point
+├── android/                      # Native Android project
+│   ├── app/                      # Android app module
+│   │   ├── src/main/AndroidManifest.xml  # Permissions
+│   │   └── build.gradle          # Android build config
+│   └── gradle/                   # Gradle wrapper
+├── ios/                          # Native iOS project
+│   └── App/                      # iOS app module
+│       ├── App/Info.plist        # iOS permissions
+│       └── App.xcodeproj/        # Xcode project
+├── capacitor.config.ts           # Capacitor configuration
+├── vite.config.ts                # Vite build configuration
+├── package.json                  # Dependencies
+├── IMPLEMENTATION_STATUS.md      # Feature completion tracking
+└── README.md                     # Setup instructions
+```
+
+### Application Entry Point
+
+#### Main Application (`src/App.tsx`)
+**Purpose**: Capacitor app root with providers and routing
+**Key Features**:
+- Clerk authentication provider setup
+- TanStack Query client configuration
+- Error boundary wrapping
+- React Router integration
+- Status bar initialization
+
+```typescript
+function App() {
+  return (
+    <ClerkProvider publishableKey={clerkKey}>
+      <QueryClientProvider client={queryClient}>
+        <ErrorBoundary>
+          <RouterProvider router={router} />
+        </ErrorBoundary>
+      </QueryClientProvider>
+    </ClerkProvider>
+  );
+}
+```
+
+### Screen Components
+
+#### 1. Home Screen (`screens/HomeScreen.tsx`)
+**Purpose**: Welcome screen with quick access to main features
+**Features**:
+- Welcome message with user greeting
+- Quick action buttons (Find Stations, Scan QR)
+- "How to Charge" instructions section
+- Visual guides for first-time users
+
+#### 2. Stations Screen (`screens/StationsScreen.tsx`)
+**Purpose**: Interactive map for discovering charging stations
+**Features**:
+- **Leaflet Map Integration**: Full-screen interactive map
+- **Geolocation**: User's current location with distance calculation (Haversine formula)
+- **Color-Coded Markers**: Green (available chargers), Red (all busy)
+- **Station Details**: Bottom sheet with:
+  - Station name and address
+  - Distance from user
+  - Available/total chargers count
+  - "Get Directions" button (opens Google Maps)
+- **Real-time Data**: Auto-refresh station availability
+- **Pull-to-Refresh**: Manual refresh gesture
+
+#### 3. Scanner Screen (`screens/ScannerScreen.tsx`)
+**Purpose**: QR code scanning for charger access
+**Native Plugin**: `@capacitor/barcode-scanner` v2.2.0
+**Features**:
+- Camera permission handling
+- QR code and barcode scanning
+- Manual alphanumeric input fallback
+- Automatic navigation to charge screen on success
+- Error handling for denied permissions
+
+#### 4. Charge Screen (`screens/ChargeScreen.tsx`)
+**Purpose**: Live charging session monitoring and control
+**Features**:
+- **Real-time Status**: Updates every 2-3 seconds
+- **Live Meter Values**:
+  - Energy consumed (kWh)
+  - Current power (kW)
+  - Voltage (V)
+  - Current (A)
+- **Session Controls**:
+  - Remote start/stop charging buttons
+  - Session duration timer
+  - Estimated cost calculation
+- **Status Indicators**: Visual charger status (Available, Charging, Faulted, etc.)
+- **Auto-refresh**: Continuous polling for live data
+
+#### 5. Sessions Screen (`screens/SessionsScreen.tsx`)
+**Purpose**: Combined transaction history and wallet management
+**Features**:
+- **Merged History**: Charging sessions + wallet transactions
+- **Wallet Balance**: Prominent display with recharge button
+- **Razorpay Integration**: Native payment modal for recharge
+- **Transaction Details**:
+  - Date, time, and amount
+  - Transaction type (charge/topup)
+  - Status indicators
+- **Pull-to-Refresh**: Manual data refresh
+- **Pagination**: Load more on scroll
+
+#### 6. Sign In Screen (`screens/SignInScreen.tsx`)
+**Purpose**: User authentication via Clerk
+**Features**:
+- Clerk sign-in component integration
+- Automatic redirect on success
+- Error handling
+- Mobile-optimized layout
+
+### Mobile-Specific Components
+
+#### Layout Component (`components/Layout.tsx`)
+**Purpose**: Main app layout with bottom navigation
+**Features**:
+- **Bottom Tab Navigation**: 5 tabs (Home, Stations, Scan, Sessions, Profile)
+- **Header**: App logo + user info
+- **Responsive**: Adapts to different screen sizes
+- **Active Tab Highlighting**: Visual feedback
+
+#### Error Boundary (`components/ErrorBoundary.tsx`)
+**Purpose**: Comprehensive error handling for mobile
+**Features**:
+- Catches React errors
+- User-friendly error messages
+- Reload button
+- Error logging (for debugging)
+
+#### Network Status (`components/NetworkStatus.tsx`)
+**Purpose**: Network connectivity indicator
+**Features**:
+- Real-time network status via Capacitor Network plugin
+- Visual banner when offline
+- Auto-hide when online
+
+#### Pull-to-Refresh (`components/PullToRefresh.tsx`)
+**Purpose**: Standard mobile gesture for data refresh
+**Features**:
+- Touch gesture detection
+- Visual loading indicator
+- Callback function on complete
+- Configurable refresh threshold
+
+### Native Integrations
+
+#### Capacitor Plugins
+The app uses 4 official Capacitor plugins for native features:
+
+1. **Barcode Scanner** (`@capacitor/barcode-scanner` v2.2.0)
+   - QR code and barcode scanning
+   - Camera permission handling
+   - Supports all standard barcode formats
+
+2. **Geolocation** (`@capacitor/geolocation` v7.1.5)
+   - GPS location access
+   - Distance calculations
+   - Location permission handling
+   - Background location support
+
+3. **Network** (`@capacitor/network` v7.0.2)
+   - Network connectivity status
+   - WiFi/Cellular detection
+   - Real-time connectivity events
+
+4. **Razorpay** (`capacitor-razorpay` v1.3.0)
+   - Native payment SDK integration
+   - Secure payment flow
+   - iOS and Android support
+   - Test/Live mode switching
+
+#### Platform-Specific Configuration
+
+**iOS Configuration** (`ios/App/App/Info.plist`):
+```xml
+<key>NSCameraUsageDescription</key>
+<string>Camera access is required to scan QR codes on chargers</string>
+
+<key>NSLocationWhenInUseUsageDescription</key>
+<string>Location access helps find nearby charging stations</string>
+```
+
+**Android Configuration** (`android/app/src/main/AndroidManifest.xml`):
+```xml
+<uses-permission android:name="android.permission.CAMERA" />
+<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+<uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+<uses-permission android:name="android.permission.INTERNET" />
+<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+```
+
+### API Integration
+
+#### API Client (`src/lib/api-client.ts`)
+**Purpose**: Centralized HTTP client with Clerk JWT integration
+**Features**:
+- Automatic JWT token injection
+- Request/response interceptors
+- Error handling
+- Base URL configuration
+
+#### API Services (`src/lib/api-services.ts`)
+**Purpose**: User-focused API method wrappers
+**Services**:
+- `stationsService`: Get stations, charger details
+- `chargingService`: Remote start/stop, session monitoring
+- `sessionsService`: Transaction history
+- `walletService`: Wallet balance, recharge, history
+
+### Custom Hooks
+
+#### Network Status Hook (`hooks/useNetworkStatus.ts`)
+```typescript
+const { isConnected, connectionType } = useNetworkStatus();
+```
+**Features**:
+- Real-time network status
+- WiFi/Cellular detection
+- React state updates
+
+#### Pull-to-Refresh Hook (`hooks/usePullToRefresh.ts`)
+```typescript
+const { refreshing, onRefresh } = usePullToRefresh(async () => {
+  await refetchData();
+});
+```
+**Features**:
+- Gesture handling
+- Loading state management
+- Async callback support
+
+#### Status Bar Hook (`hooks/useStatusBar.ts`)
+```typescript
+useStatusBar({ style: 'dark' });
+```
+**Features**:
+- Status bar style control
+- iOS and Android support
+- Automatic cleanup
+
+### Build and Deployment
+
+#### Development Build
+```bash
+cd app
+npm install
+npm run dev  # Vite dev server on http://localhost:5173
+```
+
+#### Native Builds
+```bash
+# iOS
+npm run build
+npx cap sync ios
+npx cap open ios  # Open in Xcode
+
+# Android
+npm run build
+npx cap sync android
+npx cap open android  # Open in Android Studio
+```
+
+#### Production Configuration
+- **App ID**: `com.lyncpower.user` (configured in capacitor.config.ts)
+- **Bundle ID**: Same as App ID for iOS
+- **Package Name**: Same as App ID for Android
+- **App Name**: "LyncPower"
+- **Estimated Store Submission Time**: 4-7 hours (after developer account setup)
+
+### Mobile App Features Summary
+
+| Feature | Status | Implementation |
+|---------|--------|----------------|
+| Authentication | ✅ Complete | Clerk React SDK |
+| Station Finder | ✅ Complete | Leaflet + Geolocation |
+| QR Scanner | ✅ Complete | Capacitor Barcode Scanner |
+| Live Charging | ✅ Complete | Real-time polling + WebSocket fallback |
+| Remote Control | ✅ Complete | Start/Stop via API |
+| Transaction History | ✅ Complete | Merged charging + wallet |
+| Wallet Recharge | ✅ Complete | Razorpay native SDK |
+| Pull-to-Refresh | ✅ Complete | Custom gesture handling |
+| Network Status | ✅ Complete | Capacitor Network plugin |
+| Error Handling | ✅ Complete | Error boundary + logging |
+| Loading States | ✅ Complete | Skeleton components |
+| Push Notifications | ❌ NOT Implemented | Proposed but missing |
+| Offline Mode | ❌ NOT Implemented | Future enhancement |
+| Biometrics | ❌ NOT Implemented | Future enhancement |
+
+### Key Differences from Web Frontend
+
+| Aspect | Web Frontend | Mobile App |
+|--------|-------------|------------|
+| **Users** | Admins + Users | Users only |
+| **Features** | Admin dashboard + user UI | User features only |
+| **Navigation** | Top navbar + sidebar | Bottom tabs |
+| **Map Library** | Same (React Leaflet) | Same (React Leaflet) |
+| **Build Tool** | Next.js | Vite |
+| **Native Features** | None | QR, GPS, Payments, Network |
+| **Deployment** | Vercel | App Stores |
+| **Framework** | Next.js 15 App Router | React 19 + React Router |
+| **Bundle Size** | ~2MB (includes admin) | ~500KB (user only) |
 
 ---
 

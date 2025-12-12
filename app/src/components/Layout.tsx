@@ -1,10 +1,15 @@
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { Home, Map, ScanLine, Receipt } from 'lucide-react';
 import { UserButton } from '@clerk/clerk-react';
+import { NetworkStatus } from './NetworkStatus';
+import { useStatusBar } from '../hooks/useStatusBar';
 
 export const Layout = () => {
   const location = useLocation();
   const navigate = useNavigate();
+
+  // Configure status bar for mobile
+  useStatusBar();
 
   const navItems = [
     { path: '/', icon: Home, label: 'Home' },
@@ -15,10 +20,15 @@ export const Layout = () => {
 
   return (
     <div className="h-screen flex flex-col bg-gray-50">
+      {/* Network Status Indicator - with safe area for status bar */}
+      <div style={{ paddingTop: 'env(safe-area-inset-top)' }}>
+        <NetworkStatus />
+      </div>
+
       {/* Header */}
       <header className="bg-white shadow-sm px-4 py-3 flex items-center justify-between">
         <h1 className="text-xl font-bold text-gray-900">LyncPower</h1>
-        <UserButton afterSignOutUrl="/sign-in" />
+        <UserButton />
       </header>
 
       {/* Main Content */}
@@ -27,7 +37,10 @@ export const Layout = () => {
       </main>
 
       {/* Bottom Navigation */}
-      <nav className="bg-white border-t border-gray-200 px-4 py-2 safe-area-bottom">
+      <nav
+        className="bg-white border-t border-gray-200 px-4 py-2"
+        style={{ paddingBottom: 'max(0.5rem, env(safe-area-inset-bottom))' }}
+      >
         <div className="flex justify-around items-center">
           {navItems.map((item) => {
             const isActive = location.pathname === item.path;

@@ -43,6 +43,7 @@ export interface Charger {
   connection_status: boolean;
   created_at: string;
   updated_at: string;
+  tariff_per_kwh?: number;
 }
 
 export interface ChargerCreate {

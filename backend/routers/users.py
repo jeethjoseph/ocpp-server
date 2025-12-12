@@ -503,13 +503,22 @@ async def get_user_transaction_details(
     try:
         # Get transaction and verify it belongs to the current user (or admin can access any)
         from models import UserRoleEnum
+        logger.info(f"User {current_user.email} (ID: {current_user.id}) requesting transaction {transaction_id}")
+
         if current_user.role == UserRoleEnum.ADMIN:
             transaction = await Transaction.filter(id=transaction_id).first()
         else:
             transaction = await Transaction.filter(id=transaction_id, user_id=current_user.id).first()
-            
+
         if not transaction:
-            raise HTTPException(status_code=404, detail="Transaction not found or access denied")
+            # Check if transaction exists but belongs to someone else
+            existing_tx = await Transaction.filter(id=transaction_id).first()
+            if existing_tx:
+                logger.warning(f"User {current_user.email} (ID: {current_user.id}) tried to access transaction {transaction_id} belonging to user ID {existing_tx.user_id}")
+                raise HTTPException(status_code=403, detail="You can only access your own transactions")
+            else:
+                logger.warning(f"Transaction {transaction_id} not found")
+                raise HTTPException(status_code=404, detail="Transaction not found")
         
         # Get related data
         charger = await Charger.filter(id=transaction.charger_id).first()
@@ -581,14 +590,23 @@ async def get_user_transaction_meter_values(
     from models import Transaction, MeterValue, UserRoleEnum
     
     try:
+        logger.info(f"User {current_user.email} (ID: {current_user.id}) requesting meter values for transaction {transaction_id}")
+
         # Get transaction and verify it belongs to the current user (or admin can access any)
         if current_user.role == UserRoleEnum.ADMIN:
             transaction = await Transaction.filter(id=transaction_id).first()
         else:
             transaction = await Transaction.filter(id=transaction_id, user_id=current_user.id).first()
-            
+
         if not transaction:
-            raise HTTPException(status_code=404, detail="Transaction not found or access denied")
+            # Check if transaction exists but belongs to someone else
+            existing_tx = await Transaction.filter(id=transaction_id).first()
+            if existing_tx:
+                logger.warning(f"User {current_user.email} (ID: {current_user.id}) tried to access meter values for transaction {transaction_id} belonging to user ID {existing_tx.user_id}")
+                raise HTTPException(status_code=403, detail="You can only access your own transactions")
+            else:
+                logger.warning(f"Transaction {transaction_id} not found for meter values request")
+                raise HTTPException(status_code=404, detail="Transaction not found")
         
         meter_values = await MeterValue.filter(transaction_id=transaction_id).order_by("created_at")
         
@@ -618,3 +636,222 @@ async def get_user_transaction_meter_values(
     except Exception as e:
         logger.error(f"Error getting user transaction meter values {transaction_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve meter values")
+
+
+# ===== User-Facing Charger Operations (String ID Support) =====
+
+@router.get("/charger/{charge_point_id}", response_model=dict)
+async def get_charger_by_string_id(
+    charge_point_id: str,
+    current_user: User = Depends(require_user())
+):
+    """Get charger details by charge_point_string_id (for customer-facing apps with QR codes)
+
+    This endpoint accepts alphanumeric charge point IDs like 'AIRPORT_EXPRESS_CHARGING_01'
+    and returns the same data structure as the admin endpoint but uses string IDs.
+    """
+    from models import Charger, ChargingStation, Connector
+    from redis_manager import redis_manager
+    from datetime import datetime, timezone
+
+    try:
+        # Look up charger by charge_point_string_id
+        charger = await Charger.filter(charge_point_string_id=charge_point_id).prefetch_related('station', 'connectors').first()
+
+        if not charger:
+            raise HTTPException(status_code=404, detail="Charger not found")
+
+        # Get connection status
+        connected_charger_ids = set(await redis_manager.get_all_connected_chargers())
+        is_connected_redis = charger.charge_point_string_id in connected_charger_ids
+
+        connection_status = False
+        if is_connected_redis and charger.last_heart_beat_time:
+            current_time = datetime.now(timezone.utc)
+            time_diff = current_time - charger.last_heart_beat_time
+            connection_status = time_diff.total_seconds() <= 90
+
+        # Get applicable tariff for this charger
+        from services.wallet_service import WalletService
+        tariff_rate = await WalletService.get_applicable_tariff(charger.id)
+
+        # Get current transaction if any
+        from models import Transaction
+        current_transaction = await Transaction.filter(
+            charger=charger,
+            transaction_status__in=["RUNNING", "PENDING_START", "STARTED"]
+        ).order_by('-created_at').first()
+
+        # Get most recent completed transaction
+        recent_transaction = await Transaction.filter(
+            charger=charger,
+            transaction_status__in=["COMPLETED", "STOPPED"]
+        ).order_by('-created_at').first()
+
+        return {
+            "charger": {
+                "id": charger.id,
+                "charge_point_string_id": charger.charge_point_string_id,
+                "station_id": charger.station_id,
+                "name": charger.name,
+                "model": charger.model,
+                "vendor": charger.vendor,
+                "serial_number": charger.serial_number,
+                "firmware_version": charger.firmware_version,
+                "latest_status": charger.latest_status.value,
+                "last_heart_beat_time": charger.last_heart_beat_time.isoformat() if charger.last_heart_beat_time else None,
+                "connection_status": connection_status,
+                "created_at": charger.created_at.isoformat(),
+                "updated_at": charger.updated_at.isoformat(),
+                "tariff_per_kwh": float(tariff_rate) if tariff_rate else None,
+            },
+            "station": {
+                "id": charger.station.id,
+                "name": charger.station.name,
+                "address": charger.station.address,
+            },
+            "connectors": [
+                {
+                    "id": conn.id,
+                    "connector_id": conn.connector_id,
+                    "connector_type": conn.connector_type,
+                    "max_power_kw": conn.max_power_kw,
+                } for conn in charger.connectors
+            ],
+            "current_transaction": {
+                "transaction_id": current_transaction.id
+            } if current_transaction else None,
+            "recent_transaction": {
+                "transaction_id": recent_transaction.id
+            } if recent_transaction else None,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting charger {charge_point_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve charger details")
+
+
+@router.post("/charger/{charge_point_id}/remote-start", response_model=dict)
+async def remote_start_by_string_id(
+    charge_point_id: str,
+    connector_id: int = 1,
+    current_user: User = Depends(require_user())
+):
+    """Start charging remotely using charge_point_string_id (for customer-facing apps)"""
+    from models import Charger, Transaction
+    from redis_manager import redis_manager
+
+    try:
+        # Look up charger by charge_point_string_id
+        charger = await Charger.filter(charge_point_string_id=charge_point_id).first()
+
+        if not charger:
+            raise HTTPException(status_code=404, detail="Charger not found")
+
+        # Use the user's RFID card ID as idTag for OCPP identification
+        if not current_user.rfid_card_id:
+            raise HTTPException(status_code=409, detail="User does not have an RFID card ID assigned")
+
+        # Check if charger is connected
+        connected_cps = await redis_manager.get_all_connected_chargers()
+        if charger.charge_point_string_id not in connected_cps:
+            raise HTTPException(status_code=409, detail="Charger is not connected")
+
+        # Check if there's already an active transaction
+        active_transaction = await Transaction.filter(
+            charger=charger,
+            transaction_status__in=["RUNNING", "PENDING_START", "STARTED"]
+        ).first()
+
+        if active_transaction:
+            raise HTTPException(status_code=409, detail="Charger already has an active transaction")
+
+        # Send OCPP RemoteStartTransaction command
+        from main import send_ocpp_request
+        success, response = await send_ocpp_request(
+            charger.charge_point_string_id,
+            "RemoteStartTransaction",
+            {
+                "connector_id": connector_id,
+                "id_tag": current_user.rfid_card_id
+            }
+        )
+
+        if not success:
+            raise HTTPException(status_code=500, detail=f"Remote start failed: {response}")
+
+        return {
+            "message": "Remote start command sent successfully",
+            "charger_id": charger.charge_point_string_id,
+            "response": response
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error starting charger {charge_point_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to start charging")
+
+
+@router.post("/charger/{charge_point_id}/remote-stop", response_model=dict)
+async def remote_stop_by_string_id(
+    charge_point_id: str,
+    reason: Optional[str] = "Requested by user",
+    current_user: User = Depends(require_user())
+):
+    """Stop charging remotely using charge_point_string_id (for customer-facing apps)"""
+    from models import Charger, Transaction
+    from redis_manager import redis_manager
+
+    try:
+        # Look up charger by charge_point_string_id
+        charger = await Charger.filter(charge_point_string_id=charge_point_id).first()
+
+        if not charger:
+            raise HTTPException(status_code=404, detail="Charger not found")
+
+        # Check if charger is connected
+        connected_cps = await redis_manager.get_all_connected_chargers()
+        if charger.charge_point_string_id not in connected_cps:
+            raise HTTPException(status_code=409, detail="Charger is not connected")
+
+        # Find the active transaction
+        transaction = await Transaction.filter(
+            charger=charger,
+            transaction_status__in=["RUNNING", "PENDING_START", "STARTED"]
+        ).order_by('-created_at').first()
+
+        if not transaction:
+            raise HTTPException(status_code=404, detail="No active transaction found for this charger")
+
+        # Verify user owns this transaction (or is admin)
+        if current_user.role != UserRoleEnum.ADMIN and transaction.user_id != current_user.id:
+            raise HTTPException(status_code=403, detail="You can only stop your own charging sessions")
+
+        # Send OCPP RemoteStopTransaction command
+        from main import send_ocpp_request
+        logger.info(f"User {current_user.email} requesting remote stop for charger {charger.charge_point_string_id}, transaction {transaction.id}")
+        success, response = await send_ocpp_request(
+            charger.charge_point_string_id,
+            "RemoteStopTransaction",
+            {"transaction_id": transaction.id}
+        )
+
+        if not success:
+            logger.error(f"Remote stop failed for {charger.charge_point_string_id}: {response}")
+            raise HTTPException(status_code=409, detail=f"{response}")
+
+        return {
+            "message": "Remote stop command sent successfully",
+            "charger_id": charger.charge_point_string_id,
+            "transaction_id": transaction.id,
+            "response": response
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error stopping charger {charge_point_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to stop charging")

@@ -19,9 +19,9 @@ import {
   Receipt
 } from "lucide-react";
 import {
-  useCharger,
-  useRemoteStart,
-  useRemoteStop,
+  useChargerByStringId,
+  useRemoteStartByStringId,
+  useRemoteStopByStringId,
 } from "@/lib/queries/chargers";
 import {
   useTransaction,
@@ -32,7 +32,7 @@ import { toast } from "sonner";
 export default function UserChargePage() {
   const params = useParams();
   const router = useRouter();
-  const chargerId = parseInt(params.id as string);
+  const chargePointId = params.id as string; // This is now a string ID
 
   const [lastTransactionId, setLastTransactionId] = useState<number | null>(null);
   const [hasActiveTransaction, setHasActiveTransaction] = useState(false);
@@ -41,10 +41,10 @@ export default function UserChargePage() {
     data: chargerData,
     isLoading: chargerLoading,
     error: chargerError,
-  } = useCharger(chargerId, hasActiveTransaction);
-  
-  const remoteStartMutation = useRemoteStart();
-  const remoteStopMutation = useRemoteStop();
+  } = useChargerByStringId(chargePointId, hasActiveTransaction);
+
+  const remoteStartMutation = useRemoteStartByStringId();
+  const remoteStopMutation = useRemoteStopByStringId();
 
   const charger = chargerData?.charger;
   const station = chargerData?.station;
@@ -90,10 +90,9 @@ export default function UserChargePage() {
     // This prevents losing track of recently completed transactions
     setLastTransactionId(null);
     remoteStartMutation.mutate(
-      { 
-        id: chargerId, 
-        connectorId: 1, 
-        idTag: "auto" // Backend will use authenticated user's ID
+      {
+        chargePointId,
+        connectorId: 1,
       },
       {
         onSuccess: () => {
@@ -109,8 +108,8 @@ export default function UserChargePage() {
   const handleRemoteStop = () => {
     if (!charger || !currentTransactionId) return;
     remoteStopMutation.mutate(
-      { 
-        id: chargerId,
+      {
+        chargePointId,
         reason: "Remote"
       },
       {

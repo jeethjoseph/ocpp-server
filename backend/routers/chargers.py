@@ -46,6 +46,7 @@ class ChargerResponse(BaseModel):
     connection_status: bool
     created_at: datetime
     updated_at: datetime
+    tariff_per_kwh: Optional[float] = None
 
     class Config:
         from_attributes = True
@@ -264,21 +265,25 @@ async def create_charger(charger_data: ChargerCreate, admin_user: User = Depends
 async def get_charger_details(charger_id: int, user: User = Depends(require_user_or_admin())):
     """Get detailed charger information (accessible by users and admins)"""
 
-    
+
     charger = await Charger.filter(id=charger_id).first()
     if not charger:
         raise HTTPException(status_code=404, detail="Charger not found")
-    
+
     # Get related data
     station = await ChargingStation.filter(id=charger.station_id).first()
     connectors = await Connector.filter(charger_id=charger_id).all()
-    
+
+    # Get applicable tariff for this charger
+    from services.wallet_service import WalletService
+    tariff_rate = await WalletService.get_applicable_tariff(charger_id)
+
     # Get current active transaction if any
     current_transaction = await Transaction.filter(
         charger_id=charger_id,
         transaction_status__in=["STARTED", "PENDING_START", "RUNNING"]
     ).first()
-    
+
     # If no active transaction, get the most recent completed transaction (within last 5 minutes)
     # This helps users see billing info after remote stops by admin
     recent_transaction = None
@@ -290,13 +295,19 @@ async def get_charger_details(charger_id: int, user: User = Depends(require_user
             transaction_status__in=["COMPLETED", "STOPPED", "BILLING_FAILED", "FAILED"],
             end_time__gte=five_minutes_ago
         ).order_by('-end_time').first()
-    
+
     # Get connection status
     connection_status_dict = await get_bulk_connection_status([charger])
     connection_status = connection_status_dict.get(charger.charge_point_string_id, False)
+
+    # Build charger response with tariff
+    charger_response = charger_to_response(charger, connection_status)
+    charger_dict = charger_response.model_dump()
+    charger_dict['tariff_per_kwh'] = float(tariff_rate) if tariff_rate else None
+
     # Build response
     response = ChargerDetailResponse(
-        charger=charger_to_response(charger, connection_status),
+        charger=ChargerResponse(**charger_dict),
         station=StationBasicInfo.model_validate(station, from_attributes=True),
         connectors=[ConnectorResponse.model_validate(c, from_attributes=True) for c in connectors]
     )

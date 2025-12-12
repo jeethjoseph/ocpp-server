@@ -14,10 +14,8 @@ export const SignInScreen = () => {
 
       <div className="mt-8 sm:mx-auto sm:w-full sm:max-w-md">
         <SignIn
-          routing="path"
-          path="/sign-in"
-          signUpUrl="/sign-up"
-          afterSignInUrl="/"
+          routing="virtual"
+          fallbackRedirectUrl="/"
         />
       </div>
     </div>

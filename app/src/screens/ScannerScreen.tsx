@@ -20,8 +20,7 @@ export const ScannerScreen = () => {
       const result = await CapacitorBarcodeScanner.scanBarcode({
         hint: CapacitorBarcodeScannerTypeHint.QR_CODE,
         scanInstructions: 'Align QR code within the frame',
-        scanButton: true,
-        scanText: 'Scanning...',
+        scanButton: false,
       });
 
       setIsScanning(false);
@@ -38,20 +37,24 @@ export const ScannerScreen = () => {
 
   const handleScannedCode = (code: string) => {
     // Expected format: https://domain.com/charge/{chargerId}
-    // Or just the charger ID number
+    // Or just the charger ID (alphanumeric with underscores)
 
+    console.log('Scanned code:', code);
     let chargerId: string | null = null;
 
-    // Try to extract from URL
-    const urlMatch = code.match(/\/charge\/(\d+)/);
+    // Try to extract from URL (supports alphanumeric IDs with underscores)
+    const urlMatch = code.match(/\/charge\/([A-Za-z0-9_-]+)/i);
     if (urlMatch) {
       chargerId = urlMatch[1];
-    } else if (/^\d+$/.test(code)) {
-      // Just a number
+      console.log('Extracted charger ID from URL:', chargerId);
+    } else if (/^[A-Za-z0-9_-]+$/.test(code)) {
+      // Just an alphanumeric ID
       chargerId = code;
+      console.log('Using direct charger ID:', chargerId);
     }
 
     if (chargerId) {
+      console.log('Navigating to:', `/charge/${chargerId}`);
       navigate(`/charge/${chargerId}`);
     } else {
       setError(`Invalid QR code format: ${code}`);
@@ -64,12 +67,22 @@ export const ScannerScreen = () => {
       return;
     }
 
-    if (!/^\d+$/.test(manualInput)) {
-      setError('Charger ID must be a number');
+    // Try to extract from URL first, otherwise use as-is
+    const urlMatch = manualInput.match(/\/charge\/([A-Za-z0-9_-]+)/i);
+    let chargerId: string;
+
+    if (urlMatch) {
+      chargerId = urlMatch[1];
+    } else {
+      chargerId = manualInput.trim();
+    }
+
+    if (!/^[A-Za-z0-9_-]+$/.test(chargerId)) {
+      setError('Charger ID can only contain letters, numbers, underscores, and hyphens');
       return;
     }
 
-    navigate(`/charge/${manualInput}`);
+    navigate(`/charge/${chargerId}`);
   };
 
   return (
@@ -128,10 +141,15 @@ export const ScannerScreen = () => {
 
         <div className="space-y-3">
           <input
-            type="number"
-            placeholder="Enter charger ID manually"
+            type="text"
+            placeholder="e.g., DOWNTOWN_PLAZA_STATION_03 or URL"
             value={manualInput}
             onChange={(e) => setManualInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                handleManualInput();
+              }
+            }}
             className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
           />
 

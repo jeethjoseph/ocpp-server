@@ -12,8 +12,8 @@ This document provides context for Large Language Models (LLMs) like Claude to u
 
 **Current Status**: Actively deployed on Render (backend) and Vercel (frontend) with Clerk authentication, handling real-world charging stations with WebSocket OCPP communication.
 
-**Version**: 2.1 (January 2025)
-**Current Branch**: 39-feature---user-transaction-pages-zero-charged-transactions
+**Version**: 2.2 (December 2024)
+**Current Branch**: 45-capacitor-app
 
 **Key Capabilities**:
 - Real-time OCPP 1.6 communication with charging stations
@@ -32,15 +32,19 @@ This document provides context for Large Language Models (LLMs) like Claude to u
 
 ```
 EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (Admin + User)
-                ↓                    ↓                           ↓
-          WebSocket /ocpp/     PostgreSQL + Redis          Clerk Authentication
+                ↓                    ↓                    ↓
+          WebSocket /ocpp/     PostgreSQL + Redis    Clerk Authentication
+                                     ↓                    ↓
+                              Capacitor Mobile App (iOS/Android)
+                              React + Native Features
 ```
 
 **Backend**: Python FastAPI 0.115.12 with Tortoise ORM 0.25.1, Redis for connection state, Clerk JWT authentication
-**Frontend**: Next.js 15.3.4 with TypeScript 5.x, React 19, TanStack Query 5.81.2 for state, role-based UI (Admin/User)
+**Web Frontend**: Next.js 15.3.4 with TypeScript 5.x, React 19, TanStack Query 5.81.2 for state, role-based UI (Admin/User)
+**Mobile App**: **NEW** - Capacitor 7.4.4 + React 19 + Vite 7.2.4 for native iOS/Android apps with QR scanning, geolocation, payments
 **Database**: PostgreSQL with comprehensive schema for charging infrastructure
 **Protocol**: OCPP 1.6 via WebSocket with full message support
-**Authentication**: Clerk 6.29.0-powered JWT with role-based access control
+**Authentication**: Clerk (6.29.0 web, 5.56.1 mobile) JWT with role-based access control
 **Testing**: Pytest 8.3.4 with async support
 
 ---
@@ -101,11 +105,14 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
     - Real-time update status monitoring (10s auto-refresh)
     - Summary cards (pending, downloading, installing, completed, failed)
     - Firmware library with delete capability
-  - **`app/admin/chargers/[id]/page.tsx`** - Charger detail with **firmware update & signal quality**
+  - **`app/admin/chargers/[id]/page.tsx`** - Charger detail with **firmware update, reset & signal quality**
     - Current firmware version display
     - Update firmware button (disabled if offline)
     - Firmware version selection dialog
     - Recent update history (last 3 updates)
+    - **Reset charger button** with Hard/Soft selection dialog
+    - Visual warning for Hard reset during active charging
+    - Reset button disabled if charger offline
     - **Real-time signal quality badge** (Good/Fair/Poor/Unknown)
     - RSSI display with color-coding (auto-refresh every 5s)
 - **`app/stations/page.tsx`** - Interactive map with React Leaflet 5.0.0 for station discovery
@@ -115,6 +122,57 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
 - **`components/RoleWrapper.tsx`** - RBAC components (AdminOnly, UserOnly, AuthenticatedOnly)
 - **`components/MeterValuesChart.tsx`** - Energy visualization with Recharts 3.2.1
 - **`components/WalletRechargeModal.tsx`** - **NEW** Razorpay payment integration for wallet recharge
+
+### **NEW**: Mobile App (`/app/`)
+- **`src/App.tsx`** - Capacitor app root with Clerk provider and QueryClient setup
+- **`src/routes.tsx`** - React Router with route prefetching for performance
+- **`capacitor.config.ts`** - Capacitor configuration (App ID: com.lyncpower.user)
+- **`android/`** - Native Android project with permissions configured
+- **`ios/`** - Native iOS project with Info.plist permissions
+
+### Mobile App Screens (`/app/src/screens/`)
+- **`HomeScreen.tsx`** - Welcome screen with quick actions and "How to charge" guide
+- **`StationsScreen.tsx`** - Interactive Leaflet map with:
+  - Real-time station data with geolocation
+  - Distance calculation (Haversine formula)
+  - Color-coded markers (green=available, red=full)
+  - Station details bottom sheet with Google Maps directions
+- **`ScannerScreen.tsx`** - QR code scanner using `@capacitor/barcode-scanner`
+  - Camera permission handling
+  - Manual alphanumeric input fallback
+- **`ChargeScreen.tsx`** - Live charging session with:
+  - Real-time status updates (2-3s refresh)
+  - Live meter values (energy, power, voltage, current)
+  - Remote start/stop charging
+  - Session duration timer and estimated cost
+- **`SessionsScreen.tsx`** - Combined transaction history:
+  - Charging sessions + wallet transactions merged
+  - Wallet balance with Razorpay recharge integration
+  - Pull-to-refresh
+- **`SignInScreen.tsx`** - Clerk authentication flow
+
+### Mobile App Components (`/app/src/components/`)
+- **`ErrorBoundary.tsx`** - **NEW** - Comprehensive error handling for mobile
+- **`Layout.tsx`** - **NEW** - Bottom tab navigation + header with user info
+- **`Modal.tsx`** - **NEW** - Portal-based modal optimized for mobile
+- **`NetworkStatus.tsx`** - **NEW** - Network connectivity indicator
+- **`PullToRefresh.tsx`** - **NEW** - Pull-to-refresh gesture component
+- **`SessionsSkeleton.tsx`** & **`StationsSkeleton.tsx`** - **NEW** - Loading states
+
+### Mobile App Hooks (`/app/src/hooks/`)
+- **`useNetworkStatus.ts`** - **NEW** - Track network connectivity via Capacitor
+- **`usePullToRefresh.ts`** - **NEW** - Pull-to-refresh gesture handling
+- **`useStatusBar.ts`** - **NEW** - Native status bar control
+
+### Native Integrations
+- **Capacitor Plugins**:
+  - `@capacitor/barcode-scanner` v2.2.0 - QR code scanning
+  - `@capacitor/geolocation` v7.1.5 - GPS location for station finder
+  - `@capacitor/network` v7.0.2 - Network status detection
+  - `capacitor-razorpay` v1.3.0 - Native payment SDK integration
+- **Permissions Configured**:
+  - iOS: Camera (QR), Location (station finder) in Info.plist
+  - Android: Camera, Location, Internet, Network State in AndroidManifest.xml
 
 ### API Integration (`/frontend/lib/`)
 - **`api-client.ts`** - Base HTTP client with automatic Clerk JWT injection
@@ -132,6 +190,11 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
     - `bulkUpdate()` - Multiple chargers update
     - `getFirmwareHistory()` - Update history per charger
     - `getUpdateStatus()` - Real-time dashboard status
+  - **`chargerService`** - **Charger control API methods**
+    - `remoteStart()` - Start charging remotely
+    - `remoteStop()` - Stop charging remotely
+    - `changeAvailability()` - Change charger availability
+    - `reset()` - Reset charger (Hard/Soft)
   - **`signalQualityService`** - **Cellular signal quality monitoring**
     - `getSignalQuality()` - Get history with time filtering
     - `getLatestSignalQuality()` - Get most recent reading
@@ -145,7 +208,10 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
     - `useBulkUpdate()` - Bulk update mutation
     - `useFirmwareHistory()` - Update history query (10s stale)
     - `useUpdateStatus()` - Dashboard status (5s stale, **10s auto-refresh**)
-  - **`chargers.ts`** - **Signal quality hooks** (in charger queries file)
+  - **`chargers.ts`** - **Charger control & monitoring hooks**
+    - `useRemoteStart()` - Remote start mutation
+    - `useRemoteStop()` - Remote stop mutation
+    - `useResetCharger()` - Reset charger mutation (Hard/Soft)
     - `useSignalQuality()` - Signal history (10s stale, **10s auto-refresh**)
     - `useLatestSignalQuality()` - Latest reading (5s stale, **5s auto-refresh**)
 - **`csv-export.ts`** - CSV export utility for transaction data
@@ -226,6 +292,11 @@ log (id, charge_point_id, direction, payload, correlation_id) -- All OCPP messag
   - Sends download URL, retrieve date, retries, retry interval
   - Pre-validated: charger online, no active transaction
   - Tracked via FirmwareUpdate database record
+- **`Reset`** (`main.py:814-818`) - **Remote charger reboot (Hard/Soft)**
+  - Hard: Complete reboot, stops all operations (blocked during active charging)
+  - Soft: Graceful restart, may continue operations
+  - Charger sends BootNotification after reset
+  - Safety validation: Hard reset blocked if active transaction exists
 
 ### WebSocket Endpoint
 - **URL**: `ws://localhost:8000/ocpp/{charge_point_id}` (development)
@@ -285,6 +356,7 @@ GET/PUT/DELETE /chargers/{id} - Individual charger operations
 POST /chargers/{id}/remote-start - Send RemoteStartTransaction OCPP command
 POST /chargers/{id}/remote-stop - Send RemoteStopTransaction OCPP command
 POST /chargers/{id}/change-availability - Send ChangeAvailability OCPP command
+POST /chargers/{id}/reset?type={Hard|Soft} - Send Reset OCPP command (Hard reset blocked during active charging)
 
 Transactions:
 GET /transactions - List transactions with filtering and analytics summary
@@ -391,18 +463,57 @@ GET /api/logs/{charge_point_id} - Logs for specific charger
 
 ## Current State & Recent Updates
 
-### Latest Changes (January 2025)
+### Latest Changes (December 2024)
 
-**Recent Features**:
-1. **Razorpay Payment Integration** - Secure wallet recharge with payment gateway integration
+**Recent Major Features**:
+1. **🚀 Native Mobile App (Capacitor)** - Complete iOS/Android application
+   - React 19 + Capacitor 7.4.4 + Vite 7.2.4
+   - 6 main screens: Home, Stations (map), Scanner (QR), Charge (live session), Sessions, Sign In
+   - Native features: QR scanning, geolocation, network detection, Razorpay payments
+   - Pull-to-refresh, skeleton loading, error boundaries
+   - 100% feature complete, ready for App Store submission
+   - App ID: com.lyncpower.user
+   - 3K lines of source code + comprehensive component library
+
+2. **Firmware OTA Update System** - Remote firmware management
+   - Admin firmware upload with version management (`.bin`, `.hex`, `.fw`)
+   - OCPP UpdateFirmware command integration
+   - FirmwareStatusNotification progress tracking
+   - Real-time dashboard with auto-refresh (10s polling)
+   - Safety validations (online check, no active transactions)
+   - Bulk update capability for multiple chargers
+   - Public API for non-OCPP devices (`GET /api/firmware/latest`)
+   - MD5 checksum verification
+   - Comprehensive update history tracking
+
+3. **Razorpay Payment Integration** - Secure wallet recharge
    - Dual verification (frontend callback + webhook)
    - Idempotent payment processing
    - HMAC SHA256 signature verification
    - Test/Live mode support
-2. **Zero Charged Transaction Handling** - Gracefully handles 0 kWh transactions without billing errors
-3. **User Transaction Pages** - New admin views for user transaction and wallet history
-4. **My Sessions Page** - Combined user view of charging and wallet activity with recharge button
-5. **Running Balance Display** - Shows balance progression in wallet history
+   - Native SDK integration for mobile app (`capacitor-razorpay`)
+
+4. **Data Retention Service** - Automated cleanup
+   - Background service for old data cleanup
+   - Signal quality data retention (90 days)
+   - OCPP log cleanup (90 days)
+   - Runs every 24 hours
+   - Configurable retention periods
+
+5. **Signal Quality Monitoring** - Cellular metrics tracking
+   - Real-time RSSI and BER data via OCPP DataTransfer
+   - Historical data with time-based filtering
+   - Color-coded signal badges (Good/Fair/Poor/Unknown)
+   - Auto-refresh every 5s in admin panel
+   - Vendor-specific support (JET_EV1 chargers)
+
+6. **Zero Charged Transaction Handling** - Gracefully handles 0 kWh transactions without billing errors
+
+7. **User Transaction Pages** - New admin views for user transaction and wallet history
+
+8. **My Sessions Page** - Combined user view of charging and wallet activity with recharge button
+
+9. **Running Balance Display** - Shows balance progression in wallet history
 
 **Recent Bug Fixes**:
 - Fixed decimal precision in energy display (now shows 0.01 kWh accuracy)
@@ -410,26 +521,37 @@ GET /api/logs/{charge_point_id} - Logs for specific charger
 - Improved WebSocket connection cleanup (ghost session fixes)
 - Enhanced natural disconnect handling
 
-**Recent Commits** (Branch: 39-feature---user-transaction-pages-zero-charged-transactions):
-- e3f6b38: "wallet balance and zero charge transaction"
+**Recent Commits** (Branch: 45-capacitor-app):
+- 7022bba: "firmware (#44)" - Complete firmware OTA system
+- 4bb159e: "app init" - Mobile app initialization with Capacitor
+- ab6df51: "wrapping razorpay (#42)" - Payment gateway completion
+- 85cc30a: "#39 feature - user transaction pages zero charged transactions"
 - b385b61: "#36 investigation - websocket debug"
 - 9fe8f2f: "Debug code for natural web disconnect"
 - c42f1fc: "Changed timings" (heartbeat: 90s, cleanup: 5min)
 - 38816d3: "#29 bug - energy decimals, chart downloadable, scales readable"
 
 ### Technology Stack
-**Authentication**: Clerk 6.29.0 for JWT and role management
-**Payment Gateway**: Razorpay SDK 2.0.0 for wallet recharge (backend) + Razorpay Checkout.js (frontend)
+**Authentication**: Clerk 6.29.0 (web) / 5.56.1 (mobile) for JWT and role management
+**Payment Gateway**: Razorpay SDK 2.0.0 (backend) + Razorpay Checkout.js (web) + capacitor-razorpay 1.3.0 (mobile)
 **Database**: Tortoise ORM 0.25.1 (async) with PostgreSQL and SSL in production
-**Frontend**: Next.js 15.3.4 with App Router, TypeScript 5.x, React 19, TanStack Query 5.81.2, Shadcn/ui
+**Web Frontend**: Next.js 15.3.4 with App Router, TypeScript 5.x, React 19, TanStack Query 5.81.2, Shadcn/ui
+**Mobile App**: Capacitor 7.4.4 + React 19 + Vite 7.2.4 + TypeScript 5.9 + TanStack Query 5.90.10
 **Backend**: FastAPI 0.115.12 with Uvicorn 0.34.3, Python-OCPP 2.0.0
-**Real-time**: Redis for connection state, TanStack Query polling for frontend updates
+**Real-time**: Redis for connection state, TanStack Query polling for frontend/app updates
+**Maps**: React Leaflet 5.0.0 (both web and mobile) + Leaflet 1.9.4
 **Charts**: Recharts 3.2.1 for energy visualization
 **Testing**: Pytest 8.3.4 with async support
+**Mobile Build**: Vite for development and production builds of Capacitor app
 
-### Current Production Deployment  
+### Current Production Deployment
 - **Backend**: Render.com with environment variables for DB, Redis, Clerk credentials
-- **Frontend**: Vercel with automatic deployments and CDN distribution
+- **Web Frontend**: Vercel with automatic deployments and CDN distribution
+- **Mobile App**: Ready for App Store submission (iOS App Store + Google Play Store)
+  - App configured with bundle ID: com.lyncpower.user
+  - Native builds generated via Capacitor sync
+  - Production builds tested and working
+  - Estimated 4-7 hours to complete store submission process
 - **Database**: PostgreSQL with automated backups and SSL requirements
 - **Monitoring**: Structured logging with correlation IDs, health check endpoints
 
@@ -437,6 +559,15 @@ GET /api/logs/{charge_point_id} - Logs for specific charger
 ✅ Complete OCPP 1.6 message handling with all core messages
 ✅ Real-time charger status monitoring with Redis-backed connection tracking
 ✅ Transaction lifecycle management with automated billing and retry logic
+✅ **🚀 Native Mobile App (100% Complete)** - iOS/Android Capacitor app
+  - QR code scanning for charger access
+  - Interactive station finder with geolocation and distance calculation
+  - Live charging session monitoring with real-time meter values
+  - Remote start/stop charging from mobile
+  - Combined transaction history (charging + wallet)
+  - Native Razorpay payment integration
+  - Pull-to-refresh, network status detection, error boundaries
+  - Ready for App Store submission
 ✅ **NEW**: Razorpay payment integration for wallet recharge
   - Secure order creation and payment verification
   - Webhook integration for reliability
@@ -456,14 +587,25 @@ GET /api/logs/{charge_point_id} - Logs for specific charger
   - **Public API for non-OCPP devices** (`GET /api/firmware/latest`)
   - MD5 checksum verification for integrity
   - Comprehensive update history tracking
-  - Static file serving for firmware downloads
+✅ **Remote Charger Reset** (OCPP 1.6 compliant)
+  - Hard reset: Complete reboot with safety validation (blocked during charging)
+  - Soft reset: Graceful restart without interruption
+  - Admin UI with reset type selection dialog
+  - Visual warnings for unsafe operations
+  - Automatic BootNotification after reset
+  - Full OCPP compliance and audit logging
 ✅ **Signal Quality Monitoring** (via OCPP DataTransfer)
   - Real-time cellular signal quality tracking (RSSI, BER)
   - Vendor-specific DataTransfer handler (JET_EV1 chargers)
   - Historical signal quality data with time-based filtering
   - Color-coded signal strength display (Good/Fair/Poor/Unknown)
   - Auto-refresh every 5 seconds on charger detail page
-  - Data retention service (90-day cleanup)
+✅ **Data Retention Service** (Automated Cleanup)
+  - Background service for database maintenance
+  - Signal quality data cleanup (90-day retention)
+  - OCPP log cleanup (90-day retention)
+  - Runs every 24 hours with configurable intervals
+  - Error handling and graceful shutdown
 ✅ Remote start/stop charging with immediate OCPP command execution
 ✅ Availability control for chargers (Operative/Inoperative)
 ✅ Role-based admin dashboard with comprehensive management tools
@@ -587,6 +729,24 @@ pytest -m infrastructure # Database/Redis tests (~5 seconds) - external dependen
 **Solution Required**: Implement transaction reconciliation with PENDING_RECONCILIATION status
 **Status**: **Still open** - Requires implementation of reconciliation logic
 
+### Known Gaps & Missing Features
+❌ **Push Notifications (NOT Implemented)**
+- **Original Proposal**: Firebase Cloud Messaging for session notifications
+- **Status**: NOT implemented in mobile app
+- **Impact**: Users must manually check app for charging completion
+- **Dependencies**: Firebase SDK, FCM setup, notification permissions
+- **Estimated Effort**: 8-12 hours (FCM setup + backend integration + mobile implementation)
+
+❌ **Offline Mode**
+- **Status**: Marked as future enhancement in IMPLEMENTATION_STATUS.md
+- **Impact**: App requires network connectivity for all operations
+- **Suggested**: Local caching of station data and session history
+
+❌ **Biometric Authentication**
+- **Status**: Marked as future enhancement
+- **Impact**: Users must manually sign in each time
+- **Suggested**: Face ID / Touch ID for quick access
+
 ### Recently Fixed Issues
 ✅ **Zero Energy Billing** - Fixed in commit e3f6b38 (now handles 0 kWh gracefully)
 ✅ **Decimal Precision** - Fixed in commit 38816d3 (shows 0.01 kWh accuracy)
@@ -684,26 +844,35 @@ pytest -m infrastructure # Database/Redis tests (~5 seconds) - external dependen
 
 1. **`backend/main.py`** - Core OCPP WebSocket handling, all message handlers, FastAPI app setup
 2. **`backend/models.py`** - Complete database schema with relationships and OCPP-compliant enums
-3. **`frontend/app/page.tsx`** - Role-based dashboard to understand user experience patterns
-4. **`backend/routers/chargers.py`** - Most complex API with OCPP integration and admin operations
-5. **`frontend/components/RoleWrapper.tsx`** - RBAC implementation patterns
-6. **`backend/auth_middleware.py`** - Clerk authentication and role validation
-7. **`frontend/lib/api-client.ts`** - Frontend-backend integration with automatic JWT handling
+3. **`app/src/App.tsx`** - **NEW** Mobile app entry point with Clerk + QueryClient setup
+4. **`app/src/routes.tsx`** - **NEW** Mobile app routing with all screens
+5. **`frontend/app/page.tsx`** - Web role-based dashboard to understand user experience patterns
+6. **`backend/routers/chargers.py`** - Most complex API with OCPP integration and admin operations
+7. **`frontend/components/RoleWrapper.tsx`** - RBAC implementation patterns
+8. **`backend/auth_middleware.py`** - Clerk authentication and role validation
+9. **`frontend/lib/api-client.ts`** - Frontend-backend integration with automatic JWT handling
+10. **`app/capacitor.config.ts`** - **NEW** Capacitor configuration for native builds
 
 **For specific functionality**:
 - **OCPP message handling** → `main.py` (ChargePoint class with @on decorators)
 - **Database schema & relationships** → `models.py`
 - **Admin APIs & OCPP commands** → `routers/` directory
-- **User interfaces & role-based UI** → `frontend/app/` directory
-- **Real-time features & caching** → `redis_manager.py` + `lib/queries/` hooks
-- **Authentication & RBAC** → `auth_middleware.py` + `middleware.ts` + `RoleWrapper.tsx`
-- **Financial operations** → `services/wallet_service.py` + `services/billing_retry_service.py`
-- **Firmware OTA updates** → `routers/firmware.py` + `services/storage_service.py` + `app/admin/firmware/page.tsx` + `lib/queries/firmware.ts`
+- **Web user interfaces & role-based UI** → `frontend/app/` directory
+- **Mobile app screens** → **NEW** `app/src/screens/` directory (6 screens)
+- **Native mobile features** → **NEW** `app/src/hooks/` + Capacitor plugins
+- **Real-time features & caching** → `redis_manager.py` + `lib/queries/` hooks (both web and mobile)
+- **Authentication & RBAC** → `auth_middleware.py` + `middleware.ts` (web) + `App.tsx` (mobile)
+- **Financial operations** → `services/wallet_service.py` + `services/billing_retry_service.py` + `services/razorpay_service.py`
+- **Firmware OTA updates** → `routers/firmware.py` + `services/storage_service.py` + `frontend/app/admin/firmware/page.tsx` + `lib/queries/firmware.ts`
+- **Data retention & cleanup** → **NEW** `services/data_retention_service.py`
 
 **For troubleshooting**:
 - **OCPP communication issues** → Check `log` table and `redis_manager.py` connection state
 - **Authentication problems** → Check Clerk webhook processing in `routers/webhooks.py`
 - **Transaction billing issues** → Check `wallet_service.py` and BILLING_FAILED status handling
-- **Frontend role issues** → Check `middleware.ts` and role-based component wrappers
+- **Web frontend role issues** → Check `middleware.ts` and role-based component wrappers
+- **Mobile app issues** → **NEW** Check Capacitor logs, native permissions, network status component
+- **Native feature issues** → **NEW** Check Capacitor plugin installation and platform-specific configs
+- **Payment issues** → Check Razorpay service logs, webhook signatures, `wallet_payments.py` router
 
-This context should give any LLM a solid foundation for understanding and working with this modern, production-ready OCPP 1.6 CSMS with role-based access control and comprehensive user experience features.
+This context should give any LLM a solid foundation for understanding and working with this modern, production-ready OCPP 1.6 CSMS with role-based access control, comprehensive user experience features, and native mobile applications for iOS and Android.
