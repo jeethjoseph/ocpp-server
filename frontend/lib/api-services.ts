@@ -84,6 +84,10 @@ export const chargerService = {
 
   getById: (id: number) => api.get<ChargerDetail>(`/api/admin/chargers/${id}`),
 
+  // User-facing endpoint that accepts string IDs (charge_point_string_id)
+  getByStringId: (chargePointId: string) =>
+    api.get<ChargerDetail>(`/api/users/charger/${chargePointId}`),
+
   create: (data: ChargerCreate) =>
     api.post<ApiResponse<{ charger: Charger; ocpp_url: string }>>(
       "/api/admin/chargers",
@@ -113,10 +117,23 @@ export const chargerService = {
       reason ? { reason } : undefined
     ),
 
+  // User-facing remote stop that accepts string IDs
+  remoteStopByStringId: (chargePointId: string, reason?: string) =>
+    api.post<ApiResponse>(
+      `/api/users/charger/${chargePointId}/remote-stop`,
+      reason ? { reason } : undefined
+    ),
+
   remoteStart: (id: number, connectorId: number = 1, idTag: string = "admin") =>
     api.post<ApiResponse>(`/api/admin/chargers/${id}/remote-start`, {
       connector_id: connectorId,
       id_tag: idTag,
+    }),
+
+  // User-facing remote start that accepts string IDs
+  remoteStartByStringId: (chargePointId: string, connectorId: number = 1) =>
+    api.post<ApiResponse>(`/api/users/charger/${chargePointId}/remote-start`, {
+      connector_id: connectorId,
     }),
 
   reset: (chargerId: number, type: 'Hard' | 'Soft' = 'Hard') =>

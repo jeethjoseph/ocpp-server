@@ -16,22 +16,29 @@ PG_SUPERUSER=$(shell whoami)
 BACKEND_DIR=backend
 SCRIPTS_DIR=$(BACKEND_DIR)/scripts
 
-.PHONY: help db-reset db-reset-cloud db-first-time db-drop-user db-create-user db-drop db-create migrate seed setup-dev truncate-tables
+.PHONY: help db-reset db-reset-cloud db-first-time db-drop-user db-create-user db-drop db-create migrate seed setup-dev truncate-tables deploy-dry-run deploy deploy-force restart-service
 
 help:
 	@echo "Available commands:"
-	@echo "  help          - Show this help message"
-	@echo "  db-reset      - Database reset (drop, recreate, migrate, seed)"
-	@echo "  db-reset-cloud- Cloud database reset (truncate tables, migrate, seed)"
-	@echo "  db-first-time - First-time setup (drop, recreate, init-db, seed)"
-	@echo "  db-drop-user  - Drop database user"
-	@echo "  db-create-user- Create database user"
-	@echo "  db-drop       - Drop database"
-	@echo "  db-create     - Create database"
-	@echo "  init-fresh-db - Initialize fresh database with schema"
-	@echo "  migrate       - Run database migrations (for existing DB)"
-	@echo "  seed          - Run seed script"
-	@echo "  setup-dev     - Initial development setup"
+	@echo ""
+	@echo "Database Management:"
+	@echo "  db-reset        - Database reset (drop, recreate, migrate, seed)"
+	@echo "  db-reset-cloud  - Cloud database reset (truncate tables, migrate, seed)"
+	@echo "  db-first-time   - First-time setup (drop, recreate, init-db, seed)"
+	@echo "  db-drop-user    - Drop database user"
+	@echo "  db-create-user  - Create database user"
+	@echo "  db-drop         - Drop database"
+	@echo "  db-create       - Create database"
+	@echo "  init-fresh-db   - Initialize fresh database with schema"
+	@echo "  migrate         - Run database migrations (for existing DB)"
+	@echo "  seed            - Run seed script"
+	@echo "  setup-dev       - Initial development setup"
+	@echo ""
+	@echo "Deployment:"
+	@echo "  deploy-dry-run  - Show what would be deployed (no changes)"
+	@echo "  deploy          - Deploy to production (with confirmation)"
+	@echo "  deploy-force    - Deploy without confirmation (use with caution!)"
+	@echo "  restart-service - Restart the production service"
 
 # Complete database reset (uses existing migrations)
 db-reset: db-drop db-drop-user db-create-user db-create migrate seed
@@ -116,3 +123,105 @@ test-migrations:
 truncate-tables:
 	@echo "🗑️  Truncating all tables..."
 	cd $(BACKEND_DIR) && source .venv/bin/activate && python scripts/truncate_tables.py
+
+# Deployment configuration
+REMOTE_USER=root
+REMOTE_HOST=lyncpower.com
+REMOTE_PATH=/root/ocpp_server/
+LOCAL_PATH=./backend/
+SERVICE_NAME=ocpp-server
+
+# Common rsync exclusions
+RSYNC_EXCLUDES=--exclude '.git/' \
+	--exclude '.gitignore' \
+	--exclude '__pycache__/' \
+	--exclude '*.pyc' \
+	--exclude '*.pyo' \
+	--exclude '*.py[cod]' \
+	--exclude '.env' \
+	--exclude '.env.local' \
+	--exclude '.env.production' \
+	--exclude '.env.staging' \
+	--exclude '.venv/' \
+	--exclude 'venv/' \
+	--exclude 'env/' \
+	--exclude '.idea/' \
+	--exclude '.vscode/' \
+	--exclude 'test.html' \
+	--exclude 'dump.rdb' \
+	--exclude '.claude/' \
+	--exclude '*.sql' \
+	--exclude '*.dump' \
+	--exclude '*.log' \
+	--exclude 'logs/' \
+	--exclude 'firmware_files/*.bin' \
+	--exclude 'firmware_files/*.hex' \
+	--exclude 'firmware_files/*.fw' \
+	--exclude 'backend/firmware_files/*.bin' \
+	--exclude 'backend/firmware_files/*.hex' \
+	--exclude 'backend/firmware_files/*.fw' \
+	--exclude 'node_modules/' \
+	--exclude 'npm-debug.log' \
+	--exclude 'yarn-debug.log' \
+	--exclude 'yarn-error.log' \
+	--exclude '.next/' \
+	--exclude 'out/' \
+	--exclude 'dist/' \
+	--exclude 'build/' \
+	--exclude '.DS_Store' \
+	--exclude '._*' \
+	--exclude 'certs/' \
+	--exclude 'app/' \
+	--exclude 'frontend/'
+
+# Deployment dry run (shows what would be transferred)
+deploy-dry-run:
+	@echo "🔍 Running deployment dry-run to $(REMOTE_USER)@$(REMOTE_HOST)..."
+	@echo "   This will show what files would be transferred/deleted"
+	@echo ""
+	rsync -avzn --delete $(RSYNC_EXCLUDES) $(LOCAL_PATH) $(REMOTE_USER)@$(REMOTE_HOST):$(REMOTE_PATH)
+	@echo ""
+	@echo "✅ Dry-run complete. Review the changes above."
+
+# Full deployment (with confirmation)
+deploy: deploy-dry-run
+	@echo ""
+	@echo "⚠️  Ready to deploy to production!"
+	@read -p "Do you want to proceed with deployment? (yes/no): " confirm; \
+	if [ "$$confirm" = "yes" ]; then \
+		echo "🚀 Starting deployment..."; \
+		rsync -avz --delete $(RSYNC_EXCLUDES) $(LOCAL_PATH) $(REMOTE_USER)@$(REMOTE_HOST):$(REMOTE_PATH); \
+		if [ $$? -eq 0 ]; then \
+			echo "✅ Files deployed successfully!"; \
+			echo "🔄 Restarting service $(SERVICE_NAME)..."; \
+			ssh $(REMOTE_USER)@$(REMOTE_HOST) "systemctl restart $(SERVICE_NAME) && systemctl status $(SERVICE_NAME) --no-pager"; \
+			if [ $$? -eq 0 ]; then \
+				echo "✅ Service restarted successfully!"; \
+				echo "✅ Deployment complete!"; \
+			else \
+				echo "⚠️  Service restart failed! Check logs with: ssh $(REMOTE_USER)@$(REMOTE_HOST) 'systemctl status $(SERVICE_NAME)'"; \
+				exit 1; \
+			fi \
+		else \
+			echo "❌ Deployment failed!"; \
+			exit 1; \
+		fi \
+	else \
+		echo "❌ Deployment cancelled."; \
+		exit 1; \
+	fi
+
+# Quick deploy (no confirmation - use with caution!)
+deploy-force:
+	@echo "🚀 Deploying to $(REMOTE_USER)@$(REMOTE_HOST) (no confirmation)..."
+	rsync -avz --delete $(RSYNC_EXCLUDES) $(LOCAL_PATH) $(REMOTE_USER)@$(REMOTE_HOST):$(REMOTE_PATH)
+	@echo "✅ Files deployed successfully!"
+	@echo "🔄 Restarting service $(SERVICE_NAME)..."
+	@ssh $(REMOTE_USER)@$(REMOTE_HOST) "systemctl restart $(SERVICE_NAME) && systemctl status $(SERVICE_NAME) --no-pager"
+	@echo "✅ Deployment complete!"
+
+# Restart the production service
+restart-service:
+	@echo "🔄 Restarting service $(SERVICE_NAME) on $(REMOTE_HOST)..."
+	@ssh $(REMOTE_USER)@$(REMOTE_HOST) "systemctl restart $(SERVICE_NAME) && systemctl status $(SERVICE_NAME) --no-pager"
+	@echo "✅ Service restarted!"

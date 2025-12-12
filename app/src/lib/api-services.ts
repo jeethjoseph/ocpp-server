@@ -41,36 +41,37 @@ export const publicStationService = (api: ApiClient) => ({
 });
 
 /**
- * Charger service - User actions
- * Used for controlling chargers and viewing status
+ * Charger service - User actions (String ID support for customer-facing apps)
+ * Used for controlling chargers and viewing status using alphanumeric charge_point_string_id
  */
 export const chargerService = (api: ApiClient) => ({
   /**
    * Get charger details including current transaction
+   * @param id - Charger charge_point_string_id (alphanumeric, e.g., 'AIRPORT_EXPRESS_CHARGING_01')
    */
-  getById: (id: number) =>
-    api.get<ChargerDetail>(`/api/admin/chargers/${id}`),
+  getById: (id: string) =>
+    api.get<ChargerDetail>(`/api/users/charger/${id}`),
 
   /**
    * Start a charging session (Remote Start)
-   * @param id - Charger ID
+   * @param id - Charger charge_point_string_id (alphanumeric)
    * @param connectorId - Connector ID (default: 1)
    * @param idTag - User ID tag (default: user's email or ID)
    */
-  remoteStart: (id: number, connectorId: number = 1, idTag: string = "user") =>
-    api.post<ApiResponse>(`/api/admin/chargers/${id}/remote-start`, {
+  remoteStart: (id: string, connectorId: number = 1, idTag: string = "user") =>
+    api.post<ApiResponse>(`/api/users/charger/${id}/remote-start`, {
       connector_id: connectorId,
       id_tag: idTag,
     }),
 
   /**
    * Stop a charging session (Remote Stop)
-   * @param id - Charger ID
+   * @param id - Charger charge_point_string_id (alphanumeric)
    * @param reason - Optional stop reason
    */
-  remoteStop: (id: number, reason?: string) =>
+  remoteStop: (id: string, reason?: string) =>
     api.post<ApiResponse>(
-      `/api/admin/chargers/${id}/remote-stop`,
+      `/api/users/charger/${id}/remote-stop`,
       reason ? { reason } : undefined
     ),
 });
@@ -104,28 +105,39 @@ export const transactionService = (api: ApiClient) => ({
 export const userSessionService = (api: ApiClient) => ({
   /**
    * Get user's sessions (charging + wallet transactions)
+   * Returns paginated transactions of both types
    */
-  getMySessions: () =>
+  getMySessions: (page: number = 1, limit: number = 20) =>
     api.get<{
-      charging_sessions: Array<{
-        transaction_id: number;
-        charger_name: string;
-        station_name: string;
-        energy_kwh: number;
-        cost: number;
-        start_time: string;
-        end_time?: string;
-        status: string;
-      }>;
-      wallet_transactions: Array<{
+      data: Array<{
         id: number;
-        amount: number;
-        type: string;
-        description: string;
+        type: "charging" | "wallet";
         created_at: string;
+        // Charging transaction fields
+        station_name?: string;
+        charger_name?: string;
+        energy_consumed_kwh?: number;
+        start_time?: string;
+        end_time?: string;
+        status?: string;
+        amount?: number;
+        wallet_transactions?: Array<{
+          id: number;
+          amount: number;
+          type: string;
+          description: string;
+          created_at: string;
+        }>;
+        // Wallet transaction fields
+        transaction_type?: string;
+        description?: string;
+        payment_metadata?: any;
       }>;
-      wallet_balance: number;
-    }>(`/api/users/my-sessions`),
+      total: number;
+      page: number;
+      limit: number;
+      total_pages: number;
+    }>(`/api/users/my-sessions?page=${page}&limit=${limit}`),
 
   /**
    * Get user's wallet balance

@@ -178,6 +178,7 @@ export interface Charger {
   connection_status: boolean;
   created_at: string;
   updated_at: string;
+  tariff_per_kwh?: number;
 }
 
 export interface Connector {
@@ -214,6 +215,6 @@ export interface ChargerDetail {
 
 // User Wallet Info
 export interface UserWallet {
-  balance: number;
-  currency: string;
+  wallet_balance: number;
+  currency?: string;
 }

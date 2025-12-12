@@ -49,8 +49,10 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:3000",           # Local development
-        "http://127.0.0.1:3000",           # Local development
+        "http://localhost:3000",           # Local development - Next.js
+        "http://127.0.0.1:3000",           # Local development - Next.js
+        "http://localhost:5173",           # Local development - Vite (mobile app)
+        "http://127.0.0.1:5173",           # Local development - Vite (mobile app)
         "https://powerlync.com",            # Production frontend
         "https://www.powerlync.com",        # Production frontend (www)
         "https://ocpp-frontend-mu.vercel.app",  # Legacy Vercel frontend
@@ -79,6 +81,8 @@ class OptionsMiddleware(BaseHTTPMiddleware):
             allowed_origins = [
                 "http://localhost:3000",
                 "http://127.0.0.1:3000",
+                "http://localhost:5173",
+                "http://127.0.0.1:5173",
                 "https://powerlync.com",
                 "https://www.powerlync.com",
                 "https://ocpp-frontend-mu.vercel.app",
@@ -696,36 +700,177 @@ class LoggingWebSocketAdapter(FastAPIWebSocketAdapter):
     def __init__(self, websocket: WebSocket, charge_point_id: str):
         super().__init__(websocket)
         self.charge_point_id = charge_point_id
+        self._at_command_skip_count = 0  # Track consecutive AT commands
 
     async def recv(self):
         msg = await super().recv()
-        
+
         # Ghost session detection - check if this charge point is in our connected list
         if self.charge_point_id not in connected_charge_points:
             logger.warning(f"[DISCONNECT] Ghost session detected for {self.charge_point_id} - message received but not in connected list")
-            
+
             # Force close the ghost connection
             try:
                 await self.websocket.close(code=1008, reason="Ghost session cleanup")
                 logger.info(f"[DISCONNECT] Closed ghost session WebSocket for {self.charge_point_id}")
             except Exception as e:
                 logger.warning(f"[DISCONNECT] Error closing ghost session WebSocket for {self.charge_point_id}: {e}")
-            
+
             # Don't process the message or log it - use WebSocketDisconnect to follow existing except path
             from fastapi import WebSocketDisconnect
             raise WebSocketDisconnect(code=1008)
-        
+
         # Update last_seen for ANY incoming message from valid connections
         connected_charge_points[self.charge_point_id]["last_seen"] = datetime.datetime.now(datetime.timezone.utc)
-        
+
+        # Filter out AT commands (firmware bug where charger sends raw modem commands)
+        # Common AT commands: AT+CSQ (signal quality), AT+COPS, AT+CREG, etc.
+        # This is a known issue with some charger firmware (e.g., JET_EV1)
+        msg_stripped = msg.strip()
+        if msg_stripped.startswith("AT+") or msg_stripped.startswith("AT ") or msg_stripped.startswith("at+") or msg_stripped.startswith("at "):
+            self._at_command_skip_count += 1
+
+            # If we've skipped too many AT commands in a row, this might indicate a serious firmware issue
+            if self._at_command_skip_count > 50:
+                logger.error(f"[FIRMWARE BUG] {self.charge_point_id} sent {self._at_command_skip_count} consecutive AT commands - possible firmware malfunction. Disconnecting for safety.")
+                from fastapi import WebSocketDisconnect
+                raise WebSocketDisconnect(code=1008)
+
+            logger.warning(f"[FIRMWARE BUG] {self.charge_point_id} sent AT modem command over OCPP websocket: '{msg_stripped}' - ignoring (skip count: {self._at_command_skip_count})")
+            # Don't log to database or process further - wait for next valid message
+            # Recursively call recv() to get the next message
+            return await self.recv()
+
+        # Reset counter on valid message
+        self._at_command_skip_count = 0
+
+        # Validate OCPP message format before processing
         correlation_id = None
         try:
             parsed = json.loads(msg)
-            if isinstance(parsed, list) and len(parsed) > 1:
+
+            # OCPP messages must be JSON arrays
+            if not isinstance(parsed, list):
+                logger.error(f"[OCPP VALIDATION] {self.charge_point_id} sent non-array message: {msg}")
+                await self._send_protocol_error("RPC message must be a JSON array")
+                # Log the invalid message
+                await log_message(
+                    charger_id=self.charge_point_id,
+                    direction="IN",
+                    message_type="OCPP",
+                    payload=msg,
+                    status="error",
+                    correlation_id="invalid"
+                )
+                # Skip this message and wait for next one
+                return await self.recv()
+
+            # Validate OCPP message structure
+            # CALL: [2, "messageId", "action", {payload}]
+            # CALLRESULT: [3, "messageId", {payload}]
+            # CALLERROR: [4, "messageId", "errorCode", "errorDescription", {errorDetails}]
+            message_type_id = parsed[0] if len(parsed) > 0 else None
+
+            if message_type_id not in [2, 3, 4]:
+                logger.error(f"[OCPP VALIDATION] {self.charge_point_id} sent invalid message type ID {message_type_id}: {msg}")
+                await self._send_protocol_error(f"Invalid OCPP message type ID: {message_type_id}")
+                await log_message(
+                    charger_id=self.charge_point_id,
+                    direction="IN",
+                    message_type="OCPP",
+                    payload=msg,
+                    status="error",
+                    correlation_id="invalid"
+                )
+                return await self.recv()
+
+            # Extract correlation ID (message ID)
+            if len(parsed) > 1:
                 correlation_id = str(parsed[1])
-        except Exception:
-            logger.error(f"Failed to parse OCPP message in the logging adapter: {msg}", exc_info=True)
-        
+            else:
+                logger.error(f"[OCPP VALIDATION] {self.charge_point_id} sent message without message ID: {msg}")
+                await self._send_protocol_error("OCPP message missing message ID")
+                await log_message(
+                    charger_id=self.charge_point_id,
+                    direction="IN",
+                    message_type="OCPP",
+                    payload=msg,
+                    status="error",
+                    correlation_id="missing"
+                )
+                return await self.recv()
+
+            # Validate CALL message structure (most common from charge points)
+            if message_type_id == 2:
+                if len(parsed) < 4:
+                    logger.error(f"[OCPP VALIDATION] {self.charge_point_id} sent incomplete CALL message: {msg}")
+                    await self._send_call_error(correlation_id, "ProtocolError", "CALL message must have [messageType, messageId, action, payload]")
+                    await log_message(
+                        charger_id=self.charge_point_id,
+                        direction="IN",
+                        message_type="OCPP",
+                        payload=msg,
+                        status="error",
+                        correlation_id=correlation_id
+                    )
+                    return await self.recv()
+
+                action = parsed[2]
+                payload = parsed[3]
+
+                if not isinstance(action, str):
+                    logger.error(f"[OCPP VALIDATION] {self.charge_point_id} sent CALL with non-string action: {msg}")
+                    await self._send_call_error(correlation_id, "ProtocolError", "Action must be a string")
+                    await log_message(
+                        charger_id=self.charge_point_id,
+                        direction="IN",
+                        message_type="OCPP",
+                        payload=msg,
+                        status="error",
+                        correlation_id=correlation_id
+                    )
+                    return await self.recv()
+
+                if not isinstance(payload, dict):
+                    logger.error(f"[OCPP VALIDATION] {self.charge_point_id} sent CALL with non-object payload: {msg}")
+                    await self._send_call_error(correlation_id, "ProtocolError", "Payload must be a JSON object")
+                    await log_message(
+                        charger_id=self.charge_point_id,
+                        direction="IN",
+                        message_type="OCPP",
+                        payload=msg,
+                        status="error",
+                        correlation_id=correlation_id
+                    )
+                    return await self.recv()
+
+        except json.JSONDecodeError as e:
+            logger.error(f"[OCPP VALIDATION] {self.charge_point_id} sent invalid JSON: {msg} - Error: {e}")
+            await self._send_protocol_error(f"Invalid JSON: {str(e)}")
+            await log_message(
+                charger_id=self.charge_point_id,
+                direction="IN",
+                message_type="OCPP",
+                payload=msg,
+                status="error",
+                correlation_id="invalid_json"
+            )
+            # Skip this message and wait for next one
+            return await self.recv()
+        except Exception as e:
+            logger.error(f"[OCPP VALIDATION] {self.charge_point_id} message validation error: {msg} - Error: {e}", exc_info=True)
+            await self._send_protocol_error(f"Message validation failed: {str(e)}")
+            await log_message(
+                charger_id=self.charge_point_id,
+                direction="IN",
+                message_type="OCPP",
+                payload=msg,
+                status="error",
+                correlation_id="validation_error"
+            )
+            return await self.recv()
+
+        # Message is valid - log it
         await log_message(
             charger_id=self.charge_point_id,
             direction="IN",
@@ -736,6 +881,39 @@ class LoggingWebSocketAdapter(FastAPIWebSocketAdapter):
         )
         logger.info(f"[OCPP][IN] {msg}")
         return msg
+
+    async def _send_protocol_error(self, error_description: str):
+        """Send a protocol error when message can't be parsed (no message ID available)"""
+        try:
+            # For protocol errors where we don't have a message ID, we can't send a CALLERROR
+            # Just log it and close the connection if errors persist
+            logger.warning(f"[OCPP ERROR] Sending protocol error to {self.charge_point_id}: {error_description}")
+        except Exception as e:
+            logger.error(f"[OCPP ERROR] Failed to handle protocol error for {self.charge_point_id}: {e}")
+
+    async def _send_call_error(self, message_id: str, error_code: str, error_description: str):
+        """Send an OCPP CALLERROR response for validation failures"""
+        try:
+            # CALLERROR format: [4, "messageId", "errorCode", "errorDescription", {}]
+            error_message = [4, message_id, error_code, error_description, {}]
+            error_json = json.dumps(error_message)
+
+            logger.warning(f"[OCPP ERROR] Sending CALLERROR to {self.charge_point_id}: {error_json}")
+
+            # Log outgoing error
+            await log_message(
+                charger_id=self.charge_point_id,
+                direction="OUT",
+                message_type="OCPP",
+                payload=error_json,
+                status="sent",
+                correlation_id=message_id
+            )
+
+            # Send error response
+            await super().send(error_json)
+        except Exception as e:
+            logger.error(f"[OCPP ERROR] Failed to send CALLERROR to {self.charge_point_id}: {e}", exc_info=True)
 
     async def send(self, data):
         correlation_id = None
@@ -762,14 +940,18 @@ async def send_ocpp_request(charge_point_id: str, action: str, payload: Dict = N
     # Check Redis for connection status
     is_connected = await redis_manager.is_charger_connected(charge_point_id)
     if not is_connected:
-        logger.warning(f"Charge point {charge_point_id} not connected")
+        logger.warning(f"Charge point {charge_point_id} not connected (not in Redis)")
         return False, f"Charge point {charge_point_id} not connected"
 
     # Get connection data from in-memory dict
     connection_data = connected_charge_points.get(charge_point_id)
     if not connection_data:
-        logger.warning(f"ChargePoint instance for {charge_point_id} not found")
-        return False, f"ChargePoint instance for {charge_point_id} not found"
+        # Desync between Redis and in-memory dict (likely server restart)
+        logger.warning(f"ChargePoint instance for {charge_point_id} not found in memory but found in Redis (stale entry after server restart)")
+        logger.warning(f"Connected chargers in memory: {list(connected_charge_points.keys())}")
+        # Clean up stale Redis entry
+        await redis_manager.remove_connected_charger(charge_point_id)
+        return False, f"Charger connection lost. Please wait for charger to reconnect (usually within 60 seconds)"
     
     cp = connection_data.get("cp")
     websocket = connection_data.get("websocket")
