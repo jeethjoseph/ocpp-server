@@ -9,8 +9,9 @@ User=root
 WorkingDirectory=/root/ocpp_server
 Environment="PATH=/root/ocpp_server/.venv/bin:/usr/local/bin:/usr/bin:/bin"
 
-# CRITICAL: Bind to localhost only on port 8080 (nginx will proxy from port 443)
-ExecStart=/root/ocpp_server/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8080 --workers 2
+# Uses wrapper script that conditionally enables New Relic monitoring based on .env
+# Script checks NEW_RELIC_MONITOR_MODE and wraps uvicorn with newrelic-admin if enabled
+ExecStart=/root/ocpp_server/start_server.sh
 
 Restart=always
 RestartSec=10
@@ -23,3 +24,26 @@ StartLimitBurst=5
 
 [Install]
 WantedBy=multi-user.target
+
+# ============================================================================
+# Deployment Instructions:
+#
+# 1. Copy wrapper script to server:
+#    scp backend/docs/server-config/start_server.sh root@your-server:/root/ocpp_server/
+#    ssh root@your-server "chmod +x /root/ocpp_server/start_server.sh"
+#
+# 2. Copy updated service file to server:
+#    sudo cp ocpp-server-production.service /etc/systemd/system/ocpp-server.service
+#
+# 3. Reload systemd and restart:
+#    sudo systemctl daemon-reload
+#    sudo systemctl restart ocpp-server
+#
+# 4. View logs to confirm New Relic status:
+#    sudo journalctl -u ocpp-server -f
+#
+# 5. To enable/disable monitoring:
+#    - Edit /root/ocpp_server/.env
+#    - Set NEW_RELIC_MONITOR_MODE=true (or false)
+#    - sudo systemctl restart ocpp-server
+# ============================================================================

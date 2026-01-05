@@ -142,6 +142,7 @@ RSYNC_EXCLUDES=--exclude '.git/' \
 	--exclude '.env.local' \
 	--exclude '.env.production' \
 	--exclude '.env.staging' \
+	--exclude '.env.example' \
 	--exclude '.venv/' \
 	--exclude 'venv/' \
 	--exclude 'env/' \
@@ -154,12 +155,8 @@ RSYNC_EXCLUDES=--exclude '.git/' \
 	--exclude '*.dump' \
 	--exclude '*.log' \
 	--exclude 'logs/' \
-	--exclude 'firmware_files/*.bin' \
-	--exclude 'firmware_files/*.hex' \
-	--exclude 'firmware_files/*.fw' \
-	--exclude 'backend/firmware_files/*.bin' \
-	--exclude 'backend/firmware_files/*.hex' \
-	--exclude 'backend/firmware_files/*.fw' \
+	--exclude 'docs/' \
+	--exclude 'firmware_files/' \
 	--exclude 'node_modules/' \
 	--exclude 'npm-debug.log' \
 	--exclude 'yarn-debug.log' \

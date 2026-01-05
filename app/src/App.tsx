@@ -4,6 +4,8 @@ import { BrowserRouter } from 'react-router-dom';
 import { AppRoutes } from './routes';
 import { SignInScreen } from './screens/SignInScreen';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { useEffect } from 'react';
+import { initNewRelicMobile } from './lib/newrelic-mobile';
 
 // Import Clerk publishable key
 const CLERK_PUBLISHABLE_KEY = import.meta.env.VITE_CLERK_PUBLISHABLE_KEY;
@@ -35,6 +37,11 @@ const queryClient = new QueryClient({
 });
 
 function App() {
+  // Initialize New Relic Mobile monitoring on app mount
+  useEffect(() => {
+    initNewRelicMobile();
+  }, []);
+
   return (
     <ErrorBoundary>
       <ClerkProvider publishableKey={CLERK_PUBLISHABLE_KEY}>

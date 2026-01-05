@@ -31,6 +31,20 @@ import json
 # Import routers
 from routers import stations, chargers, transactions, auth, webhooks, users, public_stations, logs, wallet_payments, firmware
 
+# Import monitoring service
+from services.monitoring_service import (
+    initialize_monitoring,
+    MetricsCollector,
+    OCPPMetrics,
+    SentryHelper,
+    trace_transaction,
+    trace_function
+)
+
+# Initialize monitoring BEFORE creating FastAPI app
+# This must happen before app = FastAPI() for proper instrumentation
+initialize_monitoring()
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,  # Back to INFO level after debugging
@@ -63,6 +77,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Configure Sentry middleware for error tracking
+if os.getenv("SENTRY_ENABLED", "false").lower() == "true":
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
+        app.add_middleware(SentryAsgiMiddleware)
+        logger.info("✅ Sentry ASGI middleware added")
+    except ImportError:
+        logger.warning("⚠️ Sentry SDK not available, middleware not added")
 
 # Middleware to handle OPTIONS (CORS preflight) requests
 # This ensures OPTIONS requests don't hit authentication middleware
@@ -132,7 +156,19 @@ cleanup_task = None
 # Define a ChargePoint class using python-ocpp
 class ChargePoint(OcppChargePoint):
     @on('BootNotification')
+    @trace_transaction(name="OCPP/BootNotification", group="OCPP/Messages")
     async def on_boot_notification(self, charge_point_vendor, charge_point_model, **kwargs):
+        # Record metric
+        await OCPPMetrics.record_message("BootNotification", "IN")
+
+        # Add Sentry breadcrumb
+        SentryHelper.add_breadcrumb(
+            category="ocpp.message",
+            message=f"BootNotification from {self.id}",
+            level="info",
+            data={"vendor": charge_point_vendor, "model": charge_point_model}
+        )
+
         # Extract optional fields from kwargs
         firmware_version = kwargs.get('firmware_version')
         charge_point_serial_number = kwargs.get('charge_point_serial_number')
@@ -184,6 +220,9 @@ class ChargePoint(OcppChargePoint):
 
     @on('Heartbeat')
     async def on_heartbeat(self, **kwargs):
+        # Record heartbeat metric (lightweight, don't trace entire transaction)
+        await OCPPMetrics.record_message("Heartbeat", "IN")
+
         # Update last heartbeat timestamp for this charge point
         current_time = datetime.datetime.now(datetime.timezone.utc)
         if self.id in connected_charge_points:
@@ -198,8 +237,11 @@ class ChargePoint(OcppChargePoint):
     
     @on('StatusNotification')
     async def on_status_notification(self, connector_id, status, error_code=None, info=None, **kwargs):
+        # Record metric
+        await OCPPMetrics.record_message("StatusNotification", "IN")
+
         logger.info(f"StatusNotification from {self.id}: connector_id={connector_id}, status={status}, error_code={error_code}, info={info}")
-        
+
         try:
             # Update charger status in database
             result = await update_charger_status(self.id, status)
@@ -281,7 +323,11 @@ class ChargePoint(OcppChargePoint):
             return call_result.StatusNotification()
 
     @on('StartTransaction')
+    @trace_transaction(name="OCPP/StartTransaction", group="OCPP/Messages")
     async def on_start_transaction(self, connector_id, id_tag, meter_start, timestamp, **kwargs):
+        # Record metric
+        await OCPPMetrics.record_message("StartTransaction", "IN")
+
         logger.info(f"StartTransaction from {self.id}: connector_id={connector_id}, id_tag={id_tag}, meter_start={meter_start}")
         
         from models import Transaction, User, VehicleProfile, Charger, TransactionStatusEnum
@@ -329,8 +375,12 @@ class ChargePoint(OcppChargePoint):
                 start_meter_kwh=float(meter_start) / 1000,  # Convert Wh to kWh
                 transaction_status=TransactionStatusEnum.RUNNING  # Changed from STARTED to RUNNING
             )
-            
+
             logger.info(f"🔋 Created transaction {transaction.id} for charger {self.id} with status RUNNING")
+
+            # Record transaction started event
+            await OCPPMetrics.record_transaction_started(self.id, user.id)
+            SentryHelper.set_transaction_context(transaction.id, self.id, user.id)
             
             return call_result.StartTransaction(
                 transaction_id=transaction.id,
@@ -345,7 +395,11 @@ class ChargePoint(OcppChargePoint):
             )
 
     @on('StopTransaction')
+    @trace_transaction(name="OCPP/StopTransaction", group="OCPP/Messages")
     async def on_stop_transaction(self, transaction_id, meter_stop, timestamp, **kwargs):
+        # Record metric
+        await OCPPMetrics.record_message("StopTransaction", "IN")
+
         logger.info(f"🛑 StopTransaction from {self.id}: transaction_id={transaction_id}, meter_stop={meter_stop}")
         
         from models import Transaction, TransactionStatusEnum
@@ -371,8 +425,12 @@ class ChargePoint(OcppChargePoint):
             transaction.stop_reason = kwargs.get('reason', 'Remote')
             
             await transaction.save()
-            
+
             logger.info(f"🛑 ✅ Transaction stopped {transaction_id}: {transaction.energy_consumed_kwh} kWh consumed")
+
+            # Record transaction completed event
+            duration_minutes = (transaction.end_time - transaction.start_time).total_seconds() / 60 if transaction.start_time and transaction.end_time else 0
+            await OCPPMetrics.record_transaction_completed(transaction_id, transaction.energy_consumed_kwh, duration_minutes)
             
             # Process wallet billing asynchronously
             try:
@@ -402,7 +460,11 @@ class ChargePoint(OcppChargePoint):
             )
 
     @on('MeterValues')
+    @trace_transaction(name="OCPP/MeterValues", group="OCPP/Messages")
     async def on_meter_values(self, connector_id, meter_value, transaction_id=None, **kwargs):
+        # Record metric
+        await OCPPMetrics.record_message("MeterValues", "IN")
+
         logger.info(f"🔋 MeterValues from {self.id}: connector_id={connector_id}, transaction_id={transaction_id}")
         logger.debug(f"🔋 Raw meter_value data: {meter_value}")
         
@@ -529,6 +591,9 @@ class ChargePoint(OcppChargePoint):
         OCPP 1.6 FirmwareStatusNotification handler
         Charger sends this to report firmware update progress
         """
+        # Record metric
+        await OCPPMetrics.record_message("FirmwareStatusNotification", "IN")
+
         logger.info(f"📦 FirmwareStatusNotification from {self.id}: status={status}")
 
         from models import Charger, FirmwareUpdate, FirmwareFile
@@ -537,14 +602,19 @@ class ChargePoint(OcppChargePoint):
             # Get charger from database
             charger = await Charger.get(charge_point_string_id=self.id)
 
-            # Find the most recent pending/in-progress update for this charger
+            # Find the most recent active update for this charger
+            # Note: With new schema, each charger+firmware combo has one row
+            # Only one should be "active" (in progress) at a time per charger
             firmware_update = await FirmwareUpdate.filter(
                 charger_id=charger.id,
                 status__in=["PENDING", "DOWNLOADING", "DOWNLOADED", "INSTALLING"]
-            ).order_by('-initiated_at').first()
+            ).order_by('-started_at', '-initiated_at').first()
 
             if not firmware_update:
-                logger.warning(f"📦 No active firmware update found for {self.id}, but received status: {status}")
+                logger.warning(
+                    f"📦 No active firmware update found for {self.id}, "
+                    f"but received FirmwareStatusNotification: {status}"
+                )
                 return call_result.FirmwareStatusNotification()
 
             # Map OCPP status to our database status
@@ -607,6 +677,9 @@ class ChargePoint(OcppChargePoint):
         Handles vendor-specific data messages from chargers
         Currently supports: JET_EV1 Signal Quality data
         """
+        # Record metric
+        await OCPPMetrics.record_message("DataTransfer", "IN")
+
         logger.info(f"📡 DataTransfer from {self.id}: vendorId={vendor_id}, messageId={message_id}")
 
         from models import Charger, SignalQuality, OCPPLog
@@ -1064,8 +1137,12 @@ async def force_disconnect(charge_point_id: str, reason: str):
         
         # 6. Clean up the lock for this connection to prevent memory leak
         cleanup_locks.pop(charge_point_id, None)
-        
+
         logger.warning(f"[DISCONNECT] Force disconnected {charge_point_id}: {reason}")
+
+        # Update active connections metric
+        active_connections = len(connected_charge_points)
+        await OCPPMetrics.record_active_connections(active_connections)
 
 async def cleanup_dead_connection(charge_point_id: str):
     """Legacy cleanup function - redirects to force_disconnect"""
@@ -1088,6 +1165,15 @@ async def heartbeat_monitor(charge_point_id: str, websocket: WebSocket):
                     last_heartbeat = connected_charge_points[charge_point_id].get("last_seen") or connected_charge_points[charge_point_id].get("connected_at")
                 if last_heartbeat is None or (now - last_heartbeat).total_seconds() > HEARTBEAT_TIMEOUT:
                     logger.warning(f"No OCPP Heartbeat from {charge_point_id} in {HEARTBEAT_TIMEOUT} seconds. Cleaning up.")
+
+                    # Record heartbeat timeout
+                    await OCPPMetrics.record_heartbeat_timeout(charge_point_id)
+                    SentryHelper.add_breadcrumb(
+                        category="ocpp.heartbeat",
+                        message=f"Heartbeat timeout for {charge_point_id}",
+                        level="warning"
+                    )
+
                     await force_disconnect(charge_point_id, f"Heartbeat timeout ({HEARTBEAT_TIMEOUT}s)")
                     break
                 logger.info(f"Heartbeat monitor: {charge_point_id} last heartbeat {(now - last_heartbeat).total_seconds():.1f}s ago")
@@ -1141,6 +1227,64 @@ async def periodic_cleanup():
         except Exception as e:
             logger.error(f"Error in periodic cleanup: {e}")
 
+# ============ Health Check Endpoint ============
+@app.get("/health")
+async def health_check():
+    """
+    Health check endpoint for monitoring systems
+    Checks database and Redis connectivity
+    """
+    import time
+    from starlette.responses import Response
+    start_time = time.time()
+
+    health_status = {
+        "status": "healthy",
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "checks": {}
+    }
+
+    # Check database
+    try:
+        from models import Charger
+        await Charger.all().limit(1)
+        health_status["checks"]["database"] = {
+            "status": "healthy",
+            "message": "Database connection OK"
+        }
+    except Exception as e:
+        health_status["status"] = "unhealthy"
+        health_status["checks"]["database"] = {
+            "status": "unhealthy",
+            "message": f"Database error: {str(e)}"
+        }
+
+    # Check Redis
+    try:
+        await redis_manager.redis_client.ping()
+        health_status["checks"]["redis"] = {
+            "status": "healthy",
+            "message": "Redis connection OK"
+        }
+    except Exception as e:
+        health_status["checks"]["redis"] = {
+            "status": "degraded",
+            "message": f"Redis error: {str(e)} (non-critical)"
+        }
+
+    # Add response time
+    health_status["response_time_ms"] = round((time.time() - start_time) * 1000, 2)
+
+    # Return appropriate status code
+    if health_status["status"] == "unhealthy":
+        return Response(
+            content=json.dumps(health_status),
+            status_code=503,
+            media_type="application/json"
+        )
+
+    return health_status
+
 # ============ Include Routers ============
 app.include_router(stations.router)
 app.include_router(chargers.router)
@@ -1160,11 +1304,20 @@ async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
     """OCPP WebSocket endpoint for charge points"""
     logger.info(f"[CONNECTION ATTEMPT] {charge_point_id} attempting WebSocket connection")
 
+    # Add Sentry breadcrumb
+    SentryHelper.add_breadcrumb(
+        category="ocpp.connection",
+        message=f"WebSocket connection attempt: {charge_point_id}",
+        level="info"
+    )
+
     try:
         await websocket.accept()
         logger.info(f"[CONNECTION ATTEMPT] {charge_point_id} WebSocket handshake successful")
     except Exception as e:
         logger.error(f"[CONNECTION ATTEMPT] {charge_point_id} WebSocket handshake failed: {e}")
+        await OCPPMetrics.record_websocket_connection(charge_point_id, success=False)
+        SentryHelper.capture_exception(e, extra={"charger_id": charge_point_id})
         return
 
     # Check for recent disconnection tombstone to prevent reconnection races
@@ -1215,6 +1368,13 @@ async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
     await redis_manager.add_connected_charger(charge_point_id, connection_data)
 
     logger.info(f"[CONNECTION ATTEMPT] {charge_point_id} connection established successfully - starting OCPP message handling")
+
+    # Record successful WebSocket connection
+    await OCPPMetrics.record_websocket_connection(charge_point_id, success=True)
+
+    # Update active connections metric
+    active_connections = len(connected_charge_points)
+    await OCPPMetrics.record_active_connections(active_connections)
 
     try:
         await cp.start()
@@ -1343,6 +1503,10 @@ async def startup_event():
     from services.billing_retry_service import start_billing_retry_service
     await start_billing_retry_service()
 
+    # Start firmware update service (process pending firmware updates)
+    from services.firmware_update_service import start_firmware_update_service
+    await start_firmware_update_service()
+
     # Start data retention service (cleanup old signal quality data & OCPP logs)
     from services.data_retention_service import start_data_retention_service
     await start_data_retention_service(retention_days=90, cleanup_interval_hours=24)
@@ -1354,6 +1518,20 @@ async def startup_event():
     logger.info("REST API available at: /api/")
     logger.info("API Documentation available at: /docs")
     logger.info("OCPP WebSocket available at: /ocpp/{charge_point_id}")
+
+    # Record initial metrics
+    await OCPPMetrics.record_active_connections(0)
+
+    # Log monitoring status
+    if os.getenv("NEW_RELIC_MONITOR_MODE", "false").lower() == "true":
+        logger.info("✅ New Relic APM: ENABLED")
+    else:
+        logger.info("ℹ️ New Relic APM: DISABLED")
+
+    if os.getenv("SENTRY_ENABLED", "false").lower() == "true":
+        logger.info("✅ Sentry Error Tracking: ENABLED")
+    else:
+        logger.info("ℹ️ Sentry Error Tracking: DISABLED")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -1371,6 +1549,10 @@ async def shutdown_event():
     # Stop billing retry service
     from services.billing_retry_service import stop_billing_retry_service
     await stop_billing_retry_service()
+
+    # Stop firmware update service
+    from services.firmware_update_service import stop_firmware_update_service
+    await stop_firmware_update_service()
 
     # Stop data retention service
     from services.data_retention_service import stop_data_retention_service

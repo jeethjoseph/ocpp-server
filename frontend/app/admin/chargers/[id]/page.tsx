@@ -415,18 +415,15 @@ export default function ChargerDetailPage() {
 
               <Button
                 onClick={() => setShowFirmwareDialog(true)}
-                disabled={!charger.connection_status}
                 className="w-full"
                 variant="secondary">
                 <Download className="h-4 w-4 mr-2" />
-                Update Firmware
+                Schedule Update
               </Button>
 
-              {!charger.connection_status && (
-                <p className="text-sm text-muted-foreground text-center">
-                  Charger must be online to update
-                </p>
-              )}
+              <p className="text-xs text-muted-foreground text-center">
+                Updates are processed automatically when charger is ready
+              </p>
 
               {/* Recent Update History */}
               {firmwareHistoryData && firmwareHistoryData.data.length > 0 && (
@@ -462,9 +459,9 @@ export default function ChargerDetailPage() {
         <Dialog open={showFirmwareDialog} onOpenChange={setShowFirmwareDialog}>
           <DialogContent>
             <DialogHeader>
-              <DialogTitle>Update Firmware</DialogTitle>
+              <DialogTitle>Schedule Firmware Update</DialogTitle>
               <DialogDescription>
-                Select a firmware version to install on {charger.name}
+                Select a firmware version to schedule for {charger.name}. The update will be triggered automatically when the charger is ready.
               </DialogDescription>
             </DialogHeader>
 
@@ -486,12 +483,13 @@ export default function ChargerDetailPage() {
                 </Select>
               </div>
 
-              <div className="bg-yellow-50 dark:bg-yellow-900/20 p-3 rounded-lg text-sm">
-                <p className="font-medium mb-1">Safety Checks:</p>
+              <div className="bg-blue-50 dark:bg-blue-900/20 p-3 rounded-lg text-sm">
+                <p className="font-medium mb-1">Automatic Processing:</p>
                 <ul className="list-disc list-inside space-y-1 text-muted-foreground">
-                  <li>Charger must be online</li>
-                  <li>No active charging session</li>
-                  <li>Update will be sent immediately via OCPP</li>
+                  <li>Update will be scheduled immediately</li>
+                  <li>Background service checks every 60 seconds</li>
+                  <li>Triggers when charger is online and not charging</li>
+                  <li>You can schedule multiple firmware versions</li>
                 </ul>
               </div>
             </div>
@@ -507,7 +505,7 @@ export default function ChargerDetailPage() {
                 type="button"
                 onClick={handleFirmwareUpdate}
                 disabled={!selectedFirmwareId || triggerUpdateMutation.isPending}>
-                {triggerUpdateMutation.isPending ? "Sending..." : "Update Firmware"}
+                {triggerUpdateMutation.isPending ? "Scheduling..." : "Schedule Update"}
               </Button>
             </DialogFooter>
           </DialogContent>

@@ -197,6 +197,7 @@ class Charger(Model):
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)
     charge_point_string_id = fields.CharField(max_length=255, unique=True)
+    external_charger_id = fields.CharField(max_length=255, unique=True, null=True)
     station = fields.ForeignKeyField("models.ChargingStation", related_name="chargers")
     name = fields.CharField(max_length=255, null=True)
     model = fields.CharField(max_length=100, null=True)
@@ -321,9 +322,11 @@ class FirmwareUpdate(Model):
     started_at = fields.DatetimeField(null=True)
     completed_at = fields.DatetimeField(null=True)
     error_message = fields.TextField(null=True)
+    retry_count = fields.IntField(default=0)
 
     class Meta:
         table = "firmware_update"
+        unique_together = [("charger", "firmware_file")]
 
 class SignalQuality(Model):
     """

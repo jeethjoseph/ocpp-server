@@ -24,6 +24,7 @@ class ChargerCreate(BaseModel):
     model: Optional[str] = None
     vendor: Optional[str] = None
     serial_number: Optional[str] = None
+    external_charger_id: Optional[str] = None
     connectors: List[ConnectorInput]
 
 class ChargerUpdate(BaseModel):
@@ -31,10 +32,12 @@ class ChargerUpdate(BaseModel):
     model: Optional[str] = None
     vendor: Optional[str] = None
     latest_status: Optional[str] = None
+    external_charger_id: Optional[str] = None
 
 class ChargerResponse(BaseModel):
     id: int
     charge_point_string_id: str
+    external_charger_id: Optional[str]
     station_id: int
     name: str
     model: Optional[str]
@@ -149,6 +152,7 @@ def charger_to_response(charger: Charger, connection_status: bool) -> ChargerRes
     return ChargerResponse(
         id=charger.id,
         charge_point_string_id=charger.charge_point_string_id,
+        external_charger_id=charger.external_charger_id,
         station_id=charger.station_id,
         name=charger.name,
         model=charger.model,
@@ -229,6 +233,7 @@ async def create_charger(charger_data: ChargerCreate, admin_user: User = Depends
         # Create charger
         charger = await Charger.create(
             charge_point_string_id=charge_point_id,
+            external_charger_id=charger_data.external_charger_id,
             station_id=charger_data.station_id,
             name=charger_data.name,
             model=charger_data.model,
@@ -259,7 +264,7 @@ async def create_charger(charger_data: ChargerCreate, admin_user: User = Depends
             "message": "Charger onboarded successfully"
         }
     except IntegrityError as e:
-        raise HTTPException(status_code=400, detail="Charger creation failed - check serial number uniqueness")
+        raise HTTPException(status_code=400, detail="Charger creation failed - check serial number or external charger ID uniqueness")
 
 @router.get("/{charger_id}", response_model=ChargerDetailResponse)
 async def get_charger_details(charger_id: int, user: User = Depends(require_user_or_admin())):
@@ -325,18 +330,32 @@ async def get_charger_details(charger_id: int, user: User = Depends(require_user
 @router.put("/{charger_id}", response_model=dict)
 async def update_charger(charger_id: int, update_data: ChargerUpdate, admin_user: User = Depends(require_admin())):
     """Update charger information"""
-    
+
     charger = await Charger.filter(id=charger_id).first()
     if not charger:
         raise HTTPException(status_code=404, detail="Charger not found")
-    
+
+    # Check if external_charger_id is being updated and validate uniqueness
+    if update_data.external_charger_id is not None:
+        existing = await Charger.filter(
+            external_charger_id=update_data.external_charger_id
+        ).exclude(id=charger_id).first()
+        if existing:
+            raise HTTPException(
+                status_code=400,
+                detail="External charger ID already exists"
+            )
+
     # Update only provided fields
     update_dict = update_data.model_dump(exclude_unset=True)
     for field, value in update_dict.items():
         setattr(charger, field, value)
-    
-    await charger.save()
-    
+
+    try:
+        await charger.save()
+    except IntegrityError:
+        raise HTTPException(status_code=400, detail="Update failed - check external charger ID uniqueness")
+
     # Get connection status for response
     connection_status_dict = await get_bulk_connection_status([charger])
     connection_status = connection_status_dict.get(charger.charge_point_string_id, False)

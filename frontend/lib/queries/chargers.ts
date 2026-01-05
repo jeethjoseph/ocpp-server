@@ -341,6 +341,51 @@ export function useDeleteCharger() {
   });
 }
 
+// Create Charger Mutation Hook
+export function useCreateCharger() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (data: Parameters<typeof chargerService.create>[0]) =>
+      chargerService.create(data),
+    onSuccess: () => {
+      // Invalidate chargers list to refetch
+      queryClient.invalidateQueries({ queryKey: chargerKeys.lists() });
+      toast.success("Charger created successfully");
+    },
+    onError: (err) => {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      console.error("Create charger error:", errorMessage);
+      toast.error("Failed to create charger");
+    },
+  });
+}
+
+// Update Charger Mutation Hook
+export function useUpdateCharger() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id, data }: { id: number; data: Parameters<typeof chargerService.update>[1] }) =>
+      chargerService.update(id, data),
+    onSuccess: (_, variables) => {
+      // Invalidate chargers list and detail to refetch
+      queryClient.invalidateQueries({ queryKey: chargerKeys.lists() });
+      queryClient.invalidateQueries({ queryKey: chargerKeys.detail(variables.id) });
+      toast.success("Charger updated successfully");
+    },
+    onError: (err) => {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      console.error("Update charger error:", errorMessage);
+      if (errorMessage.includes("External charger ID already exists")) {
+        toast.error("External charger ID already exists");
+      } else {
+        toast.error("Failed to update charger");
+      }
+    },
+  });
+}
+
 // Signal Quality Query Hooks
 
 /**

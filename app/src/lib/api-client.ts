@@ -44,6 +44,14 @@ async function apiRequest<T>(
   const url = `${API_BASE_URL}${endpoint}`;
   const isNative = Capacitor.isNativePlatform();
 
+  // ⭐ New Relic Distributed Tracing:
+  // - Web Platform: New Relic Browser agent automatically instruments fetch()
+  //   and injects distributed tracing headers (traceparent, newrelic)
+  // - Native Platform: CapacitorHttp bypasses browser fetch, so distributed
+  //   tracing headers are NOT automatically added. For full native tracing,
+  //   we would need to manually inject headers from browserAgent.generateDistributedTracePayload()
+  //   This is a future enhancement if needed.
+
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...(token && {

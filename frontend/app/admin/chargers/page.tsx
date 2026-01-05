@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Zap, Plus, ExternalLink } from "lucide-react";
+import { Zap, Plus, ExternalLink, Pencil } from "lucide-react";
 import Link from "next/link";
 
 import { AdminOnly } from "@/components/RoleWrapper";
@@ -10,16 +10,20 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Table } from "@/components/ui/table";
 
-import { ChargerCreate, Station } from "@/types/api";
-import { 
-  useChargers, 
-  useStations, 
-  useChangeAvailability, 
-  useDeleteCharger 
+import { Charger, ChargerCreate, ChargerUpdate, Station } from "@/types/api";
+import {
+  useChargers,
+  useStations,
+  useChangeAvailability,
+  useDeleteCharger,
+  useCreateCharger,
+  useUpdateCharger,
 } from "@/lib/queries/chargers";
 
 export default function AdminChargersPage() {
   const [showCreateModal, setShowCreateModal] = useState(false);
+  const [showEditModal, setShowEditModal] = useState(false);
+  const [editingCharger, setEditingCharger] = useState<Charger | null>(null);
   const [searchTerm, setSearchTerm] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
   const [stationFilter, setStationFilter] = useState("");
@@ -45,6 +49,8 @@ export default function AdminChargersPage() {
 
   const changeAvailabilityMutation = useChangeAvailability();
   const deleteChargerMutation = useDeleteCharger();
+  const createChargerMutation = useCreateCharger();
+  const updateChargerMutation = useUpdateCharger();
   
   // Track loading state per charger
   const [toggleLoadingChargers, setToggleLoadingChargers] = useState<Set<number>>(new Set());
@@ -57,9 +63,29 @@ export default function AdminChargersPage() {
   const error = chargersError ? "Failed to load chargers" : null;
 
   const handleCreateCharger = async (chargerData: ChargerCreate) => {
-    // TODO: Add mutation for create charger
-    console.log('Creating charger:', chargerData);
-    setShowCreateModal(false);
+    createChargerMutation.mutate(chargerData, {
+      onSuccess: () => {
+        setShowCreateModal(false);
+      },
+    });
+  };
+
+  const handleUpdateCharger = async (chargerData: ChargerUpdate) => {
+    if (!editingCharger) return;
+    updateChargerMutation.mutate(
+      { id: editingCharger.id, data: chargerData },
+      {
+        onSuccess: () => {
+          setShowEditModal(false);
+          setEditingCharger(null);
+        },
+      }
+    );
+  };
+
+  const openEditModal = (charger: Charger) => {
+    setEditingCharger(charger);
+    setShowEditModal(true);
   };
 
   const handleDeleteCharger = async (id: number) => {
@@ -341,6 +367,12 @@ export default function AdminChargersPage() {
                             View
                           </Link>
                           <button
+                            onClick={() => openEditModal(charger)}
+                            className="text-primary hover:text-primary/80 transition-colors ml-2">
+                            <Pencil className="h-4 w-4 inline mr-1" />
+                            Edit
+                          </button>
+                          <button
                             onClick={() => handleDeleteCharger(charger.id)}
                             className="text-destructive hover:text-destructive/80 transition-colors ml-2">
                             Delete
@@ -383,6 +415,17 @@ export default function AdminChargersPage() {
               onClose={() => setShowCreateModal(false)}
             />
           )}
+
+          {showEditModal && editingCharger && (
+            <EditChargerModal
+              charger={editingCharger}
+              onSubmit={handleUpdateCharger}
+              onClose={() => {
+                setShowEditModal(false);
+                setEditingCharger(null);
+              }}
+            />
+          )}
         </div>
       )}
     </AdminOnly>
@@ -402,6 +445,7 @@ function ChargerModal({ stations, onSubmit, onClose }: ChargerModalProps) {
     model: "",
     vendor: "",
     serial_number: "",
+    external_charger_id: "",
     connectors: [
       { connector_id: 1, connector_type: "Type2", max_power_kw: 22 },
     ],
@@ -415,6 +459,7 @@ function ChargerModal({ stations, onSubmit, onClose }: ChargerModalProps) {
       model: formData.model || undefined,
       vendor: formData.vendor || undefined,
       serial_number: formData.serial_number || undefined,
+      external_charger_id: formData.external_charger_id || undefined,
     });
   };
 
@@ -521,18 +566,34 @@ function ChargerModal({ stations, onSubmit, onClose }: ChargerModalProps) {
             </div>
           </div>
 
-          <div>
-            <label className="block text-sm font-medium text-card-foreground mb-1">
-              Serial Number
-            </label>
-            <input
-              type="text"
-              value={formData.serial_number}
-              onChange={(e) =>
-                setFormData({ ...formData, serial_number: e.target.value })
-              }
-              className="w-full px-3 py-2 border border-border bg-input text-foreground rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 transition-colors"
-            />
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-medium text-card-foreground mb-1">
+                Serial Number
+              </label>
+              <input
+                type="text"
+                value={formData.serial_number}
+                onChange={(e) =>
+                  setFormData({ ...formData, serial_number: e.target.value })
+                }
+                className="w-full px-3 py-2 border border-border bg-input text-foreground rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 transition-colors"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-card-foreground mb-1">
+                External Charger ID
+              </label>
+              <input
+                type="text"
+                value={formData.external_charger_id}
+                onChange={(e) =>
+                  setFormData({ ...formData, external_charger_id: e.target.value })
+                }
+                placeholder="Optional unique identifier"
+                className="w-full px-3 py-2 border border-border bg-input text-foreground rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 transition-colors"
+              />
+            </div>
           </div>
 
           <div>
@@ -630,6 +691,114 @@ function ChargerModal({ stations, onSubmit, onClose }: ChargerModalProps) {
               type="submit"
               className="px-4 py-2 text-sm font-medium text-primary-foreground bg-primary rounded-md hover:bg-primary/90 transition-colors">
               Create
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+interface EditChargerModalProps {
+  charger: Charger;
+  onSubmit: (data: ChargerUpdate) => void;
+  onClose: () => void;
+}
+
+function EditChargerModal({ charger, onSubmit, onClose }: EditChargerModalProps) {
+  const [formData, setFormData] = useState({
+    name: charger.name || "",
+    model: charger.model || "",
+    vendor: charger.vendor || "",
+    external_charger_id: charger.external_charger_id || "",
+  });
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    onSubmit({
+      name: formData.name || undefined,
+      model: formData.model || undefined,
+      vendor: formData.vendor || undefined,
+      external_charger_id: formData.external_charger_id || undefined,
+    });
+  };
+
+  return (
+    <div className="fixed inset-0 bg-background/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+      <div className="bg-card rounded-lg max-w-md w-full p-6 border border-border shadow-lg">
+        <h2 className="text-lg font-medium mb-4 text-card-foreground">
+          Edit Charger
+        </h2>
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-card-foreground mb-1">
+              Name
+            </label>
+            <input
+              type="text"
+              value={formData.name}
+              onChange={(e) =>
+                setFormData({ ...formData, name: e.target.value })
+              }
+              className="w-full px-3 py-2 border border-border bg-input text-foreground rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 transition-colors"
+            />
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-medium text-card-foreground mb-1">
+                Model
+              </label>
+              <input
+                type="text"
+                value={formData.model}
+                onChange={(e) =>
+                  setFormData({ ...formData, model: e.target.value })
+                }
+                className="w-full px-3 py-2 border border-border bg-input text-foreground rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 transition-colors"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-card-foreground mb-1">
+                Vendor
+              </label>
+              <input
+                type="text"
+                value={formData.vendor}
+                onChange={(e) =>
+                  setFormData({ ...formData, vendor: e.target.value })
+                }
+                className="w-full px-3 py-2 border border-border bg-input text-foreground rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 transition-colors"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-card-foreground mb-1">
+              External Charger ID
+            </label>
+            <input
+              type="text"
+              value={formData.external_charger_id}
+              onChange={(e) =>
+                setFormData({ ...formData, external_charger_id: e.target.value })
+              }
+              placeholder="Unique identifier"
+              className="w-full px-3 py-2 border border-border bg-input text-foreground rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 transition-colors"
+            />
+          </div>
+
+          <div className="flex justify-end space-x-3 pt-4">
+            <button
+              type="button"
+              onClick={onClose}
+              className="px-4 py-2 text-sm font-medium text-secondary-foreground bg-secondary rounded-md hover:bg-secondary/80 transition-colors">
+              Cancel
+            </button>
+            <button
+              type="submit"
+              className="px-4 py-2 text-sm font-medium text-primary-foreground bg-primary rounded-md hover:bg-primary/90 transition-colors">
+              Save Changes
             </button>
           </div>
         </form>

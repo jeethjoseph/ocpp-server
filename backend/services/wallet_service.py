@@ -9,6 +9,7 @@ from models import (
     Wallet, WalletTransaction, Transaction, Tariff, User,
     TransactionTypeEnum, TransactionStatusEnum, PaymentStatusEnum
 )
+from services.monitoring_service import trace_function, MetricsCollector, SentryHelper
 
 logger = logging.getLogger(__name__)
 
@@ -58,14 +59,18 @@ class WalletService:
     
     @staticmethod
     @atomic()
+    @trace_function(name="WalletService.process_transaction_billing")
     async def process_transaction_billing(transaction_id: int) -> Tuple[bool, str, Optional[Decimal]]:
         """
         Process billing for a completed charging transaction.
-        
+
         Returns:
             (success: bool, message: str, amount: Optional[Decimal])
         """
         try:
+            # Set Sentry context
+            SentryHelper.set_context("billing", {"transaction_id": transaction_id})
+
             # Get transaction with lock
             transaction = await Transaction.filter(id=transaction_id).select_for_update().first()
             if not transaction:
@@ -126,13 +131,21 @@ class WalletService:
                     "new_balance": float(new_balance)
                 }
             )
-            
+
+            # Record billing success metrics
+            MetricsCollector.record_metric("Custom/Billing/Amount", float(billing_amount))
+            MetricsCollector.increment_counter("Custom/Billing/Success")
+
             logger.info(f"✅ Successfully billed transaction {transaction_id}: ₹{billing_amount}")
             return True, f"Successfully billed ₹{billing_amount}", billing_amount
                 
         except Exception as e:
             logger.error(f"❌ Error processing billing for transaction {transaction_id}: {e}", exc_info=True)
-            
+
+            # Record billing failure metrics
+            MetricsCollector.increment_counter("Custom/Billing/Failed")
+            SentryHelper.capture_exception(e, extra={"transaction_id": transaction_id})
+
             # Mark transaction as billing failed
             try:
                 await Transaction.filter(id=transaction_id).update(
@@ -140,7 +153,7 @@ class WalletService:
                 )
             except Exception as update_error:
                 logger.error(f"Failed to update transaction status: {update_error}")
-            
+
             return False, f"Billing failed: {str(e)}", None
     
     @staticmethod
@@ -186,6 +199,7 @@ class WalletService:
 
     @staticmethod
     @atomic()
+    @trace_function(name="WalletService.process_wallet_topup")
     async def process_wallet_topup(
         wallet_transaction_id: int,
         razorpay_payment_id: str,
@@ -203,6 +217,11 @@ class WalletService:
             (success: bool, message: str, new_balance: Optional[Decimal])
         """
         try:
+            # Set Sentry context
+            SentryHelper.set_context("wallet_topup", {
+                "wallet_transaction_id": wallet_transaction_id,
+                "razorpay_payment_id": razorpay_payment_id
+            })
             # Get wallet transaction with lock
             wallet_txn = await WalletTransaction.filter(
                 id=wallet_transaction_id
@@ -253,6 +272,10 @@ class WalletService:
                 payment_metadata=updated_metadata
             )
 
+            # Record topup success metrics
+            MetricsCollector.record_metric("Custom/Wallet/TopupAmount", float(top_up_amount))
+            MetricsCollector.increment_counter("Custom/Wallet/TopupSuccess")
+
             logger.info(
                 f"✅ Successfully processed wallet top-up: "
                 f"Transaction {wallet_transaction_id}, "
@@ -267,6 +290,10 @@ class WalletService:
                 f"❌ Error processing wallet top-up for transaction {wallet_transaction_id}: {e}",
                 exc_info=True
             )
+
+            # Record topup failure metrics
+            MetricsCollector.increment_counter("Custom/Wallet/TopupFailed")
+            SentryHelper.capture_exception(e, extra={"wallet_transaction_id": wallet_transaction_id})
 
             # Mark transaction as failed
             try:

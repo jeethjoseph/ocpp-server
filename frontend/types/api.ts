@@ -32,6 +32,7 @@ export interface StationListResponse {
 export interface Charger {
   id: number;
   charge_point_string_id: string;
+  external_charger_id?: string;
   station_id: number;
   name: string;
   model?: string;
@@ -52,6 +53,7 @@ export interface ChargerCreate {
   model?: string;
   vendor?: string;
   serial_number?: string;
+  external_charger_id?: string;
   connectors: ConnectorInput[];
 }
 
@@ -66,6 +68,7 @@ export interface ChargerUpdate {
   model?: string;
   vendor?: string;
   latest_status?: string;
+  external_charger_id?: string;
 }
 
 export interface ChargerListResponse {
@@ -328,6 +331,7 @@ export interface FirmwareUpdate {
   started_at?: string;
   completed_at?: string;
   error_message?: string;
+  retry_count?: number;
 }
 
 export interface FirmwareHistoryResponse {
