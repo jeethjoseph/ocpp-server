@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.eggs/
+*.egg-info/
+*.egg
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment files (use Docker env instead)
+.env
+.env.*
+!.env.example
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+docs/
+
+# Tests (not needed in production)
+tests/
+test_*.py
+*_test.py
+
+# Development scripts
+watch_and_test.py
+simulators/
+
+# Temporary files
+*.log
+dump.rdb
+*.sql
+*.dump
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Firmware files (mounted as volume)
+firmware_files/*.bin
+firmware_files/*.hex
+firmware_files/*.fw

@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { chargerService, stationService, signalQualityService } from "@/lib/api-services";
+import { chargerService, stationService, signalQualityService, chargerErrorService } from "@/lib/api-services";
 import { ChargerListResponse } from "@/types/api";
 import { toast } from "sonner";
 import { transactionKeys } from "./transactions";
@@ -14,6 +14,7 @@ export const chargerKeys = {
   detail: (id: number) => [...chargerKeys.details(), id] as const,
   signalQuality: (chargerId: number, hours: number) => [...chargerKeys.all, "signal-quality", chargerId, hours] as const,
   signalQualityLatest: (chargerId: number) => [...chargerKeys.all, "signal-quality-latest", chargerId] as const,
+  errors: (chargerId: number, params: Record<string, unknown>) => [...chargerKeys.all, "errors", chargerId, params] as const,
 };
 
 export const stationKeys = {
@@ -418,5 +419,28 @@ export function useLatestSignalQuality(chargerId: number) {
     enabled: isAuthReady && !!chargerId, // Wait for auth and valid id
     staleTime: 1000 * 5, // 5 seconds
     refetchInterval: 1000 * 5, // Auto-refresh every 5 seconds for real-time monitoring
+  });
+}
+
+// Charger Error Query Hooks
+
+/**
+ * Hook to fetch error history for a charger
+ * @param chargerId - The charger ID
+ * @param params - Query parameters (hours, include_resolved, limit)
+ */
+export function useChargerErrors(
+  chargerId: number,
+  params: { hours?: number; include_resolved?: boolean; limit?: number } = {}
+) {
+  const { isAuthReady } = useAuth();
+  const queryParams = { hours: 168, include_resolved: true, limit: 20, ...params };
+
+  return useQuery({
+    queryKey: chargerKeys.errors(chargerId, queryParams),
+    queryFn: () => chargerErrorService.getErrors(chargerId, queryParams),
+    enabled: isAuthReady && !!chargerId,
+    staleTime: 1000 * 30, // 30 seconds - errors don't change as frequently
+    refetchInterval: 1000 * 30, // Auto-refresh every 30 seconds
   });
 }

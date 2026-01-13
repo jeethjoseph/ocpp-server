@@ -6,7 +6,7 @@ from datetime import datetime
 import uuid
 import logging
 
-from models import Charger, ChargingStation, Connector, Transaction, OCPPLog, User
+from models import Charger, ChargingStation, Connector, Transaction, OCPPLog, User, ChargerError
 from tortoise.exceptions import IntegrityError
 from auth_middleware import require_admin, require_user_or_admin
 
@@ -34,6 +34,13 @@ class ChargerUpdate(BaseModel):
     latest_status: Optional[str] = None
     external_charger_id: Optional[str] = None
 
+class LatestErrorInfo(BaseModel):
+    """Summary of latest unresolved error for a charger"""
+    error_code: str
+    vendor_error_code: Optional[str] = None
+    info: Optional[str] = None
+    created_at: datetime
+
 class ChargerResponse(BaseModel):
     id: int
     charge_point_string_id: str
@@ -50,6 +57,7 @@ class ChargerResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     tariff_per_kwh: Optional[float] = None
+    latest_error: Optional[LatestErrorInfo] = None
 
     class Config:
         from_attributes = True
@@ -147,8 +155,17 @@ async def get_bulk_connection_status(chargers: List[Charger]) -> Dict[str, bool]
     
     return status_dict
 
-def charger_to_response(charger: Charger, connection_status: bool) -> ChargerResponse:
-    """Convert a Charger model to ChargerResponse with connection status"""
+def charger_to_response(charger: Charger, connection_status: bool, latest_error: Optional[ChargerError] = None) -> ChargerResponse:
+    """Convert a Charger model to ChargerResponse with connection status and latest error"""
+    error_info = None
+    if latest_error:
+        error_info = LatestErrorInfo(
+            error_code=latest_error.error_code,
+            vendor_error_code=latest_error.vendor_error_code,
+            info=latest_error.info,
+            created_at=latest_error.created_at
+        )
+
     return ChargerResponse(
         id=charger.id,
         charge_point_string_id=charger.charge_point_string_id,
@@ -163,8 +180,28 @@ def charger_to_response(charger: Charger, connection_status: bool) -> ChargerRes
         last_heart_beat_time=charger.last_heart_beat_time,
         created_at=charger.created_at,
         updated_at=charger.updated_at,
-        connection_status=connection_status
+        connection_status=connection_status,
+        latest_error=error_info
     )
+
+async def get_latest_errors_for_chargers(charger_ids: List[int]) -> Dict[int, ChargerError]:
+    """Get the latest unresolved error for multiple chargers efficiently"""
+    if not charger_ids:
+        return {}
+
+    # Get latest unresolved error for each charger
+    errors = await ChargerError.filter(
+        charger_id__in=charger_ids,
+        is_resolved=False
+    ).order_by("-created_at")
+
+    # Group by charger_id and take the first (latest) for each
+    error_dict = {}
+    for error in errors:
+        if error.charger_id not in error_dict:
+            error_dict[error.charger_id] = error
+
+    return error_dict
 
 @router.get("", response_model=ChargerListResponse)
 async def list_chargers(
@@ -203,13 +240,18 @@ async def list_chargers(
     
     # Get connection status for all chargers efficiently
     connection_status_dict = await get_bulk_connection_status(chargers)
-    
-    # Build response with connection status
+
+    # Get latest errors for all chargers
+    charger_ids = [c.id for c in chargers]
+    error_dict = await get_latest_errors_for_chargers(charger_ids)
+
+    # Build response with connection status and errors
     charger_responses = []
     for charger in chargers:
         connection_status = connection_status_dict.get(charger.charge_point_string_id, False)
-        charger_responses.append(charger_to_response(charger, connection_status))
-    
+        latest_error = error_dict.get(charger.id)
+        charger_responses.append(charger_to_response(charger, connection_status, latest_error))
+
     return ChargerListResponse(
         data=charger_responses,
         total=total,
@@ -305,8 +347,14 @@ async def get_charger_details(charger_id: int, user: User = Depends(require_user
     connection_status_dict = await get_bulk_connection_status([charger])
     connection_status = connection_status_dict.get(charger.charge_point_string_id, False)
 
-    # Build charger response with tariff
-    charger_response = charger_to_response(charger, connection_status)
+    # Get latest unresolved error
+    latest_error = await ChargerError.filter(
+        charger_id=charger_id,
+        is_resolved=False
+    ).order_by("-created_at").first()
+
+    # Build charger response with tariff and error
+    charger_response = charger_to_response(charger, connection_status, latest_error)
     charger_dict = charger_response.model_dump()
     charger_dict['tariff_per_kwh'] = float(tariff_rate) if tariff_rate else None
 
@@ -510,39 +558,31 @@ async def change_charger_availability(
     connector_id: int = Query(..., ge=0),
     admin_user: User = Depends(require_admin())
 ):
-    """Change charger availability (Operative/Inoperative) - OCPP 1.6 compliant"""
-    
+    """
+    Change charger availability (Operative/Inoperative) - OCPP 1.6 compliant
+
+    Per OCPP 1.6 spec, ChangeAvailability can be sent at any time.
+    The charger responds with:
+    - Accepted: Change applied immediately
+    - Scheduled: Will change after current transaction ends
+    - Rejected: Cannot comply (e.g., hardware fault)
+    """
+
     charger = await Charger.filter(id=charger_id).first()
     if not charger:
         raise HTTPException(status_code=404, detail="Charger not found")
-    
-    # OCPP 1.6 Compliance: Validate state transitions
+
     current_status = charger.latest_status
-    
-    if type == "Inoperative":
-        # Can only set to Inoperative if currently Available
-        if current_status != "Available":
-            raise HTTPException(
-                status_code=409, 
-                detail=f"Cannot set charger to Inoperative. Current status is '{current_status}'. Only 'Available' chargers can be made Inoperative."
-            )
-    elif type == "Operative":
-        # Can only set to Operative if currently Unavailable
-        if current_status != "Unavailable":
-            raise HTTPException(
-                status_code=409,
-                detail=f"Cannot set charger to Operative. Current status is '{current_status}'. Only 'Unavailable' chargers can be made Operative."
-            )
-    
+
     # Get connected charge points
     connected_cps = get_connected_charge_points()
-    
+
     if charger.charge_point_string_id not in connected_cps:
         raise HTTPException(status_code=409, detail="Charger is not connected")
-    
+
     # Import and use the send_ocpp_request function
     from main import send_ocpp_request
-    
+
     # Send ChangeAvailability command
     success, response = await send_ocpp_request(
         charger.charge_point_string_id,
@@ -552,13 +592,18 @@ async def change_charger_availability(
             "type": type
         }
     )
-    
+
     if success:
+        # Get the OCPP response status (Accepted/Scheduled/Rejected)
+        ocpp_status = getattr(response, 'status', str(response))
+
         return {
             "success": True,
-            "message": f"Availability changed to {type} successfully",
+            "message": f"ChangeAvailability command sent",
+            "ocpp_response": ocpp_status,
+            "type": type,
             "previous_status": current_status,
-            "expected_new_status": "Available" if type == "Operative" else "Unavailable"
+            "note": "Scheduled" if ocpp_status == "Scheduled" else None
         }
     else:
         raise HTTPException(status_code=500, detail=f"Failed to change availability: {response}")
@@ -767,3 +812,117 @@ async def get_charger_latest_signal_quality(
         return None
 
     return SignalQualityResponse.model_validate(latest, from_attributes=True)
+
+# ============ Charger Error Endpoints ============
+
+class ChargerErrorResponse(BaseModel):
+    """Response schema for charger error data"""
+    id: int
+    charger_id: int
+    connector_id: int
+    status: str
+    error_code: str
+    vendor_error_code: Optional[str] = None
+    vendor_id: Optional[str] = None
+    info: Optional[str] = None
+    error_timestamp: Optional[datetime] = None
+    is_resolved: bool
+    resolved_at: Optional[datetime] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class ChargerErrorListResponse(BaseModel):
+    """Response schema for list of charger errors"""
+    data: List[ChargerErrorResponse]
+    total: int
+    page: int
+    limit: int
+    charger_id: int
+    unresolved_count: int
+
+@router.get("/{charger_id}/errors", response_model=ChargerErrorListResponse)
+async def get_charger_errors(
+    charger_id: int,
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=100, description="Items per page"),
+    include_resolved: bool = Query(True, description="Include resolved errors"),
+    hours: int = Query(168, ge=1, le=2160, description="Hours of history (max 90 days)"),
+    admin_user: User = Depends(require_admin())
+):
+    """
+    Get error history for a specific charger (Admin only)
+
+    Returns paginated error data including both standard OCPP error codes
+    and vendor-specific error codes.
+    """
+    from datetime import timedelta
+
+    # Verify charger exists
+    charger = await Charger.get_or_none(id=charger_id)
+    if not charger:
+        raise HTTPException(status_code=404, detail="Charger not found")
+
+    # Calculate cutoff time
+    cutoff_time = datetime.utcnow() - timedelta(hours=hours)
+
+    # Build query
+    query = ChargerError.filter(
+        charger_id=charger_id,
+        created_at__gte=cutoff_time
+    )
+
+    if not include_resolved:
+        query = query.filter(is_resolved=False)
+
+    # Get total count
+    total = await query.count()
+
+    # Get unresolved count
+    unresolved_count = await ChargerError.filter(
+        charger_id=charger_id,
+        is_resolved=False
+    ).count()
+
+    # Apply pagination
+    offset = (page - 1) * limit
+    errors = await query.order_by("-created_at").offset(offset).limit(limit)
+
+    # Convert to response models
+    data_responses = [ChargerErrorResponse.model_validate(e, from_attributes=True) for e in errors]
+
+    return ChargerErrorListResponse(
+        data=data_responses,
+        total=total,
+        page=page,
+        limit=limit,
+        charger_id=charger_id,
+        unresolved_count=unresolved_count
+    )
+
+@router.get("/{charger_id}/errors/latest", response_model=Optional[ChargerErrorResponse])
+async def get_charger_latest_error(
+    charger_id: int,
+    admin_user: User = Depends(require_admin())
+):
+    """
+    Get the most recent unresolved error for a specific charger (Admin only)
+
+    Returns the latest error, or null if no unresolved errors.
+    """
+    # Verify charger exists
+    charger = await Charger.get_or_none(id=charger_id)
+    if not charger:
+        raise HTTPException(status_code=404, detail="Charger not found")
+
+    # Get most recent unresolved error
+    latest = await ChargerError.filter(
+        charger_id=charger_id,
+        is_resolved=False
+    ).order_by("-created_at").first()
+
+    if not latest:
+        return None
+
+    return ChargerErrorResponse.model_validate(latest, from_attributes=True)

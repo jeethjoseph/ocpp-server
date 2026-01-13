@@ -14,6 +14,8 @@ import {
   ApiResponse,
   SignalQuality,
   SignalQualityListResponse,
+  ChargerError,
+  ChargerErrorListResponse,
 } from "@/types/api";
 
 export const stationService = {
@@ -454,5 +456,42 @@ export const signalQualityService = {
   getLatestSignalQuality: (chargerId: number) =>
     api.get<SignalQuality | null>(
       `/api/admin/chargers/${chargerId}/signal-quality/latest`
+    ),
+};
+
+/**
+ * Charger Error Service
+ * Handles charger error history and diagnostics
+ */
+export const chargerErrorService = {
+  /**
+   * Get error history for a charger
+   * @param chargerId - The charger ID
+   * @param params - Query parameters (page, limit, hours, include_resolved)
+   */
+  getErrors: (
+    chargerId: number,
+    params?: { page?: number; limit?: number; hours?: number; include_resolved?: boolean }
+  ) => {
+    const searchParams = new URLSearchParams();
+    if (params?.page) searchParams.set("page", params.page.toString());
+    if (params?.limit) searchParams.set("limit", params.limit.toString());
+    if (params?.hours) searchParams.set("hours", params.hours.toString());
+    if (params?.include_resolved !== undefined)
+      searchParams.set("include_resolved", params.include_resolved.toString());
+
+    const query = searchParams.toString();
+    return api.get<ChargerErrorListResponse>(
+      `/api/admin/chargers/${chargerId}/errors${query ? `?${query}` : ""}`
+    );
+  },
+
+  /**
+   * Get the most recent unresolved error for a charger
+   * @param chargerId - The charger ID
+   */
+  getLatestError: (chargerId: number) =>
+    api.get<ChargerError | null>(
+      `/api/admin/chargers/${chargerId}/errors/latest`
     ),
 };

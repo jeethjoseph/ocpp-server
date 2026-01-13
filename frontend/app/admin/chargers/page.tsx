@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Zap, Plus, ExternalLink, Pencil } from "lucide-react";
+import { Zap, Plus, ExternalLink, Pencil, AlertTriangle } from "lucide-react";
 import Link from "next/link";
 
 import { AdminOnly } from "@/components/RoleWrapper";
@@ -93,38 +93,30 @@ export default function AdminChargersPage() {
     deleteChargerMutation.mutate(id);
   };
 
-  const canChangeAvailability = (status: string) => {
-    // Only allow availability changes for Available and Unavailable statuses
-    return status === "Available" || status === "Unavailable";
+  const canChangeAvailability = (status: string, connectionStatus: boolean) => {
+    // Per OCPP 1.6, ChangeAvailability can be sent at any time
+    // Only requirement is that charger must be connected
+    return connectionStatus;
   };
 
   const getAvailabilityToggleState = (status: string) => {
-    // Green/ON for Available, Gray/OFF for all others
-    return status === "Available";
+    // Green/ON for operational states, Gray/OFF for Unavailable/Faulted
+    return status !== "Unavailable" && status !== "Faulted";
   };
 
   const handleChangeAvailability = async (
     chargerId: number,
     currentStatus: string
   ) => {
-    // OCPP 1.6 compliant logic: only allow toggle between Available <-> Unavailable
-    let newType: "Inoperative" | "Operative" | null = null;
-    
-    if (currentStatus === "Available") {
-      newType = "Inoperative"; // Available -> Unavailable
-    } else if (currentStatus === "Unavailable") {
-      newType = "Operative"; // Unavailable -> Available
-    }
-    
-    // Don't proceed if status change isn't allowed
-    if (!newType) {
-      console.warn(`Cannot change availability for charger with status: ${currentStatus}`);
-      return;
-    }
-    
+    // OCPP 1.6: ChangeAvailability can be sent at any time
+    // Toggle logic: if currently operational -> Inoperative, otherwise -> Operative
+    // The charger may respond with Accepted, Scheduled, or Rejected
+    const isCurrentlyOperational = currentStatus !== "Unavailable" && currentStatus !== "Faulted";
+    const newType: "Inoperative" | "Operative" = isCurrentlyOperational ? "Inoperative" : "Operative";
+
     // Add charger to loading set
     setToggleLoadingChargers(prev => new Set(prev).add(chargerId));
-    
+
     changeAvailabilityMutation.mutate(
       { id: chargerId, type: newType, connectorId: 0 },
       {
@@ -266,6 +258,9 @@ export default function AdminChargersPage() {
                       Connection
                     </th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap">
+                      Error
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap">
                       Station
                     </th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap">
@@ -312,6 +307,28 @@ export default function AdminChargersPage() {
                               : "Disconnected"}
                           </span>
                         </td>
+                        <td className="px-6 py-4 whitespace-nowrap">
+                          {charger.latest_error ? (
+                            <div
+                              className="flex flex-col gap-1"
+                              title={`${charger.latest_error.error_code}${charger.latest_error.vendor_error_code ? ` | Vendor: ${charger.latest_error.vendor_error_code}` : ''}${charger.latest_error.info ? ` | ${charger.latest_error.info}` : ''}`}
+                            >
+                              <div className="flex items-center gap-1">
+                                <AlertTriangle className="h-3 w-3 text-destructive" />
+                                <span className="px-1.5 py-0.5 text-xs font-medium rounded bg-destructive/20 text-destructive">
+                                  {charger.latest_error.error_code}
+                                </span>
+                              </div>
+                              {charger.latest_error.vendor_error_code && (
+                                <span className="px-1.5 py-0.5 text-xs font-medium rounded bg-orange-500/20 text-orange-700 dark:text-orange-400 w-fit">
+                                  {charger.latest_error.vendor_error_code}
+                                </span>
+                              )}
+                            </div>
+                          ) : (
+                            <span className="text-xs text-muted-foreground">—</span>
+                          )}
+                        </td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm text-muted-foreground">
                           {station?.name || "Unknown"}
                         </td>
@@ -332,7 +349,7 @@ export default function AdminChargersPage() {
                             }
                             disabled={
                               toggleLoadingChargers.has(charger.id) ||
-                              !canChangeAvailability(charger.latest_status)
+                              !canChangeAvailability(charger.latest_status, charger.connection_status)
                             }
                             className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed ${
                               getAvailabilityToggleState(charger.latest_status)
@@ -342,9 +359,9 @@ export default function AdminChargersPage() {
                             title={
                               toggleLoadingChargers.has(charger.id)
                                 ? "Changing availability..."
-                                : !canChangeAvailability(charger.latest_status)
-                                ? `Cannot toggle availability for ${charger.latest_status} status`
-                                : "Toggle charger availability (Available ↔ Unavailable)"
+                                : !charger.connection_status
+                                ? "Charger must be connected to change availability"
+                                : `Toggle availability (${getAvailabilityToggleState(charger.latest_status) ? "Operative → Inoperative" : "Inoperative → Operative"})`
                             }>
                             {toggleLoadingChargers.has(charger.id) ? (
                               <div className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-background border-t-transparent mx-auto" />

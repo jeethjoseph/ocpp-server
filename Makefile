@@ -16,10 +16,38 @@ PG_SUPERUSER=$(shell whoami)
 BACKEND_DIR=backend
 SCRIPTS_DIR=$(BACKEND_DIR)/scripts
 
-.PHONY: help db-reset db-reset-cloud db-first-time db-drop-user db-create-user db-drop db-create migrate seed setup-dev truncate-tables deploy-dry-run deploy deploy-force restart-service
+.PHONY: help db-reset db-reset-cloud db-first-time db-drop-user db-create-user db-drop db-create migrate seed setup-dev truncate-tables deploy-dry-run deploy deploy-force restart-service docker-dev docker-dev-detach docker-staging docker-staging-detach docker-prod docker-prod-detach docker-down docker-down-staging docker-down-prod docker-logs docker-logs-backend docker-logs-frontend docker-build docker-build-staging docker-build-prod docker-clean docker-migrate docker-staging-cert docker-prod-cert docker-cert-renew
 
 help:
 	@echo "Available commands:"
+	@echo ""
+	@echo "Docker Commands - Development:"
+	@echo "  docker-dev         - Start development environment with hot-reload"
+	@echo "  docker-dev-detach  - Start development environment (detached)"
+	@echo "  docker-down        - Stop development containers"
+	@echo "  docker-build       - Build development images"
+	@echo ""
+	@echo "Docker Commands - Staging:"
+	@echo "  docker-staging         - Start staging environment"
+	@echo "  docker-staging-detach  - Start staging environment (detached)"
+	@echo "  docker-down-staging    - Stop staging containers"
+	@echo "  docker-build-staging   - Build staging images"
+	@echo "  docker-staging-cert    - Obtain SSL certificate for staging"
+	@echo ""
+	@echo "Docker Commands - Production:"
+	@echo "  docker-prod         - Start production environment"
+	@echo "  docker-prod-detach  - Start production environment (detached)"
+	@echo "  docker-down-prod    - Stop production containers"
+	@echo "  docker-build-prod   - Build production images"
+	@echo "  docker-prod-cert    - Obtain SSL certificate for production"
+	@echo ""
+	@echo "Docker Commands - Common:"
+	@echo "  docker-logs          - Follow all container logs"
+	@echo "  docker-logs-backend  - Follow backend logs"
+	@echo "  docker-logs-frontend - Follow frontend logs"
+	@echo "  docker-migrate       - Run database migrations in Docker"
+	@echo "  docker-clean         - Remove containers, volumes, and images"
+	@echo "  docker-cert-renew    - Force SSL certificate renewal"
 	@echo ""
 	@echo "Database Management:"
 	@echo "  db-reset        - Database reset (drop, recreate, migrate, seed)"
@@ -222,3 +250,237 @@ restart-service:
 	@echo "🔄 Restarting service $(SERVICE_NAME) on $(REMOTE_HOST)..."
 	@ssh $(REMOTE_USER)@$(REMOTE_HOST) "systemctl restart $(SERVICE_NAME) && systemctl status $(SERVICE_NAME) --no-pager"
 	@echo "✅ Service restarted!"
+
+# ===========================================
+# Docker Commands
+# ===========================================
+
+# Start development environment with hot-reload
+docker-dev:
+	@echo "🐳 Starting development environment..."
+	docker compose up --build
+
+# Start development environment (detached)
+docker-dev-detach:
+	@echo "🐳 Starting development environment (detached)..."
+	docker compose up --build -d
+	@echo "✅ Development environment started!"
+	@echo "   Frontend: http://localhost:3000"
+	@echo "   Backend:  http://localhost:8000"
+	@echo "   API Docs: http://localhost:8000/docs"
+
+# Start production environment
+docker-prod:
+	@echo "🐳 Starting production environment..."
+	docker compose -f docker-compose.prod.yml up --build
+
+# Start production environment (detached)
+docker-prod-detach:
+	@echo "🐳 Starting production environment (detached)..."
+	docker compose -f docker-compose.prod.yml up --build -d
+	@echo "✅ Production environment started!"
+
+# Stop development containers
+docker-down:
+	@echo "🛑 Stopping development containers..."
+	docker compose down
+	@echo "✅ Development containers stopped!"
+
+# Stop production containers
+docker-down-prod:
+	@echo "🛑 Stopping production containers..."
+	docker compose -f docker-compose.prod.yml down
+	@echo "✅ Production containers stopped!"
+
+# Follow all container logs
+docker-logs:
+	docker compose logs -f
+
+# Follow backend logs
+docker-logs-backend:
+	docker compose logs -f backend
+
+# Follow frontend logs
+docker-logs-frontend:
+	docker compose logs -f frontend
+
+# Build development images
+docker-build:
+	@echo "🔨 Building development images..."
+	docker compose build
+
+# Build production images
+docker-build-prod:
+	@echo "🔨 Building production images..."
+	docker compose -f docker-compose.prod.yml build
+
+# Remove containers, volumes, and images
+docker-clean:
+	@echo "🧹 Cleaning up Docker resources..."
+	docker compose down -v --rmi local
+	docker compose -f docker-compose.prod.yml down -v --rmi local 2>/dev/null || true
+	docker system prune -f
+	@echo "✅ Docker cleanup complete!"
+
+# Run database migrations in Docker
+docker-migrate:
+	@echo "🔄 Running database migrations in Docker..."
+	docker compose exec backend aerich upgrade
+	@echo "✅ Migrations complete!"
+
+# Initialize fresh database in Docker
+docker-init-db:
+	@echo "🔄 Initializing fresh database in Docker..."
+	docker compose exec backend aerich init-db
+	@echo "✅ Database initialized!"
+
+# Run seed script in Docker
+docker-seed:
+	@echo "🌱 Seeding database in Docker..."
+	docker compose exec backend python scripts/seed_data.py
+	@echo "✅ Database seeded!"
+
+# Run Docker-specific seed script (supports CLERK_ADMIN_ID)
+# Usage: make docker-seed-dev CLERK_ADMIN_ID=user_xxxxx
+docker-seed-dev:
+	@echo "🌱 Seeding Docker database for development..."
+	@if [ -n "$(CLERK_ADMIN_ID)" ]; then \
+		echo "📌 Using CLERK_ADMIN_ID: $(CLERK_ADMIN_ID)"; \
+		docker compose exec -e CLERK_ADMIN_ID=$(CLERK_ADMIN_ID) backend python scripts/seed_docker.py; \
+	else \
+		echo "💡 Tip: Run with CLERK_ADMIN_ID=your_id to seed yourself as admin"; \
+		docker compose exec backend python scripts/seed_docker.py; \
+	fi
+
+# Reset Docker database completely (WARNING: destroys all data)
+docker-db-reset:
+	@echo "⚠️  WARNING: This will destroy ALL Docker database data!"
+	@echo "   Press Ctrl+C to cancel, or wait 5 seconds to continue..."
+	@sleep 5
+	@echo "🗑️  Stopping and removing containers with volumes..."
+	docker compose down -v
+	@echo "🔄 Starting fresh database..."
+	docker compose up -d postgres redis
+	@echo "⏳ Waiting for database to be ready (10s)..."
+	@sleep 10
+	@echo "🔄 Starting backend (will auto-create tables)..."
+	docker compose up -d backend
+	@echo "⏳ Waiting for backend to initialize (15s)..."
+	@sleep 15
+	@echo "🔄 Starting remaining services..."
+	docker compose up -d
+	@echo ""
+	@echo "✅ Docker database reset complete!"
+	@echo ""
+	@echo "📋 Next steps:"
+	@echo "   1. Get your Clerk User ID from browser DevTools or Clerk Dashboard"
+	@echo "   2. Run: make docker-seed-dev CLERK_ADMIN_ID=user_xxxxx"
+	@echo "   3. Refresh your browser"
+
+# ===========================================
+# Staging Docker Commands
+# ===========================================
+
+# Start staging environment
+docker-staging:
+	@echo "🐳 Starting staging environment..."
+	docker compose -f docker-compose.staging.yml --env-file .env.staging up --build
+
+# Start staging environment (detached)
+docker-staging-detach:
+	@echo "🐳 Starting staging environment (detached)..."
+	docker compose -f docker-compose.staging.yml --env-file .env.staging up --build -d
+	@echo "✅ Staging environment started!"
+	@echo "   URL: https://$${DOMAIN_NAME}"
+
+# Stop staging containers
+docker-down-staging:
+	@echo "🛑 Stopping staging containers..."
+	docker compose -f docker-compose.staging.yml --env-file .env.staging down
+	@echo "✅ Staging containers stopped!"
+
+# Build staging images
+docker-build-staging:
+	@echo "🔨 Building staging images..."
+	docker compose -f docker-compose.staging.yml --env-file .env.staging build
+
+# Run migrations in staging
+docker-staging-migrate:
+	@echo "🔄 Running migrations in staging..."
+	docker compose -f docker-compose.staging.yml --env-file .env.staging exec backend aerich upgrade
+	@echo "✅ Staging migrations complete!"
+
+# ===========================================
+# SSL Certificate Commands
+# ===========================================
+
+# Obtain SSL certificate for staging
+docker-staging-cert:
+	@echo "🔐 Obtaining SSL certificate for staging..."
+	@echo "   Make sure DOMAIN_NAME and CERTBOT_EMAIL are set in .env.staging"
+	docker compose -f docker-compose.staging.yml --env-file .env.staging exec certbot \
+		certbot certonly --webroot --webroot-path=/var/www/certbot \
+		--email $${CERTBOT_EMAIL} --agree-tos --no-eff-email \
+		-d $${DOMAIN_NAME}
+	@echo "🔄 Restarting nginx to load new certificate..."
+	docker compose -f docker-compose.staging.yml --env-file .env.staging restart nginx
+	@echo "✅ SSL certificate obtained for staging!"
+
+# Obtain SSL certificate for production
+docker-prod-cert:
+	@echo "🔐 Obtaining SSL certificate for production..."
+	@echo "   Make sure DOMAIN_NAME and CERTBOT_EMAIL are set in .env.prod"
+	docker compose -f docker-compose.prod.yml --env-file .env.prod exec certbot \
+		certbot certonly --webroot --webroot-path=/var/www/certbot \
+		--email $${CERTBOT_EMAIL} --agree-tos --no-eff-email \
+		-d $${DOMAIN_NAME}
+	@echo "🔄 Restarting nginx to load new certificate..."
+	docker compose -f docker-compose.prod.yml --env-file .env.prod restart nginx
+	@echo "✅ SSL certificate obtained for production!"
+
+# Force certificate renewal (for staging or prod)
+docker-cert-renew:
+	@echo "🔄 Forcing certificate renewal..."
+	@if [ -f .env.staging ]; then \
+		docker compose -f docker-compose.staging.yml --env-file .env.staging exec certbot certbot renew --force-renewal; \
+		docker compose -f docker-compose.staging.yml --env-file .env.staging restart nginx; \
+	elif [ -f .env.prod ]; then \
+		docker compose -f docker-compose.prod.yml --env-file .env.prod exec certbot certbot renew --force-renewal; \
+		docker compose -f docker-compose.prod.yml --env-file .env.prod restart nginx; \
+	else \
+		echo "❌ No .env.staging or .env.prod file found!"; \
+		exit 1; \
+	fi
+	@echo "✅ Certificate renewal complete!"
+
+# View certificate status
+docker-cert-status:
+	@echo "📜 Certificate status..."
+	@if [ -f .env.staging ]; then \
+		docker compose -f docker-compose.staging.yml --env-file .env.staging exec certbot certbot certificates; \
+	elif [ -f .env.prod ]; then \
+		docker compose -f docker-compose.prod.yml --env-file .env.prod exec certbot certbot certificates; \
+	else \
+		echo "❌ No .env.staging or .env.prod file found!"; \
+	fi
+
+# ===========================================
+# Production Docker Commands (updated)
+# ===========================================
+
+# Start production environment with env file
+docker-prod-env:
+	@echo "🐳 Starting production environment..."
+	docker compose -f docker-compose.prod.yml --env-file .env.prod up --build
+
+# Start production environment detached with env file
+docker-prod-env-detach:
+	@echo "🐳 Starting production environment (detached)..."
+	docker compose -f docker-compose.prod.yml --env-file .env.prod up --build -d
+	@echo "✅ Production environment started!"
+
+# Run migrations in production
+docker-prod-migrate:
+	@echo "🔄 Running migrations in production..."
+	docker compose -f docker-compose.prod.yml --env-file .env.prod exec backend aerich upgrade
+	@echo "✅ Production migrations complete!"

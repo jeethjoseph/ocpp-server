@@ -31,6 +31,9 @@ import json
 # Import routers
 from routers import stations, chargers, transactions, auth, webhooks, users, public_stations, logs, wallet_payments, firmware
 
+# Import admin panel
+from admin import admin_app
+
 # Import monitoring service
 from services.monitoring_service import (
     initialize_monitoring,
@@ -67,6 +70,8 @@ app.add_middleware(
         "http://127.0.0.1:3000",           # Local development - Next.js
         "http://localhost:5173",           # Local development - Vite (mobile app)
         "http://127.0.0.1:5173",           # Local development - Vite (mobile app)
+        "http://frontend:3000",            # Docker internal network
+        "http://ocpp-frontend:3000",       # Docker container name
         "https://powerlync.com",            # Production frontend
         "https://www.powerlync.com",        # Production frontend (www)
         "https://ocpp-frontend-mu.vercel.app",  # Legacy Vercel frontend
@@ -214,7 +219,7 @@ class ChargePoint(OcppChargePoint):
 
         return call_result.BootNotification(
             current_time=datetime.datetime.utcnow().isoformat() + "Z",
-            interval=300,
+            interval=30,
             status="Accepted"
         )
 
@@ -236,11 +241,17 @@ class ChargePoint(OcppChargePoint):
         )
     
     @on('StatusNotification')
-    async def on_status_notification(self, connector_id, status, error_code=None, info=None, **kwargs):
+    async def on_status_notification(self, connector_id, status, error_code=None, info=None,
+                                      vendor_error_code=None, vendor_id=None, timestamp=None, **kwargs):
         # Record metric
         await OCPPMetrics.record_message("StatusNotification", "IN")
 
-        logger.info(f"StatusNotification from {self.id}: connector_id={connector_id}, status={status}, error_code={error_code}, info={info}")
+        # Extract vendor error code fields (OCPP 1.6 uses camelCase in messages)
+        vendor_error_code = vendor_error_code or kwargs.get('vendorErrorCode')
+        vendor_id = vendor_id or kwargs.get('vendorId')
+
+        logger.info(f"StatusNotification from {self.id}: connector_id={connector_id}, status={status}, "
+                   f"error_code={error_code}, info={info}, vendor_error_code={vendor_error_code}, vendor_id={vendor_id}")
 
         try:
             # Update charger status in database
@@ -249,7 +260,49 @@ class ChargePoint(OcppChargePoint):
                 logger.warning(f"Failed to update status for charger {self.id} - charger not found in database")
             else:
                 logger.info(f"Successfully updated charger {self.id} status to {status}")
-            
+
+            # Store error information in ChargerError table
+            from models import ChargerError, Charger
+            try:
+                charger = await Charger.filter(charge_point_string_id=self.id).first()
+                if charger:
+                    if error_code and error_code != "NoError":
+                        # Parse timestamp if provided
+                        error_ts = None
+                        if timestamp:
+                            try:
+                                error_ts = datetime.datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                            except (ValueError, AttributeError):
+                                pass
+
+                        # Create error record
+                        await ChargerError.create(
+                            charger=charger,
+                            connector_id=connector_id,
+                            status=status,
+                            error_code=error_code,
+                            vendor_error_code=vendor_error_code,
+                            vendor_id=vendor_id,
+                            info=info[:255] if info else None,  # Truncate to max length
+                            error_timestamp=error_ts
+                        )
+                        logger.info(f"Stored error for charger {self.id}: error_code={error_code}, "
+                                   f"vendor_error_code={vendor_error_code}, vendor_id={vendor_id}")
+                    elif error_code == "NoError":
+                        # Mark unresolved errors for this connector as resolved
+                        resolved_count = await ChargerError.filter(
+                            charger=charger,
+                            connector_id=connector_id,
+                            is_resolved=False
+                        ).update(
+                            is_resolved=True,
+                            resolved_at=datetime.datetime.now(datetime.timezone.utc)
+                        )
+                        if resolved_count > 0:
+                            logger.info(f"Resolved {resolved_count} errors for charger {self.id} connector {connector_id}")
+            except Exception as error_tracking_error:
+                logger.error(f"Error tracking charger error: {error_tracking_error}", exc_info=True)
+
             # Check if status indicates not charging and fail ongoing transactions
             # Charging states: Charging, Preparing, SuspendedEVSE, SuspendedEV, Finishing
             charging_states = {"Charging", "Preparing", "SuspendedEVSE", "SuspendedEV", "Finishing"}
@@ -1298,6 +1351,9 @@ app.include_router(logs.router)
 app.include_router(firmware.router)
 app.include_router(firmware.public_router)
 
+# Mount admin panel
+app.mount("/admin", admin_app)
+
 # ============ OCPP WebSocket Endpoint ============
 @app.websocket("/ocpp/{charge_point_id}")
 async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
@@ -1495,6 +1551,8 @@ async def startup_event():
     global cleanup_task
     await init_db()
     await redis_manager.connect()
+
+    logger.info("Admin panel available at /admin")
 
     # Start periodic cleanup task for stale connections
     cleanup_task = asyncio.create_task(periodic_cleanup())

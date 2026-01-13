@@ -29,8 +29,9 @@ TORTOISE_ORM = {
     "apps": {
         "models": {
             "models": [
-                "models",  
-                "aerich.models" 
+                "models",
+                "admin",  # FastAdmin models
+                "aerich.models"
             ],
             "default_connection": "default",
         },
