@@ -320,7 +320,8 @@ export type FirmwareUpdateStatus =
   | 'INSTALLING'
   | 'INSTALLED'
   | 'DOWNLOAD_FAILED'
-  | 'INSTALLATION_FAILED';
+  | 'INSTALLATION_FAILED'
+  | 'CANCELLED';
 
 export interface FirmwareUpdate {
   id: number;
@@ -333,6 +334,7 @@ export interface FirmwareUpdate {
   completed_at?: string;
   error_message?: string;
   retry_count?: number;
+  firmware_version?: string;
 }
 
 export interface FirmwareHistoryResponse {

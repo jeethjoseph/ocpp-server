@@ -422,6 +422,12 @@ export const firmwareService = {
     api.get<import("@/types/api").UpdateStatusDashboard>(
       "/api/admin/firmware/updates/status"
     ),
+
+  /**
+   * Cancel a pending firmware update
+   */
+  cancelUpdate: (updateId: number) =>
+    api.post(`/api/admin/firmware/updates/${updateId}/cancel`, {}),
 };
 
 /**

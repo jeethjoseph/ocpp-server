@@ -60,6 +60,7 @@ class FirmwareUpdateResponse(BaseModel):
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
     error_message: Optional[str]
+    firmware_version: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -221,6 +222,20 @@ async def delete_firmware_file(
             status_code=400,
             detail=f"Cannot delete firmware version {firmware_file.version}. {chargers_using} charger(s) are currently using it."
         )
+
+    # Auto-cancel any pending updates that reference this firmware file
+    pending_updates = await FirmwareUpdate.filter(
+        firmware_file_id=firmware_id,
+        status=FirmwareUpdateStatusEnum.PENDING
+    )
+    cancelled_count = 0
+    for update in pending_updates:
+        update.status = FirmwareUpdateStatusEnum.CANCELLED
+        await update.save()
+        cancelled_count += 1
+
+    if cancelled_count > 0:
+        logger.info(f"📦 Auto-cancelled {cancelled_count} pending update(s) for firmware ID={firmware_id}")
 
     # Soft delete
     firmware_file.is_active = False
@@ -445,10 +460,16 @@ async def get_firmware_history(
     offset = (page - 1) * limit
 
     total = await FirmwareUpdate.filter(charger_id=charger_id).count()
-    updates = await FirmwareUpdate.filter(charger_id=charger_id).order_by('-initiated_at').offset(offset).limit(limit)
+    updates = await FirmwareUpdate.filter(charger_id=charger_id).prefetch_related('firmware_file').order_by('-initiated_at').offset(offset).limit(limit)
+
+    response_list = []
+    for u in updates:
+        resp = FirmwareUpdateResponse.from_orm(u)
+        resp.firmware_version = u.firmware_file.version if u.firmware_file else None
+        response_list.append(resp)
 
     return FirmwareHistoryResponse(
-        data=[FirmwareUpdateResponse.from_orm(u) for u in updates],
+        data=response_list,
         total=total,
         page=page,
         limit=limit
@@ -515,9 +536,38 @@ async def get_update_status_dashboard(
     )
 
 
+@router.post("/updates/{update_id}/cancel")
+async def cancel_firmware_update(
+    update_id: int,
+    user: User = Depends(require_admin())
+):
+    """
+    Cancel a pending firmware update (Admin only)
+
+    Only updates with PENDING status can be cancelled.
+    Sets status to CANCELLED to preserve audit trail.
+    """
+    update = await FirmwareUpdate.get_or_none(id=update_id)
+    if not update:
+        raise HTTPException(status_code=404, detail="Firmware update not found")
+
+    if update.status != FirmwareUpdateStatusEnum.PENDING:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot cancel update with status '{update.status}'. Only PENDING updates can be cancelled."
+        )
+
+    update.status = FirmwareUpdateStatusEnum.CANCELLED
+    await update.save()
+
+    logger.info(f"Firmware update {update_id} cancelled by user {user.id}")
+
+    return {"message": "Firmware update cancelled successfully", "update_id": update_id}
+
+
 # ============ Public Firmware Discovery Endpoint ============
 
-@public_router.get("/latest", response_model=LatestFirmwareResponse)
+@public_router.get("/latest", response_model=Optional[LatestFirmwareResponse])
 async def get_latest_firmware(
     request: Request,
     charger_id: Optional[str] = None,
@@ -553,16 +603,21 @@ async def get_latest_firmware(
                 detail=f"Charger not found with external_charger_id: {external_charger_id}"
             )
 
-        # Get most recent firmware_update for this charger
+        # Get most recent active firmware_update for this charger
+        # Exclude cancelled/failed updates and soft-deleted firmware files
         latest_update = await FirmwareUpdate.filter(
-            charger_id=charger.id
+            charger_id=charger.id,
+            status__not_in=[
+                FirmwareUpdateStatusEnum.CANCELLED,
+                FirmwareUpdateStatusEnum.DOWNLOAD_FAILED,
+                FirmwareUpdateStatusEnum.INSTALLATION_FAILED,
+            ],
+            firmware_file__is_active=True,
         ).prefetch_related('firmware_file').order_by('-initiated_at').first()
 
         if not latest_update:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No firmware updates found for charger: {external_charger_id}"
-            )
+            logger.info(f"📦 No firmware updates found for external_charger_id: {external_charger_id}")
+            return None
 
         latest_firmware = latest_update.firmware_file
         logger.info(
@@ -582,16 +637,21 @@ async def get_latest_firmware(
                 detail=f"Charger not found: {charger_id}"
             )
 
-        # Get most recent firmware_update for this charger (any status, ordered by initiated_at)
+        # Get most recent active firmware_update for this charger
+        # Exclude cancelled/failed updates and soft-deleted firmware files
         latest_update = await FirmwareUpdate.filter(
-            charger_id=charger.id
+            charger_id=charger.id,
+            status__not_in=[
+                FirmwareUpdateStatusEnum.CANCELLED,
+                FirmwareUpdateStatusEnum.DOWNLOAD_FAILED,
+                FirmwareUpdateStatusEnum.INSTALLATION_FAILED,
+            ],
+            firmware_file__is_active=True,
         ).prefetch_related('firmware_file').order_by('-initiated_at').first()
 
         if not latest_update:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No firmware updates found for charger: {charger_id}"
-            )
+            logger.info(f"📦 No firmware updates found for charger: {charger_id}")
+            return None
 
         latest_firmware = latest_update.firmware_file
         logger.info(
@@ -605,10 +665,8 @@ async def get_latest_firmware(
         latest_firmware = await FirmwareFile.filter(is_active=True).order_by('-created_at').first()
 
         if not latest_firmware:
-            raise HTTPException(
-                status_code=404,
-                detail="No firmware files available"
-            )
+            logger.info("📦 No firmware files available (global mode)")
+            return None
 
         logger.info(
             f"📦 Latest firmware (global): version={latest_firmware.version}, "

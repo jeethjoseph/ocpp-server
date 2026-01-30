@@ -49,6 +49,7 @@ class FirmwareUpdateStatusEnum(str, enum.Enum):
     INSTALLED = "INSTALLED"
     DOWNLOAD_FAILED = "DOWNLOAD_FAILED"
     INSTALLATION_FAILED = "INSTALLATION_FAILED"
+    CANCELLED = "CANCELLED"
 
 # OCPP 1.6 Standard Error Codes
 class OCPPErrorCodeEnum(str, enum.Enum):

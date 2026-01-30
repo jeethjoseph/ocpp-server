@@ -42,6 +42,7 @@ import {
   useFirmwareFiles,
   useTriggerUpdate,
   useFirmwareHistory,
+  useCancelUpdate,
 } from "@/lib/queries/firmware";
 
 // Transaction data comes exclusively from transaction API
@@ -83,6 +84,7 @@ export default function ChargerDetailPage() {
   const { data: firmwareData } = useFirmwareFiles({ is_active: true });
   const { data: firmwareHistoryData } = useFirmwareHistory(chargerId);
   const triggerUpdateMutation = useTriggerUpdate();
+  const cancelUpdateMutation = useCancelUpdate();
 
   // Extract data from charger query
   const charger = chargerData?.charger;
@@ -445,6 +447,35 @@ export default function ChargerDetailPage() {
                 </div>
               </div>
 
+              {/* Pending Update Info */}
+              {firmwareHistoryData?.data.some((u) => u.status === "PENDING") && (() => {
+                const pendingUpdate = firmwareHistoryData.data.find((u) => u.status === "PENDING")!;
+                return (
+                  <div className="flex items-center justify-between rounded-md border border-yellow-200 bg-yellow-50 dark:border-yellow-800 dark:bg-yellow-950 px-3 py-2">
+                    <div>
+                      <p className="text-sm font-medium text-yellow-900 dark:text-yellow-100">
+                        Pending Update: {pendingUpdate.firmware_version || "Unknown"}
+                      </p>
+                      <p className="text-xs text-yellow-700 dark:text-yellow-300">
+                        Scheduled {new Date(pendingUpdate.initiated_at).toLocaleDateString()}
+                      </p>
+                    </div>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => {
+                        if (confirm("Cancel this pending firmware update?")) {
+                          cancelUpdateMutation.mutateAsync(pendingUpdate.id);
+                        }
+                      }}
+                      disabled={cancelUpdateMutation.isPending}
+                    >
+                      <X className="h-4 w-4 text-destructive" />
+                    </Button>
+                  </div>
+                );
+              })()}
+
               <Button
                 onClick={() => setShowFirmwareDialog(true)}
                 className="w-full"
@@ -462,12 +493,14 @@ export default function ChargerDetailPage() {
                 <div className="mt-4 pt-4 border-t">
                   <p className="text-sm font-medium mb-2">Recent Updates:</p>
                   <div className="space-y-2">
-                    {firmwareHistoryData.data.slice(0, 3).map((update) => (
-                      <div key={update.id} className="text-xs">
+                    {firmwareHistoryData.data.filter((u) => u.status !== "PENDING").slice(0, 3).map((update) => (
+                      <div key={update.id} className="flex items-center text-xs">
                         <Badge
                           variant={
                             update.status === "INSTALLED"
                               ? "outline"
+                              : update.status === "CANCELLED"
+                              ? "secondary"
                               : update.status.includes("FAILED")
                               ? "destructive"
                               : "default"
@@ -475,6 +508,9 @@ export default function ChargerDetailPage() {
                           className="text-xs">
                           {update.status}
                         </Badge>
+                        {update.firmware_version && (
+                          <span className="ml-2">{update.firmware_version}</span>
+                        )}
                         <span className="ml-2 text-muted-foreground">
                           {new Date(update.initiated_at).toLocaleDateString()}
                         </span>
