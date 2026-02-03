@@ -48,10 +48,12 @@ from services.monitoring_service import (
 # This must happen before app = FastAPI() for proper instrumentation
 initialize_monitoring()
 
-# Configure logging
+# Configure logging - use force=True so it works even when uvicorn
+# has already configured the root logger (multi-worker mode)
 logging.basicConfig(
-    level=logging.INFO,  # Back to INFO level after debugging
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    force=True
 )
 logger = logging.getLogger("ocpp-server")
 
