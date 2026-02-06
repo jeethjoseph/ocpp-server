@@ -6,9 +6,9 @@ import os
 # IMPORTANT: Set environment variables BEFORE importing fastadmin
 os.environ["ADMIN_USER_MODEL"] = "Admin"
 os.environ["ADMIN_USER_MODEL_USERNAME_FIELD"] = "username"
-_secret_key = os.getenv("SECRET_KEY")
+_secret_key = os.getenv("FASTADMIN_SECRET_KEY")
 if not _secret_key:
-    raise ValueError("SECRET_KEY must be set in environment variables")
+    raise ValueError("FASTADMIN_SECRET_KEY must be set in environment variables")
 os.environ["ADMIN_SECRET_KEY"] = _secret_key
 
 import bcrypt

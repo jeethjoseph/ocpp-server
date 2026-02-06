@@ -204,7 +204,7 @@ deploy-dry-run:
 	@echo "🔍 Running deployment dry-run to $(REMOTE_USER)@$(REMOTE_HOST)..."
 	@echo "   This will show what files would be transferred/deleted"
 	@echo ""
-	rsync -avzn --delete $(RSYNC_EXCLUDES) $(LOCAL_PATH) $(REMOTE_USER)@$(REMOTE_HOST):$(REMOTE_PATH)
+	rsync -avzcn --delete $(RSYNC_EXCLUDES) $(LOCAL_PATH) $(REMOTE_USER)@$(REMOTE_HOST):$(REMOTE_PATH)
 	@echo ""
 	@echo "✅ Dry-run complete. Review the changes above."
 
@@ -215,7 +215,7 @@ deploy: deploy-dry-run
 	@read -p "Do you want to proceed with deployment? (yes/no): " confirm; \
 	if [ "$$confirm" = "yes" ]; then \
 		echo "🚀 Starting deployment..."; \
-		rsync -avz --delete $(RSYNC_EXCLUDES) $(LOCAL_PATH) $(REMOTE_USER)@$(REMOTE_HOST):$(REMOTE_PATH); \
+		rsync -avzc --delete $(RSYNC_EXCLUDES) $(LOCAL_PATH) $(REMOTE_USER)@$(REMOTE_HOST):$(REMOTE_PATH); \
 		if [ $$? -eq 0 ]; then \
 			echo "✅ Files deployed successfully!"; \
 			echo "🔄 Restarting service $(SERVICE_NAME)..."; \
@@ -239,7 +239,7 @@ deploy: deploy-dry-run
 # Quick deploy (no confirmation - use with caution!)
 deploy-force:
 	@echo "🚀 Deploying to $(REMOTE_USER)@$(REMOTE_HOST) (no confirmation)..."
-	rsync -avz --delete $(RSYNC_EXCLUDES) $(LOCAL_PATH) $(REMOTE_USER)@$(REMOTE_HOST):$(REMOTE_PATH)
+	rsync -avzc --delete $(RSYNC_EXCLUDES) $(LOCAL_PATH) $(REMOTE_USER)@$(REMOTE_HOST):$(REMOTE_PATH)
 	@echo "✅ Files deployed successfully!"
 	@echo "🔄 Restarting service $(SERVICE_NAME)..."
 	@ssh $(REMOTE_USER)@$(REMOTE_HOST) "systemctl restart $(SERVICE_NAME) && systemctl status $(SERVICE_NAME) --no-pager"
