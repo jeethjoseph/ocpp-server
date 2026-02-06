@@ -30,26 +30,38 @@ TORTOISE_ORM = {
     },
     "apps": {
         "models": {
-            "models": ["models"],
+            "models": [
+                "models",
+                "admin",  # FastAdmin models
+                "aerich.models"  # Migration tracking
+            ],
             "default_connection": "default",
         },
     },
 }
 
 async def init_db():
-    """Initialize database connection"""
+    """Initialize database connection
+
+    Note: Schema changes should be handled via Aerich migrations, not auto-generation.
+    Run 'aerich upgrade' before starting the app in production.
+    """
     await Tortoise.init(config=TORTOISE_ORM)
-    await Tortoise.generate_schemas()
+    # Don't auto-generate schemas - use Aerich migrations instead
+    # await Tortoise.generate_schemas()
 
 async def close_db():
     """Close database connection"""
     await Tortoise.close_connections()
 
 def register_tortoise_app(app):
-    """Register Tortoise ORM with FastAPI app"""
+    """Register Tortoise ORM with FastAPI app
+
+    Note: generate_schemas=False because we use Aerich migrations.
+    """
     register_tortoise(
         app,
-        config=TORTOISE_ORM,  # Use config instead of db_url
-        generate_schemas=True,
+        config=TORTOISE_ORM,
+        generate_schemas=False,  # Use Aerich migrations instead
         add_exception_handlers=True,
     )

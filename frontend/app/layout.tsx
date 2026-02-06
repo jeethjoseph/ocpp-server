@@ -7,6 +7,7 @@ import { QueryProvider } from "@/contexts/QueryClientProvider";
 import { AuthProvider } from "@/contexts/AuthContext";
 import { ClerkProvider } from '@clerk/nextjs';
 import { Toaster } from "sonner";
+import NewRelicInitializer from "@/components/NewRelicInitializer";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -33,6 +34,7 @@ export default function RootLayout({
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased bg-background text-foreground transition-colors duration-300`}
       >
+        <NewRelicInitializer />
         <ClerkProvider>
           <AuthProvider>
             <QueryProvider>

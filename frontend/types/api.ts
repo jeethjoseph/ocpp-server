@@ -32,6 +32,7 @@ export interface StationListResponse {
 export interface Charger {
   id: number;
   charge_point_string_id: string;
+  external_charger_id?: string;
   station_id: number;
   name: string;
   model?: string;
@@ -44,6 +45,7 @@ export interface Charger {
   created_at: string;
   updated_at: string;
   tariff_per_kwh?: number;
+  latest_error?: LatestErrorInfo;
 }
 
 export interface ChargerCreate {
@@ -52,6 +54,7 @@ export interface ChargerCreate {
   model?: string;
   vendor?: string;
   serial_number?: string;
+  external_charger_id?: string;
   connectors: ConnectorInput[];
 }
 
@@ -66,6 +69,7 @@ export interface ChargerUpdate {
   model?: string;
   vendor?: string;
   latest_status?: string;
+  external_charger_id?: string;
 }
 
 export interface ChargerListResponse {
@@ -316,7 +320,8 @@ export type FirmwareUpdateStatus =
   | 'INSTALLING'
   | 'INSTALLED'
   | 'DOWNLOAD_FAILED'
-  | 'INSTALLATION_FAILED';
+  | 'INSTALLATION_FAILED'
+  | 'CANCELLED';
 
 export interface FirmwareUpdate {
   id: number;
@@ -328,6 +333,8 @@ export interface FirmwareUpdate {
   started_at?: string;
   completed_at?: string;
   error_message?: string;
+  retry_count?: number;
+  firmware_version?: string;
 }
 
 export interface FirmwareHistoryResponse {
@@ -398,4 +405,36 @@ export interface SignalQualityListResponse {
   charger_id: number;
   latest_rssi?: number;
   latest_ber?: number;
+}
+
+// Charger Error Types
+export interface LatestErrorInfo {
+  error_code: string;
+  vendor_error_code?: string;
+  info?: string;
+  created_at: string;
+}
+
+export interface ChargerError {
+  id: number;
+  charger_id: number;
+  connector_id: number;
+  status: string;
+  error_code: string;
+  vendor_error_code?: string;
+  vendor_id?: string;
+  info?: string;
+  error_timestamp?: string;
+  is_resolved: boolean;
+  resolved_at?: string;
+  created_at: string;
+}
+
+export interface ChargerErrorListResponse {
+  data: ChargerError[];
+  total: number;
+  page: number;
+  limit: number;
+  charger_id: number;
+  unresolved_count: number;
 }

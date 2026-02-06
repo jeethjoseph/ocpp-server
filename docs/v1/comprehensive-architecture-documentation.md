@@ -4,13 +4,13 @@
 
 This document provides comprehensive technical documentation for a production-ready **Open Charge Point Protocol (OCPP) 1.6** compliant Charging Station Management System (CSMS). The system implements a full-stack solution for managing Electric Vehicle (EV) charging stations with real-time monitoring, remote control capabilities, role-based access control, and integrated financial management.
 
-**System Version**: 2.2
+**System Version**: 2.3
 **OCPP Compliance**: OCPP 1.6 Full Implementation
 **Architecture**: Modern async Python backend with React web frontend + Capacitor mobile apps
 **Authentication**: Clerk-powered JWT authentication with RBAC
 **Deployment**: Production-ready on Render (backend) + Vercel (web) + App Stores (mobile)
-**Current Branch**: 45-capacitor-app
-**Last Updated**: December 2024  
+**Current Branch**: 47-new-relic
+**Last Updated**: January 2025  
 
 ---
 
@@ -1236,6 +1236,44 @@ CREATE INDEX idx_signal_quality_charger ON signal_quality(charger_id);
 
 **Data Retention**: Records older than 90 days are automatically deleted by the data retention service
 
+#### Charger Error Tracking (NEW)
+```sql
+-- OCPP StatusNotification error tracking
+-- Defined in: backend/models.py:366-386
+CREATE TABLE charger_error (
+    id SERIAL PRIMARY KEY,
+    charger_id INTEGER REFERENCES charger(id) ON DELETE CASCADE,
+    connector_id INTEGER NOT NULL,
+    status VARCHAR(50) NOT NULL,                    -- Charger status when error occurred
+    error_code VARCHAR(50) NOT NULL,                -- Standard OCPP error code
+    vendor_error_code VARCHAR(50),                  -- Vendor-specific error code
+    vendor_id VARCHAR(255),                         -- Vendor identifier
+    info VARCHAR(255),                              -- Additional error information
+    error_timestamp TIMESTAMP,                      -- Timestamp from charger (if provided)
+    is_resolved BOOLEAN DEFAULT FALSE,             -- Track if error was resolved
+    resolved_at TIMESTAMP,                          -- When error was resolved
+    created_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX idx_charger_error_charger ON charger_error(charger_id);
+CREATE INDEX idx_charger_error_code ON charger_error(error_code);
+CREATE INDEX idx_charger_error_vendor ON charger_error(vendor_error_code);
+CREATE INDEX idx_charger_error_resolved ON charger_error(is_resolved);
+CREATE INDEX idx_charger_error_created ON charger_error(created_at);
+```
+
+**Standard OCPP Error Codes**:
+- `NoError`, `ConnectorLockFailure`, `EVCommunicationError`, `GroundFailure`
+- `HighTemperature`, `InternalError`, `LocalListConflict`, `OtherError`
+- `OverCurrentFailure`, `OverVoltage`, `PowerMeterFailure`, `PowerSwitchFailure`
+- `ReaderFailure`, `ResetFailure`, `UnderVoltage`, `WeakSignal`
+
+**Vendor Error Code Examples** (JET_EV1):
+- `GF001` - Vendor-specific ground fault code
+- `TEMP_CRIT_01` - Critical temperature exceeded
+- `GSM_LOW_RSSI` - Low cellular signal strength
+
+**Resolution Logic**: When charger sends StatusNotification with `error_code="NoError"`, all unresolved errors for that connector are marked as resolved.
+
 #### Transaction Management
 ```sql
 -- OCPP charging transactions
@@ -1316,7 +1354,7 @@ CREATE TABLE log (
 
 #### 1. BootNotification Handler
 ```python
-# Implementation: backend/main.py:65-102
+# Implementation: backend/main.py:163-224
 @on('BootNotification')
 async def on_boot_notification(self, charge_point_vendor, charge_point_model, **kwargs):
 ```
@@ -1324,7 +1362,8 @@ async def on_boot_notification(self, charge_point_vendor, charge_point_model, **
 **Business Logic**:
 - Validates charger registration in database
 - **❗ Known Issue**: Currently fails ongoing transactions immediately (see Technical Debt section)
-- Sets 300-second heartbeat interval
+- Sets 30-second heartbeat interval (changed from 300s in January 2025)
+- Updates charger firmware_version, vendor, model from BootNotification payload
 - Comprehensive connection logging
 
 **Response**: OCPP-compliant BootNotificationResponse with "Accepted" status
@@ -1344,9 +1383,10 @@ async def on_heartbeat(self, **kwargs):
 
 #### 3. StatusNotification Handler
 ```python
-# Implementation: backend/main.py:119-140
+# Implementation: backend/main.py:243-377
 @on('StatusNotification')
-async def on_status_notification(self, connector_id, status, error_code=None, **kwargs):
+async def on_status_notification(self, connector_id, status, error_code=None, info=None,
+                                  vendor_error_code=None, vendor_id=None, timestamp=None, **kwargs):
 ```
 
 **OCPP 1.6 Status Support**:
@@ -1359,6 +1399,13 @@ async def on_status_notification(self, connector_id, status, error_code=None, **
 - `Reserved`: Reserved for specific user
 - `Unavailable`: Not available for charging
 - `Faulted`: Error condition present
+
+**Error Tracking (NEW)**:
+- Captures standard OCPP error codes (e.g., `GroundFailure`, `HighTemperature`)
+- Captures vendor-specific error codes via `vendorErrorCode` field
+- Stores errors in `charger_error` table with timestamps
+- Auto-resolves errors when `error_code="NoError"` is received
+- Supports full error history with resolution tracking
 
 #### 4. StartTransaction Handler
 ```python
@@ -3807,7 +3854,49 @@ CORS_ORIGINS = [
 
 ## Recent Changes & Updates
 
-### Latest Release - January 2025 (Branch: 39-feature---user-transaction-pages-zero-charged-transactions)
+### Latest Release - January 2025 (Branch: 47-new-relic)
+
+#### New Features Implemented
+
+**1. Charger Error Tracking System**
+- **Feature**: Complete OCPP StatusNotification error capture with vendor error code support
+- **Implementation**:
+  - New `ChargerError` model stores all error events from StatusNotification
+  - Captures standard OCPP error codes (GroundFailure, HighTemperature, etc.)
+  - Captures vendor-specific error codes (`vendorErrorCode` field)
+  - Auto-resolves errors when `error_code="NoError"` is received
+  - Resolution timestamp tracking
+- **API Endpoints**:
+  - `GET /api/admin/chargers/{id}/errors` - Error history with pagination
+  - `GET /api/admin/chargers/{id}/errors/latest` - Latest unresolved error
+- **Frontend**:
+  - Error history table on charger detail page (last 7 days)
+  - Color-coded badges: red for OCPP error codes, orange for vendor codes
+  - Resolution status indicators (green=resolved, yellow=unresolved)
+  - Charger list shows latest error with clear distinction
+- **Files Added**:
+  - `backend/migrations/models/6_20260113163547_add_admin_and_charger_error.py`
+  - `backend/simulators/ocpp_simulator_vendor_errors.py`
+- **Files Modified**:
+  - `backend/models.py` - ChargerError model
+  - `backend/main.py` - StatusNotification handler with error capture
+  - `backend/routers/chargers.py` - Error history endpoints
+  - `frontend/lib/api-services.ts` - chargerErrorService
+  - `frontend/lib/queries/chargers.ts` - useChargerErrors hook
+  - `frontend/app/admin/chargers/[id]/page.tsx` - Error history display
+  - `frontend/app/admin/chargers/page.tsx` - Error column improvements
+
+**2. OCPP Compliance Improvements**
+- **Heartbeat Interval**: Changed from 300s to 30s for more responsive connection monitoring
+- **ChangeAvailability**: Now OCPP 1.6 compliant - can be sent at any time, not just for Available/Unavailable statuses
+- **Files Modified**:
+  - `backend/main.py` - BootNotification response interval
+  - `backend/routers/chargers.py` - ChangeAvailability endpoint
+  - `frontend/app/admin/chargers/page.tsx` - Availability toggle logic
+
+---
+
+### Previous Release - December 2024 (Branch: 39-feature---user-transaction-pages-zero-charged-transactions)
 
 #### New Features Implemented
 

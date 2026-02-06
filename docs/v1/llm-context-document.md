@@ -12,8 +12,8 @@ This document provides context for Large Language Models (LLMs) like Claude to u
 
 **Current Status**: Actively deployed on Render (backend) and Vercel (frontend) with Clerk authentication, handling real-world charging stations with WebSocket OCPP communication.
 
-**Version**: 2.2 (December 2024)
-**Current Branch**: 45-capacitor-app
+**Version**: 2.3 (January 2025)
+**Current Branch**: 47-new-relic
 
 **Key Capabilities**:
 - Real-time OCPP 1.6 communication with charging stations
@@ -105,7 +105,7 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
     - Real-time update status monitoring (10s auto-refresh)
     - Summary cards (pending, downloading, installing, completed, failed)
     - Firmware library with delete capability
-  - **`app/admin/chargers/[id]/page.tsx`** - Charger detail with **firmware update, reset & signal quality**
+  - **`app/admin/chargers/[id]/page.tsx`** - Charger detail with **firmware update, reset, signal quality & error history**
     - Current firmware version display
     - Update firmware button (disabled if offline)
     - Firmware version selection dialog
@@ -115,6 +115,8 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
     - Reset button disabled if charger offline
     - **Real-time signal quality badge** (Good/Fair/Poor/Unknown)
     - RSSI display with color-coding (auto-refresh every 5s)
+    - **NEW**: Latest error display with error code + vendor error code badges
+    - **NEW**: Error history table (last 7 days) with resolution status
 - **`app/stations/page.tsx`** - Interactive map with React Leaflet 5.0.0 for station discovery
 - **`app/scanner/page.tsx`** - QR code scanner using ZXing 0.21.3
 - **`app/my-sessions/page.tsx`** - **NEW** Combined user sessions (charging + wallet) with recharge button
@@ -198,6 +200,9 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
   - **`signalQualityService`** - **Cellular signal quality monitoring**
     - `getSignalQuality()` - Get history with time filtering
     - `getLatestSignalQuality()` - Get most recent reading
+  - **`chargerErrorService`** - **NEW** - Charger error history and diagnostics
+    - `getErrors()` - Get error history with filters (hours, include_resolved, limit)
+    - `getLatestError()` - Get most recent unresolved error
 - **`queries/`** - TanStack Query hooks with optimized caching strategies
   - **`users.ts`** - **NEW** User transaction and wallet query hooks
   - **`firmware.ts`** - **Firmware TanStack Query hooks**
@@ -214,6 +219,7 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
     - `useResetCharger()` - Reset charger mutation (Hard/Soft)
     - `useSignalQuality()` - Signal history (10s stale, **10s auto-refresh**)
     - `useLatestSignalQuality()` - Latest reading (5s stale, **5s auto-refresh**)
+    - `useChargerErrors()` - **NEW** Error history (30s stale, **30s auto-refresh**)
 - **`csv-export.ts`** - CSV export utility for transaction data
 
 ### Key Configuration
@@ -248,6 +254,9 @@ firmware_update (id, charger_id, firmware_file_id, status, download_url, started
 -- Signal Quality Monitoring
 signal_quality (id, charger_id, rssi, ber, timestamp, created_at) -- Cellular signal metrics via DataTransfer
 
+-- Charger Error Tracking
+charger_error (id, charger_id, connector_id, status, error_code, vendor_error_code, vendor_id, info, error_timestamp, is_resolved, resolved_at) -- OCPP StatusNotification errors
+
 -- System Logging
 log (id, charge_point_id, direction, payload, correlation_id) -- All OCPP messages
 ```
@@ -265,9 +274,13 @@ log (id, charge_point_id, direction, payload, correlation_id) -- All OCPP messag
 ### Message Handlers in `main.py`
 
 **Core OCPP Messages Implemented**:
-1. **BootNotification** (`main.py:65-102`) - Charger registration, **❗ Known Issue**: fails ongoing transactions immediately
-2. **Heartbeat** (`main.py:104-117`) - Connection liveness (90s timeout)  
-3. **StatusNotification** (`main.py:119-140`) - Updates charger.latest_status
+1. **BootNotification** (`main.py:163-224`) - Charger registration with 30s heartbeat interval, **❗ Known Issue**: fails ongoing transactions immediately
+2. **Heartbeat** (`main.py:226-241`) - Connection liveness (90s timeout)
+3. **StatusNotification** (`main.py:243-377`) - Updates charger.latest_status + **error tracking with vendor codes**
+   - Captures standard OCPP error codes (GroundFailure, HighTemperature, etc.)
+   - Captures vendor-specific error codes (vendorErrorCode field)
+   - Stores errors in `charger_error` table with resolution tracking
+   - Auto-resolves errors when "NoError" status received
 4. **StartTransaction** (`main.py:142-204`) - Creates Transaction with RUNNING status
 5. **StopTransaction** (`main.py:206-261`) - Finalizes transaction with automated billing via WalletService
 6. **MeterValues** (`main.py:263-387`) - Stores real-time energy data (kWh, current, voltage, power)
@@ -351,12 +364,14 @@ GET/POST /stations - List/create stations with geographic data
 GET/PUT/DELETE /stations/{id} - Individual station operations
 
 Chargers:
-GET/POST /chargers - List/create chargers with real-time connection status
-GET/PUT/DELETE /chargers/{id} - Individual charger operations
+GET/POST /chargers - List/create chargers with real-time connection status + latest_error
+GET/PUT/DELETE /chargers/{id} - Individual charger operations with latest_error
 POST /chargers/{id}/remote-start - Send RemoteStartTransaction OCPP command
 POST /chargers/{id}/remote-stop - Send RemoteStopTransaction OCPP command
-POST /chargers/{id}/change-availability - Send ChangeAvailability OCPP command
+POST /chargers/{id}/change-availability - Send ChangeAvailability OCPP command (can be sent at any time per OCPP 1.6)
 POST /chargers/{id}/reset?type={Hard|Soft} - Send Reset OCPP command (Hard reset blocked during active charging)
+GET /chargers/{id}/errors - **NEW** Error history with pagination (hours, include_resolved filters)
+GET /chargers/{id}/errors/latest - **NEW** Latest unresolved error for charger
 
 Transactions:
 GET /transactions - List transactions with filtering and analytics summary
@@ -463,9 +478,24 @@ GET /api/logs/{charge_point_id} - Logs for specific charger
 
 ## Current State & Recent Updates
 
-### Latest Changes (December 2024)
+### Latest Changes (January 2025)
 
 **Recent Major Features**:
+10. **Charger Error Tracking System** - Complete error monitoring
+    - ChargerError model stores OCPP StatusNotification errors
+    - Standard error codes (GroundFailure, HighTemperature, etc.)
+    - Vendor-specific error codes (vendorErrorCode field)
+    - Error resolution tracking with timestamps
+    - API endpoints for error history and latest error
+    - Frontend error history table with color-coded badges
+    - Clear distinction between error code (OCPP) and vendor code
+
+11. **OCPP Compliance Improvements**
+    - Heartbeat interval reduced from 300s to 30s
+    - ChangeAvailability now OCPP 1.6 compliant (can be sent at any time)
+    - Toggle works on any charger status (not just Available/Unavailable)
+
+**Previous Major Features (December 2024)**:
 1. **🚀 Native Mobile App (Capacitor)** - Complete iOS/Android application
    - React 19 + Capacitor 7.4.4 + Vite 7.2.4
    - 6 main screens: Home, Stations (map), Scanner (QR), Charge (live session), Sessions, Sign In
@@ -606,6 +636,12 @@ GET /api/logs/{charge_point_id} - Logs for specific charger
   - OCPP log cleanup (90-day retention)
   - Runs every 24 hours with configurable intervals
   - Error handling and graceful shutdown
+✅ **NEW**: Charger Error Tracking System
+  - OCPP StatusNotification error capture with vendor codes
+  - Error history API with pagination and filtering
+  - Resolution tracking (auto-resolves on NoError)
+  - Frontend error history display with color-coded badges
+  - Clear visual distinction between error code and vendor code
 ✅ Remote start/stop charging with immediate OCPP command execution
 ✅ Availability control for chargers (Operative/Inoperative)
 ✅ Role-based admin dashboard with comprehensive management tools
@@ -712,6 +748,10 @@ pytest -m infrastructure # Database/Redis tests (~5 seconds) - external dependen
 ### OCPP Simulators
 - **`simulators/ocpp_simulator_full_success.py`** - Complete charging session simulation
 - **`simulators/ocpp_simulator_change_availability.py`** - Availability command testing
+- **`simulators/ocpp_simulator_vendor_errors.py`** - **NEW** Vendor error code testing
+  - Tests standard OCPP error codes and vendor-specific codes
+  - Interactive mode for custom error injection
+  - Complete error lifecycle testing (error → resolution)
 
 ### Test Environment
 - **Configuration**: `backend/pyproject.toml` with async support and markers

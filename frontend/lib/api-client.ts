@@ -22,6 +22,11 @@ async function apiRequest<T>(
 ): Promise<T> {
   const url = `${API_BASE_URL}${endpoint}`;
 
+  // ⭐ New Relic Browser agent automatically instruments fetch() requests
+  // It injects distributed tracing headers (traceparent, newrelic) to connect
+  // frontend requests to backend traces. No manual header injection needed!
+  // The browser agent detects fetch() calls and adds headers automatically.
+
   // Get current auth token using the abstraction layer
   let token: string | null = null;
 

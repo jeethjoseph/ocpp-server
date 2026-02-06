@@ -149,12 +149,13 @@ export default function MeterValuesChart({ meterValues, transactionId }: MeterVa
     }
   };
 
-  const formatTooltipLabel = (label: string) => {
-    const dataPoint = chartData.find(d => d.timeDisplay === label);
-    if (!dataPoint) return label;
+  const formatTooltipLabel = (label: React.ReactNode) => {
+    const labelStr = String(label ?? '');
+    const dataPoint = chartData.find(d => d.timeDisplay === labelStr);
+    if (!dataPoint) return labelStr;
 
     const date = new Date(dataPoint.timestamp);
-    if (isNaN(date.getTime())) return label;
+    if (isNaN(date.getTime())) return labelStr;
 
     return date.toLocaleString('en-IN', {
       timeZone: 'Asia/Kolkata',

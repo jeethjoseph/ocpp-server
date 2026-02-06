@@ -129,6 +129,27 @@ export function useBulkUpdate() {
 }
 
 /**
+ * Cancel a pending firmware update
+ */
+export function useCancelUpdate() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (updateId: number) => firmwareService.cancelUpdate(updateId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: firmwareKeys.status() });
+      queryClient.invalidateQueries({ queryKey: firmwareKeys.all });
+      toast.success("Firmware update cancelled");
+    },
+    onError: (err) => {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      console.error("Cancel update error:", errorMessage);
+      toast.error(`Failed to cancel update: ${errorMessage}`);
+    },
+  });
+}
+
+/**
  * Get firmware update history for a charger
  */
 export function useFirmwareHistory(chargerId: number, params?: { page?: number; limit?: number }) {

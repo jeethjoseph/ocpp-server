@@ -7,10 +7,11 @@ load_dotenv()
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 IS_PRODUCTION = ENVIRONMENT.lower() in ["production", "prod"]
 
-# SSL configuration: always require for cloud databases like Neon
+# SSL configuration: require for cloud DBs, disable for localhost
 db_host = os.getenv("DB_HOST", "localhost")
-is_cloud_db = any(provider in db_host for provider in ["neon.tech", "aws.com", "gcp.com", "azure.com"])
-ssl_config = "require" if (IS_PRODUCTION or is_cloud_db) else "disable"
+is_localhost = db_host in ["localhost", "127.0.0.1"]
+is_cloud_db = any(provider in db_host for provider in ["neon.tech", "aws.com", "gcp.com", "azure.com", "vultrdb.com"])
+ssl_config = "disable" if is_localhost else ("require" if (IS_PRODUCTION or is_cloud_db) else "disable")
 
 TORTOISE_ORM = {
     "connections": {
@@ -29,8 +30,9 @@ TORTOISE_ORM = {
     "apps": {
         "models": {
             "models": [
-                "models",  
-                "aerich.models" 
+                "models",
+                "admin",  # FastAdmin models
+                "aerich.models"
             ],
             "default_connection": "default",
         },

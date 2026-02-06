@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Zap, Play, Square, Activity, Clock, MapPin, X, CreditCard, Download, Signal } from "lucide-react";
+import { Zap, Play, Square, Activity, Clock, MapPin, X, CreditCard, Download, Signal, AlertTriangle } from "lucide-react";
 import { AdminOnly } from "@/components/RoleWrapper";
 import { toast } from "sonner";
 import ChargerLogs from "@/components/ChargerLogs";
@@ -32,6 +32,7 @@ import {
   useRemoteStop,
   useResetCharger,
   useLatestSignalQuality,
+  useChargerErrors,
 } from "@/lib/queries/chargers";
 import {
   useAdminTransaction,
@@ -41,6 +42,7 @@ import {
   useFirmwareFiles,
   useTriggerUpdate,
   useFirmwareHistory,
+  useCancelUpdate,
 } from "@/lib/queries/firmware";
 
 // Transaction data comes exclusively from transaction API
@@ -75,10 +77,14 @@ export default function ChargerDetailPage() {
   // Signal quality query
   const { data: signalQuality } = useLatestSignalQuality(chargerId);
 
+  // Error history query
+  const { data: errorHistoryData } = useChargerErrors(chargerId, { hours: 168, limit: 10 });
+
   // Firmware queries
   const { data: firmwareData } = useFirmwareFiles({ is_active: true });
   const { data: firmwareHistoryData } = useFirmwareHistory(chargerId);
   const triggerUpdateMutation = useTriggerUpdate();
+  const cancelUpdateMutation = useCancelUpdate();
 
   // Extract data from charger query
   const charger = chargerData?.charger;
@@ -339,6 +345,34 @@ export default function ChargerDetailPage() {
                   </Badge>
                 </div>
               </div>
+              {/* Latest Error */}
+              {charger.latest_error && (
+                <div className="mt-4 p-3 bg-destructive/10 border border-destructive/20 rounded-lg">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="h-5 w-5 text-destructive mt-0.5" />
+                    <div className="flex-1 space-y-2">
+                      <div className="flex flex-wrap gap-2 items-center">
+                        <span className="px-2 py-0.5 text-xs font-medium rounded bg-destructive/20 text-destructive">
+                          {charger.latest_error.error_code}
+                        </span>
+                        {charger.latest_error.vendor_error_code && (
+                          <span className="px-2 py-0.5 text-xs font-medium rounded bg-orange-500/20 text-orange-700 dark:text-orange-400">
+                            Vendor: {charger.latest_error.vendor_error_code}
+                          </span>
+                        )}
+                      </div>
+                      {charger.latest_error.info && (
+                        <p className="text-sm text-muted-foreground">
+                          {charger.latest_error.info}
+                        </p>
+                      )}
+                      <p className="text-xs text-muted-foreground">
+                        Since: {new Date(charger.latest_error.created_at).toLocaleString()}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
             </CardContent>
           </Card>
 
@@ -413,32 +447,60 @@ export default function ChargerDetailPage() {
                 </div>
               </div>
 
+              {/* Pending Update Info */}
+              {firmwareHistoryData?.data.some((u) => u.status === "PENDING") && (() => {
+                const pendingUpdate = firmwareHistoryData.data.find((u) => u.status === "PENDING")!;
+                return (
+                  <div className="flex items-center justify-between rounded-md border border-yellow-200 bg-yellow-50 dark:border-yellow-800 dark:bg-yellow-950 px-3 py-2">
+                    <div>
+                      <p className="text-sm font-medium text-yellow-900 dark:text-yellow-100">
+                        Pending Update: {pendingUpdate.firmware_version || "Unknown"}
+                      </p>
+                      <p className="text-xs text-yellow-700 dark:text-yellow-300">
+                        Scheduled {new Date(pendingUpdate.initiated_at).toLocaleDateString()}
+                      </p>
+                    </div>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => {
+                        if (confirm("Cancel this pending firmware update?")) {
+                          cancelUpdateMutation.mutateAsync(pendingUpdate.id);
+                        }
+                      }}
+                      disabled={cancelUpdateMutation.isPending}
+                    >
+                      <X className="h-4 w-4 text-destructive" />
+                    </Button>
+                  </div>
+                );
+              })()}
+
               <Button
                 onClick={() => setShowFirmwareDialog(true)}
-                disabled={!charger.connection_status}
                 className="w-full"
                 variant="secondary">
                 <Download className="h-4 w-4 mr-2" />
-                Update Firmware
+                Schedule Update
               </Button>
 
-              {!charger.connection_status && (
-                <p className="text-sm text-muted-foreground text-center">
-                  Charger must be online to update
-                </p>
-              )}
+              <p className="text-xs text-muted-foreground text-center">
+                Updates are processed automatically when charger is ready
+              </p>
 
               {/* Recent Update History */}
               {firmwareHistoryData && firmwareHistoryData.data.length > 0 && (
                 <div className="mt-4 pt-4 border-t">
                   <p className="text-sm font-medium mb-2">Recent Updates:</p>
                   <div className="space-y-2">
-                    {firmwareHistoryData.data.slice(0, 3).map((update) => (
-                      <div key={update.id} className="text-xs">
+                    {firmwareHistoryData.data.filter((u) => u.status !== "PENDING").slice(0, 3).map((update) => (
+                      <div key={update.id} className="flex items-center text-xs">
                         <Badge
                           variant={
                             update.status === "INSTALLED"
                               ? "outline"
+                              : update.status === "CANCELLED"
+                              ? "secondary"
                               : update.status.includes("FAILED")
                               ? "destructive"
                               : "default"
@@ -446,6 +508,9 @@ export default function ChargerDetailPage() {
                           className="text-xs">
                           {update.status}
                         </Badge>
+                        {update.firmware_version && (
+                          <span className="ml-2">{update.firmware_version}</span>
+                        )}
                         <span className="ml-2 text-muted-foreground">
                           {new Date(update.initiated_at).toLocaleDateString()}
                         </span>
@@ -462,9 +527,9 @@ export default function ChargerDetailPage() {
         <Dialog open={showFirmwareDialog} onOpenChange={setShowFirmwareDialog}>
           <DialogContent>
             <DialogHeader>
-              <DialogTitle>Update Firmware</DialogTitle>
+              <DialogTitle>Schedule Firmware Update</DialogTitle>
               <DialogDescription>
-                Select a firmware version to install on {charger.name}
+                Select a firmware version to schedule for {charger.name}. The update will be triggered automatically when the charger is ready.
               </DialogDescription>
             </DialogHeader>
 
@@ -486,12 +551,13 @@ export default function ChargerDetailPage() {
                 </Select>
               </div>
 
-              <div className="bg-yellow-50 dark:bg-yellow-900/20 p-3 rounded-lg text-sm">
-                <p className="font-medium mb-1">Safety Checks:</p>
+              <div className="bg-blue-50 dark:bg-blue-900/20 p-3 rounded-lg text-sm">
+                <p className="font-medium mb-1">Automatic Processing:</p>
                 <ul className="list-disc list-inside space-y-1 text-muted-foreground">
-                  <li>Charger must be online</li>
-                  <li>No active charging session</li>
-                  <li>Update will be sent immediately via OCPP</li>
+                  <li>Update will be scheduled immediately</li>
+                  <li>Background service checks every 60 seconds</li>
+                  <li>Triggers when charger is online and not charging</li>
+                  <li>You can schedule multiple firmware versions</li>
                 </ul>
               </div>
             </div>
@@ -507,7 +573,7 @@ export default function ChargerDetailPage() {
                 type="button"
                 onClick={handleFirmwareUpdate}
                 disabled={!selectedFirmwareId || triggerUpdateMutation.isPending}>
-                {triggerUpdateMutation.isPending ? "Sending..." : "Update Firmware"}
+                {triggerUpdateMutation.isPending ? "Scheduling..." : "Schedule Update"}
               </Button>
             </DialogFooter>
           </DialogContent>
@@ -778,9 +844,94 @@ export default function ChargerDetailPage() {
           />
         )}
 
+        {/* Error History Section */}
+        {errorHistoryData && errorHistoryData.data.length > 0 && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <AlertTriangle className="h-5 w-5" />
+                  Error History
+                </div>
+                {errorHistoryData.unresolved_count > 0 && (
+                  <Badge variant="destructive">
+                    {errorHistoryData.unresolved_count} unresolved
+                  </Badge>
+                )}
+              </CardTitle>
+              <p className="text-sm text-muted-foreground">
+                Last 7 days of error events from OCPP StatusNotification
+              </p>
+            </CardHeader>
+            <CardContent>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b">
+                      <th className="text-left p-2 font-medium">Time</th>
+                      <th className="text-left p-2 font-medium">Error Code</th>
+                      <th className="text-left p-2 font-medium">Vendor Code</th>
+                      <th className="text-left p-2 font-medium">Status</th>
+                      <th className="text-left p-2 font-medium">Info</th>
+                      <th className="text-left p-2 font-medium">Resolved</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {errorHistoryData.data.map((error) => (
+                      <tr key={error.id} className="border-b hover:bg-accent/50">
+                        <td className="p-2 whitespace-nowrap">
+                          {new Date(error.created_at).toLocaleString()}
+                        </td>
+                        <td className="p-2">
+                          <span className="px-2 py-0.5 text-xs font-medium rounded bg-destructive/20 text-destructive">
+                            {error.error_code}
+                          </span>
+                        </td>
+                        <td className="p-2">
+                          {error.vendor_error_code ? (
+                            <span className="px-2 py-0.5 text-xs font-medium rounded bg-orange-500/20 text-orange-700 dark:text-orange-400">
+                              {error.vendor_error_code}
+                            </span>
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </td>
+                        <td className="p-2">
+                          <Badge variant="outline" className="text-xs">
+                            {error.status}
+                          </Badge>
+                        </td>
+                        <td className="p-2 max-w-xs truncate" title={error.info || ''}>
+                          {error.info || <span className="text-muted-foreground">—</span>}
+                        </td>
+                        <td className="p-2">
+                          {error.is_resolved ? (
+                            <span className="px-2 py-0.5 text-xs font-medium rounded bg-green-500/20 text-green-700 dark:text-green-400">
+                              Yes
+                            </span>
+                          ) : (
+                            <span className="px-2 py-0.5 text-xs font-medium rounded bg-yellow-500/20 text-yellow-700 dark:text-yellow-400">
+                              No
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {errorHistoryData.total > errorHistoryData.data.length && (
+                <p className="text-xs text-muted-foreground text-center mt-3">
+                  Showing {errorHistoryData.data.length} of {errorHistoryData.total} errors
+                </p>
+              )}
+            </CardContent>
+          </Card>
+        )}
+
         {/* OCPP Logs Section */}
         {charger && (
-          <ChargerLogs 
+          <ChargerLogs
             chargePointId={charger.charge_point_string_id}
             chargerName={charger.name}
           />

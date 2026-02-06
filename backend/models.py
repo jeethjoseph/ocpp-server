@@ -49,6 +49,26 @@ class FirmwareUpdateStatusEnum(str, enum.Enum):
     INSTALLED = "INSTALLED"
     DOWNLOAD_FAILED = "DOWNLOAD_FAILED"
     INSTALLATION_FAILED = "INSTALLATION_FAILED"
+    CANCELLED = "CANCELLED"
+
+# OCPP 1.6 Standard Error Codes
+class OCPPErrorCodeEnum(str, enum.Enum):
+    CONNECTOR_LOCK_FAILURE = "ConnectorLockFailure"
+    EV_COMMUNICATION_ERROR = "EVCommunicationError"
+    GROUND_FAILURE = "GroundFailure"
+    HIGH_TEMPERATURE = "HighTemperature"
+    INTERNAL_ERROR = "InternalError"
+    LOCAL_LIST_CONFLICT = "LocalListConflict"
+    NO_ERROR = "NoError"
+    OTHER_ERROR = "OtherError"
+    OVER_CURRENT_FAILURE = "OverCurrentFailure"
+    OVER_VOLTAGE = "OverVoltage"
+    POWER_METER_FAILURE = "PowerMeterFailure"
+    POWER_SWITCH_FAILURE = "PowerSwitchFailure"
+    READER_FAILURE = "ReaderFailure"
+    RESET_FAILURE = "ResetFailure"
+    UNDER_VOLTAGE = "UnderVoltage"
+    WEAK_SIGNAL = "WeakSignal"
 
 # Authentication enums
 class UserRoleEnum(str, enum.Enum):
@@ -197,6 +217,7 @@ class Charger(Model):
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)
     charge_point_string_id = fields.CharField(max_length=255, unique=True)
+    external_charger_id = fields.CharField(max_length=255, unique=True, null=True)
     station = fields.ForeignKeyField("models.ChargingStation", related_name="chargers")
     name = fields.CharField(max_length=255, null=True)
     model = fields.CharField(max_length=100, null=True)
@@ -321,9 +342,11 @@ class FirmwareUpdate(Model):
     started_at = fields.DatetimeField(null=True)
     completed_at = fields.DatetimeField(null=True)
     error_message = fields.TextField(null=True)
+    retry_count = fields.IntField(default=0)
 
     class Meta:
         table = "firmware_update"
+        unique_together = [("charger", "firmware_file")]
 
 class SignalQuality(Model):
     """
@@ -341,9 +364,31 @@ class SignalQuality(Model):
     class Meta:
         table = "signal_quality"
 
+class ChargerError(Model):
+    """
+    Stores error events from chargers received via OCPP StatusNotification.
+    Captures both standard OCPP error codes and vendor-specific error codes.
+    """
+    id = fields.IntField(pk=True)
+    created_at = fields.DatetimeField(auto_now_add=True, index=True)
+    charger = fields.ForeignKeyField("models.Charger", related_name="errors", index=True)
+    connector_id = fields.IntField(index=True)
+    status = fields.CharField(max_length=50)  # Charger status when error occurred
+    error_code = fields.CharField(max_length=50, index=True)  # Standard OCPP error code
+    vendor_error_code = fields.CharField(max_length=50, null=True, index=True)  # Vendor-specific error code
+    vendor_id = fields.CharField(max_length=255, null=True)  # Vendor identifier
+    info = fields.CharField(max_length=255, null=True)  # Additional error information
+    error_timestamp = fields.DatetimeField(null=True)  # Timestamp from charger (if provided)
+    is_resolved = fields.BooleanField(default=False, index=True)  # Track if error was resolved
+    resolved_at = fields.DatetimeField(null=True)
+
+    class Meta:
+        table = "charger_error"
+
 # Pydantic models for API serialization
 User_Pydantic = pydantic_model_creator(User, name="User")
 UserIn_Pydantic = pydantic_model_creator(User, name="UserIn", exclude_readonly=True)
 Charger_Pydantic = pydantic_model_creator(Charger, name="Charger")
 OCPPLog_Pydantic = pydantic_model_creator(OCPPLog, name="OCPPLog")
 SignalQuality_Pydantic = pydantic_model_creator(SignalQuality, name="SignalQuality")
+ChargerError_Pydantic = pydantic_model_creator(ChargerError, name="ChargerError")

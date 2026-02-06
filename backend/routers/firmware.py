@@ -60,6 +60,7 @@ class FirmwareUpdateResponse(BaseModel):
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
     error_message: Optional[str]
+    firmware_version: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -222,6 +223,20 @@ async def delete_firmware_file(
             detail=f"Cannot delete firmware version {firmware_file.version}. {chargers_using} charger(s) are currently using it."
         )
 
+    # Auto-cancel any pending updates that reference this firmware file
+    pending_updates = await FirmwareUpdate.filter(
+        firmware_file_id=firmware_id,
+        status=FirmwareUpdateStatusEnum.PENDING
+    )
+    cancelled_count = 0
+    for update in pending_updates:
+        update.status = FirmwareUpdateStatusEnum.CANCELLED
+        await update.save()
+        cancelled_count += 1
+
+    if cancelled_count > 0:
+        logger.info(f"📦 Auto-cancelled {cancelled_count} pending update(s) for firmware ID={firmware_id}")
+
     # Soft delete
     firmware_file.is_active = False
     await firmware_file.save()
@@ -275,14 +290,15 @@ async def update_charger_firmware(
     user: User = Depends(require_admin())
 ):
     """
-    Trigger firmware update for a single charger (Admin only)
+    Schedule firmware update for a single charger (Admin only)
 
-    Performs safety checks:
-    - Charger must be online (heartbeat within 90 seconds)
+    Creates or updates a firmware_update record with PENDING status.
+    The background service will automatically trigger the update when:
+    - Charger is online (heartbeat within 90 seconds)
     - No active charging session
-    - Version validation (warn if same version)
+    - Charger is not already on the target version
 
-    Sends OCPP UpdateFirmware command immediately.
+    Can be scheduled even when charger is offline - update will trigger when ready.
     """
     # Get charger
     charger = await Charger.get_or_none(id=charger_id).prefetch_related('station')
@@ -294,58 +310,50 @@ async def update_charger_firmware(
     if not firmware_file:
         raise HTTPException(status_code=404, detail="Firmware file not found or inactive")
 
-    # Validate charger can receive update
-    validation_error = await _validate_charger_for_update(charger, firmware_file.version)
-    if validation_error:
-        raise HTTPException(status_code=400, detail=validation_error)
+    # No validation checks here - background service will validate when triggering
+    # This allows scheduling updates for offline chargers
 
     # Generate download URL
     base_url = str(request.base_url).rstrip('/')
     download_url = storage_service.get_firmware_download_url(firmware_file.filename, base_url)
 
-    logger.info(f"📦 Initiating firmware update for charger {charger.charge_point_string_id} to version {firmware_file.version}")
+    logger.info(f"📦 Scheduling firmware update for charger {charger.charge_point_string_id} to version {firmware_file.version}")
     logger.info(f"📦 Download URL: {download_url}")
 
-    # Create FirmwareUpdate record
-    firmware_update = await FirmwareUpdate.create(
-        charger_id=charger.id,
-        firmware_file_id=firmware_file.id,
-        status=FirmwareUpdateStatusEnum.PENDING,
-        initiated_by_id=user.id,
-        download_url=download_url
-    )
-
-    # Send OCPP UpdateFirmware command
+    # UPSERT: Get or create FirmwareUpdate record
+    # If exists for this charger+firmware combo, reset it to PENDING
     from datetime import datetime, timezone
-    retrieve_date = datetime.now(timezone.utc).isoformat()
 
-    payload = {
-        "location": download_url,
-        "retrieve_date": retrieve_date,
-        "retries": 3,
-        "retry_interval": 300  # 5 minutes between retries
-    }
-
-    # Import here to avoid circular import
-    from main import send_ocpp_request
-
-    success, response = await send_ocpp_request(
-        charger.charge_point_string_id,
-        "UpdateFirmware",
-        payload
+    firmware_update = await FirmwareUpdate.get_or_none(
+        charger_id=charger.id,
+        firmware_file_id=firmware_file.id
     )
 
-    if not success:
-        # Update failed - update record
-        firmware_update.status = FirmwareUpdateStatusEnum.DOWNLOAD_FAILED
-        firmware_update.error_message = f"Failed to send OCPP command: {response}"
-        firmware_update.completed_at = datetime.now(timezone.utc)
+    if firmware_update:
+        # Update existing record - reset to PENDING state
+        logger.info(f"📦 Found existing update record (ID: {firmware_update.id}), resetting to PENDING")
+        firmware_update.status = FirmwareUpdateStatusEnum.PENDING
+        firmware_update.initiated_by_id = user.id
+        firmware_update.download_url = download_url
+        firmware_update.started_at = None
+        firmware_update.completed_at = None
+        firmware_update.error_message = None
+        firmware_update.retry_count = 0
         await firmware_update.save()
+    else:
+        # Create new record
+        logger.info(f"📦 Creating new update record for charger+firmware combination")
+        firmware_update = await FirmwareUpdate.create(
+            charger_id=charger.id,
+            firmware_file_id=firmware_file.id,
+            status=FirmwareUpdateStatusEnum.PENDING,
+            initiated_by_id=user.id,
+            download_url=download_url,
+            retry_count=0
+        )
 
-        logger.error(f"📦 ❌ Failed to send UpdateFirmware command: {response}")
-        raise HTTPException(status_code=500, detail=f"Failed to send update command: {response}")
-
-    logger.info(f"📦 ✅ UpdateFirmware command sent successfully to {charger.charge_point_string_id}")
+    logger.info(f"📦 ✅ Firmware update scheduled (will be processed by background service)")
+    logger.info(f"📦 Background service will check if charger is ready and trigger update automatically")
 
     return FirmwareUpdateResponse.from_orm(firmware_update)
 
@@ -357,10 +365,13 @@ async def bulk_update_firmware(
     user: User = Depends(require_admin())
 ):
     """
-    Trigger firmware update for multiple chargers (Admin only)
+    Schedule firmware updates for multiple chargers (Admin only)
 
-    Applies same safety checks as single update for each charger.
-    Returns list of successes and failures.
+    Creates or updates firmware_update records with PENDING status for all chargers.
+    Background service will automatically trigger updates when each charger is ready.
+
+    Can be scheduled even when chargers are offline - updates will trigger when ready.
+    Returns list of successfully scheduled and failed chargers.
     """
     # Get firmware file
     firmware_file = await FirmwareFile.get_or_none(id=bulk_request.firmware_file_id, is_active=True)
@@ -379,67 +390,47 @@ async def bulk_update_firmware(
             })
             continue
 
-        # Validate charger
-        validation_error = await _validate_charger_for_update(charger, firmware_file.version)
-        if validation_error:
-            failed_list.append({
-                "charger_id": charger_id,
-                "charger_name": charger.name,
-                "reason": validation_error
-            })
-            continue
+        # No validation checks - background service will validate when triggering
+        # This allows scheduling updates for offline chargers
 
         # Generate download URL
         base_url = str(request.base_url).rstrip('/')
         download_url = storage_service.get_firmware_download_url(firmware_file.filename, base_url)
 
-        # Create FirmwareUpdate record
-        firmware_update = await FirmwareUpdate.create(
-            charger_id=charger.id,
-            firmware_file_id=firmware_file.id,
-            status=FirmwareUpdateStatusEnum.PENDING,
-            initiated_by_id=user.id,
-            download_url=download_url
-        )
-
-        # Send OCPP UpdateFirmware command
+        # UPSERT: Get or create FirmwareUpdate record
         from datetime import datetime, timezone
-        retrieve_date = datetime.now(timezone.utc).isoformat()
 
-        payload = {
-            "location": download_url,
-            "retrieve_date": retrieve_date,
-            "retries": 3,
-            "retry_interval": 300
-        }
-
-        # Import here to avoid circular import
-        from main import send_ocpp_request
-
-        success, response = await send_ocpp_request(
-            charger.charge_point_string_id,
-            "UpdateFirmware",
-            payload
+        firmware_update = await FirmwareUpdate.get_or_none(
+            charger_id=charger.id,
+            firmware_file_id=firmware_file.id
         )
 
-        if not success:
-            # Update failed
-            firmware_update.status = FirmwareUpdateStatusEnum.DOWNLOAD_FAILED
-            firmware_update.error_message = f"Failed to send OCPP command: {response}"
-            firmware_update.completed_at = datetime.now(timezone.utc)
+        if firmware_update:
+            # Update existing record - reset to PENDING state
+            firmware_update.status = FirmwareUpdateStatusEnum.PENDING
+            firmware_update.initiated_by_id = user.id
+            firmware_update.download_url = download_url
+            firmware_update.started_at = None
+            firmware_update.completed_at = None
+            firmware_update.error_message = None
+            firmware_update.retry_count = 0
             await firmware_update.save()
-
-            failed_list.append({
-                "charger_id": charger_id,
-                "charger_name": charger.name,
-                "reason": f"OCPP command failed: {response}"
-            })
         else:
-            success_list.append({
-                "charger_id": charger_id,
-                "charger_name": charger.name,
-                "update_id": firmware_update.id
-            })
+            # Create new record
+            firmware_update = await FirmwareUpdate.create(
+                charger_id=charger.id,
+                firmware_file_id=firmware_file.id,
+                status=FirmwareUpdateStatusEnum.PENDING,
+                initiated_by_id=user.id,
+                download_url=download_url,
+                retry_count=0
+            )
+
+        success_list.append({
+            "charger_id": charger_id,
+            "charger_name": charger.name,
+            "update_id": firmware_update.id
+        })
 
     logger.info(f"📦 Bulk update completed: {len(success_list)} succeeded, {len(failed_list)} failed")
 
@@ -469,10 +460,16 @@ async def get_firmware_history(
     offset = (page - 1) * limit
 
     total = await FirmwareUpdate.filter(charger_id=charger_id).count()
-    updates = await FirmwareUpdate.filter(charger_id=charger_id).order_by('-initiated_at').offset(offset).limit(limit)
+    updates = await FirmwareUpdate.filter(charger_id=charger_id).prefetch_related('firmware_file').order_by('-initiated_at').offset(offset).limit(limit)
+
+    response_list = []
+    for u in updates:
+        resp = FirmwareUpdateResponse.from_orm(u)
+        resp.firmware_version = u.firmware_file.version if u.firmware_file else None
+        response_list.append(resp)
 
     return FirmwareHistoryResponse(
-        data=[FirmwareUpdateResponse.from_orm(u) for u in updates],
+        data=response_list,
         total=total,
         page=page,
         limit=limit
@@ -539,26 +536,141 @@ async def get_update_status_dashboard(
     )
 
 
+@router.post("/updates/{update_id}/cancel")
+async def cancel_firmware_update(
+    update_id: int,
+    user: User = Depends(require_admin())
+):
+    """
+    Cancel a pending firmware update (Admin only)
+
+    Only updates with PENDING status can be cancelled.
+    Sets status to CANCELLED to preserve audit trail.
+    """
+    update = await FirmwareUpdate.get_or_none(id=update_id)
+    if not update:
+        raise HTTPException(status_code=404, detail="Firmware update not found")
+
+    if update.status != FirmwareUpdateStatusEnum.PENDING:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot cancel update with status '{update.status}'. Only PENDING updates can be cancelled."
+        )
+
+    update.status = FirmwareUpdateStatusEnum.CANCELLED
+    await update.save()
+
+    logger.info(f"Firmware update {update_id} cancelled by user {user.id}")
+
+    return {"message": "Firmware update cancelled successfully", "update_id": update_id}
+
+
 # ============ Public Firmware Discovery Endpoint ============
 
-@public_router.get("/latest", response_model=LatestFirmwareResponse)
-async def get_latest_firmware(request: Request):
+@public_router.get("/latest", response_model=Optional[LatestFirmwareResponse])
+async def get_latest_firmware(
+    request: Request,
+    charger_id: Optional[str] = None,
+    external_charger_id: Optional[str] = None
+):
     """
     Get the latest available firmware for non-OCPP charge points
 
     Public endpoint - no authentication required.
     Returns firmware info for charge points to download and install.
 
+    Three modes:
+    1. With external_charger_id: Returns latest firmware scheduled for charger identified by external ID
+    2. With charger_id: Returns latest firmware scheduled for that specific charger
+       (uses charge_point_string_id, e.g., "DOWNTOWN_PLAZA_STATION_01")
+       Returns most recent firmware_update by initiated_at
+    3. Without any ID: Returns globally latest firmware file
+       (backward compatibility for non-OCPP chargers)
+
     This endpoint is designed for charge points that do not support OCPP
     and need to check for firmware updates programmatically.
     """
-    # Query for latest active firmware
-    latest_firmware = await FirmwareFile.filter(is_active=True).order_by('-created_at').first()
+    latest_firmware = None
 
-    if not latest_firmware:
-        raise HTTPException(
-            status_code=404,
-            detail="No firmware files available"
+    if external_charger_id:
+        # Mode 1: Find charger by external_charger_id
+        logger.info(f"📦 Latest firmware requested for external_charger_id={external_charger_id}")
+
+        charger = await Charger.get_or_none(external_charger_id=external_charger_id)
+        if not charger:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Charger not found with external_charger_id: {external_charger_id}"
+            )
+
+        # Get most recent active firmware_update for this charger
+        # Exclude cancelled/failed updates and soft-deleted firmware files
+        latest_update = await FirmwareUpdate.filter(
+            charger_id=charger.id,
+            status__not_in=[
+                FirmwareUpdateStatusEnum.CANCELLED,
+                FirmwareUpdateStatusEnum.DOWNLOAD_FAILED,
+                FirmwareUpdateStatusEnum.INSTALLATION_FAILED,
+            ],
+            firmware_file__is_active=True,
+        ).prefetch_related('firmware_file').order_by('-initiated_at').first()
+
+        if not latest_update:
+            logger.info(f"📦 No firmware updates found for external_charger_id: {external_charger_id}")
+            return None
+
+        latest_firmware = latest_update.firmware_file
+        logger.info(
+            f"📦 Latest firmware for external_charger_id {external_charger_id}: version={latest_firmware.version}, "
+            f"update_status={latest_update.status}"
+        )
+
+    elif charger_id:
+        # Mode 2: Charger-specific - find charger by charge_point_string_id
+        logger.info(f"📦 Latest firmware requested for charger_id={charger_id}")
+
+        # First, find the charger by its string ID
+        charger = await Charger.get_or_none(charge_point_string_id=charger_id)
+        if not charger:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Charger not found: {charger_id}"
+            )
+
+        # Get most recent active firmware_update for this charger
+        # Exclude cancelled/failed updates and soft-deleted firmware files
+        latest_update = await FirmwareUpdate.filter(
+            charger_id=charger.id,
+            status__not_in=[
+                FirmwareUpdateStatusEnum.CANCELLED,
+                FirmwareUpdateStatusEnum.DOWNLOAD_FAILED,
+                FirmwareUpdateStatusEnum.INSTALLATION_FAILED,
+            ],
+            firmware_file__is_active=True,
+        ).prefetch_related('firmware_file').order_by('-initiated_at').first()
+
+        if not latest_update:
+            logger.info(f"📦 No firmware updates found for charger: {charger_id}")
+            return None
+
+        latest_firmware = latest_update.firmware_file
+        logger.info(
+            f"📦 Latest firmware for charger {charger_id}: version={latest_firmware.version}, "
+            f"update_status={latest_update.status}"
+        )
+    else:
+        # Mode 2: Global - return latest active firmware file (backward compatibility)
+        logger.info("📦 Latest firmware requested (global mode - no charger_id)")
+
+        latest_firmware = await FirmwareFile.filter(is_active=True).order_by('-created_at').first()
+
+        if not latest_firmware:
+            logger.info("📦 No firmware files available (global mode)")
+            return None
+
+        logger.info(
+            f"📦 Latest firmware (global): version={latest_firmware.version}, "
+            f"filename={latest_firmware.filename}"
         )
 
     # Generate download URL
@@ -566,11 +678,6 @@ async def get_latest_firmware(request: Request):
     download_url = storage_service.get_firmware_download_url(
         latest_firmware.filename,
         base_url
-    )
-
-    logger.info(
-        f"📦 Latest firmware requested: version={latest_firmware.version}, "
-        f"filename={latest_firmware.filename}"
     )
 
     return LatestFirmwareResponse(

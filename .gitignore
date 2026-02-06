@@ -2,11 +2,12 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Environment files (keep .env.example)
+# Environment files (keep .env.*.example)
 .env
 .env.local
 .env.production
 .env.staging
+.env.prod
 
 # Virtual environment
 .venv

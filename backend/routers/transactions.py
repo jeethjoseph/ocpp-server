@@ -191,15 +191,12 @@ async def force_stop_transaction(transaction_id: int, request: StopTransactionRe
     if not charger:
         raise HTTPException(status_code=500, detail="Charger not found")
     
-    # Import connection checking function
-    def get_connected_charge_points():
-        from main import connected_charge_points
-        return connected_charge_points
-    
-    connected_cps = get_connected_charge_points()
-    
+    # Check if charger is connected (via Redis - works across all workers)
+    from redis_manager import redis_manager
+    charger_connected = await redis_manager.is_charger_connected(charger.charge_point_string_id)
+
     # Try to send OCPP stop command if charger is connected
-    if charger.charge_point_string_id in connected_cps:
+    if charger_connected:
         from main import send_ocpp_request
         
         success, response = await send_ocpp_request(

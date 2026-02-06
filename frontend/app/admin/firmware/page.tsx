@@ -22,8 +22,9 @@ import {
   useUploadFirmware,
   useDeleteFirmware,
   useUpdateStatus,
+  useCancelUpdate,
 } from "@/lib/queries/firmware";
-import { Upload, Trash2, RefreshCw, AlertCircle, CheckCircle2, Clock, Download, XCircle } from "lucide-react";
+import { Upload, Trash2, RefreshCw, AlertCircle, CheckCircle2, Clock, Download, XCircle, X } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
 
 export default function AdminFirmwarePage() {
@@ -40,6 +41,7 @@ export default function AdminFirmwarePage() {
   // Mutations
   const uploadMutation = useUploadFirmware();
   const deleteMutation = useDeleteFirmware();
+  const cancelMutation = useCancelUpdate();
 
   const firmwareFiles = firmwareData?.data || [];
   const inProgressUpdates = statusData?.in_progress || [];
@@ -65,6 +67,12 @@ export default function AdminFirmwarePage() {
     setShowUploadDialog(false);
   };
 
+  const handleCancelUpdate = async (updateId: number) => {
+    if (confirm("Are you sure you want to cancel this pending update?")) {
+      await cancelMutation.mutateAsync(updateId);
+    }
+  };
+
   const handleDelete = async (firmwareId: number, version: string) => {
     if (confirm(`Are you sure you want to delete firmware version ${version}?`)) {
       await deleteMutation.mutateAsync(firmwareId);
@@ -80,6 +88,7 @@ export default function AdminFirmwarePage() {
       INSTALLED: { variant: "outline", icon: <CheckCircle2 className="h-3 w-3" /> },
       DOWNLOAD_FAILED: { variant: "destructive", icon: <XCircle className="h-3 w-3" /> },
       INSTALLATION_FAILED: { variant: "destructive", icon: <AlertCircle className="h-3 w-3" /> },
+      CANCELLED: { variant: "secondary", icon: <X className="h-3 w-3" /> },
     };
 
     const { variant, icon } = variants[status] || { variant: "secondary" as const, icon: <Clock className="h-3 w-3" /> };
@@ -158,6 +167,7 @@ export default function AdminFirmwarePage() {
                     <TableHead>Version</TableHead>
                     <TableHead>Status</TableHead>
                     <TableHead>Started</TableHead>
+                    <TableHead>Actions</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -175,6 +185,18 @@ export default function AdminFirmwarePage() {
                         {update.started_at
                           ? new Date(update.started_at).toLocaleString()
                           : new Date(update.initiated_at).toLocaleString()}
+                      </TableCell>
+                      <TableCell>
+                        {update.status === "PENDING" && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => handleCancelUpdate(update.update_id)}
+                            disabled={cancelMutation.isPending}
+                          >
+                            <X className="h-4 w-4 text-destructive" />
+                          </Button>
+                        )}
                       </TableCell>
                     </TableRow>
                   ))}
