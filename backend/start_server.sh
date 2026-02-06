@@ -14,7 +14,7 @@ fi
 # Get configuration from environment variables with defaults
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8080}"
-WORKERS="${WORKERS:-2}"
+WORKERS="${WORKERS:-1}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
 UVICORN_PATH="/root/ocpp_server/.venv/bin/uvicorn"
 

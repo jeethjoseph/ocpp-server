@@ -741,24 +741,20 @@ class ChargePoint(OcppChargePoint):
         import json
 
         try:
-            # Route to vendor-specific handlers
-            if vendor_id == "JET_EV1":
-                if message_id == "SignalQuality":
-                    return await self._handle_jet_ev1_signal_quality(data)
-                else:
-                    logger.warning(f"📡 Unknown messageId for JET_EV1: {message_id}")
-                    return call_result.DataTransfer(status="UnknownMessageId")
+            # Route by messageId (vendor-agnostic)
+            if message_id == "SignalQuality":
+                return await self._handle_signal_quality(data)
             else:
-                logger.warning(f"📡 Unknown vendorId: {vendor_id}")
-                return call_result.DataTransfer(status="UnknownVendorId")
+                logger.warning(f"📡 Unhandled DataTransfer from {self.id}: vendorId={vendor_id}, messageId={message_id}")
+                return call_result.DataTransfer(status="UnknownMessageId")
 
         except Exception as e:
             logger.error(f"📡 ❌ Error processing DataTransfer from {self.id}: {e}", exc_info=True)
             return call_result.DataTransfer(status="Rejected")
 
-    async def _handle_jet_ev1_signal_quality(self, data: str):
+    async def _handle_signal_quality(self, data: str):
         """
-        Handle JET_EV1 SignalQuality messages
+        Handle SignalQuality DataTransfer messages (vendor-agnostic)
         Data format: {"rssi":22,"ber":99,"timestamp":"86"}
         """
         from models import Charger, SignalQuality

@@ -123,11 +123,9 @@ router = APIRouter(
 # Import Redis manager for connection status
 from redis_manager import redis_manager
 
-# Import the global connected_charge_points from main.py
-# This is a bit hacky but works for now - in production you'd use a proper state manager
-def get_connected_charge_points():
-    from main import connected_charge_points
-    return connected_charge_points
+async def is_charger_connected(charge_point_string_id: str) -> bool:
+    """Check if a charger is connected via Redis (works across all workers)"""
+    return await redis_manager.is_charger_connected(charge_point_string_id)
 
 async def get_bulk_connection_status(chargers: List[Charger]) -> Dict[str, bool]:
     """Get connection status for multiple chargers efficiently"""
@@ -447,12 +445,10 @@ async def remote_start_charging(charger_id: int, connector_id: int = 1, user: Us
     if charger.latest_status != "Preparing":
         raise HTTPException(status_code=409, detail=f"Cannot start charging. Charger status is {charger.latest_status}, should be Preparing")
     
-    # Get connected charge points
-    connected_cps = get_connected_charge_points()
-    
-    if charger.charge_point_string_id not in connected_cps:
+    # Check if charger is connected (via Redis - works across all workers)
+    if not await is_charger_connected(charger.charge_point_string_id):
         raise HTTPException(status_code=409, detail="Charger is not connected")
-    
+
     # Check if there's already an active transaction
     existing_transaction = await Transaction.filter(
         charger_id=charger_id,
@@ -460,7 +456,10 @@ async def remote_start_charging(charger_id: int, connector_id: int = 1, user: Us
     ).first()
     
     if existing_transaction:
-        raise HTTPException(status_code=409, detail="There is already an active charging session")
+        logger.warning(f"🚫 Blocking remote start: existing transaction id={existing_transaction.id}, "
+                      f"status={existing_transaction.transaction_status}, charger_id={existing_transaction.charger_id}, "
+                      f"created_at={existing_transaction.created_at}")
+        raise HTTPException(status_code=409, detail=f"There is already an active charging session (transaction {existing_transaction.id}, status: {existing_transaction.transaction_status})")
     
     # Import and use the send_ocpp_request function
     from main import send_ocpp_request
@@ -492,15 +491,13 @@ async def remote_stop_charging(charger_id: int, reason: Optional[str] = "Request
     if not charger:
         raise HTTPException(status_code=404, detail="Charger not found")
     
-    # Get connected charge points
-    connected_cps = get_connected_charge_points()
-    
-    if charger.charge_point_string_id not in connected_cps:
+    # Check if charger is connected (via Redis - works across all workers)
+    if not await is_charger_connected(charger.charge_point_string_id):
         raise HTTPException(status_code=409, detail="Charger is not connected")
-    
+
     # Import and use the send_ocpp_request function
     from main import send_ocpp_request
-    
+
     # Get active transaction
     transaction = await Transaction.filter(
         charger_id=charger_id,
@@ -574,10 +571,8 @@ async def change_charger_availability(
 
     current_status = charger.latest_status
 
-    # Get connected charge points
-    connected_cps = get_connected_charge_points()
-
-    if charger.charge_point_string_id not in connected_cps:
+    # Check if charger is connected (via Redis - works across all workers)
+    if not await is_charger_connected(charger.charge_point_string_id):
         raise HTTPException(status_code=409, detail="Charger is not connected")
 
     # Import and use the send_ocpp_request function
@@ -640,10 +635,8 @@ async def reset_charger(
                 detail="Cannot perform Hard reset while charging is active. Please stop the transaction first or use Soft reset."
             )
 
-    # Get connected charge points
-    connected_cps = get_connected_charge_points()
-
-    if charger.charge_point_string_id not in connected_cps:
+    # Check if charger is connected (via Redis - works across all workers)
+    if not await is_charger_connected(charger.charge_point_string_id):
         raise HTTPException(status_code=409, detail="Charger is not connected")
 
     # Import and use the send_ocpp_request function
