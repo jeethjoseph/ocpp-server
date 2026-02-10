@@ -122,6 +122,7 @@ async def get_my_sessions(
                 "type": "charging",
                 "station_name": ct.charger.station.name if ct.charger.station else "Unknown Station",
                 "charger_name": ct.charger.name or f"Charger {ct.charger.id}",
+                "charger_id": ct.charger.charge_point_string_id,
                 "energy_consumed_kwh": ct.energy_consumed_kwh,
                 "start_time": ct.start_time.isoformat() if ct.start_time else None,
                 "end_time": ct.end_time.isoformat() if ct.end_time else None,

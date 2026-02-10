@@ -12,7 +12,7 @@ export const useStatusBar = () => {
         await StatusBar.setOverlaysWebView({ overlay: false });
 
         // Set status bar to default style (dark icons/text on white background)
-        await StatusBar.setStyle({ style: Style.Default });
+        await StatusBar.setStyle({ style: Style.Light });
 
         // Set background color to white to match app header
         await StatusBar.setBackgroundColor({ color: '#ffffff' });

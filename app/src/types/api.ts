@@ -55,6 +55,16 @@ export interface ApiResponse<T = any> {
 }
 
 // Public Stations Types
+export interface StationChargerInfo {
+  charge_point_string_id: string;
+  name: string;
+  latest_status: string;
+  connectors: Array<{
+    connector_type: string;
+    max_power_kw: number | null;
+  }>;
+}
+
 export interface PublicStationResponse {
   id: number;
   name: string;
@@ -70,6 +80,7 @@ export interface PublicStationResponse {
     available_count: number;
     total_count: number;
   }>;
+  chargers: StationChargerInfo[];
   price_per_kwh: number | null;
 }
 

@@ -232,6 +232,12 @@ async def force_stop_transaction(transaction_id: int, request: StopTransactionRe
         except Exception as billing_error:
             billing_message = f"Billing error: {str(billing_error)}"
             logger.error(f"💰 Force stop billing error for transaction {transaction_id}: {billing_error}")
+            try:
+                await Transaction.filter(id=transaction_id).update(
+                    transaction_status="BILLING_FAILED"
+                )
+            except Exception as update_error:
+                logger.error(f"Failed to update transaction status to BILLING_FAILED: {update_error}")
     else:
         billing_message = "No energy consumed - no billing required"
     

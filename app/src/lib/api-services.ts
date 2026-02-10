@@ -116,6 +116,7 @@ export const userSessionService = (api: ApiClient) => ({
         // Charging transaction fields
         station_name?: string;
         charger_name?: string;
+        charger_id?: string;
         energy_consumed_kwh?: number;
         start_time?: string;
         end_time?: string;

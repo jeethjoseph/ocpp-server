@@ -17,7 +17,8 @@ from crud import (
     update_charger_status,
     update_charger_heartbeat
 )
-from models import OCPPLog
+from models import OCPPLog, Transaction, TransactionStatusEnum, MeterValue
+from services.wallet_service import WalletService
 from redis_manager import redis_manager
 
 from ocpp.v16 import ChargePoint as OcppChargePoint
@@ -214,10 +215,57 @@ class ChargePoint(OcppChargePoint):
         except Exception as e:
             logger.error(f"❌ Error updating charger info from BootNotification: {e}")
 
-        # Don't automatically fail transactions on reboot - let StatusNotification handle actual status
-        # The charger will send StatusNotification after boot which will determine if transactions should fail
+        # A BootNotification means the charger rebooted - any prior transaction is dead.
+        # Auto-stop and bill ongoing transactions since the charger lost its session.
+        try:
+            ongoing_transactions = await Transaction.filter(
+                charger__charge_point_string_id=self.id,
+                transaction_status__in=[
+                    TransactionStatusEnum.RUNNING,
+                    TransactionStatusEnum.STARTED,
+                    TransactionStatusEnum.PENDING_START,
+                    TransactionStatusEnum.PENDING_STOP
+                ]
+            ).all()
 
-        # Don't assume status - wait for StatusNotification from charge point
+            if ongoing_transactions:
+                logger.warning(f"⚠️ BootNotification from {self.id} - found {len(ongoing_transactions)} ongoing transactions - stopping and billing")
+
+                for transaction in ongoing_transactions:
+                    if transaction.end_meter_kwh is None:
+                        latest_meter_value = await MeterValue.filter(
+                            transaction_id=transaction.id
+                        ).order_by("-created_at").first()
+
+                        if latest_meter_value:
+                            transaction.end_meter_kwh = latest_meter_value.reading_kwh
+                            transaction.energy_consumed_kwh = transaction.end_meter_kwh - (transaction.start_meter_kwh or 0)
+                            logger.info(f"Calculated energy for transaction {transaction.id}: {transaction.energy_consumed_kwh} kWh")
+                        else:
+                            logger.warning(f"No meter values found for transaction {transaction.id}")
+
+                    transaction.transaction_status = TransactionStatusEnum.STOPPED
+                    transaction.stop_reason = "CHARGER_REBOOT"
+                    transaction.end_time = datetime.datetime.now(datetime.timezone.utc)
+                    await transaction.save()
+                    logger.info(f"🛑 Stopped transaction {transaction.id} due to charger reboot")
+
+                    if transaction.energy_consumed_kwh is not None and transaction.energy_consumed_kwh > 0:
+                        try:
+                            success, message, billing_amount = await WalletService.process_transaction_billing(transaction.id)
+                            if success:
+                                logger.info(f"💰 Billed transaction {transaction.id} after reboot: ₹{billing_amount}")
+                            else:
+                                logger.warning(f"💰 Billing failed for transaction {transaction.id}: {message}")
+                        except Exception as billing_error:
+                            logger.error(f"💰 Billing error for transaction {transaction.id}: {billing_error}", exc_info=True)
+                            await Transaction.filter(id=transaction.id).update(
+                                transaction_status=TransactionStatusEnum.BILLING_FAILED
+                            )
+                    else:
+                        logger.info(f"💰 No energy consumed for transaction {transaction.id} - skipping billing")
+        except Exception as e:
+            logger.error(f"Error stopping transactions on BootNotification for {self.id}: {e}", exc_info=True)
 
         return call_result.BootNotification(
             current_time=datetime.datetime.utcnow().isoformat() + "Z",
@@ -1200,34 +1248,33 @@ async def cleanup_dead_connection(charge_point_id: str):
     await force_disconnect(charge_point_id, "Dead connection detected")
 
 async def heartbeat_monitor(charge_point_id: str, websocket: WebSocket):
-    """Monitor OCPP Heartbeat message to check device liveness."""
-    HEARTBEAT_TIMEOUT = 90  # seconds - disconnect if no heartbeat for 90 seconds
+    """Monitor OCPP activity to check device liveness. Tracks any incoming OCPP message, not just Heartbeat."""
+    OCPP_TIMEOUT = 120  # seconds - disconnect if no OCPP message received for 120 seconds
 
     try:
         while True:
             await asyncio.sleep(15)  # Check every 15 seconds
             try:
                 now = datetime.datetime.now(datetime.timezone.utc)
-                last_heartbeat = None
+                last_activity = None
                 if charge_point_id in connected_charge_points:
-                    last_heartbeat = connected_charge_points[charge_point_id].get("last_heartbeat")
-                if last_heartbeat is None:
-                    # No heartbeat received yet, use last_seen or connected_at
-                    last_heartbeat = connected_charge_points[charge_point_id].get("last_seen") or connected_charge_points[charge_point_id].get("connected_at")
-                if last_heartbeat is None or (now - last_heartbeat).total_seconds() > HEARTBEAT_TIMEOUT:
-                    logger.warning(f"No OCPP Heartbeat from {charge_point_id} in {HEARTBEAT_TIMEOUT} seconds. Cleaning up.")
+                    # Use last_seen which is updated on ANY incoming OCPP message
+                    last_activity = connected_charge_points[charge_point_id].get("last_seen") or connected_charge_points[charge_point_id].get("connected_at")
+                if last_activity is None or (now - last_activity).total_seconds() > OCPP_TIMEOUT:
+                    idle_seconds = (now - last_activity).total_seconds() if last_activity else OCPP_TIMEOUT
+                    logger.warning(f"No OCPP messages received from {charge_point_id} for {idle_seconds:.0f}s. Cleaning up.")
 
                     # Record heartbeat timeout
                     await OCPPMetrics.record_heartbeat_timeout(charge_point_id)
                     SentryHelper.add_breadcrumb(
                         category="ocpp.heartbeat",
-                        message=f"Heartbeat timeout for {charge_point_id}",
+                        message=f"OCPP activity timeout for {charge_point_id}",
                         level="warning"
                     )
 
-                    await force_disconnect(charge_point_id, f"Heartbeat timeout ({HEARTBEAT_TIMEOUT}s)")
+                    await force_disconnect(charge_point_id, f"OCPP activity timeout ({OCPP_TIMEOUT}s)")
                     break
-                logger.info(f"Heartbeat monitor: {charge_point_id} last heartbeat {(now - last_heartbeat).total_seconds():.1f}s ago")
+                logger.info(f"Heartbeat monitor: {charge_point_id} last OCPP message {(now - last_activity).total_seconds():.1f}s ago")
             except Exception as e:
                 logger.warning(f"Heartbeat monitor error for {charge_point_id}: {e}")
                 await force_disconnect(charge_point_id, f"Heartbeat monitor error: {e}")
@@ -1249,8 +1296,8 @@ async def periodic_cleanup():
             stale_connections = []
             most_recent_times = {}  # Store per-connection most_recent for proper reason message
             
-            # Find connections that haven't been seen for more than 5 minutes (300 seconds)
-            # This should be longer than heartbeat timeout (90s) to avoid false positives
+            # Find connections that haven't been seen for more than 120 seconds
+            # Consistent with OCPP activity timeout
             for charge_point_id, connection_data in connected_charge_points.items():
                 last_seen = connection_data.get("last_seen")
                 last_heartbeat = connection_data.get("last_heartbeat")
@@ -1262,8 +1309,8 @@ async def periodic_cleanup():
                 )
                 most_recent_times[charge_point_id] = most_recent
                 
-                # Only mark as stale if no activity for 90 seconds (consistent with heartbeat timeout)
-                if (current_time - most_recent).total_seconds() > 90:
+                # Only mark as stale if no activity for 120 seconds (consistent with OCPP activity timeout)
+                if (current_time - most_recent).total_seconds() > 120:
 
                     stale_connections.append(charge_point_id)
                     logger.warning(f"Connection {charge_point_id} stale: last activity {(current_time - most_recent).total_seconds():.1f}s ago")

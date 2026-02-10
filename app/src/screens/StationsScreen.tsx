@@ -1,8 +1,9 @@
 import { useQuery } from '@tanstack/react-query';
 import { useApi } from '../lib/api-client';
 import { publicStationService } from '../lib/api-services';
-import { MapPin, Navigation, Zap, Loader2, Info, AlertCircle } from 'lucide-react';
+import { MapPin, Navigation, Zap, Loader2, Info, AlertCircle, ChevronRight } from 'lucide-react';
 import { useEffect, useState, useRef, useMemo } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Geolocation } from '@capacitor/geolocation';
 import { MapContainer, TileLayer, Marker, Popup, useMap } from 'react-leaflet';
 import L from 'leaflet';
@@ -84,8 +85,18 @@ function MapController({ center }: { center: [number, number] }) {
 // Station with distance
 type StationWithDistance = PublicStationResponse & { distance: number | null };
 
+const getStatusColor = (status: string) => {
+  switch (status) {
+    case 'Available': return 'bg-green-100 text-green-800';
+    case 'Preparing': return 'bg-yellow-100 text-yellow-800';
+    case 'Charging': return 'bg-blue-100 text-blue-800';
+    default: return 'bg-gray-100 text-gray-800';
+  }
+};
+
 export const StationsScreen = () => {
   const api = useApi();
+  const navigate = useNavigate();
   const [selectedStation, setSelectedStation] = useState<StationWithDistance | null>(null);
   const mapRef = useRef<L.Map | null>(null);
 
@@ -413,6 +424,39 @@ export const StationsScreen = () => {
                           {connector.available_count}/{connector.total_count} available
                         </span>
                       </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Individual Chargers */}
+              {selectedStation.chargers && selectedStation.chargers.length > 0 && (
+                <div>
+                  <h4 className="font-semibold text-gray-900 mb-3 flex items-center space-x-2">
+                    <Zap className="w-4 h-4" />
+                    <span>Chargers</span>
+                  </h4>
+                  <div className="space-y-2">
+                    {selectedStation.chargers.map((charger) => (
+                        <button
+                          key={charger.charge_point_string_id}
+                          onClick={() => navigate(`/charge/${charger.charge_point_string_id}`)}
+                          className="w-full flex items-center justify-between rounded-lg p-3 text-left transition-colors bg-gray-50 hover:bg-gray-100"
+                        >
+                          <div>
+                            <p className="font-medium text-gray-900">{charger.name}</p>
+                            <p className="text-xs text-gray-500">
+                              {charger.connectors.map(c => c.connector_type).join(', ')}
+                              {charger.connectors[0]?.max_power_kw && ` · ${charger.connectors[0].max_power_kw} kW`}
+                            </p>
+                          </div>
+                          <div className="flex items-center space-x-2">
+                            <span className={`px-2 py-1 rounded text-xs font-medium ${getStatusColor(charger.latest_status)}`}>
+                              {charger.latest_status}
+                            </span>
+                            <ChevronRight className="w-4 h-4 text-gray-400" />
+                          </div>
+                        </button>
                     ))}
                   </div>
                 </div>

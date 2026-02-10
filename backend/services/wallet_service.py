@@ -2,7 +2,7 @@
 import asyncio
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, Tuple
-from tortoise.transactions import atomic
+from tortoise.transactions import atomic, in_transaction
 import logging
 
 from models import (
@@ -110,27 +110,28 @@ class WalletService:
             # Get current balance (allowing None)
             current_balance = wallet.balance or Decimal('0.00')
             new_balance = current_balance - billing_amount
-            
+
             logger.info(f"Wallet billing: ₹{current_balance} - ₹{billing_amount} = ₹{new_balance}")
-            
-            # Update wallet balance (allowing negative)
-            await Wallet.filter(id=wallet.id).update(balance=new_balance)
-            
-            # Create wallet transaction record
-            wallet_transaction = await WalletTransaction.create(
-                wallet=wallet,
-                amount=-billing_amount,  # Negative for deduction
-                type=TransactionTypeEnum.CHARGE_DEDUCT,
-                description=f"Charging session - {transaction.energy_consumed_kwh:.2f} kWh @ ₹{tariff_rate}/kWh",
-                charging_transaction=transaction,
-                payment_metadata={
-                    "energy_consumed_kwh": transaction.energy_consumed_kwh,
-                    "rate_per_kwh": float(tariff_rate),
-                    "calculated_amount": float(billing_amount),
-                    "previous_balance": float(current_balance),
-                    "new_balance": float(new_balance)
-                }
-            )
+
+            # Wallet deduction + record creation in a savepoint so both
+            # roll back together if either fails (prevents partial charge)
+            async with in_transaction():
+                await Wallet.filter(id=wallet.id).update(balance=new_balance)
+
+                wallet_transaction = await WalletTransaction.create(
+                    wallet=wallet,
+                    amount=-billing_amount,  # Negative for deduction
+                    type=TransactionTypeEnum.CHARGE_DEDUCT,
+                    description=f"Charging session - {transaction.energy_consumed_kwh:.2f} kWh @ ₹{tariff_rate}/kWh",
+                    charging_transaction=transaction,
+                    payment_metadata={
+                        "energy_consumed_kwh": transaction.energy_consumed_kwh,
+                        "rate_per_kwh": float(tariff_rate),
+                        "calculated_amount": float(billing_amount),
+                        "previous_balance": float(current_balance),
+                        "new_balance": float(new_balance)
+                    }
+                )
 
             # Record billing success metrics
             MetricsCollector.record_metric("Custom/Billing/Amount", float(billing_amount))
@@ -138,7 +139,7 @@ class WalletService:
 
             logger.info(f"✅ Successfully billed transaction {transaction_id}: ₹{billing_amount}")
             return True, f"Successfully billed ₹{billing_amount}", billing_amount
-                
+
         except Exception as e:
             logger.error(f"❌ Error processing billing for transaction {transaction_id}: {e}", exc_info=True)
 

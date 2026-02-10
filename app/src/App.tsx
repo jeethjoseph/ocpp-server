@@ -28,7 +28,7 @@ const queryClient = new QueryClient({
         // Exponential backoff: 1s, 2s, 4s, 8s, max 30s
         return Math.min(1000 * 2 ** attemptIndex, 30000);
       },
-      staleTime: 5 * 60 * 1000, // 5 minutes
+      staleTime: 60 * 1000, // 1 minute
       refetchOnWindowFocus: false,
       refetchOnReconnect: true, // Refetch when network reconnects
       networkMode: 'online', // Only fetch when online
