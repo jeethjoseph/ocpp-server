@@ -82,10 +82,10 @@ async def list_public_stations(current_user: User = Depends(require_user())):
             if not is_connected_redis:
                 continue
 
-            # Check heartbeat timeout (90 seconds)
+            # Check heartbeat timeout (120 seconds, consistent with OCPP activity timeout in main.py)
             if charger.last_heart_beat_time:
                 time_diff = current_time - charger.last_heart_beat_time.replace(tzinfo=timezone.utc)
-                if time_diff.total_seconds() > 90:
+                if time_diff.total_seconds() > 120:
                     continue
             else:
                 continue

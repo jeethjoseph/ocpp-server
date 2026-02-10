@@ -29,7 +29,7 @@ const queryClient = new QueryClient({
         return Math.min(1000 * 2 ** attemptIndex, 30000);
       },
       staleTime: 60 * 1000, // 1 minute
-      refetchOnWindowFocus: false,
+      refetchOnWindowFocus: true,
       refetchOnReconnect: true, // Refetch when network reconnects
       networkMode: 'online', // Only fetch when online
     },

@@ -145,6 +145,24 @@ export const userSessionService = (api: ApiClient) => ({
    */
   getMyWallet: () =>
     api.get<UserWallet>(`/api/users/my-wallet`),
+
+  /**
+   * Get user's active charging session(s)
+   * Lightweight endpoint for HomeScreen polling
+   */
+  getActiveSession: () =>
+    api.get<{
+      data: Array<{
+        id: number;
+        charger_name: string;
+        station_name: string;
+        charger_id: string;
+        status: string;
+        start_time: string | null;
+        energy_consumed_kwh: number | null;
+      }>;
+      count: number;
+    }>(`/api/users/active-session`),
 });
 
 /**

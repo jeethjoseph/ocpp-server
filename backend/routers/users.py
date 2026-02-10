@@ -4,7 +4,7 @@ from tortoise.exceptions import DoesNotExist
 from decimal import Decimal
 
 from auth_middleware import require_admin, require_user_or_admin, require_user
-from models import User, Transaction, WalletTransaction, Wallet, UserRoleEnum
+from models import User, Transaction, WalletTransaction, Wallet, UserRoleEnum, TransactionStatusEnum
 from schemas import BaseModel
 import logging
 
@@ -78,6 +78,45 @@ async def get_my_wallet(
     except Exception as e:
         logger.error(f"Error getting wallet for user {current_user.id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve wallet balance")
+
+@router.get("/active-session", response_model=dict)
+async def get_active_session(
+    current_user: User = Depends(require_user())
+):
+    """Get current user's active charging session(s), if any.
+
+    Lightweight endpoint for HomeScreen polling. Returns only active
+    sessions (RUNNING, STARTED, PENDING_START) with minimal fields.
+
+    Note: This route must appear before dynamic '/{user_id}' routes to avoid
+    path-matching conflicts that could incorrectly enforce ADMIN access.
+    """
+    try:
+        active_transactions = await Transaction.filter(
+            user=current_user,
+            transaction_status__in=[
+                TransactionStatusEnum.RUNNING.value,
+                TransactionStatusEnum.STARTED.value,
+                TransactionStatusEnum.PENDING_START.value,
+            ]
+        ).prefetch_related('charger__station').order_by('-created_at')
+
+        sessions = []
+        for t in active_transactions:
+            sessions.append({
+                "id": t.id,
+                "charger_name": t.charger.name or f"Charger {t.charger.id}",
+                "station_name": t.charger.station.name if t.charger.station else "Unknown Station",
+                "charger_id": t.charger.charge_point_string_id,
+                "status": t.transaction_status.value,
+                "start_time": t.start_time.isoformat() if t.start_time else None,
+                "energy_consumed_kwh": t.energy_consumed_kwh,
+            })
+
+        return {"data": sessions, "count": len(sessions)}
+    except Exception as e:
+        logger.error(f"Error getting active session for user {current_user.id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve active session")
 
 @router.get("/my-sessions", response_model=dict)
 async def get_my_sessions(

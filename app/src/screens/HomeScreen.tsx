@@ -12,17 +12,17 @@ export const HomeScreen = () => {
   const navigate = useNavigate();
   const api = useApi();
 
-  // Fetch sessions for active session detection
-  const { data: sessionsData } = useQuery({
-    queryKey: ['my-sessions'],
-    queryFn: () => userSessionService(api).getMySessions(1, 100),
+  // Fetch active session only (lightweight endpoint)
+  const { data: activeSessionData } = useQuery({
+    queryKey: ['active-session'],
+    queryFn: () => userSessionService(api).getActiveSession(),
     staleTime: 10 * 1000,
-    refetchInterval: 5000,
+    refetchInterval: (query) => {
+      return (query.state.data?.count ?? 0) > 0 ? 5000 : false;
+    },
   });
 
-  const activeSessions = sessionsData?.data?.filter(
-    (t) => t.type === 'charging' && ['RUNNING', 'STARTED', 'PENDING_START'].includes(t.status || '')
-  ) || [];
+  const activeSessions = activeSessionData?.data ?? [];
 
   // Live timer for active sessions
   const [now, setNow] = useState(Date.now());

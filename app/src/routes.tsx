@@ -27,11 +27,11 @@ export const AppRoutes = () => {
         staleTime: 2 * 60 * 1000,
       });
 
-      // Prefetch user sessions and wallet
+      // Prefetch active session and wallet
       queryClient.prefetchQuery({
-        queryKey: ['my-sessions'],
-        queryFn: () => userSessionService(api).getMySessions(1, 100),
-        staleTime: 30 * 1000,
+        queryKey: ['active-session'],
+        queryFn: () => userSessionService(api).getActiveSession(),
+        staleTime: 10 * 1000,
       });
 
       queryClient.prefetchQuery({

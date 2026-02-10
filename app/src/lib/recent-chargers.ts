@@ -19,7 +19,8 @@ export const recentChargersStorage = {
       return parsed.sort(
         (a, b) => new Date(b.last_used).getTime() - new Date(a.last_used).getTime()
       );
-    } catch {
+    } catch (e) {
+      console.error('Failed to read recent chargers:', e);
       return [];
     }
   },
@@ -35,16 +36,16 @@ export const recentChargersStorage = {
         ...filtered,
       ].slice(0, MAX_RECENT_CHARGERS);
       await Preferences.set({ key: STORAGE_KEY, value: JSON.stringify(updated) });
-    } catch {
-      // Silently fail
+    } catch (e) {
+      console.error('Failed to save recent charger:', e);
     }
   },
 
   async clear(): Promise<void> {
     try {
       await Preferences.remove({ key: STORAGE_KEY });
-    } catch {
-      // Silently fail
+    } catch (e) {
+      console.error('Failed to clear recent chargers:', e);
     }
   },
 };
