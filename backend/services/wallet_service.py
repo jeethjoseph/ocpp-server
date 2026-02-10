@@ -2,7 +2,7 @@
 import asyncio
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, Tuple
-from tortoise.transactions import atomic
+from tortoise.transactions import atomic, in_transaction
 import logging
 
 from models import (
@@ -76,6 +76,16 @@ class WalletService:
             if not transaction:
                 return False, f"Transaction {transaction_id} not found", None
             
+            # Idempotency guard: skip if already billed (prevents double billing
+            # when BootNotification and StopTransaction both trigger billing)
+            existing_charge = await WalletTransaction.filter(
+                charging_transaction_id=transaction_id,
+                type=TransactionTypeEnum.CHARGE_DEDUCT
+            ).first()
+            if existing_charge:
+                logger.info(f"Transaction {transaction_id} already billed (wallet_txn={existing_charge.id}), skipping")
+                return True, f"Already billed ₹{abs(existing_charge.amount)}", abs(existing_charge.amount)
+
             # Validate transaction state
             if not transaction.energy_consumed_kwh or transaction.energy_consumed_kwh <= 0:
                 logger.info(f"Transaction {transaction_id} has no energy consumption, skipping billing")
@@ -110,27 +120,35 @@ class WalletService:
             # Get current balance (allowing None)
             current_balance = wallet.balance or Decimal('0.00')
             new_balance = current_balance - billing_amount
-            
+
             logger.info(f"Wallet billing: ₹{current_balance} - ₹{billing_amount} = ₹{new_balance}")
-            
-            # Update wallet balance (allowing negative)
-            await Wallet.filter(id=wallet.id).update(balance=new_balance)
-            
-            # Create wallet transaction record
-            wallet_transaction = await WalletTransaction.create(
-                wallet=wallet,
-                amount=-billing_amount,  # Negative for deduction
-                type=TransactionTypeEnum.CHARGE_DEDUCT,
-                description=f"Charging session - {transaction.energy_consumed_kwh:.2f} kWh @ ₹{tariff_rate}/kWh",
-                charging_transaction=transaction,
-                payment_metadata={
-                    "energy_consumed_kwh": transaction.energy_consumed_kwh,
-                    "rate_per_kwh": float(tariff_rate),
-                    "calculated_amount": float(billing_amount),
-                    "previous_balance": float(current_balance),
-                    "new_balance": float(new_balance)
-                }
-            )
+
+            # TECHNICAL DEBT: This in_transaction() savepoint looks redundant with the
+            # outer @atomic(), but it's necessary. The try/except on line ~143 catches all
+            # exceptions and returns a (False, msg, None) tuple instead of re-raising.
+            # This means @atomic() always sees a normal return and always commits.
+            # Without this savepoint, if WalletTransaction.create fails but Wallet.update
+            # succeeds, the balance is deducted with no record — money vanishes.
+            # The proper fix: remove the try/except, let exceptions propagate so @atomic()
+            # can roll back naturally, and move error handling to callers. This requires
+            # updating every call site (BootNotification, StopTransaction, admin endpoints).
+            async with in_transaction():
+                await Wallet.filter(id=wallet.id).update(balance=new_balance)
+
+                await WalletTransaction.create(
+                    wallet=wallet,
+                    amount=-billing_amount,  # Negative for deduction
+                    type=TransactionTypeEnum.CHARGE_DEDUCT,
+                    description=f"Charging session - {transaction.energy_consumed_kwh:.2f} kWh @ ₹{tariff_rate}/kWh",
+                    charging_transaction=transaction,
+                    payment_metadata={
+                        "energy_consumed_kwh": transaction.energy_consumed_kwh,
+                        "rate_per_kwh": float(tariff_rate),
+                        "calculated_amount": float(billing_amount),
+                        "previous_balance": float(current_balance),
+                        "new_balance": float(new_balance)
+                    }
+                )
 
             # Record billing success metrics
             MetricsCollector.record_metric("Custom/Billing/Amount", float(billing_amount))
@@ -138,7 +156,7 @@ class WalletService:
 
             logger.info(f"✅ Successfully billed transaction {transaction_id}: ₹{billing_amount}")
             return True, f"Successfully billed ₹{billing_amount}", billing_amount
-                
+
         except Exception as e:
             logger.error(f"❌ Error processing billing for transaction {transaction_id}: {e}", exc_info=True)
 

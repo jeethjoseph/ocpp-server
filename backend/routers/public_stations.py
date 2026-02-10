@@ -1,7 +1,7 @@
 # routers/public_stations.py
 from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, HTTPException, Query, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime
 from enum import Enum
 
@@ -17,6 +17,16 @@ class ConnectorInfo(BaseModel):
     available_count: int
     total_count: int
 
+class ChargerConnectorInfo(BaseModel):
+    connector_type: str
+    max_power_kw: Optional[float]
+
+class StationChargerInfo(BaseModel):
+    charge_point_string_id: str
+    name: str
+    latest_status: str
+    connectors: List[ChargerConnectorInfo]
+
 class PublicStationResponse(BaseModel):
     id: int
     name: str
@@ -27,8 +37,9 @@ class PublicStationResponse(BaseModel):
     total_chargers: int
     connector_types: List[str]
     connector_details: List[ConnectorInfo]
+    chargers: List[StationChargerInfo] = Field(default_factory=list)
     price_per_kwh: Optional[float]
-    
+
     class Config:
         from_attributes = True
 
@@ -71,10 +82,10 @@ async def list_public_stations(current_user: User = Depends(require_user())):
             if not is_connected_redis:
                 continue
 
-            # Check heartbeat timeout (90 seconds)
+            # Check heartbeat timeout (120 seconds, consistent with OCPP activity timeout in main.py)
             if charger.last_heart_beat_time:
                 time_diff = current_time - charger.last_heart_beat_time.replace(tzinfo=timezone.utc)
-                if time_diff.total_seconds() > 90:
+                if time_diff.total_seconds() > 120:
                     continue
             else:
                 continue
@@ -149,6 +160,23 @@ async def list_public_stations(current_user: User = Depends(require_user())):
                 if global_tariff:
                     price_per_kwh = float(global_tariff.rate_per_kwh)
         
+        # Build individual charger info
+        charger_info_list = []
+        for charger in real_chargers:
+            charger_connectors = [
+                ChargerConnectorInfo(
+                    connector_type=conn.connector_type,
+                    max_power_kw=conn.max_power_kw
+                )
+                for conn in charger.connectors
+            ]
+            charger_info_list.append(StationChargerInfo(
+                charge_point_string_id=charger.charge_point_string_id,
+                name=charger.name or f"Charger {charger.id}",
+                latest_status=charger.latest_status.value,
+                connectors=charger_connectors
+            ))
+
         station_response = PublicStationResponse(
             id=station.id,
             name=station.name or f"Station {station.id}",
@@ -159,11 +187,12 @@ async def list_public_stations(current_user: User = Depends(require_user())):
             total_chargers=total_chargers,
             connector_types=sorted(list(all_connector_types)),
             connector_details=sorted(connector_details, key=lambda x: x.connector_type),
+            chargers=charger_info_list,
             price_per_kwh=price_per_kwh
         )
-        
+
         station_responses.append(station_response)
-    
+
     return PublicStationsListResponse(
         data=station_responses,
         total=len(station_responses)
@@ -197,10 +226,10 @@ async def get_public_station_details(station_id: int, current_user: User = Depen
         if not is_connected_redis:
             continue
 
-        # Check heartbeat timeout (90 seconds)
+        # Check heartbeat timeout (120 seconds, consistent with OCPP activity timeout in main.py)
         if charger.last_heart_beat_time:
             time_diff = current_time - charger.last_heart_beat_time.replace(tzinfo=timezone.utc)
-            if time_diff.total_seconds() > 90:
+            if time_diff.total_seconds() > 120:
                 continue
         else:
             continue
@@ -269,6 +298,23 @@ async def get_public_station_details(station_id: int, current_user: User = Depen
             if global_tariff:
                 price_per_kwh = float(global_tariff.rate_per_kwh)
     
+    # Build individual charger info
+    charger_info_list = []
+    for charger in real_chargers:
+        charger_connectors = [
+            ChargerConnectorInfo(
+                connector_type=conn.connector_type,
+                max_power_kw=conn.max_power_kw
+            )
+            for conn in charger.connectors
+        ]
+        charger_info_list.append(StationChargerInfo(
+            charge_point_string_id=charger.charge_point_string_id,
+            name=charger.name or f"Charger {charger.id}",
+            latest_status=charger.latest_status.value,
+            connectors=charger_connectors
+        ))
+
     return PublicStationResponse(
         id=station.id,
         name=station.name or f"Station {station.id}",
@@ -279,5 +325,6 @@ async def get_public_station_details(station_id: int, current_user: User = Depen
         total_chargers=total_chargers,
         connector_types=sorted(list(all_connector_types)),
         connector_details=sorted(connector_details, key=lambda x: x.connector_type),
+        chargers=charger_info_list,
         price_per_kwh=price_per_kwh
     )

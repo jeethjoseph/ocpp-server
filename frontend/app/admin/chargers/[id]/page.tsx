@@ -5,7 +5,8 @@ import { useEffect, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Zap, Play, Square, Activity, Clock, MapPin, X, CreditCard, Download, Signal, AlertTriangle } from "lucide-react";
+import { Zap, Play, Square, Activity, Clock, MapPin, X, CreditCard, Download, Signal, AlertTriangle, QrCode, Printer } from "lucide-react";
+import { QRCodeSVG, QRCodeCanvas } from "qrcode.react";
 import { AdminOnly } from "@/components/RoleWrapper";
 import { toast } from "sonner";
 import ChargerLogs from "@/components/ChargerLogs";
@@ -59,6 +60,9 @@ export default function ChargerDetailPage() {
   // Firmware update dialog state
   const [showFirmwareDialog, setShowFirmwareDialog] = useState(false);
   const [selectedFirmwareId, setSelectedFirmwareId] = useState<string>("");
+
+  // QR code dialog state
+  const [showQrDialog, setShowQrDialog] = useState(false);
 
   // Reset dialog state
   const [showResetDialog, setShowResetDialog] = useState(false);
@@ -250,6 +254,18 @@ export default function ChargerDetailPage() {
   const isActionLoading =
     remoteStartMutation.isPending || remoteStopMutation.isPending;
 
+  const qrUrl = `${process.env.NEXT_PUBLIC_APP_URL || "https://www.powerlync.com"}/charge/${charger?.charge_point_string_id}`;
+
+  const handleDownloadQr = () => {
+    const canvas = document.getElementById("qr-canvas") as HTMLCanvasElement | null;
+    if (!canvas) return;
+    const url = canvas.toDataURL("image/png");
+    const link = document.createElement("a");
+    link.download = `qr-${charger?.charge_point_string_id || "charger"}.png`;
+    link.href = url;
+    link.click();
+  };
+
   if (chargerLoading) {
     return (
       <AdminOnly>
@@ -281,7 +297,18 @@ export default function ChargerDetailPage() {
         {/* Header */}
         <div className="flex justify-between items-start">
           <div>
-            <h1 className="text-3xl font-bold">{charger.name}</h1>
+            <div className="flex items-center gap-3">
+              <h1 className="text-3xl font-bold">{charger.name}</h1>
+              <Button
+                variant="outline"
+                size="icon"
+                onClick={() => setShowQrDialog(true)}
+                title="Generate QR Code"
+                aria-label="Generate QR Code"
+              >
+                <QrCode className="h-5 w-5" />
+              </Button>
+            </div>
             <p className="text-muted-foreground">
               ID: {charger.charge_point_string_id}
             </p>
@@ -639,6 +666,55 @@ export default function ChargerDetailPage() {
                 disabled={resetMutation.isPending || (resetType === 'Hard' && !!currentTransactionId)}
               >
                 {resetMutation.isPending ? "Sending..." : `Send ${resetType} Reset`}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        {/* QR Code Dialog */}
+        <Dialog open={showQrDialog} onOpenChange={setShowQrDialog}>
+          <DialogContent className="sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle>QR Code</DialogTitle>
+              <DialogDescription>
+                Print or download this QR code to place on the charger.
+              </DialogDescription>
+            </DialogHeader>
+
+            <div id="qr-print-area" className="flex flex-col items-center gap-4 py-4">
+              <QRCodeSVG
+                value={qrUrl}
+                size={256}
+                level="H"
+                includeMargin
+              />
+              <div className="text-center space-y-1">
+                <p className="font-semibold">{charger.name}</p>
+                {station && (
+                  <p className="text-sm text-muted-foreground">{station.name}</p>
+                )}
+                <p className="text-xs text-muted-foreground break-all">{qrUrl}</p>
+              </div>
+              {/* Hidden canvas for PNG download */}
+              <div className="hidden">
+                <QRCodeCanvas
+                  id="qr-canvas"
+                  value={qrUrl}
+                  size={1024}
+                  level="H"
+                  includeMargin
+                />
+              </div>
+            </div>
+
+            <DialogFooter className="flex gap-2 sm:gap-0">
+              <Button variant="outline" onClick={() => window.print()}>
+                <Printer className="h-4 w-4 mr-2" />
+                Print
+              </Button>
+              <Button onClick={handleDownloadQr}>
+                <Download className="h-4 w-4 mr-2" />
+                Download PNG
               </Button>
             </DialogFooter>
           </DialogContent>

@@ -1,7 +1,8 @@
 import { useParams, useNavigate } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useApi } from '../lib/api-client';
 import { chargerService, transactionService } from '../lib/api-services';
+import { recentChargersStorage } from '../lib/recent-chargers';
 import { Battery, Zap, Clock, IndianRupee, Power, AlertCircle, Loader2, ArrowLeft, X } from 'lucide-react';
 import { useState, useEffect } from 'react';
 import { useUser } from '@clerk/clerk-react';
@@ -10,6 +11,7 @@ export const ChargeScreen = () => {
   const { chargerId } = useParams<{ chargerId: string }>();
   const navigate = useNavigate();
   const api = useApi();
+  const queryClient = useQueryClient();
   const { user } = useUser();
   const [isStarting, setIsStarting] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
@@ -44,6 +46,17 @@ export const ChargeScreen = () => {
     }
   }, [currentTransactionId]);
 
+  // Save charger to recent chargers when data loads
+  useEffect(() => {
+    if (chargerData?.charger && chargerData?.station) {
+      recentChargersStorage.add({
+        charge_point_string_id: chargerData.charger.charge_point_string_id,
+        charger_name: chargerData.charger.name,
+        station_name: chargerData.station.name,
+      });
+    }
+  }, [chargerData?.charger?.charge_point_string_id]);
+
   const { data: transactionData, refetch: refetchTransaction } = useQuery({
     queryKey: ['transaction', transactionIdToShow],
     queryFn: () => transactionService(api).getUserTransaction(transactionIdToShow!),
@@ -60,6 +73,14 @@ export const ChargeScreen = () => {
     staleTime: 1000 * 2, // 2 seconds
     refetchInterval: isCharging ? 2000 : false, // Poll every 2s while charging
   });
+
+  // Live timer tick every second while charging
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (!isCharging) return;
+    const interval = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(interval);
+  }, [isCharging]);
 
   // Clear transaction handler
   const clearTransaction = () => {
@@ -83,6 +104,7 @@ export const ChargeScreen = () => {
       // Wait a bit and refresh to show updated status
       setTimeout(() => {
         refetchCharger();
+        queryClient.invalidateQueries({ queryKey: ['active-session'] });
         setIsStarting(false);
       }, 2000);
     } catch (err: any) {
@@ -105,6 +127,8 @@ export const ChargeScreen = () => {
       setTimeout(() => {
         refetchCharger();
         refetchTransaction();
+        queryClient.invalidateQueries({ queryKey: ['active-session'] });
+        queryClient.invalidateQueries({ queryKey: ['my-sessions'] });
         setIsStopping(false);
       }, 2000);
     } catch (err: any) {
@@ -168,9 +192,9 @@ export const ChargeScreen = () => {
   const getTransactionStatus = () => transaction?.transaction_status || 'Unknown';
   const getEnergyConsumed = () => transaction?.energy_consumed_kwh;
 
-  // Calculate session duration
+  // Calculate session duration using live timer
   const sessionDuration = transaction?.start_time
-    ? Math.floor((Date.now() - new Date(transaction.start_time).getTime()) / 1000)
+    ? Math.floor((now - new Date(transaction.start_time).getTime()) / 1000)
     : 0;
 
   const formatDuration = (seconds: number) => {
@@ -259,7 +283,7 @@ export const ChargeScreen = () => {
             </div>
 
             {/* Voltage */}
-            {latestMeter.voltage && (
+            {latestMeter.voltage != null && (
               <div className="bg-white rounded-lg p-4 shadow-sm">
                 <div className="flex items-center space-x-2 text-gray-600 mb-2">
                   <Power className="w-5 h-5" />
@@ -273,7 +297,7 @@ export const ChargeScreen = () => {
             )}
 
             {/* Current */}
-            {latestMeter.current && (
+            {latestMeter.current != null && (
               <div className="bg-white rounded-lg p-4 shadow-sm">
                 <div className="flex items-center space-x-2 text-gray-600 mb-2">
                   <Zap className="w-5 h-5" />

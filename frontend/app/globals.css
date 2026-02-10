@@ -180,3 +180,47 @@ body {
     @apply bg-background text-foreground;
   }
 }
+
+/* QR Code print styles */
+@media print {
+  body > *:not([data-radix-portal]) {
+    display: none !important;
+  }
+
+  [data-radix-portal] > * {
+    position: static !important;
+  }
+
+  [data-radix-portal] [role="dialog"] {
+    position: static !important;
+    box-shadow: none !important;
+    border: none !important;
+    max-width: 100% !important;
+    padding: 0 !important;
+  }
+
+  /* Hide dialog overlay */
+  [data-radix-portal] [data-state="open"][role="dialog"] ~ div,
+  [data-radix-portal] > div:first-child {
+    display: none !important;
+  }
+
+  /* Hide dialog close button and footer buttons */
+  [data-radix-portal] button[data-dialog-close],
+  [data-radix-portal] [role="dialog"] > button {
+    display: none !important;
+  }
+
+  #qr-print-area {
+    display: flex !important;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    padding: 2rem;
+  }
+
+  #qr-print-area p {
+    color: #000 !important;
+  }
+}
