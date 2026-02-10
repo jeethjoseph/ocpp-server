@@ -118,7 +118,7 @@ class WalletService:
             async with in_transaction():
                 await Wallet.filter(id=wallet.id).update(balance=new_balance)
 
-                wallet_transaction = await WalletTransaction.create(
+                await WalletTransaction.create(
                     wallet=wallet,
                     amount=-billing_amount,  # Negative for deduction
                     type=TransactionTypeEnum.CHARGE_DEDUCT,
