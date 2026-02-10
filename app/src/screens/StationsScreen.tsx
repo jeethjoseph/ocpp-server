@@ -414,7 +414,7 @@ export const StationsScreen = () => {
                           <p className="font-medium text-gray-900">
                             {connector.connector_type}
                           </p>
-                          {connector.max_power_kw && (
+                          {connector.max_power_kw != null && (
                             <p className="text-sm text-gray-600">
                               Max {connector.max_power_kw} kW
                             </p>
@@ -447,7 +447,7 @@ export const StationsScreen = () => {
                             <p className="font-medium text-gray-900">{charger.name}</p>
                             <p className="text-xs text-gray-500">
                               {charger.connectors.map(c => c.connector_type).join(', ')}
-                              {charger.connectors[0]?.max_power_kw && ` · ${charger.connectors[0].max_power_kw} kW`}
+                              {charger.connectors[0]?.max_power_kw != null && ` · ${charger.connectors[0].max_power_kw} kW`}
                             </p>
                           </div>
                           <div className="flex items-center space-x-2">

@@ -304,6 +304,7 @@ export default function ChargerDetailPage() {
                 size="icon"
                 onClick={() => setShowQrDialog(true)}
                 title="Generate QR Code"
+                aria-label="Generate QR Code"
               >
                 <QrCode className="h-5 w-5" />
               </Button>

@@ -1,5 +1,5 @@
 import { useParams, useNavigate } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useApi } from '../lib/api-client';
 import { chargerService, transactionService } from '../lib/api-services';
 import { recentChargersStorage } from '../lib/recent-chargers';
@@ -11,6 +11,7 @@ export const ChargeScreen = () => {
   const { chargerId } = useParams<{ chargerId: string }>();
   const navigate = useNavigate();
   const api = useApi();
+  const queryClient = useQueryClient();
   const { user } = useUser();
   const [isStarting, setIsStarting] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
@@ -103,6 +104,7 @@ export const ChargeScreen = () => {
       // Wait a bit and refresh to show updated status
       setTimeout(() => {
         refetchCharger();
+        queryClient.invalidateQueries({ queryKey: ['active-session'] });
         setIsStarting(false);
       }, 2000);
     } catch (err: any) {
@@ -125,6 +127,8 @@ export const ChargeScreen = () => {
       setTimeout(() => {
         refetchCharger();
         refetchTransaction();
+        queryClient.invalidateQueries({ queryKey: ['active-session'] });
+        queryClient.invalidateQueries({ queryKey: ['my-sessions'] });
         setIsStopping(false);
       }, 2000);
     } catch (err: any) {

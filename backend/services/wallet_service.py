@@ -76,6 +76,16 @@ class WalletService:
             if not transaction:
                 return False, f"Transaction {transaction_id} not found", None
             
+            # Idempotency guard: skip if already billed (prevents double billing
+            # when BootNotification and StopTransaction both trigger billing)
+            existing_charge = await WalletTransaction.filter(
+                charging_transaction_id=transaction_id,
+                type=TransactionTypeEnum.CHARGE_DEDUCT
+            ).first()
+            if existing_charge:
+                logger.info(f"Transaction {transaction_id} already billed (wallet_txn={existing_charge.id}), skipping")
+                return True, f"Already billed ₹{abs(existing_charge.amount)}", abs(existing_charge.amount)
+
             # Validate transaction state
             if not transaction.energy_consumed_kwh or transaction.energy_consumed_kwh <= 0:
                 logger.info(f"Transaction {transaction_id} has no energy consumption, skipping billing")
@@ -113,8 +123,15 @@ class WalletService:
 
             logger.info(f"Wallet billing: ₹{current_balance} - ₹{billing_amount} = ₹{new_balance}")
 
-            # Wallet deduction + record creation in a savepoint so both
-            # roll back together if either fails (prevents partial charge)
+            # TECHNICAL DEBT: This in_transaction() savepoint looks redundant with the
+            # outer @atomic(), but it's necessary. The try/except on line ~143 catches all
+            # exceptions and returns a (False, msg, None) tuple instead of re-raising.
+            # This means @atomic() always sees a normal return and always commits.
+            # Without this savepoint, if WalletTransaction.create fails but Wallet.update
+            # succeeds, the balance is deducted with no record — money vanishes.
+            # The proper fix: remove the try/except, let exceptions propagate so @atomic()
+            # can roll back naturally, and move error handling to callers. This requires
+            # updating every call site (BootNotification, StopTransaction, admin endpoints).
             async with in_transaction():
                 await Wallet.filter(id=wallet.id).update(balance=new_balance)
 

@@ -1,7 +1,7 @@
 # routers/public_stations.py
 from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, HTTPException, Query, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime
 from enum import Enum
 
@@ -37,7 +37,7 @@ class PublicStationResponse(BaseModel):
     total_chargers: int
     connector_types: List[str]
     connector_details: List[ConnectorInfo]
-    chargers: List[StationChargerInfo] = []
+    chargers: List[StationChargerInfo] = Field(default_factory=list)
     price_per_kwh: Optional[float]
 
     class Config:
@@ -226,10 +226,10 @@ async def get_public_station_details(station_id: int, current_user: User = Depen
         if not is_connected_redis:
             continue
 
-        # Check heartbeat timeout (90 seconds)
+        # Check heartbeat timeout (120 seconds, consistent with OCPP activity timeout in main.py)
         if charger.last_heart_beat_time:
             time_diff = current_time - charger.last_heart_beat_time.replace(tzinfo=timezone.utc)
-            if time_diff.total_seconds() > 90:
+            if time_diff.total_seconds() > 120:
                 continue
         else:
             continue
