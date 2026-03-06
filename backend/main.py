@@ -3,31 +3,32 @@ import os
 import asyncio
 import datetime
 from typing import Dict, List
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from database import init_db, close_db
 from schemas import OCPPCommand, OCPPResponse, MessageLogResponse, ChargePointStatus
 from crud import (
-    log_message, 
-    get_logs, 
-    get_logs_by_charge_point, 
-    validate_and_connect_charger,
+    get_logs,
+    get_logs_by_charge_point,
     update_charger_status,
-    update_charger_heartbeat
+    update_charger_heartbeat,
+    log_audit_event,
 )
 from models import OCPPLog, Transaction, TransactionStatusEnum, MeterValue
 from services.wallet_service import WalletService
 from redis_manager import redis_manager
+from core.connection_manager import connection_manager
 
 from ocpp.v16 import ChargePoint as OcppChargePoint
 from ocpp.v16 import call, call_result
 from ocpp.routing import on
-from starlette.websockets import WebSocketState
-
 import logging
 import json
+
+# Transaction resume constants
+SUSPEND_TIMEOUT_SECONDS = 300  # 5 minutes
 
 # Import routers
 from routers import stations, chargers, transactions, auth, webhooks, users, public_stations, logs, wallet_payments, firmware
@@ -49,14 +50,14 @@ from services.monitoring_service import (
 # This must happen before app = FastAPI() for proper instrumentation
 initialize_monitoring()
 
-# Configure logging - use force=True so it works even when uvicorn
-# has already configured the root logger (multi-worker mode)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    force=True
-)
+# Configure the app logger only — avoids overriding the root logger
+# (which would strip handlers set up by uvicorn, Sentry, or New Relic).
 logger = logging.getLogger("ocpp-server")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
 # FastAPI app
 app = FastAPI(
@@ -147,19 +148,9 @@ FIRMWARE_DIR = os.path.join(os.path.dirname(__file__), "firmware_files")
 os.makedirs(FIRMWARE_DIR, exist_ok=True)
 app.mount("/firmware", StaticFiles(directory=FIRMWARE_DIR), name="firmware")
 
-# Store connected charge points with metadata (now moved to Redis)
-# Keep this for backward compatibility but will be deprecated
-connected_charge_points: Dict[str, Dict] = {}
-
-# Helper to determine if a WebSocket is currently in CONNECTED state (avoids magic numbers)
-def _is_ws_connected(ws: WebSocket) -> bool:
-    try:
-        return ws is not None and ws.client_state == WebSocketState.CONNECTED
-    except Exception:
-        return False
-
-# Global cleanup task
-cleanup_task = None
+# Backward-compatible alias: same dict object by reference, so all existing
+# reads/writes (including `from main import connected_charge_points`) work unchanged.
+connected_charge_points = connection_manager.connected_charge_points
 
 # Define a ChargePoint class using python-ocpp
 class ChargePoint(OcppChargePoint):
@@ -199,7 +190,7 @@ class ChargePoint(OcppChargePoint):
                 charger.model = charge_point_model
             if firmware_version:
                 charger.firmware_version = firmware_version
-                logger.info(f"📦 Updated firmware version for {self.id}: {firmware_version}")
+                logger.info(f"📦 Recorded firmware version for {self.id}: {firmware_version}")
             if charge_point_serial_number:
                 charger.serial_number = charge_point_serial_number
             if iccid:
@@ -215,8 +206,9 @@ class ChargePoint(OcppChargePoint):
         except Exception as e:
             logger.error(f"❌ Error updating charger info from BootNotification: {e}")
 
-        # A BootNotification means the charger rebooted - any prior transaction is dead.
-        # Auto-stop and bill ongoing transactions since the charger lost its session.
+        # A BootNotification means the charger rebooted. Suspend ongoing transactions
+        # to allow the charger to resume them via DataTransfer(GetLastMeterValue).
+        # If the charger doesn't resume within SUSPEND_TIMEOUT_SECONDS, auto-stop and bill.
         try:
             ongoing_transactions = await Transaction.filter(
                 charger__charge_point_string_id=self.id,
@@ -224,54 +216,104 @@ class ChargePoint(OcppChargePoint):
                     TransactionStatusEnum.RUNNING,
                     TransactionStatusEnum.STARTED,
                     TransactionStatusEnum.PENDING_START,
-                    TransactionStatusEnum.PENDING_STOP
+                    TransactionStatusEnum.PENDING_STOP,
+                    TransactionStatusEnum.SUSPENDED,
                 ]
             ).all()
 
             if ongoing_transactions:
-                logger.warning(f"⚠️ BootNotification from {self.id} - found {len(ongoing_transactions)} ongoing transactions - stopping and billing")
+                logger.warning(f"⚠️ BootNotification from {self.id} - suspending {len(ongoing_transactions)} ongoing transactions for possible resume")
 
+                now = datetime.datetime.now(datetime.timezone.utc)
                 for transaction in ongoing_transactions:
-                    if transaction.end_meter_kwh is None:
-                        latest_meter_value = await MeterValue.filter(
-                            transaction_id=transaction.id
-                        ).order_by("-created_at").first()
-
-                        if latest_meter_value:
-                            transaction.end_meter_kwh = latest_meter_value.reading_kwh
-                            transaction.energy_consumed_kwh = transaction.end_meter_kwh - (transaction.start_meter_kwh or 0)
-                            logger.info(f"Calculated energy for transaction {transaction.id}: {transaction.energy_consumed_kwh} kWh")
-                        else:
-                            logger.warning(f"No meter values found for transaction {transaction.id}")
-
-                    transaction.transaction_status = TransactionStatusEnum.STOPPED
-                    transaction.stop_reason = "CHARGER_REBOOT"
-                    transaction.end_time = datetime.datetime.now(datetime.timezone.utc)
+                    previous_status = transaction.transaction_status
+                    transaction.transaction_status = TransactionStatusEnum.SUSPENDED
+                    transaction.suspended_at = now
                     await transaction.save()
-                    logger.info(f"🛑 Stopped transaction {transaction.id} due to charger reboot")
+                    logger.info(f"⏸️ Suspended transaction {transaction.id} (was {previous_status}) due to charger reboot")
 
-                    if transaction.energy_consumed_kwh is not None and transaction.energy_consumed_kwh > 0:
-                        try:
-                            success, message, billing_amount = await WalletService.process_transaction_billing(transaction.id)
-                            if success:
-                                logger.info(f"💰 Billed transaction {transaction.id} after reboot: ₹{billing_amount}")
-                            else:
-                                logger.warning(f"💰 Billing failed for transaction {transaction.id}: {message}")
-                        except Exception as billing_error:
-                            logger.error(f"💰 Billing error for transaction {transaction.id}: {billing_error}", exc_info=True)
-                            await Transaction.filter(id=transaction.id).update(
-                                transaction_status=TransactionStatusEnum.BILLING_FAILED
-                            )
-                    else:
-                        logger.info(f"💰 No energy consumed for transaction {transaction.id} - skipping billing")
+                    asyncio.create_task(log_audit_event(
+                        action="transaction.suspended",
+                        entity_type="transaction",
+                        entity_id=transaction.id,
+                        actor_type="system",
+                        changes={"previous_status": str(previous_status), "new_status": "SUSPENDED", "trigger": "BootNotification"},
+                    ))
+
+                    # Start timeout task — will auto-stop if charger doesn't resume
+                    asyncio.create_task(self._suspend_timeout(transaction.id, now, SUSPEND_TIMEOUT_SECONDS))
         except Exception as e:
-            logger.error(f"Error stopping transactions on BootNotification for {self.id}: {e}", exc_info=True)
+            logger.error(f"Error suspending transactions on BootNotification for {self.id}: {e}", exc_info=True)
 
         return call_result.BootNotification(
             current_time=datetime.datetime.utcnow().isoformat() + "Z",
             interval=30,
             status="Accepted"
         )
+
+    async def _suspend_timeout(self, transaction_id: int, original_suspended_at, timeout_seconds: int = 300):
+        """Auto-stop a SUSPENDED transaction if the charger doesn't resume it in time."""
+        try:
+            await asyncio.sleep(timeout_seconds)
+
+            transaction = await Transaction.filter(id=transaction_id).first()
+            if not transaction:
+                return
+
+            # Only act if still SUSPENDED with the same suspended_at (handles double-boot race)
+            if (
+                transaction.transaction_status != TransactionStatusEnum.SUSPENDED
+                or transaction.suspended_at != original_suspended_at
+            ):
+                logger.info(f"⏸️ Suspend timeout for transaction {transaction_id} — status already changed, skipping")
+                return
+
+            # Calculate energy from last meter value
+            latest_meter_value = await MeterValue.filter(
+                transaction_id=transaction_id
+            ).order_by("-created_at").first()
+
+            if latest_meter_value:
+                transaction.end_meter_kwh = latest_meter_value.reading_kwh
+                transaction.energy_consumed_kwh = transaction.end_meter_kwh - (transaction.start_meter_kwh or 0)
+                logger.info(f"Calculated energy for timed-out transaction {transaction_id}: {transaction.energy_consumed_kwh} kWh")
+            else:
+                logger.warning(f"No meter values found for timed-out transaction {transaction_id}")
+
+            transaction.transaction_status = TransactionStatusEnum.STOPPED
+            transaction.stop_reason = "SUSPENDED_TIMEOUT"
+            transaction.end_time = datetime.datetime.now(datetime.timezone.utc)
+            await transaction.save()
+            logger.info(f"🛑 Auto-stopped suspended transaction {transaction_id} after {timeout_seconds}s timeout")
+
+            asyncio.create_task(log_audit_event(
+                action="transaction.suspended_timeout",
+                entity_type="transaction",
+                entity_id=transaction_id,
+                actor_type="system",
+                changes={"previous_status": "SUSPENDED", "new_status": "STOPPED", "trigger": "SuspendTimeout"},
+            ))
+
+            # Process billing
+            if transaction.energy_consumed_kwh is not None and transaction.energy_consumed_kwh > 0:
+                try:
+                    success, message, billing_amount = await WalletService.process_transaction_billing(transaction_id)
+                    if success:
+                        logger.info(f"💰 Billed timed-out transaction {transaction_id}: ₹{billing_amount}")
+                    else:
+                        logger.warning(f"💰 Billing failed for timed-out transaction {transaction_id}: {message}")
+                except Exception as billing_error:
+                    logger.error(f"💰 Billing error for timed-out transaction {transaction_id}: {billing_error}", exc_info=True)
+                    await Transaction.filter(id=transaction_id).update(
+                        transaction_status=TransactionStatusEnum.BILLING_FAILED
+                    )
+            else:
+                logger.info(f"💰 No energy consumed for timed-out transaction {transaction_id} - skipping billing")
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Error in suspend timeout for transaction {transaction_id}: {e}", exc_info=True)
 
     @on('Heartbeat')
     async def on_heartbeat(self, **kwargs):
@@ -366,7 +408,8 @@ class ChargePoint(OcppChargePoint):
                             TransactionStatusEnum.RUNNING,
                             TransactionStatusEnum.STARTED,
                             TransactionStatusEnum.PENDING_START,
-                            TransactionStatusEnum.PENDING_STOP
+                            TransactionStatusEnum.PENDING_STOP,
+                            TransactionStatusEnum.SUSPENDED,
                         ]
                     ).all()
                     
@@ -393,7 +436,15 @@ class ChargePoint(OcppChargePoint):
                             transaction.end_time = datetime.datetime.now(datetime.timezone.utc)
                             await transaction.save()
                             logger.info(f"Marked transaction {transaction.id} as FAILED due to status change to {status}")
-                            
+
+                            asyncio.create_task(log_audit_event(
+                                action="transaction.status_changed",
+                                entity_type="transaction",
+                                entity_id=transaction.id,
+                                actor_type="system",
+                                changes={"previous_status": "RUNNING", "new_status": "FAILED", "trigger": "StatusNotification"},
+                            ))
+
                             # Process billing if we have energy consumption data
                             if transaction.energy_consumed_kwh is not None and transaction.energy_consumed_kwh > 0:
                                 try:
@@ -481,6 +532,14 @@ class ChargePoint(OcppChargePoint):
 
             logger.info(f"🔋 Created transaction {transaction.id} for charger {self.id} with status RUNNING")
 
+            asyncio.create_task(log_audit_event(
+                action="transaction.status_changed",
+                entity_type="transaction",
+                entity_id=transaction.id,
+                actor_type="ocpp",
+                changes={"new_status": "RUNNING", "trigger": "StartTransaction"},
+            ))
+
             # Record transaction started event
             await OCPPMetrics.record_transaction_started(self.id, user.id)
             SentryHelper.set_transaction_context(transaction.id, self.id, user.id)
@@ -519,7 +578,10 @@ class ChargePoint(OcppChargePoint):
                 )
             
             logger.info(f"🛑 Transaction {transaction_id} status before stop: {transaction.transaction_status}")
-            
+
+            if transaction.transaction_status == TransactionStatusEnum.SUSPENDED:
+                logger.info(f"🛑 Stopping SUSPENDED transaction {transaction_id} — charger chose to end rather than resume")
+
             # Update transaction with end values
             transaction.end_meter_kwh = float(meter_stop) / 1000  # Convert Wh to kWh
             transaction.energy_consumed_kwh = transaction.end_meter_kwh - (transaction.start_meter_kwh or 0)
@@ -530,6 +592,14 @@ class ChargePoint(OcppChargePoint):
             await transaction.save()
 
             logger.info(f"🛑 ✅ Transaction stopped {transaction_id}: {transaction.energy_consumed_kwh} kWh consumed")
+
+            asyncio.create_task(log_audit_event(
+                action="transaction.status_changed",
+                entity_type="transaction",
+                entity_id=transaction_id,
+                actor_type="ocpp",
+                changes={"previous_status": "RUNNING", "new_status": "COMPLETED", "trigger": "StopTransaction"},
+            ))
 
             # Record transaction completed event
             duration_minutes = (transaction.end_time - transaction.start_time).total_seconds() / 60 if transaction.start_time and transaction.end_time else 0
@@ -589,7 +659,28 @@ class ChargePoint(OcppChargePoint):
                 return call_result.MeterValues()
                 
             logger.debug(f"🔋 ✅ Found transaction {transaction_id} for charger {transaction.charger.charge_point_string_id}")
-            
+
+            # Auto-resume SUSPENDED transactions on MeterValues receipt
+            if transaction.transaction_status == TransactionStatusEnum.SUSPENDED:
+                now = datetime.datetime.now(datetime.timezone.utc)
+                transaction.transaction_status = TransactionStatusEnum.RUNNING
+                transaction.resumed_at = now
+                transaction.resume_count = (transaction.resume_count or 0) + 1
+                await transaction.save()
+                logger.info(f"▶️ Auto-resumed transaction {transaction_id} via MeterValues (resume_count={transaction.resume_count})")
+                asyncio.create_task(log_audit_event(
+                    action="transaction.resumed",
+                    entity_type="transaction",
+                    entity_id=transaction_id,
+                    actor_type="ocpp",
+                    changes={
+                        "previous_status": "SUSPENDED",
+                        "new_status": "RUNNING",
+                        "trigger": "MeterValues",
+                        "resume_count": transaction.resume_count,
+                    },
+                ))
+
             # Process meter values - group all measurands by timestamp
             meter_records_created = 0
             for i, meter_reading in enumerate(meter_value):
@@ -792,6 +883,8 @@ class ChargePoint(OcppChargePoint):
             # Route by messageId (vendor-agnostic)
             if message_id == "SignalQuality":
                 return await self._handle_signal_quality(data)
+            elif message_id == "GetLastMeterValue":
+                return await self._handle_get_last_meter_value(data)
             else:
                 logger.warning(f"📡 Unhandled DataTransfer from {self.id}: vendorId={vendor_id}, messageId={message_id}")
                 return call_result.DataTransfer(status="UnknownMessageId")
@@ -856,474 +949,122 @@ class ChargePoint(OcppChargePoint):
             logger.error(f"📡 ❌ Error storing SignalQuality for {self.id}: {e}", exc_info=True)
             return call_result.DataTransfer(status="Rejected")
 
-# Adapter to make FastAPI's WebSocket compatible with python-ocpp
-class FastAPIWebSocketAdapter:
-    def __init__(self, websocket: WebSocket):
-        self.websocket = websocket
+    async def _handle_get_last_meter_value(self, data: str):
+        """
+        Handle GetLastMeterValue DataTransfer — allows charger to resume a transaction
+        after power loss by retrieving the server's last known meter reading.
 
-    async def recv(self):
-        return await self.websocket.receive_text()
+        Request data: {"transactionId": 42}
+        Response data: {"transactionId":42,"startMeterValueWh":10000,"lastMeterValueWh":15340,"energyConsumedWh":5340}
+        """
+        from models import Charger, Transaction, TransactionStatusEnum, MeterValue
 
-    async def send(self, data):
-        await self.websocket.send_text(data)
-
-# Logging adapter to persist all OCPP messages to DB
-class LoggingWebSocketAdapter(FastAPIWebSocketAdapter):
-    def __init__(self, websocket: WebSocket, charge_point_id: str):
-        super().__init__(websocket)
-        self.charge_point_id = charge_point_id
-        self._at_command_skip_count = 0  # Track consecutive AT commands
-
-    async def recv(self):
-        msg = await super().recv()
-
-        # Ghost session detection - check if this charge point is in our connected list
-        if self.charge_point_id not in connected_charge_points:
-            logger.warning(f"[DISCONNECT] Ghost session detected for {self.charge_point_id} - message received but not in connected list")
-
-            # Force close the ghost connection
-            try:
-                await self.websocket.close(code=1008, reason="Ghost session cleanup")
-                logger.info(f"[DISCONNECT] Closed ghost session WebSocket for {self.charge_point_id}")
-            except Exception as e:
-                logger.warning(f"[DISCONNECT] Error closing ghost session WebSocket for {self.charge_point_id}: {e}")
-
-            # Don't process the message or log it - use WebSocketDisconnect to follow existing except path
-            from fastapi import WebSocketDisconnect
-            raise WebSocketDisconnect(code=1008)
-
-        # Update last_seen for ANY incoming message from valid connections
-        connected_charge_points[self.charge_point_id]["last_seen"] = datetime.datetime.now(datetime.timezone.utc)
-
-        # Filter out AT commands (firmware bug where charger sends raw modem commands)
-        # Common AT commands: AT+CSQ (signal quality), AT+COPS, AT+CREG, etc.
-        # This is a known issue with some charger firmware (e.g., JET_EV1)
-        msg_stripped = msg.strip()
-        if msg_stripped.startswith("AT+") or msg_stripped.startswith("AT ") or msg_stripped.startswith("at+") or msg_stripped.startswith("at "):
-            self._at_command_skip_count += 1
-
-            # If we've skipped too many AT commands in a row, this might indicate a serious firmware issue
-            if self._at_command_skip_count > 50:
-                logger.error(f"[FIRMWARE BUG] {self.charge_point_id} sent {self._at_command_skip_count} consecutive AT commands - possible firmware malfunction. Disconnecting for safety.")
-                from fastapi import WebSocketDisconnect
-                raise WebSocketDisconnect(code=1008)
-
-            logger.warning(f"[FIRMWARE BUG] {self.charge_point_id} sent AT modem command over OCPP websocket: '{msg_stripped}' - ignoring (skip count: {self._at_command_skip_count})")
-            # Don't log to database or process further - wait for next valid message
-            # Recursively call recv() to get the next message
-            return await self.recv()
-
-        # Reset counter on valid message
-        self._at_command_skip_count = 0
-
-        # Validate OCPP message format before processing
-        correlation_id = None
         try:
-            parsed = json.loads(msg)
-
-            # OCPP messages must be JSON arrays
-            if not isinstance(parsed, list):
-                logger.error(f"[OCPP VALIDATION] {self.charge_point_id} sent non-array message: {msg}")
-                await self._send_protocol_error("RPC message must be a JSON array")
-                # Log the invalid message
-                await log_message(
-                    charger_id=self.charge_point_id,
-                    direction="IN",
-                    message_type="OCPP",
-                    payload=msg,
-                    status="error",
-                    correlation_id="invalid"
+            if not data:
+                logger.error(f"📡 ❌ No data in GetLastMeterValue from {self.id}")
+                return call_result.DataTransfer(
+                    status="Rejected",
+                    data=json.dumps({"error": "No data provided"})
                 )
-                # Skip this message and wait for next one
-                return await self.recv()
 
-            # Validate OCPP message structure
-            # CALL: [2, "messageId", "action", {payload}]
-            # CALLRESULT: [3, "messageId", {payload}]
-            # CALLERROR: [4, "messageId", "errorCode", "errorDescription", {errorDetails}]
-            message_type_id = parsed[0] if len(parsed) > 0 else None
+            payload = json.loads(data)
+            transaction_id = payload.get("transactionId")
 
-            if message_type_id not in [2, 3, 4]:
-                logger.error(f"[OCPP VALIDATION] {self.charge_point_id} sent invalid message type ID {message_type_id}: {msg}")
-                await self._send_protocol_error(f"Invalid OCPP message type ID: {message_type_id}")
-                await log_message(
-                    charger_id=self.charge_point_id,
-                    direction="IN",
-                    message_type="OCPP",
-                    payload=msg,
-                    status="error",
-                    correlation_id="invalid"
+            if transaction_id is None:
+                logger.error(f"📡 ❌ Missing transactionId in GetLastMeterValue from {self.id}")
+                return call_result.DataTransfer(
+                    status="Rejected",
+                    data=json.dumps({"error": "Missing transactionId"})
                 )
-                return await self.recv()
 
-            # Extract correlation ID (message ID)
-            if len(parsed) > 1:
-                correlation_id = str(parsed[1])
-            else:
-                logger.error(f"[OCPP VALIDATION] {self.charge_point_id} sent message without message ID: {msg}")
-                await self._send_protocol_error("OCPP message missing message ID")
-                await log_message(
-                    charger_id=self.charge_point_id,
-                    direction="IN",
-                    message_type="OCPP",
-                    payload=msg,
-                    status="error",
-                    correlation_id="missing"
+            # Look up transaction
+            transaction = await Transaction.filter(id=transaction_id).prefetch_related("charger").first()
+
+            if not transaction:
+                logger.error(f"📡 ❌ Transaction {transaction_id} not found for GetLastMeterValue from {self.id}")
+                return call_result.DataTransfer(
+                    status="Rejected",
+                    data=json.dumps({"error": "Transaction not found"})
                 )
-                return await self.recv()
 
-            # Validate CALL message structure (most common from charge points)
-            if message_type_id == 2:
-                if len(parsed) < 4:
-                    logger.error(f"[OCPP VALIDATION] {self.charge_point_id} sent incomplete CALL message: {msg}")
-                    await self._send_call_error(correlation_id, "ProtocolError", "CALL message must have [messageType, messageId, action, payload]")
-                    await log_message(
-                        charger_id=self.charge_point_id,
-                        direction="IN",
-                        message_type="OCPP",
-                        payload=msg,
-                        status="error",
-                        correlation_id=correlation_id
-                    )
-                    return await self.recv()
+            # Validate ownership — transaction must belong to this charger
+            if transaction.charger.charge_point_string_id != self.id:
+                logger.error(f"📡 ❌ Transaction {transaction_id} belongs to {transaction.charger.charge_point_string_id}, not {self.id}")
+                return call_result.DataTransfer(
+                    status="Rejected",
+                    data=json.dumps({"error": "Transaction does not belong to this charger"})
+                )
 
-                action = parsed[2]
-                payload = parsed[3]
+            # Must be in SUSPENDED state
+            if transaction.transaction_status != TransactionStatusEnum.SUSPENDED:
+                logger.error(f"📡 ❌ Transaction {transaction_id} is {transaction.transaction_status}, not SUSPENDED")
+                return call_result.DataTransfer(
+                    status="Rejected",
+                    data=json.dumps({"error": f"Transaction is {transaction.transaction_status}, not SUSPENDED"})
+                )
 
-                if not isinstance(action, str):
-                    logger.error(f"[OCPP VALIDATION] {self.charge_point_id} sent CALL with non-string action: {msg}")
-                    await self._send_call_error(correlation_id, "ProtocolError", "Action must be a string")
-                    await log_message(
-                        charger_id=self.charge_point_id,
-                        direction="IN",
-                        message_type="OCPP",
-                        payload=msg,
-                        status="error",
-                        correlation_id=correlation_id
-                    )
-                    return await self.recv()
+            # Get last meter value (fall back to start_meter_kwh)
+            latest_meter_value = await MeterValue.filter(
+                transaction_id=transaction_id
+            ).order_by("-created_at").first()
 
-                if not isinstance(payload, dict):
-                    logger.error(f"[OCPP VALIDATION] {self.charge_point_id} sent CALL with non-object payload: {msg}")
-                    await self._send_call_error(correlation_id, "ProtocolError", "Payload must be a JSON object")
-                    await log_message(
-                        charger_id=self.charge_point_id,
-                        direction="IN",
-                        message_type="OCPP",
-                        payload=msg,
-                        status="error",
-                        correlation_id=correlation_id
-                    )
-                    return await self.recv()
+            start_meter_kwh = transaction.start_meter_kwh or 0
+            last_meter_kwh = latest_meter_value.reading_kwh if latest_meter_value else start_meter_kwh
+            energy_consumed_kwh = last_meter_kwh - start_meter_kwh
+
+            # Convert to Wh (integers) for charger
+            start_meter_wh = int(round(start_meter_kwh * 1000))
+            last_meter_wh = int(round(last_meter_kwh * 1000))
+            energy_consumed_wh = int(round(energy_consumed_kwh * 1000))
+
+            # Resume: SUSPENDED → RUNNING
+            now = datetime.datetime.now(datetime.timezone.utc)
+            transaction.transaction_status = TransactionStatusEnum.RUNNING
+            transaction.resumed_at = now
+            transaction.resume_count = (transaction.resume_count or 0) + 1
+            await transaction.save()
+
+            logger.info(
+                f"▶️ Resumed transaction {transaction_id} via GetLastMeterValue: "
+                f"startWh={start_meter_wh}, lastWh={last_meter_wh}, energyWh={energy_consumed_wh}, "
+                f"resume_count={transaction.resume_count}"
+            )
+
+            asyncio.create_task(log_audit_event(
+                action="transaction.resumed",
+                entity_type="transaction",
+                entity_id=transaction_id,
+                actor_type="ocpp",
+                changes={
+                    "previous_status": "SUSPENDED",
+                    "new_status": "RUNNING",
+                    "trigger": "GetLastMeterValue",
+                    "resume_count": transaction.resume_count,
+                },
+            ))
+
+            response_data = json.dumps({
+                "transactionId": transaction_id,
+                "startMeterValueWh": start_meter_wh,
+                "lastMeterValueWh": last_meter_wh,
+                "energyConsumedWh": energy_consumed_wh,
+            })
+
+            return call_result.DataTransfer(status="Accepted", data=response_data)
 
         except json.JSONDecodeError as e:
-            logger.error(f"[OCPP VALIDATION] {self.charge_point_id} sent invalid JSON: {msg} - Error: {e}")
-            await self._send_protocol_error(f"Invalid JSON: {str(e)}")
-            await log_message(
-                charger_id=self.charge_point_id,
-                direction="IN",
-                message_type="OCPP",
-                payload=msg,
-                status="error",
-                correlation_id="invalid_json"
+            logger.error(f"📡 ❌ Invalid JSON in GetLastMeterValue from {self.id}: {e}")
+            return call_result.DataTransfer(
+                status="Rejected",
+                data=json.dumps({"error": "Invalid JSON"})
             )
-            # Skip this message and wait for next one
-            return await self.recv()
         except Exception as e:
-            logger.error(f"[OCPP VALIDATION] {self.charge_point_id} message validation error: {msg} - Error: {e}", exc_info=True)
-            await self._send_protocol_error(f"Message validation failed: {str(e)}")
-            await log_message(
-                charger_id=self.charge_point_id,
-                direction="IN",
-                message_type="OCPP",
-                payload=msg,
-                status="error",
-                correlation_id="validation_error"
-            )
-            return await self.recv()
+            logger.error(f"📡 ❌ Error handling GetLastMeterValue from {self.id}: {e}", exc_info=True)
+            return call_result.DataTransfer(status="Rejected")
 
-        # Message is valid - log it
-        await log_message(
-            charger_id=self.charge_point_id,
-            direction="IN",
-            message_type="OCPP",
-            payload=msg,
-            status="received",
-            correlation_id=correlation_id
-        )
-        logger.info(f"[OCPP][IN] {msg}")
-        return msg
-
-    async def _send_protocol_error(self, error_description: str):
-        """Send a protocol error when message can't be parsed (no message ID available)"""
-        try:
-            # For protocol errors where we don't have a message ID, we can't send a CALLERROR
-            # Just log it and close the connection if errors persist
-            logger.warning(f"[OCPP ERROR] Sending protocol error to {self.charge_point_id}: {error_description}")
-        except Exception as e:
-            logger.error(f"[OCPP ERROR] Failed to handle protocol error for {self.charge_point_id}: {e}")
-
-    async def _send_call_error(self, message_id: str, error_code: str, error_description: str):
-        """Send an OCPP CALLERROR response for validation failures"""
-        try:
-            # CALLERROR format: [4, "messageId", "errorCode", "errorDescription", {}]
-            error_message = [4, message_id, error_code, error_description, {}]
-            error_json = json.dumps(error_message)
-
-            logger.warning(f"[OCPP ERROR] Sending CALLERROR to {self.charge_point_id}: {error_json}")
-
-            # Log outgoing error
-            await log_message(
-                charger_id=self.charge_point_id,
-                direction="OUT",
-                message_type="OCPP",
-                payload=error_json,
-                status="sent",
-                correlation_id=message_id
-            )
-
-            # Send error response
-            await super().send(error_json)
-        except Exception as e:
-            logger.error(f"[OCPP ERROR] Failed to send CALLERROR to {self.charge_point_id}: {e}", exc_info=True)
-
-    async def send(self, data):
-        correlation_id = None
-        try:
-            parsed = json.loads(data)
-            if isinstance(parsed, list) and len(parsed) > 1:
-                correlation_id = str(parsed[1])
-        except Exception:
-            logger.error(f"Failed to parse OCPP message in the logging adapter: {data}", exc_info=True)
-        
-        await log_message(
-            charger_id=self.charge_point_id,
-            direction="OUT",
-            message_type="OCPP",
-            payload=data,
-            status="sent",
-            correlation_id=correlation_id
-        )
-        logger.info(f"[OCPP][OUT] {data}")
-        await super().send(data)
-
-# Function to send OCPP requests from central system to charge point
+# Backward-compatible shim: routers do `from main import send_ocpp_request`
 async def send_ocpp_request(charge_point_id: str, action: str, payload: Dict = None):
-    # Check Redis for connection status
-    is_connected = await redis_manager.is_charger_connected(charge_point_id)
-    if not is_connected:
-        logger.warning(f"Charge point {charge_point_id} not connected (not in Redis)")
-        return False, f"Charge point {charge_point_id} not connected"
-
-    # Get connection data from in-memory dict
-    connection_data = connected_charge_points.get(charge_point_id)
-    if not connection_data:
-        # Desync between Redis and in-memory dict (likely server restart)
-        logger.warning(f"ChargePoint instance for {charge_point_id} not found in memory but found in Redis (stale entry after server restart)")
-        logger.warning(f"Connected chargers in memory: {list(connected_charge_points.keys())}")
-        # Clean up stale Redis entry
-        await redis_manager.remove_connected_charger(charge_point_id)
-        return False, f"Charger connection lost. Please wait for charger to reconnect (usually within 60 seconds)"
-    
-    cp = connection_data.get("cp")
-    websocket = connection_data.get("websocket")
-    
-    if not cp or not websocket:
-        logger.warning(f"Invalid connection data for {charge_point_id}")
-        return False, f"Invalid connection data for {charge_point_id}"
-    
-    # Validate WebSocket connection is still alive (enum-based, no magic number)
-    try:
-        if not _is_ws_connected(websocket):
-            state_name = getattr(websocket.client_state, "name", str(getattr(websocket, "client_state", "unknown")))
-            logger.warning(f"WebSocket not connected for {charge_point_id} (state={state_name})")
-            await force_disconnect(charge_point_id, f"WebSocket not connected (state={state_name})")
-            return False, "Connection lost"
-    except Exception as e:
-        logger.warning(f"WebSocket validation failed for {charge_point_id}: {e}")
-        await force_disconnect(charge_point_id, f"WebSocket validation failed: {e}")
-        return False, "Connection lost"
-
-    try:
-        if action == "RemoteStartTransaction":
-            req = call.RemoteStartTransaction(**(payload or {}))
-            response = await cp.call(req)
-            logger.info(f"Sent {action} request to {charge_point_id}")
-            return True, response
-        elif action == "RemoteStopTransaction":
-            req = call.RemoteStopTransaction(**(payload or {}))
-            response = await cp.call(req)
-            logger.info(f"Sent {action} request to {charge_point_id}")
-            return True, response
-        elif action == "ChangeAvailability":
-            req = call.ChangeAvailability(**(payload or {}))
-            response = await cp.call(req)
-            logger.info(f"Sent {action} request to {charge_point_id}")
-            return True, response
-        elif action == "UpdateFirmware":
-            req = call.UpdateFirmware(**(payload or {}))
-            response = await cp.call(req)
-            logger.info(f"📦 Sent {action} request to {charge_point_id}: {payload.get('location')}")
-            return True, response
-        elif action == "Reset":
-            req = call.Reset(**(payload or {}))
-            response = await cp.call(req)
-            logger.info(f"🔄 Sent {action} request to {charge_point_id}: type={payload.get('type', 'Hard')}")
-            return True, response
-        else:
-            logger.warning(f"Action {action} not implemented in send_ocpp_request")
-            return False, f"Action {action} not implemented"
-    except Exception as e:
-        logger.error(f"Error sending request to {charge_point_id}: {e}", exc_info=True)
-        return False, str(e)
-
-# ============ Connection Management ============
-
-# Cleanup coordination locks to prevent race conditions
-cleanup_locks = {}  # Dict[str, asyncio.Lock]
-
-# Recently disconnected tombstone to prevent immediate reconnection races
-recently_disconnected = {}  # Dict[str, datetime]
-
-async def force_disconnect(charge_point_id: str, reason: str):
-    """Force complete disconnection of a charge point with proper cleanup"""
-    
-    # Ensure only one cleanup per charger at a time
-    if charge_point_id not in cleanup_locks:
-        cleanup_locks[charge_point_id] = asyncio.Lock()
-        
-    async with cleanup_locks[charge_point_id]:
-        logger.info(f"[DISCONNECT] Starting force disconnect for {charge_point_id}: {reason}")
-        
-        connection_data = connected_charge_points.get(charge_point_id)
-        if connection_data:
-            # 1. Cancel heartbeat task
-            heartbeat_task = connection_data.get("heartbeat_task")
-            if heartbeat_task and not heartbeat_task.done():
-                heartbeat_task.cancel()
-                logger.info(f"[DISCONNECT] Cancelled heartbeat task for {charge_point_id}")
-                
-            # 2. Close WebSocket with proper code (if not already closed)
-            websocket = connection_data.get("websocket")
-            if websocket:
-                try:
-                    if _is_ws_connected(websocket):
-                        await websocket.close(code=1001, reason=f"Server cleanup: {reason}")
-                        logger.info(f"[DISCONNECT] Sent WebSocket close frame to {charge_point_id}: {reason}")
-                    else:
-                        state_name = getattr(websocket.client_state, "name", str(getattr(websocket, "client_state", "unknown")))
-                        logger.info(f"[DISCONNECT] WebSocket for {charge_point_id} already closed (state={state_name})")
-                except Exception as e:
-                    logger.warning(f"[DISCONNECT] Error closing WebSocket for {charge_point_id}: {e}")
-                    if hasattr(websocket, '_transport') and websocket._transport:
-                        websocket._transport.close()
-                        logger.info(f"[DISCONNECT] Forced TCP closure for {charge_point_id}")
-                        
-        # 3. Atomic state cleanup
-        if charge_point_id in connected_charge_points:
-            del connected_charge_points[charge_point_id]
-        await redis_manager.remove_connected_charger(charge_point_id)
-        
-        # 4. Add tombstone to prevent immediate reconnection races
-        from datetime import timedelta
-        recently_disconnected[charge_point_id] = datetime.datetime.now(datetime.timezone.utc) + timedelta(milliseconds=100)
-        
-        # 5. Clean up old tombstones
-        current_time = datetime.datetime.now(datetime.timezone.utc)
-        expired_tombstones = [cp_id for cp_id, expire_time in recently_disconnected.items() if current_time > expire_time]
-        for cp_id in expired_tombstones:
-            del recently_disconnected[cp_id]
-        
-        # 6. Clean up the lock for this connection to prevent memory leak
-        cleanup_locks.pop(charge_point_id, None)
-
-        logger.warning(f"[DISCONNECT] Force disconnected {charge_point_id}: {reason}")
-
-        # Update active connections metric
-        active_connections = len(connected_charge_points)
-        await OCPPMetrics.record_active_connections(active_connections)
-
-async def cleanup_dead_connection(charge_point_id: str):
-    """Legacy cleanup function - redirects to force_disconnect"""
-    await force_disconnect(charge_point_id, "Dead connection detected")
-
-async def heartbeat_monitor(charge_point_id: str, websocket: WebSocket):
-    """Monitor OCPP activity to check device liveness. Tracks any incoming OCPP message, not just Heartbeat."""
-    OCPP_TIMEOUT = 120  # seconds - disconnect if no OCPP message received for 120 seconds
-
-    try:
-        while True:
-            await asyncio.sleep(15)  # Check every 15 seconds
-            try:
-                now = datetime.datetime.now(datetime.timezone.utc)
-                last_activity = None
-                if charge_point_id in connected_charge_points:
-                    # Use last_seen which is updated on ANY incoming OCPP message
-                    last_activity = connected_charge_points[charge_point_id].get("last_seen") or connected_charge_points[charge_point_id].get("connected_at")
-                if last_activity is None or (now - last_activity).total_seconds() > OCPP_TIMEOUT:
-                    idle_seconds = (now - last_activity).total_seconds() if last_activity else OCPP_TIMEOUT
-                    logger.warning(f"No OCPP messages received from {charge_point_id} for {idle_seconds:.0f}s. Cleaning up.")
-
-                    # Record heartbeat timeout
-                    await OCPPMetrics.record_heartbeat_timeout(charge_point_id)
-                    SentryHelper.add_breadcrumb(
-                        category="ocpp.heartbeat",
-                        message=f"OCPP activity timeout for {charge_point_id}",
-                        level="warning"
-                    )
-
-                    await force_disconnect(charge_point_id, f"OCPP activity timeout ({OCPP_TIMEOUT}s)")
-                    break
-                logger.info(f"Heartbeat monitor: {charge_point_id} last OCPP message {(now - last_activity).total_seconds():.1f}s ago")
-            except Exception as e:
-                logger.warning(f"Heartbeat monitor error for {charge_point_id}: {e}")
-                await force_disconnect(charge_point_id, f"Heartbeat monitor error: {e}")
-                break
-    except asyncio.CancelledError:
-        # Task was cancelled, normal shutdown
-        pass
-    except Exception as e:
-        logger.error(f"Heartbeat monitor error for {charge_point_id}: {e}")
-
-async def periodic_cleanup():
-    """Periodic cleanup of stale connections every 5 minutes"""
-    while True:
-        try:
-            await asyncio.sleep(300)  # Run every 5 minutes
-            logger.info("Running periodic cleanup of stale connections")
-            
-            current_time = datetime.datetime.now(datetime.timezone.utc)
-            stale_connections = []
-            most_recent_times = {}  # Store per-connection most_recent for proper reason message
-            
-            # Find connections that haven't been seen for more than 120 seconds
-            # Consistent with OCPP activity timeout
-            for charge_point_id, connection_data in connected_charge_points.items():
-                last_seen = connection_data.get("last_seen")
-                last_heartbeat = connection_data.get("last_heartbeat")
-                
-                # Use the most recent of last_seen or last_heartbeat
-                most_recent = max(
-                    last_seen or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc),
-                    last_heartbeat or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
-                )
-                most_recent_times[charge_point_id] = most_recent
-                
-                # Only mark as stale if no activity for 120 seconds (consistent with OCPP activity timeout)
-                if (current_time - most_recent).total_seconds() > 120:
-
-                    stale_connections.append(charge_point_id)
-                    logger.warning(f"Connection {charge_point_id} stale: last activity {(current_time - most_recent).total_seconds():.1f}s ago")
-            
-            # Clean up stale connections with proper reason message
-            for charge_point_id in stale_connections:
-                most_recent = most_recent_times[charge_point_id]
-                inactive_seconds = (current_time - most_recent).total_seconds()
-                logger.warning(f"Cleaning up stale connection: {charge_point_id}")
-                await force_disconnect(charge_point_id, f"Stale connection (inactive for {inactive_seconds:.1f}s)")
-                
-        except Exception as e:
-            logger.error(f"Error in periodic cleanup: {e}")
+    return await connection_manager.send_ocpp_request(charge_point_id, action, payload)
 
 # ============ Health Check Endpoint ============
 @app.get("/health")
@@ -1396,104 +1137,12 @@ app.include_router(logs.router)
 app.include_router(firmware.router)
 app.include_router(firmware.public_router)
 
+# OCPP WebSocket endpoint (connection management + message handling)
+from routers import ocpp_ws
+app.include_router(ocpp_ws.router)
+
 # Mount admin panel
 app.mount("/admin", admin_app)
-
-# ============ OCPP WebSocket Endpoint ============
-@app.websocket("/ocpp/{charge_point_id}")
-async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
-    """OCPP WebSocket endpoint for charge points"""
-    logger.info(f"[CONNECTION ATTEMPT] {charge_point_id} attempting WebSocket connection")
-
-    # Add Sentry breadcrumb
-    SentryHelper.add_breadcrumb(
-        category="ocpp.connection",
-        message=f"WebSocket connection attempt: {charge_point_id}",
-        level="info"
-    )
-
-    try:
-        await websocket.accept()
-        logger.info(f"[CONNECTION ATTEMPT] {charge_point_id} WebSocket handshake successful")
-    except Exception as e:
-        logger.error(f"[CONNECTION ATTEMPT] {charge_point_id} WebSocket handshake failed: {e}")
-        await OCPPMetrics.record_websocket_connection(charge_point_id, success=False)
-        SentryHelper.capture_exception(e, extra={"charger_id": charge_point_id})
-        return
-
-    # Check for recent disconnection tombstone to prevent reconnection races
-    current_time = datetime.datetime.now(datetime.timezone.utc)
-    if charge_point_id in recently_disconnected:
-        expire_time = recently_disconnected[charge_point_id]
-        if current_time < expire_time:
-            remaining_ms = (expire_time - current_time).total_seconds() * 1000
-            logger.warning(f"[CONNECTION ATTEMPT] Rejecting immediate reconnection for {charge_point_id} - tombstone expires in {remaining_ms:.1f}ms")
-            await websocket.close(code=1013, reason="Too soon after disconnect")
-            return
-        else:
-            # Tombstone expired, remove it
-            logger.info(f"[CONNECTION ATTEMPT] {charge_point_id} tombstone expired, allowing reconnection")
-            del recently_disconnected[charge_point_id]
-
-    # If charger already connected, force disconnect old connection (handles reconnection after reboot)
-    if charge_point_id in connected_charge_points:
-        logger.warning(f"[CONNECTION ATTEMPT] {charge_point_id} already connected - forcing disconnect of stale connection")
-        await force_disconnect(charge_point_id, "New connection attempt - replacing stale connection")
-
-    # Validate charger before connecting
-    is_valid, message = await validate_and_connect_charger(charge_point_id, connected_charge_points)
-    if not is_valid:
-        logger.warning(f"[CONNECTION ATTEMPT] Validation failed for {charge_point_id}: {message}")
-        await websocket.close(code=1008, reason=message)
-        return
-
-    logger.info(f"[CONNECTION ATTEMPT] {charge_point_id} validation successful - establishing OCPP connection")
-
-    ws_adapter = LoggingWebSocketAdapter(websocket, charge_point_id)
-    cp = ChargePoint(charge_point_id, ws_adapter)
-    
-    # Start heartbeat monitor task
-    heartbeat_task = asyncio.create_task(heartbeat_monitor(charge_point_id, websocket))
-    
-    # Store connection data with heartbeat task handle for proper cleanup
-    connection_data = {
-        "websocket": websocket,
-        "cp": cp,
-        "heartbeat_task": heartbeat_task,  # Store for cleanup
-        "connected_at": datetime.datetime.now(datetime.timezone.utc),
-        "last_seen": datetime.datetime.now(datetime.timezone.utc)
-    }
-    connected_charge_points[charge_point_id] = connection_data
-    
-    # Add to Redis
-    await redis_manager.add_connected_charger(charge_point_id, connection_data)
-
-    logger.info(f"[CONNECTION ATTEMPT] {charge_point_id} connection established successfully - starting OCPP message handling")
-
-    # Record successful WebSocket connection
-    await OCPPMetrics.record_websocket_connection(charge_point_id, success=True)
-
-    # Update active connections metric
-    active_connections = len(connected_charge_points)
-    await OCPPMetrics.record_active_connections(active_connections)
-
-    try:
-        await cp.start()
-    except WebSocketDisconnect as e:
-        logger.error(f"[DISCONNECT] Charge point {charge_point_id} disconnected naturally - WebSocket code: {getattr(e, 'code', 'unknown')}, reason: {getattr(e, 'reason', 'none')}")
-        logger.error(f"[DISCONNECT] WebSocket state at disconnect: {getattr(websocket, 'client_state', 'unknown')}")
-        logger.error(f"[DISCONNECT] Last seen: {connection_data.get('last_seen', 'never') if charge_point_id in connected_charge_points else 'connection not found'}")
-        # Apply tombstone on natural disconnect and let finally handle cleanup
-        await force_disconnect(charge_point_id, "Natural WebSocket disconnect")
-        return  # Avoid double cleanup in finally
-    except Exception as e:
-        logger.error(f"[DISCONNECT] WebSocket error for {charge_point_id}: {e}", exc_info=True)
-        logger.error(f"[DISCONNECT] WebSocket state at error: {getattr(websocket, 'client_state', 'unknown')}")
-        logger.error(f"[DISCONNECT] Connection data at error: {connection_data if charge_point_id in connected_charge_points else 'connection not found'}")
-    finally:
-        # Use force_disconnect for proper cleanup if still connected
-        if charge_point_id in connected_charge_points:
-            await force_disconnect(charge_point_id, "WebSocket session ended")
 
 # ============ Basic API Endpoints ============
 
@@ -1543,7 +1192,7 @@ async def get_connected_charge_points():
 @app.post("/api/charge-points/{charge_point_id}/request")
 async def send_command_to_charge_point(charge_point_id: str, command: OCPPCommand):
     """Send OCPP command to a specific charge point"""
-    success, result = await send_ocpp_request(charge_point_id, command.action, command.payload)
+    success, result = await connection_manager.send_ocpp_request(charge_point_id, command.action, command.payload)
     
     if success:
         return OCPPResponse(
@@ -1593,14 +1242,13 @@ async def get_charge_point_logs(charge_point_id: str, limit: int = 100):
 @app.on_event("startup")
 async def startup_event():
     """Initialize database and Redis on startup"""
-    global cleanup_task
     await init_db()
     await redis_manager.connect()
 
     logger.info("Admin panel available at /admin")
 
     # Start periodic cleanup task for stale connections
-    cleanup_task = asyncio.create_task(periodic_cleanup())
+    connection_manager.start_cleanup_task()
 
     # Start billing retry service
     from services.billing_retry_service import start_billing_retry_service
@@ -1639,15 +1287,8 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Close database and Redis connections on shutdown"""
-    global cleanup_task
-    
     # Cancel cleanup task
-    if cleanup_task:
-        cleanup_task.cancel()
-        try:
-            await cleanup_task
-        except asyncio.CancelledError:
-            pass
+    await connection_manager.stop_cleanup_task()
     
     # Stop billing retry service
     from services.billing_retry_service import stop_billing_retry_service

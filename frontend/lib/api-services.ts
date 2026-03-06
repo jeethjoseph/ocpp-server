@@ -286,6 +286,76 @@ export const logService = {
     api.get<LogSummary>(`/api/admin/logs/charger/${chargePointId}/summary`),
 };
 
+// Audit Log Service
+export interface AuditLogEntry {
+  id: number;
+  created_at: string;
+  actor_type: string;
+  actor_id: number | null;
+  actor_email: string | null;
+  action: string;
+  entity_type: string;
+  entity_id: string;
+  changes: Record<string, unknown> | null;
+}
+
+export interface AuditLogListResponse {
+  data: AuditLogEntry[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+export const auditLogService = {
+  getAuditLogs: (params?: {
+    page?: number;
+    limit?: number;
+    entity_type?: string;
+    entity_id?: string;
+    action?: string;
+    actor_type?: string;
+    start_date?: string;
+    end_date?: string;
+  }) => {
+    const searchParams = new URLSearchParams();
+    if (params?.page) searchParams.set("page", params.page.toString());
+    if (params?.limit) searchParams.set("limit", params.limit.toString());
+    if (params?.entity_type) searchParams.set("entity_type", params.entity_type);
+    if (params?.entity_id) searchParams.set("entity_id", params.entity_id);
+    if (params?.action) searchParams.set("action", params.action);
+    if (params?.actor_type) searchParams.set("actor_type", params.actor_type);
+    if (params?.start_date) searchParams.set("start_date", params.start_date);
+    if (params?.end_date) searchParams.set("end_date", params.end_date);
+
+    const query = searchParams.toString();
+    return api.get<AuditLogListResponse>(
+      `/api/admin/logs/audit${query ? `?${query}` : ""}`
+    );
+  },
+
+  getChargerTimeline: (chargePointId: string, params?: {
+    page?: number;
+    limit?: number;
+    action?: string;
+    actor_type?: string;
+    start_date?: string;
+    end_date?: string;
+  }) => {
+    const searchParams = new URLSearchParams();
+    if (params?.page) searchParams.set("page", params.page.toString());
+    if (params?.limit) searchParams.set("limit", params.limit.toString());
+    if (params?.action) searchParams.set("action", params.action);
+    if (params?.actor_type) searchParams.set("actor_type", params.actor_type);
+    if (params?.start_date) searchParams.set("start_date", params.start_date);
+    if (params?.end_date) searchParams.set("end_date", params.end_date);
+
+    const query = searchParams.toString();
+    return api.get<AuditLogListResponse>(
+      `/api/admin/logs/audit/charger-timeline/${encodeURIComponent(chargePointId)}${query ? `?${query}` : ""}`
+    );
+  },
+};
+
 // Wallet Payment Service
 export const walletPaymentService = {
   /**

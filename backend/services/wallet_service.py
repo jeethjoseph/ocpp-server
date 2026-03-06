@@ -1,5 +1,6 @@
 # Wallet service for handling billing and wallet transactions
 import asyncio
+from crud import log_audit_event
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, Tuple
 from tortoise.transactions import atomic, in_transaction
@@ -97,6 +98,13 @@ class WalletService:
                 await Transaction.filter(id=transaction_id).update(
                     transaction_status=TransactionStatusEnum.BILLING_FAILED
                 )
+                asyncio.create_task(log_audit_event(
+                    action="transaction.status_changed",
+                    entity_type="transaction",
+                    entity_id=transaction_id,
+                    actor_type="system",
+                    changes={"new_status": "BILLING_FAILED", "trigger": "BillingFailed", "reason": "No tariff configuration found"},
+                ))
                 return False, "No tariff configuration found", None
             
             # Calculate billing amount
@@ -115,6 +123,13 @@ class WalletService:
                 await Transaction.filter(id=transaction_id).update(
                     transaction_status=TransactionStatusEnum.BILLING_FAILED
                 )
+                asyncio.create_task(log_audit_event(
+                    action="transaction.status_changed",
+                    entity_type="transaction",
+                    entity_id=transaction_id,
+                    actor_type="system",
+                    changes={"new_status": "BILLING_FAILED", "trigger": "BillingFailed", "reason": f"Wallet not found for user {transaction.user_id}"},
+                ))
                 return False, f"Wallet not found for user {transaction.user_id}", None
             
             # Get current balance (allowing None)
@@ -169,6 +184,13 @@ class WalletService:
                 await Transaction.filter(id=transaction_id).update(
                     transaction_status=TransactionStatusEnum.BILLING_FAILED
                 )
+                asyncio.create_task(log_audit_event(
+                    action="transaction.status_changed",
+                    entity_type="transaction",
+                    entity_id=transaction_id,
+                    actor_type="system",
+                    changes={"new_status": "BILLING_FAILED", "trigger": "BillingFailed", "reason": str(e)},
+                ))
             except Exception as update_error:
                 logger.error(f"Failed to update transaction status: {update_error}")
 
@@ -198,6 +220,13 @@ class WalletService:
             await Transaction.filter(id=transaction_id).update(
                 transaction_status=TransactionStatusEnum.COMPLETED
             )
+            asyncio.create_task(log_audit_event(
+                action="transaction.status_changed",
+                entity_type="transaction",
+                entity_id=transaction_id,
+                actor_type="system",
+                changes={"previous_status": "BILLING_FAILED", "new_status": "COMPLETED", "trigger": "BillingRetry"},
+            ))
             logger.info(f"✅ Retry successful for transaction {transaction_id}")
         else:
             logger.warning(f"🔄 Retry failed for transaction {transaction_id}: {message}")

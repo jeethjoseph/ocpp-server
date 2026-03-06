@@ -16,6 +16,7 @@ from models import (
 )
 from auth_middleware import require_admin, require_user_or_admin
 from services import storage_service
+from crud import log_audit_event
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +163,15 @@ async def upload_firmware(
 
         logger.info(f"📦 ✅ Firmware uploaded successfully: ID={firmware_file.id}, version={version}")
 
+        await log_audit_event(
+            action="firmware.uploaded",
+            entity_type="firmware",
+            entity_id=firmware_file.id,
+            actor_type="admin",
+            actor=user,
+            changes={"version": version, "filename": storage_result['filename']},
+        )
+
         return FirmwareFileResponse.from_orm(firmware_file)
 
     except Exception as e:
@@ -242,6 +252,15 @@ async def delete_firmware_file(
     await firmware_file.save()
 
     logger.info(f"📦 Firmware file ID={firmware_id} (version={firmware_file.version}) soft deleted by user {user.id}")
+
+    await log_audit_event(
+        action="firmware.deleted",
+        entity_type="firmware",
+        entity_id=firmware_id,
+        actor_type="admin",
+        actor=user,
+        changes={"version": firmware_file.version},
+    )
 
     return {"success": True, "message": f"Firmware version {firmware_file.version} deleted"}
 
@@ -355,6 +374,15 @@ async def update_charger_firmware(
     logger.info(f"📦 ✅ Firmware update scheduled (will be processed by background service)")
     logger.info(f"📦 Background service will check if charger is ready and trigger update automatically")
 
+    await log_audit_event(
+        action="firmware.update_initiated",
+        entity_type="charger",
+        entity_id=charger.charge_point_string_id,
+        actor_type="admin",
+        actor=user,
+        changes={"firmware_version": firmware_file.version, "update_id": firmware_update.id},
+    )
+
     return FirmwareUpdateResponse.from_orm(firmware_update)
 
 
@@ -433,6 +461,15 @@ async def bulk_update_firmware(
         })
 
     logger.info(f"📦 Bulk update completed: {len(success_list)} succeeded, {len(failed_list)} failed")
+
+    await log_audit_event(
+        action="firmware.bulk_update_initiated",
+        entity_type="firmware",
+        entity_id=firmware_file.id,
+        actor_type="admin",
+        actor=user,
+        changes={"firmware_version": firmware_file.version, "charger_count": len(success_list), "failed_count": len(failed_list)},
+    )
 
     return BulkUpdateResult(
         success=success_list,

@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { logService } from "../api-services";
+import { logService, auditLogService } from "../api-services";
 import { useAuth } from "@/contexts/AuthContext";
 
 export const useChargerLogs = (
@@ -34,5 +34,55 @@ export const useChargerLogSummary = (chargePointId: string) => {
     gcTime: 30 * 60 * 1000, // Keep in cache for 30 minutes
     refetchOnWindowFocus: false,
     refetchOnMount: false,
+  });
+};
+
+export const useChargerTimeline = (
+  chargePointId: string,
+  params?: {
+    page?: number;
+    limit?: number;
+    action?: string;
+    actor_type?: string;
+    start_date?: string;
+    end_date?: string;
+  }
+) => {
+  const { isAuthReady } = useAuth();
+
+  return useQuery({
+    queryKey: ["chargerTimeline", chargePointId, params],
+    queryFn: () => auditLogService.getChargerTimeline(chargePointId, params),
+    enabled: isAuthReady && !!chargePointId,
+    staleTime: 30 * 1000,
+    gcTime: 5 * 60 * 1000,
+  });
+};
+
+export const useEntityAuditLogs = (
+  entityType: string,
+  entityId: string,
+  params?: {
+    page?: number;
+    limit?: number;
+    action?: string;
+    actor_type?: string;
+    start_date?: string;
+    end_date?: string;
+  }
+) => {
+  const { isAuthReady } = useAuth();
+
+  return useQuery({
+    queryKey: ["auditLogs", entityType, entityId, params],
+    queryFn: () =>
+      auditLogService.getAuditLogs({
+        entity_type: entityType,
+        entity_id: entityId,
+        ...params,
+      }),
+    enabled: isAuthReady && !!entityId,
+    staleTime: 30 * 1000,
+    gcTime: 5 * 60 * 1000,
   });
 };

@@ -2,10 +2,10 @@
 import asyncio
 import logging
 from typing import List
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from services.wallet_service import WalletService
-from models import Transaction, TransactionStatusEnum
+from models import Transaction, TransactionStatusEnum, MeterValue
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +48,7 @@ class BillingRetryService:
         while self.is_running:
             try:
                 await self._process_failed_billing_transactions()
+                await self._cleanup_stale_suspended_transactions()
                 await asyncio.sleep(self.retry_interval_minutes * 60)
             except asyncio.CancelledError:
                 break
@@ -58,7 +59,7 @@ class BillingRetryService:
     
     async def _process_failed_billing_transactions(self):
         """Process all failed billing transactions that are eligible for retry"""
-        cutoff_time = datetime.utcnow() - timedelta(hours=self.max_retry_age_hours)
+        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=self.max_retry_age_hours)
         
         # Get failed billing transactions within the retry window
         failed_transactions = await Transaction.filter(
@@ -99,12 +100,83 @@ class BillingRetryService:
         if success_count > 0 or failure_count > 0:
             logger.info(f"🔄 Billing retry completed: {success_count} successful, {failure_count} failed")
     
+    async def _cleanup_stale_suspended_transactions(self):
+        """Auto-stop SUSPENDED transactions orphaned by server restarts.
+
+        The in-memory asyncio timeout task is lost on restart, so this catches
+        any SUSPENDED transaction whose suspend window has expired.
+
+        Uses an atomic compare-and-swap update to avoid racing with
+        _suspend_timeout or other code paths that also transition SUSPENDED
+        transactions.
+        """
+        from main import SUSPEND_TIMEOUT_SECONDS
+
+        cutoff_time = datetime.now(timezone.utc) - timedelta(seconds=SUSPEND_TIMEOUT_SECONDS)
+
+        stale_transactions = await Transaction.filter(
+            transaction_status=TransactionStatusEnum.SUSPENDED,
+            suspended_at__lt=cutoff_time
+        ).all()
+
+        if not stale_transactions:
+            return
+
+        logger.info(f"🧹 Found {len(stale_transactions)} stale SUSPENDED transactions to clean up")
+
+        for transaction in stale_transactions:
+            try:
+                # Atomic compare-and-swap: only update if still SUSPENDED
+                rows_affected = await Transaction.filter(
+                    id=transaction.id,
+                    transaction_status=TransactionStatusEnum.SUSPENDED
+                ).update(
+                    transaction_status=TransactionStatusEnum.STOPPED,
+                    stop_reason="SUSPENDED_TIMEOUT",
+                    end_time=datetime.now(timezone.utc),
+                )
+
+                if rows_affected == 0:
+                    # Another code path already transitioned this transaction
+                    logger.debug(f"Transaction {transaction.id} already handled by another path, skipping")
+                    continue
+
+                # Refresh from DB after the atomic update
+                txn_id = transaction.id
+                transaction = await Transaction.filter(id=txn_id).first()
+                if not transaction:
+                    logger.warning(f"Transaction {txn_id} disappeared after CAS update, skipping")
+                    continue
+
+                # Calculate energy from last meter value
+                latest_meter_value = await MeterValue.filter(
+                    transaction_id=transaction.id
+                ).order_by("-created_at").first()
+
+                if latest_meter_value:
+                    transaction.end_meter_kwh = latest_meter_value.reading_kwh
+                    transaction.energy_consumed_kwh = transaction.end_meter_kwh - (transaction.start_meter_kwh or 0)
+                    await transaction.save()
+
+                logger.info(f"🛑 Auto-stopped stale SUSPENDED transaction {transaction.id}")
+
+                # Process billing
+                if transaction.energy_consumed_kwh is not None and transaction.energy_consumed_kwh > 0:
+                    success, message, billing_amount = await WalletService.process_transaction_billing(transaction.id)
+                    if success:
+                        logger.info(f"💰 Billed stale transaction {transaction.id}: ₹{billing_amount}")
+                    else:
+                        logger.warning(f"💰 Billing failed for stale transaction {transaction.id}: {message}")
+
+            except Exception as e:
+                logger.error(f"Error cleaning up stale SUSPENDED transaction {transaction.id}: {e}", exc_info=True)
+
     async def cleanup_old_failed_transactions(self, max_age_days: int = 7):
         """
         Clean up very old failed billing transactions that are beyond retry.
         This could be called periodically to prevent table bloat.
         """
-        cutoff_time = datetime.utcnow() - timedelta(days=max_age_days)
+        cutoff_time = datetime.now(timezone.utc) - timedelta(days=max_age_days)
         
         old_failed = await Transaction.filter(
             transaction_status=TransactionStatusEnum.BILLING_FAILED,

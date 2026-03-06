@@ -1,7 +1,7 @@
 # This file is to aggregate all CRUD operations related to OCPP logs and charger connections.
 import datetime
 from typing import List, Optional, Tuple
-from models import OCPPLog, Charger
+from models import OCPPLog, Charger, AuditLog, WebhookEvent
 
 
 ###
@@ -36,6 +36,51 @@ async def get_logs_by_charge_point(charge_point_id: str, limit: int = 100) -> Li
     return await OCPPLog.filter(
         charge_point_id=charge_point_id
     ).order_by('-timestamp').limit(limit)
+
+###
+### AUDIT LOG ###
+###
+
+async def log_audit_event(
+    action: str,
+    entity_type: str,
+    entity_id: str,
+    actor_type: str = "system",
+    actor=None,
+    changes: dict | None = None,
+) -> AuditLog:
+    """Append an audit log entry. Actor fields extracted from User object if provided."""
+    return await AuditLog.create(
+        actor_type=actor_type,
+        actor_id=actor.id if actor else None,
+        actor_email=actor.email if actor else None,
+        action=action,
+        entity_type=entity_type,
+        entity_id=str(entity_id),
+        changes=changes,
+    )
+
+###
+### WEBHOOK EVENT ###
+###
+
+async def log_webhook_event(
+    source,
+    event_type: str,
+    event_id: str | None = None,
+    payload: dict | None = None,
+    status: str = "processed",
+    error_message: str | None = None,
+) -> WebhookEvent:
+    """Append a webhook event record."""
+    return await WebhookEvent.create(
+        source=source,
+        event_type=event_type,
+        event_id=event_id,
+        payload=payload,
+        status=status,
+        error_message=error_message,
+    )
 
 ###
 ### CHARGER CONNECTIONS ###

@@ -8,6 +8,8 @@ import os
 from clerk_backend_api import Clerk
 from services.razorpay_service import razorpay_service
 from services.wallet_service import WalletService
+from crud import log_webhook_event
+from models import WebhookSourceEnum
 
 logger = logging.getLogger("webhooks")
 router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
@@ -142,9 +144,25 @@ async def handle_user_created(data: dict):
         await Wallet.create(user=user, balance=0.00)
         
         logger.info(f"Created new user {primary_email} from Clerk webhook")
-        
+
+        await log_webhook_event(
+            source=WebhookSourceEnum.CLERK,
+            event_type="user.created",
+            event_id=clerk_user_id,
+            payload=data,
+            status="processed",
+        )
+
     except Exception as e:
         logger.error(f"Error handling user.created webhook: {str(e)}")
+        await log_webhook_event(
+            source=WebhookSourceEnum.CLERK,
+            event_type="user.created",
+            event_id=data.get("id"),
+            payload=data,
+            status="failed",
+            error_message=str(e),
+        )
         raise
 
 async def handle_user_updated(data: dict):
@@ -190,9 +208,25 @@ async def handle_user_updated(data: dict):
         
         await user.save()
         logger.info(f"Updated user {user.email} from Clerk webhook")
-        
+
+        await log_webhook_event(
+            source=WebhookSourceEnum.CLERK,
+            event_type="user.updated",
+            event_id=clerk_user_id,
+            payload=data,
+            status="processed",
+        )
+
     except Exception as e:
         logger.error(f"Error handling user.updated webhook: {str(e)}")
+        await log_webhook_event(
+            source=WebhookSourceEnum.CLERK,
+            event_type="user.updated",
+            event_id=data.get("id"),
+            payload=data,
+            status="failed",
+            error_message=str(e),
+        )
         raise
 
 async def handle_user_deleted(data: dict):
@@ -214,8 +248,24 @@ async def handle_user_deleted(data: dict):
 
         logger.info(f"Deactivated user {user.email} from Clerk webhook")
 
+        await log_webhook_event(
+            source=WebhookSourceEnum.CLERK,
+            event_type="user.deleted",
+            event_id=clerk_user_id,
+            payload=data,
+            status="processed",
+        )
+
     except Exception as e:
         logger.error(f"Error handling user.deleted webhook: {str(e)}")
+        await log_webhook_event(
+            source=WebhookSourceEnum.CLERK,
+            event_type="user.deleted",
+            event_id=data.get("id"),
+            payload=data,
+            status="failed",
+            error_message=str(e),
+        )
         raise
 
 
@@ -338,9 +388,24 @@ async def handle_payment_captured(event_data: dict):
                 f"✅ Webhook: Successfully processed payment for order {order_id}, "
                 f"Amount ₹{wallet_txn.amount}, New balance ₹{new_balance}"
             )
+            await log_webhook_event(
+                source=WebhookSourceEnum.RAZORPAY,
+                event_type="payment.captured",
+                event_id=payment_id,
+                payload=event_data,
+                status="processed",
+            )
         else:
             logger.error(
                 f"❌ Webhook: Failed to process payment for order {order_id}: {message}"
+            )
+            await log_webhook_event(
+                source=WebhookSourceEnum.RAZORPAY,
+                event_type="payment.captured",
+                event_id=payment_id,
+                payload=event_data,
+                status="failed",
+                error_message=message,
             )
 
     except Exception as e:
@@ -394,6 +459,14 @@ async def handle_payment_failed(event_data: dict):
         )
 
         logger.info(f"Marked transaction {wallet_txn.id} as FAILED for order {order_id}")
+
+        await log_webhook_event(
+            source=WebhookSourceEnum.RAZORPAY,
+            event_type="payment.failed",
+            event_id=payment_id,
+            payload=event_data,
+            status="processed",
+        )
 
     except Exception as e:
         logger.error(f"Error handling payment.failed webhook: {e}", exc_info=True)
@@ -459,6 +532,22 @@ async def handle_order_paid(event_data: dict):
             logger.info(
                 f"✅ Webhook (order.paid): Successfully processed order {order_id}, "
                 f"New balance ₹{new_balance}"
+            )
+            await log_webhook_event(
+                source=WebhookSourceEnum.RAZORPAY,
+                event_type="order.paid",
+                event_id=order_id,
+                payload=event_data,
+                status="processed",
+            )
+        else:
+            await log_webhook_event(
+                source=WebhookSourceEnum.RAZORPAY,
+                event_type="order.paid",
+                event_id=order_id,
+                payload=event_data,
+                status="failed",
+                error_message=message,
             )
 
     except Exception as e:
