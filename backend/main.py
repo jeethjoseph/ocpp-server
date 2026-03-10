@@ -454,6 +454,13 @@ class ChargePoint(OcppChargePoint):
                                     )
                             else:
                                 logger.warning(f"💰 Cannot bill failed transaction {transaction.id} - no energy consumed (energy: {transaction.energy_consumed_kwh} kWh)")
+
+                            # Handle QR payment refund on charging failure
+                            try:
+                                from services.qr_payment_service import QRPaymentService
+                                await QRPaymentService.handle_charging_failure(transaction.id)
+                            except Exception as qr_err:
+                                logger.warning(f"QR failure handling error (non-fatal): {qr_err}")
                     else:
                         logger.debug(f"Status {status} indicates not charging but no ongoing transactions found for charger {self.id}")
                         
@@ -531,15 +538,24 @@ class ChargePoint(OcppChargePoint):
                 changes={"new_status": "RUNNING", "trigger": "StartTransaction"},
             ))
 
+            # Link QR payment to transaction if applicable
+            try:
+                from services.qr_payment_service import QRPaymentService
+                await QRPaymentService.link_transaction_to_qr_payment(
+                    transaction.id, charger.id, user.id
+                )
+            except Exception as qr_err:
+                logger.warning(f"QR payment link check failed (non-fatal): {qr_err}")
+
             # Record transaction started event
             await OCPPMetrics.record_transaction_started(self.id, user.id)
             SentryHelper.set_transaction_context(transaction.id, self.id, user.id)
-            
+
             return call_result.StartTransaction(
                 transaction_id=transaction.id,
                 id_tag_info={"status": "Accepted"}
             )
-            
+
         except Exception as e:
             logger.error(f"Error creating transaction for {self.id}: {e}", exc_info=True)
             return call_result.StartTransaction(
@@ -612,11 +628,18 @@ class ChargePoint(OcppChargePoint):
                 await Transaction.filter(id=transaction_id).update(
                     transaction_status=TransactionStatusEnum.BILLING_FAILED
                 )
-            
+
+            # Process QR payment billing (refund unused amount)
+            try:
+                from services.qr_payment_service import QRPaymentService
+                await QRPaymentService.process_qr_session_billing(transaction_id)
+            except Exception as qr_err:
+                logger.error(f"QR billing error for transaction {transaction_id}: {qr_err}", exc_info=True)
+
             return call_result.StopTransaction(
                 id_tag_info={"status": "Accepted"}
             )
-            
+
         except Exception as e:
             logger.error(f"Error stopping transaction {transaction_id}: {e}", exc_info=True)
             return call_result.StopTransaction(
@@ -761,6 +784,15 @@ class ChargePoint(OcppChargePoint):
                     logger.debug(f"🔋 Meter data was: {meter_data}")
             
             logger.info(f"🔋 📊 Summary: Created {meter_records_created} meter value records for transaction {transaction_id}")
+
+            # Check QR session budget and auto-stop if needed
+            if meter_records_created > 0 and meter_data.get('reading_kwh') is not None:
+                try:
+                    from services.qr_payment_service import QRPaymentService
+                    await QRPaymentService.check_budget_and_auto_stop(transaction_id, meter_data['reading_kwh'])
+                except Exception as qr_err:
+                    logger.warning(f"QR budget check failed (non-fatal): {qr_err}")
+
             return call_result.MeterValues()
             
         except Exception as e:
@@ -1125,6 +1157,9 @@ app.include_router(logs.router)
 app.include_router(firmware.router)
 app.include_router(firmware.public_router)
 
+from routers import qr_codes
+app.include_router(qr_codes.router)
+
 # OCPP WebSocket endpoint (connection management + message handling)
 from routers import ocpp_ws
 app.include_router(ocpp_ws.router)
@@ -1232,6 +1267,13 @@ async def startup_event():
     """Initialize database and Redis on startup"""
     await init_db()
     await redis_manager.connect()
+
+    # Ensure system guest user exists for QR payment fallback
+    from services.qr_payment_service import ensure_guest_user
+    try:
+        await ensure_guest_user()
+    except Exception as e:
+        logger.warning(f"Failed to ensure guest user (non-fatal): {e}")
 
     logger.info("Admin panel available at /admin")
 

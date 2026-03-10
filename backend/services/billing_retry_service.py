@@ -6,7 +6,8 @@ from datetime import datetime, timedelta, timezone
 
 from utils import safe_create_task
 from services.wallet_service import WalletService
-from models import Transaction, TransactionStatusEnum, MeterValue
+from services.razorpay_service import razorpay_service
+from models import Transaction, TransactionStatusEnum, MeterValue, QRPayment, QRPaymentStatusEnum
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,7 @@ class BillingRetryService:
         while self.is_running:
             try:
                 await self._process_failed_billing_transactions()
+                await self._process_failed_qr_refunds()
                 await self._cleanup_stale_suspended_transactions()
                 await asyncio.sleep(self.retry_interval_minutes * 60)
             except asyncio.CancelledError:
@@ -101,6 +103,54 @@ class BillingRetryService:
         if success_count > 0 or failure_count > 0:
             logger.info(f"🔄 Billing retry completed: {success_count} successful, {failure_count} failed")
     
+    async def _process_failed_qr_refunds(self):
+        """Retry failed QR payment refunds (e.g. insufficient Razorpay balance)"""
+        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=self.max_retry_age_hours)
+
+        failed_refunds = await QRPayment.filter(
+            status=QRPaymentStatusEnum.REFUND_FAILED,
+            updated_at__gte=cutoff_time,
+        ).all()
+
+        if not failed_refunds:
+            logger.debug("No failed QR refunds to retry")
+            return
+
+        logger.info(f"🔄 Retrying {len(failed_refunds)} failed QR refunds")
+
+        success_count = 0
+        failure_count = 0
+
+        for qr_payment in failed_refunds:
+            try:
+                refund_amount = qr_payment.refund_amount
+                if not refund_amount or refund_amount <= 0:
+                    logger.warning(f"QR payment {qr_payment.id} has no refund_amount, skipping")
+                    continue
+
+                refund_result = razorpay_service.refund_payment(
+                    qr_payment.razorpay_payment_id,
+                    amount=refund_amount,
+                    notes={"qr_payment_id": str(qr_payment.id), "reason": "Retry: " + (qr_payment.failure_reason or "unknown")},
+                )
+                qr_payment.razorpay_refund_id = refund_result.get("id")
+                qr_payment.status = QRPaymentStatusEnum.REFUNDED
+                qr_payment.failure_reason = None
+                await qr_payment.save()
+                success_count += 1
+                logger.info(f"✅ QR refund retry successful: payment {qr_payment.id}, ₹{refund_amount}")
+
+            except Exception as e:
+                failure_count += 1
+                qr_payment.failure_reason = str(e)
+                await qr_payment.save()
+                logger.warning(f"❌ QR refund retry failed for payment {qr_payment.id}: {e}")
+
+            await asyncio.sleep(0.1)
+
+        if success_count > 0 or failure_count > 0:
+            logger.info(f"🔄 QR refund retry completed: {success_count} successful, {failure_count} failed")
+
     async def _cleanup_stale_suspended_transactions(self):
         """Auto-stop SUSPENDED transactions orphaned by server restarts.
 

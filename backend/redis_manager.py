@@ -96,6 +96,49 @@ class RedisConnectionManager:
             logger.error(f"Failed to get connected chargers: {e}")
             return []
     
+    # QR session cache methods
+    QR_SESSION_PREFIX = "qr_session:"
+
+    async def set_qr_session(self, transaction_id: int, data: Dict, ttl: int = 86400) -> bool:
+        """Cache QR session data for budget checking during MeterValues"""
+        if not self.redis_client:
+            logger.error("Redis client not initialized")
+            return False
+        try:
+            key = f"{self.QR_SESSION_PREFIX}{transaction_id}"
+            await self.redis_client.set(key, json.dumps(data), ex=ttl)
+            logger.info(f"Cached QR session for transaction {transaction_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to cache QR session for transaction {transaction_id}: {e}")
+            return False
+
+    async def get_qr_session(self, transaction_id: int) -> Optional[Dict]:
+        """Get cached QR session data"""
+        if not self.redis_client:
+            return None
+        try:
+            key = f"{self.QR_SESSION_PREFIX}{transaction_id}"
+            data = await self.redis_client.get(key)
+            if data:
+                return json.loads(data)
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get QR session for transaction {transaction_id}: {e}")
+            return None
+
+    async def delete_qr_session(self, transaction_id: int) -> bool:
+        """Delete QR session cache"""
+        if not self.redis_client:
+            return False
+        try:
+            key = f"{self.QR_SESSION_PREFIX}{transaction_id}"
+            await self.redis_client.delete(key)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete QR session for transaction {transaction_id}: {e}")
+            return False
+
     async def get_charger_connected_at(self, charger_id: str) -> Optional[datetime]:
         """Get connection timestamp for a specific charger"""
         if not self.redis_client:

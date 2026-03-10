@@ -80,6 +80,16 @@ class AuthProviderEnum(str, enum.Enum):
     EMAIL = "EMAIL"
     GOOGLE = "GOOGLE"
     CLERK = "CLERK"
+    UPI_GUEST = "UPI_GUEST"
+
+class QRPaymentStatusEnum(str, enum.Enum):
+    PAID = "PAID"
+    CHARGING = "CHARGING"
+    COMPLETED = "COMPLETED"
+    REFUNDED = "REFUNDED"
+    REFUND_FAILED = "REFUND_FAILED"
+    EXPIRED = "EXPIRED"
+    FAILED = "FAILED"
 
 class WebhookSourceEnum(str, enum.Enum):
     CLERK = "CLERK"
@@ -114,6 +124,9 @@ class User(Model):
     
     # RFID/Card integration for OCPP
     rfid_card_id = fields.CharField(max_length=255, unique=True, null=True)
+
+    # UPI VPA for QR payment user lookup
+    upi_vpa = fields.CharField(max_length=255, unique=True, null=True)
     
     # Legacy password support (will be deprecated)
     password_hash = fields.CharField(max_length=255, null=True)
@@ -425,6 +438,47 @@ class WebhookEvent(Model):
     class Meta:
         table = "webhook_event"
 
+class ChargerQRCode(Model):
+    id = fields.IntField(pk=True)
+    charger = fields.OneToOneField("models.Charger", related_name="qr_code")
+    razorpay_qr_code_id = fields.CharField(max_length=255, unique=True, index=True)
+    image_url = fields.CharField(max_length=500)
+    short_url = fields.CharField(max_length=500, null=True)
+    is_active = fields.BooleanField(default=True)
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    # Relationships
+    payments: fields.ReverseRelation["QRPayment"]
+
+    class Meta:
+        table = "charger_qr_code"
+
+class QRPayment(Model):
+    id = fields.IntField(pk=True)
+    charger = fields.ForeignKeyField("models.Charger", related_name="qr_payments")
+    charger_qr_code = fields.ForeignKeyField("models.ChargerQRCode", related_name="payments")
+    user = fields.ForeignKeyField("models.User", related_name="qr_payments", null=True)
+    transaction = fields.ForeignKeyField("models.Transaction", related_name="qr_payment", null=True)
+    razorpay_payment_id = fields.CharField(max_length=255, unique=True, index=True)
+    razorpay_qr_code_id = fields.CharField(max_length=255, index=True)
+    amount_paid = fields.DecimalField(max_digits=10, decimal_places=2)
+    customer_vpa = fields.CharField(max_length=255, null=True)
+    customer_name = fields.CharField(max_length=255, null=True)
+    customer_contact = fields.CharField(max_length=255, null=True)
+    energy_cost = fields.DecimalField(max_digits=10, decimal_places=2, null=True)
+    platform_fee = fields.DecimalField(max_digits=10, decimal_places=2, null=True)
+    refund_amount = fields.DecimalField(max_digits=10, decimal_places=2, null=True)
+    razorpay_refund_id = fields.CharField(max_length=255, null=True)
+    status = fields.CharEnumField(QRPaymentStatusEnum)
+    failure_reason = fields.TextField(null=True)
+    metadata = fields.JSONField(null=True)
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = "qr_payment"
+
 # Pydantic models for API serialization
 User_Pydantic = pydantic_model_creator(User, name="User")
 UserIn_Pydantic = pydantic_model_creator(User, name="UserIn", exclude_readonly=True)
@@ -434,3 +488,5 @@ SignalQuality_Pydantic = pydantic_model_creator(SignalQuality, name="SignalQuali
 ChargerError_Pydantic = pydantic_model_creator(ChargerError, name="ChargerError")
 AuditLog_Pydantic = pydantic_model_creator(AuditLog, name="AuditLog")
 WebhookEvent_Pydantic = pydantic_model_creator(WebhookEvent, name="WebhookEvent")
+ChargerQRCode_Pydantic = pydantic_model_creator(ChargerQRCode, name="ChargerQRCode")
+QRPayment_Pydantic = pydantic_model_creator(QRPayment, name="QRPayment")

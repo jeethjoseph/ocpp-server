@@ -81,7 +81,14 @@ class WalletService:
             transaction = await Transaction.filter(id=transaction_id).select_for_update().first()
             if not transaction:
                 return False, f"Transaction {transaction_id} not found", None
-            
+
+            # Skip wallet billing for QR payment sessions
+            from models import QRPayment
+            qr_payment = await QRPayment.filter(transaction_id=transaction_id).first()
+            if qr_payment:
+                logger.info(f"Transaction {transaction_id} is a QR payment session, skipping wallet billing")
+                return True, "QR payment session - billed via QR payment flow", Decimal('0.00')
+
             # Idempotency guard: skip if already billed (prevents double billing
             # when BootNotification and StopTransaction both trigger billing)
             existing_charge = await WalletTransaction.filter(

@@ -334,6 +334,10 @@ async def handle_razorpay_webhook(
         elif event_type == "order.paid":
             await handle_order_paid(event_data)
 
+        # Handle QR code credited event (appless charging payment)
+        elif event_type == "qr_code.credited":
+            await handle_qr_code_credited(event_data)
+
         else:
             logger.info(f"Unhandled Razorpay webhook event: {event_type}")
 
@@ -540,4 +544,46 @@ async def handle_order_paid(event_data: dict):
 
     except Exception as e:
         logger.error(f"Error handling order.paid webhook: {e}", exc_info=True)
+        raise
+
+
+async def handle_qr_code_credited(event_data: dict):
+    """Handle qr_code.credited webhook event for appless QR charging"""
+    try:
+        from services.qr_payment_service import QRPaymentService
+
+        payment = event_data.get("payment", {}).get("entity", {})
+        qr_code = event_data.get("qr_code", {}).get("entity", {})
+        payment_id = payment.get("id")
+        qr_code_id = qr_code.get("id")
+
+        logger.info(
+            f"Processing qr_code.credited: "
+            f"Payment {payment_id}, QR {qr_code_id}, "
+            f"Amount {payment.get('amount')} paise"
+        )
+
+        result = await QRPaymentService.handle_qr_payment(event_data)
+
+        await log_webhook_event(
+            source=WebhookSourceEnum.RAZORPAY,
+            event_type="qr_code.credited",
+            event_id=payment_id,
+            payload=event_data,
+            status="processed" if result.get("status") != "error" else "failed",
+            error_message=result.get("reason"),
+        )
+
+        logger.info(f"QR code credited result: {result}")
+
+    except Exception as e:
+        logger.error(f"Error handling qr_code.credited webhook: {e}", exc_info=True)
+        await log_webhook_event(
+            source=WebhookSourceEnum.RAZORPAY,
+            event_type="qr_code.credited",
+            event_id=event_data.get("payment", {}).get("entity", {}).get("id"),
+            payload=event_data,
+            status="failed",
+            error_message=str(e),
+        )
         raise

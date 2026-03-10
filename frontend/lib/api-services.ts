@@ -571,3 +571,58 @@ export const chargerErrorService = {
       `/api/admin/chargers/${chargerId}/errors/latest`
     ),
 };
+
+/**
+ * QR Code Service
+ * Handles Razorpay QR codes for appless EV charging
+ */
+export const qrCodeService = {
+  create: (chargerId: number) =>
+    api.post<import("@/types/api").ChargerQRCode>("/api/admin/qr-codes", {
+      charger_id: chargerId,
+    }),
+
+  getAll: (params?: {
+    page?: number;
+    limit?: number;
+    status?: string;
+    search?: string;
+  }) => {
+    const searchParams = new URLSearchParams();
+    if (params?.page) searchParams.set("page", params.page.toString());
+    if (params?.limit) searchParams.set("limit", params.limit.toString());
+    if (params?.status) searchParams.set("status", params.status);
+    if (params?.search) searchParams.set("search", params.search);
+
+    const query = searchParams.toString();
+    return api.get<import("@/types/api").ChargerQRCodeListResponse>(
+      `/api/admin/qr-codes${query ? `?${query}` : ""}`
+    );
+  },
+
+  getById: (id: number) =>
+    api.get<import("@/types/api").ChargerQRCode>(`/api/admin/qr-codes/${id}`),
+
+  getByChargerId: (chargerId: number) =>
+    api.get<import("@/types/api").ChargerQRCode | null>(
+      `/api/admin/qr-codes/charger/${chargerId}`
+    ),
+
+  close: (id: number) =>
+    api.post<{ message: string }>(`/api/admin/qr-codes/${id}/close`, {}),
+
+  getPayments: (
+    id: number,
+    params?: { page?: number; limit?: number; status?: string }
+  ) => {
+    const searchParams = new URLSearchParams();
+    if (params?.page) searchParams.set("page", params.page.toString());
+    if (params?.limit) searchParams.set("limit", params.limit.toString());
+    if (params?.status) searchParams.set("status", params.status);
+
+    const query = searchParams.toString();
+    return api.get<import("@/types/api").QRPaymentListResponse>(
+      `/api/admin/qr-codes/${id}/payments${query ? `?${query}` : ""}`
+    );
+  },
+};

@@ -204,6 +204,66 @@ class RazorpayService:
             logger.error(f"Failed to fetch order {order_id}: {e}")
             return None
 
+    def create_qr_code(
+        self,
+        charger_id: int,
+        charge_point_string_id: str,
+        name: str
+    ) -> Optional[Dict]:
+        """Create a Razorpay QR code for a charger (static, variable amount)"""
+        if not self.is_configured():
+            raise Exception("Razorpay is not configured")
+        try:
+            qr_data = {
+                "type": "upi_qr",
+                "name": f"EV Charging - {name}",
+                "usage": "multiple_use",
+                "fixed_amount": False,
+                "description": f"Pay for EV charging at {name} ({charge_point_string_id})",
+                "notes": {
+                    "charger_id": str(charger_id),
+                    "charge_point_string_id": charge_point_string_id
+                }
+            }
+            qr_code = self.client.qrcode.create(data=qr_data)
+            logger.info(f"Razorpay QR code created: {qr_code.get('id')} for charger {charge_point_string_id}")
+            return qr_code
+        except Exception as e:
+            logger.error(f"Failed to create Razorpay QR code: {e}", exc_info=True)
+            raise Exception(f"Failed to create QR code: {str(e)}")
+
+    def close_qr_code(self, qr_code_id: str) -> Optional[Dict]:
+        """Close a Razorpay QR code"""
+        if not self.is_configured():
+            raise Exception("Razorpay is not configured")
+        try:
+            result = self.client.qrcode.close(qr_code_id)
+            logger.info(f"Razorpay QR code closed: {qr_code_id}")
+            return result
+        except Exception as e:
+            logger.error(f"Failed to close Razorpay QR code {qr_code_id}: {e}")
+            return None
+
+    def fetch_qr_code(self, qr_code_id: str) -> Optional[Dict]:
+        """Fetch QR code details from Razorpay"""
+        if not self.is_configured():
+            return None
+        try:
+            return self.client.qrcode.fetch(qr_code_id)
+        except Exception as e:
+            logger.error(f"Failed to fetch QR code {qr_code_id}: {e}")
+            return None
+
+    def fetch_qr_payments(self, qr_code_id: str, options: Optional[Dict] = None) -> Optional[Dict]:
+        """Fetch payments for a QR code"""
+        if not self.is_configured():
+            return None
+        try:
+            return self.client.qrcode.fetch_all_payments(qr_code_id, options or {})
+        except Exception as e:
+            logger.error(f"Failed to fetch payments for QR code {qr_code_id}: {e}")
+            return None
+
     def refund_payment(
         self,
         payment_id: str,
@@ -241,7 +301,7 @@ class RazorpayService:
 
         except Exception as e:
             logger.error(f"Failed to create refund for payment {payment_id}: {e}")
-            return None
+            raise
 
 
 # Singleton instance

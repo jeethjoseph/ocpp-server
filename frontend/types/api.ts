@@ -438,3 +438,58 @@ export interface ChargerErrorListResponse {
   charger_id: number;
   unresolved_count: number;
 }
+
+// QR Code Types (Appless Charging)
+export interface ChargerQRCode {
+  id: number;
+  charger_id: number;
+  charger_name: string;
+  charge_point_string_id: string;
+  razorpay_qr_code_id: string;
+  image_url: string;
+  short_url?: string;
+  is_active: boolean;
+  payment_count?: number;
+  total_revenue?: number;
+  total_refunds?: number;
+  created_at: string;
+}
+
+export interface ChargerQRCodeListResponse {
+  data: ChargerQRCode[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+export type QRPaymentStatus =
+  | "PAID"
+  | "CHARGING"
+  | "COMPLETED"
+  | "REFUNDED"
+  | "REFUND_FAILED"
+  | "EXPIRED"
+  | "FAILED";
+
+export interface QRPayment {
+  id: number;
+  razorpay_payment_id: string;
+  amount_paid: string;
+  customer_vpa?: string;
+  customer_name?: string;
+  customer_contact?: string;
+  energy_cost?: string;
+  platform_fee?: string;
+  refund_amount?: string;
+  status: QRPaymentStatus;
+  failure_reason?: string;
+  transaction_id?: number;
+  created_at: string;
+}
+
+export interface QRPaymentListResponse {
+  data: QRPayment[];
+  total: number;
+  page: number;
+  limit: number;
+}
