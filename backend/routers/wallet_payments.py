@@ -1,8 +1,8 @@
-from fastapi import APIRouter, HTTPException, Depends, Request
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, HTTPException, Depends, Request, Query
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional
-from decimal import Decimal
-from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
+from datetime import datetime, timezone
 import logging
 
 from auth_middleware import require_user
@@ -16,6 +16,12 @@ router = APIRouter(prefix="/api/wallet", tags=["Wallet Payments"])
 # Request/Response Schemas
 class CreateRechargeRequest(BaseModel):
     amount: float = Field(..., gt=0, description="Amount to recharge in rupees (must be positive)")
+
+    @field_validator("amount")
+    @classmethod
+    def round_amount(cls, v: float) -> float:
+        """Round to 2 decimal places to avoid floating-point surprises."""
+        return float(Decimal(str(v)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
     class Config:
         json_schema_extra = {
@@ -126,7 +132,7 @@ async def create_recharge_order(
         amount = Decimal(str(request.amount))
 
         # Create receipt ID for tracking
-        receipt_id = f"wallet_recharge_{current_user.id}_{int(datetime.utcnow().timestamp())}"
+        receipt_id = f"wallet_recharge_{current_user.id}_{int(datetime.now(tz=timezone.utc).timestamp())}"
 
         # Create Razorpay order
         order = razorpay_service.create_order(
@@ -336,6 +342,8 @@ async def get_payment_status(
 
 @router.get("/recharge-history", response_model=dict)
 async def get_recharge_history(
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=500),
     current_user: User = Depends(require_user())
 ):
     """
@@ -347,14 +355,19 @@ async def get_recharge_history(
         if not wallet:
             return {
                 "data": [],
-                "total": 0
+                "total": 0,
+                "page": page,
+                "limit": limit
             }
 
-        # Get all TOP_UP transactions
-        recharge_transactions = await WalletTransaction.filter(
+        query = WalletTransaction.filter(
             wallet=wallet,
             type=TransactionTypeEnum.TOP_UP
-        ).order_by('-created_at')
+        )
+
+        total = await query.count()
+        offset = (page - 1) * limit
+        recharge_transactions = await query.order_by('-created_at').offset(offset).limit(limit)
 
         transaction_data = []
         for txn in recharge_transactions:
@@ -371,7 +384,9 @@ async def get_recharge_history(
 
         return {
             "data": transaction_data,
-            "total": len(transaction_data)
+            "total": total,
+            "page": page,
+            "limit": limit
         }
 
     except Exception as e:

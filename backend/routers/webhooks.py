@@ -14,6 +14,22 @@ from models import WebhookSourceEnum
 logger = logging.getLogger("webhooks")
 router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
 
+async def _find_txn_by_order_id(order_id: str):
+    """Find a TOP_UP WalletTransaction by razorpay_order_id in payment_metadata.
+
+    Searches most-recent-first with a safety cap of 1000 rows to avoid
+    full-table scans. A proper fix is to add an indexed razorpay_order_id column.
+    """
+    recent_txns = await WalletTransaction.filter(
+        type=TransactionTypeEnum.TOP_UP
+    ).order_by("-created_at").limit(1000)
+
+    for txn in recent_txns:
+        if txn.payment_metadata and txn.payment_metadata.get("razorpay_order_id") == order_id:
+            return txn
+    return None
+
+
 CLERK_WEBHOOK_SECRET = os.getenv("CLERK_WEBHOOK_SECRET")
 CLERK_SECRET_KEY = os.getenv("CLERK_SECRET_KEY")
 
@@ -68,7 +84,7 @@ async def handle_clerk_webhook(
         
     except Exception as e:
         logger.error(f"Webhook processing error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Webhook processing failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Webhook processing failed")
 
 async def handle_user_created(data: dict):
     """Handle user.created webhook event"""
@@ -327,7 +343,7 @@ async def handle_razorpay_webhook(
         raise
     except Exception as e:
         logger.error(f"Razorpay webhook processing error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Webhook processing failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Webhook processing failed")
 
 
 async def handle_payment_captured(event_data: dict):
@@ -346,24 +362,14 @@ async def handle_payment_captured(event_data: dict):
         )
 
         if not order_id or not payment_id:
-            logger.error("Missing order_id or payment_id in webhook payload")
-            return
+            raise ValueError("Missing order_id or payment_id in webhook payload")
 
         # Find the wallet transaction by order_id
-        # Note: Can't filter by JSON field directly, so fetch and filter in Python
-        all_transactions = await WalletTransaction.filter(
-            type=TransactionTypeEnum.TOP_UP
-        ).all()
-
-        wallet_txn = None
-        for txn in all_transactions:
-            if txn.payment_metadata and txn.payment_metadata.get("razorpay_order_id") == order_id:
-                wallet_txn = txn
-                break
+        # TODO: Add indexed razorpay_order_id column to avoid in-Python filtering
+        wallet_txn = await _find_txn_by_order_id(order_id)
 
         if not wallet_txn:
-            logger.error(f"Wallet transaction not found for order {order_id}")
-            return
+            raise ValueError(f"Wallet transaction not found for order {order_id}")
 
         # Check if already completed (idempotency)
         current_status = wallet_txn.payment_metadata.get("status")
@@ -427,22 +433,13 @@ async def handle_payment_failed(event_data: dict):
         )
 
         if not order_id:
-            return
+            raise ValueError("Missing order_id in payment.failed webhook payload")
 
         # Find the wallet transaction
-        all_transactions = await WalletTransaction.filter(
-            type=TransactionTypeEnum.TOP_UP
-        ).all()
-
-        wallet_txn = None
-        for txn in all_transactions:
-            if txn.payment_metadata and txn.payment_metadata.get("razorpay_order_id") == order_id:
-                wallet_txn = txn
-                break
+        wallet_txn = await _find_txn_by_order_id(order_id)
 
         if not wallet_txn:
-            logger.error(f"Wallet transaction not found for failed order {order_id}")
-            return
+            raise ValueError(f"Wallet transaction not found for failed order {order_id}")
 
         # Mark as failed
         updated_metadata = wallet_txn.payment_metadata or {}
@@ -486,22 +483,13 @@ async def handle_order_paid(event_data: dict):
         )
 
         if not order_id:
-            return
+            raise ValueError("Missing order_id in order.paid webhook payload")
 
         # Find the wallet transaction
-        all_transactions = await WalletTransaction.filter(
-            type=TransactionTypeEnum.TOP_UP
-        ).all()
-
-        wallet_txn = None
-        for txn in all_transactions:
-            if txn.payment_metadata and txn.payment_metadata.get("razorpay_order_id") == order_id:
-                wallet_txn = txn
-                break
+        wallet_txn = await _find_txn_by_order_id(order_id)
 
         if not wallet_txn:
-            logger.error(f"Wallet transaction not found for order {order_id}")
-            return
+            raise ValueError(f"Wallet transaction not found for order {order_id}")
 
         # Check if already completed
         current_status = wallet_txn.payment_metadata.get("status")

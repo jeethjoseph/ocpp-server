@@ -8,6 +8,7 @@ import asyncio
 import datetime
 import json
 import logging
+import os
 from datetime import timedelta
 from typing import Dict, Optional
 
@@ -18,8 +19,11 @@ from ocpp.v16 import call
 from redis_manager import redis_manager
 from crud import log_message, log_audit_event
 from services.monitoring_service import OCPPMetrics, SentryHelper
+from utils import safe_create_task
 
 logger = logging.getLogger("ocpp-server")
+
+OCPP_TIMEOUT = int(os.environ.get("OCPP_TIMEOUT", "120"))
 
 
 class ConnectionManager:
@@ -114,7 +118,7 @@ class ConnectionManager:
 
             logger.warning(f"[DISCONNECT] Force disconnected {charge_point_id}: {reason}")
 
-            asyncio.create_task(log_audit_event(
+            safe_create_task(log_audit_event(
                 action="charger.disconnected",
                 entity_type="charger",
                 entity_id=charge_point_id,
@@ -132,7 +136,6 @@ class ConnectionManager:
 
     async def heartbeat_monitor(self, charge_point_id: str, websocket: WebSocket):
         """Monitor OCPP activity to check device liveness."""
-        OCPP_TIMEOUT = 120  # seconds
 
         try:
             while True:
@@ -189,7 +192,7 @@ class ConnectionManager:
                     )
                     most_recent_times[charge_point_id] = most_recent
 
-                    if (current_time - most_recent).total_seconds() > 120:
+                    if (current_time - most_recent).total_seconds() > OCPP_TIMEOUT:
                         stale_connections.append(charge_point_id)
                         logger.warning(f"Connection {charge_point_id} stale: last activity {(current_time - most_recent).total_seconds():.1f}s ago")
 
@@ -199,6 +202,16 @@ class ConnectionManager:
                     logger.warning(f"Cleaning up stale connection: {charge_point_id}")
                     await self.force_disconnect(charge_point_id, f"Stale connection (inactive for {inactive_seconds:.1f}s)")
 
+                # Prune cleanup locks for charge points no longer connected
+                stale_locks = [cp_id for cp_id in self._cleanup_locks if cp_id not in self.connected_charge_points]
+                for cp_id in stale_locks:
+                    del self._cleanup_locks[cp_id]
+
+                # Prune expired tombstones
+                expired_tombstones = [cp_id for cp_id, exp in self._recently_disconnected.items() if current_time > exp]
+                for cp_id in expired_tombstones:
+                    del self._recently_disconnected[cp_id]
+
             except Exception as e:
                 logger.error(f"Error in periodic cleanup: {e}")
 
@@ -206,7 +219,7 @@ class ConnectionManager:
 
     def start_cleanup_task(self):
         """Start the periodic cleanup background task. Call from app startup."""
-        self._cleanup_task = asyncio.create_task(self.periodic_cleanup())
+        self._cleanup_task = safe_create_task(self.periodic_cleanup())
 
     async def stop_cleanup_task(self):
         """Stop the periodic cleanup background task. Call from app shutdown."""
@@ -345,7 +358,7 @@ class LoggingWebSocketAdapter(FastAPIWebSocketAdapter):
                 if not isinstance(parsed, list):
                     logger.error(f"[OCPP VALIDATION] {self.charge_point_id} sent non-array message: {msg}")
                     await self._send_protocol_error("RPC message must be a JSON array")
-                    asyncio.create_task(log_message(
+                    safe_create_task(log_message(
                         charger_id=self.charge_point_id,
                         direction="IN",
                         message_type="OCPP",
@@ -364,7 +377,7 @@ class LoggingWebSocketAdapter(FastAPIWebSocketAdapter):
                 if message_type_id not in [2, 3, 4]:
                     logger.error(f"[OCPP VALIDATION] {self.charge_point_id} sent invalid message type ID {message_type_id}: {msg}")
                     await self._send_protocol_error(f"Invalid OCPP message type ID: {message_type_id}")
-                    asyncio.create_task(log_message(
+                    safe_create_task(log_message(
                         charger_id=self.charge_point_id,
                         direction="IN",
                         message_type="OCPP",
@@ -380,7 +393,7 @@ class LoggingWebSocketAdapter(FastAPIWebSocketAdapter):
                 else:
                     logger.error(f"[OCPP VALIDATION] {self.charge_point_id} sent message without message ID: {msg}")
                     await self._send_protocol_error("OCPP message missing message ID")
-                    asyncio.create_task(log_message(
+                    safe_create_task(log_message(
                         charger_id=self.charge_point_id,
                         direction="IN",
                         message_type="OCPP",
@@ -395,7 +408,7 @@ class LoggingWebSocketAdapter(FastAPIWebSocketAdapter):
                     if len(parsed) < 4:
                         logger.error(f"[OCPP VALIDATION] {self.charge_point_id} sent incomplete CALL message: {msg}")
                         await self._send_call_error(correlation_id, "ProtocolError", "CALL message must have [messageType, messageId, action, payload]")
-                        asyncio.create_task(log_message(
+                        safe_create_task(log_message(
                             charger_id=self.charge_point_id,
                             direction="IN",
                             message_type="OCPP",
@@ -411,7 +424,7 @@ class LoggingWebSocketAdapter(FastAPIWebSocketAdapter):
                     if not isinstance(action, str):
                         logger.error(f"[OCPP VALIDATION] {self.charge_point_id} sent CALL with non-string action: {msg}")
                         await self._send_call_error(correlation_id, "ProtocolError", "Action must be a string")
-                        asyncio.create_task(log_message(
+                        safe_create_task(log_message(
                             charger_id=self.charge_point_id,
                             direction="IN",
                             message_type="OCPP",
@@ -424,7 +437,7 @@ class LoggingWebSocketAdapter(FastAPIWebSocketAdapter):
                     if not isinstance(payload, dict):
                         logger.error(f"[OCPP VALIDATION] {self.charge_point_id} sent CALL with non-object payload: {msg}")
                         await self._send_call_error(correlation_id, "ProtocolError", "Payload must be a JSON object")
-                        asyncio.create_task(log_message(
+                        safe_create_task(log_message(
                             charger_id=self.charge_point_id,
                             direction="IN",
                             message_type="OCPP",
@@ -437,7 +450,7 @@ class LoggingWebSocketAdapter(FastAPIWebSocketAdapter):
             except json.JSONDecodeError as e:
                 logger.error(f"[OCPP VALIDATION] {self.charge_point_id} sent invalid JSON: {msg} - Error: {e}")
                 await self._send_protocol_error(f"Invalid JSON: {str(e)}")
-                asyncio.create_task(log_message(
+                safe_create_task(log_message(
                     charger_id=self.charge_point_id,
                     direction="IN",
                     message_type="OCPP",
@@ -449,7 +462,7 @@ class LoggingWebSocketAdapter(FastAPIWebSocketAdapter):
             except Exception as e:
                 logger.error(f"[OCPP VALIDATION] {self.charge_point_id} message validation error: {msg} - Error: {e}", exc_info=True)
                 await self._send_protocol_error(f"Message validation failed: {str(e)}")
-                asyncio.create_task(log_message(
+                safe_create_task(log_message(
                     charger_id=self.charge_point_id,
                     direction="IN",
                     message_type="OCPP",
@@ -460,7 +473,7 @@ class LoggingWebSocketAdapter(FastAPIWebSocketAdapter):
                 continue
 
             # Message is valid - log it and return
-            asyncio.create_task(log_message(
+            safe_create_task(log_message(
                 charger_id=self.charge_point_id,
                 direction="IN",
                 message_type="OCPP",

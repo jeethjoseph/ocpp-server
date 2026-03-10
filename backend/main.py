@@ -3,7 +3,8 @@ import os
 import asyncio
 import datetime
 from typing import Dict, List
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
+from auth_middleware import require_admin
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -20,6 +21,7 @@ from models import OCPPLog, Transaction, TransactionStatusEnum, MeterValue
 from services.wallet_service import WalletService
 from redis_manager import redis_manager
 from core.connection_manager import connection_manager
+from utils import safe_create_task, mask_id_tag, mask_email
 
 from ocpp.v16 import ChargePoint as OcppChargePoint
 from ocpp.v16 import call, call_result
@@ -28,7 +30,7 @@ import logging
 import json
 
 # Transaction resume constants
-SUSPEND_TIMEOUT_SECONDS = 300  # 5 minutes
+SUSPEND_TIMEOUT_SECONDS = int(os.environ.get("SUSPEND_TIMEOUT_SECONDS", "300"))
 
 # Import routers
 from routers import stations, chargers, transactions, auth, webhooks, users, public_stations, logs, wallet_payments, firmware
@@ -66,25 +68,28 @@ app = FastAPI(
     description="EV Charging Station Management System with OCPP 1.6 support"
 )
 
+# Allowed CORS origins — single source of truth for CORSMiddleware and OptionsMiddleware
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",           # Local development - Next.js
+    "http://127.0.0.1:3000",           # Local development - Next.js
+    "http://localhost:5173",           # Local development - Vite (mobile app)
+    "http://127.0.0.1:5173",           # Local development - Vite (mobile app)
+    "http://frontend:3000",            # Docker internal network
+    "http://ocpp-frontend:3000",       # Docker container name
+    "https://powerlync.com",            # Production frontend
+    "https://www.powerlync.com",        # Production frontend (www)
+    "https://ocpp-frontend-mu.vercel.app",  # Legacy Vercel frontend
+    "https://lyncpower.com",            # Backend domain (for testing)
+    "https://www.lyncpower.com"         # Backend domain (www)
+]
+
 # Configure CORS - Allow frontend domains
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",           # Local development - Next.js
-        "http://127.0.0.1:3000",           # Local development - Next.js
-        "http://localhost:5173",           # Local development - Vite (mobile app)
-        "http://127.0.0.1:5173",           # Local development - Vite (mobile app)
-        "http://frontend:3000",            # Docker internal network
-        "http://ocpp-frontend:3000",       # Docker container name
-        "https://powerlync.com",            # Production frontend
-        "https://www.powerlync.com",        # Production frontend (www)
-        "https://ocpp-frontend-mu.vercel.app",  # Legacy Vercel frontend
-        "https://lyncpower.com",            # Backend domain (for testing)
-        "https://www.lyncpower.com"         # Backend domain (www)
-    ],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_headers=["Authorization", "Content-Type", "Accept"],
 )
 
 # Configure Sentry middleware for error tracking
@@ -107,32 +112,18 @@ class OptionsMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         # Handle OPTIONS requests immediately with proper CORS headers
         if request.method == "OPTIONS":
-            # Get origin from request
-            origin = request.headers.get("origin", "*")
+            origin = request.headers.get("origin", "")
 
-            # Check if origin is allowed (optional security check)
-            allowed_origins = [
-                "http://localhost:3000",
-                "http://127.0.0.1:3000",
-                "http://localhost:5173",
-                "http://127.0.0.1:5173",
-                "https://powerlync.com",
-                "https://www.powerlync.com",
-                "https://ocpp-frontend-mu.vercel.app",
-                "https://lyncpower.com",
-                "https://www.lyncpower.com"
-            ]
-
-            # If origin is in allowed list, use it; otherwise use first allowed origin
-            if origin not in allowed_origins:
-                origin = allowed_origins[0] if allowed_origins else "*"
+            # Only set CORS headers if origin is allowed
+            if origin not in ALLOWED_ORIGINS:
+                return Response(status_code=403)
 
             headers = {
                 "Access-Control-Allow-Origin": origin,
                 "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
-                "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept, Origin, User-Agent",
+                "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept",
                 "Access-Control-Allow-Credentials": "true",
-                "Access-Control-Max-Age": "3600",  # Cache preflight for 1 hour
+                "Access-Control-Max-Age": "3600",
             }
 
             return Response(status_code=200, headers=headers)
@@ -204,7 +195,7 @@ class ChargePoint(OcppChargePoint):
 
             await charger.save()
         except Exception as e:
-            logger.error(f"❌ Error updating charger info from BootNotification: {e}")
+            logger.error(f"❌ Error updating charger info from BootNotification: {e}", exc_info=True)
 
         # A BootNotification means the charger rebooted. Suspend ongoing transactions
         # to allow the charger to resume them via DataTransfer(GetLastMeterValue).
@@ -232,7 +223,7 @@ class ChargePoint(OcppChargePoint):
                     await transaction.save()
                     logger.info(f"⏸️ Suspended transaction {transaction.id} (was {previous_status}) due to charger reboot")
 
-                    asyncio.create_task(log_audit_event(
+                    safe_create_task(log_audit_event(
                         action="transaction.suspended",
                         entity_type="transaction",
                         entity_id=transaction.id,
@@ -241,12 +232,12 @@ class ChargePoint(OcppChargePoint):
                     ))
 
                     # Start timeout task — will auto-stop if charger doesn't resume
-                    asyncio.create_task(self._suspend_timeout(transaction.id, now, SUSPEND_TIMEOUT_SECONDS))
+                    safe_create_task(self._suspend_timeout(transaction.id, now, SUSPEND_TIMEOUT_SECONDS))
         except Exception as e:
             logger.error(f"Error suspending transactions on BootNotification for {self.id}: {e}", exc_info=True)
 
         return call_result.BootNotification(
-            current_time=datetime.datetime.utcnow().isoformat() + "Z",
+            current_time=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") + "Z",
             interval=30,
             status="Accepted"
         )
@@ -286,7 +277,7 @@ class ChargePoint(OcppChargePoint):
             await transaction.save()
             logger.info(f"🛑 Auto-stopped suspended transaction {transaction_id} after {timeout_seconds}s timeout")
 
-            asyncio.create_task(log_audit_event(
+            safe_create_task(log_audit_event(
                 action="transaction.suspended_timeout",
                 entity_type="transaction",
                 entity_id=transaction_id,
@@ -329,7 +320,7 @@ class ChargePoint(OcppChargePoint):
         await update_charger_heartbeat(self.id)
         
         return call_result.Heartbeat(
-            current_time=datetime.datetime.utcnow().isoformat() + "Z"
+            current_time=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
         )
     
     @on('StatusNotification')
@@ -364,8 +355,8 @@ class ChargePoint(OcppChargePoint):
                         if timestamp:
                             try:
                                 error_ts = datetime.datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                            except (ValueError, AttributeError):
-                                pass
+                            except (ValueError, AttributeError) as e:
+                                logger.debug(f"Could not parse StatusNotification timestamp '{timestamp}': {e}")
 
                         # Create error record
                         await ChargerError.create(
@@ -437,7 +428,7 @@ class ChargePoint(OcppChargePoint):
                             await transaction.save()
                             logger.info(f"Marked transaction {transaction.id} as FAILED due to status change to {status}")
 
-                            asyncio.create_task(log_audit_event(
+                            safe_create_task(log_audit_event(
                                 action="transaction.status_changed",
                                 entity_type="transaction",
                                 entity_id=transaction.id,
@@ -482,7 +473,7 @@ class ChargePoint(OcppChargePoint):
         # Record metric
         await OCPPMetrics.record_message("StartTransaction", "IN")
 
-        logger.info(f"StartTransaction from {self.id}: connector_id={connector_id}, id_tag={id_tag}, meter_start={meter_start}")
+        logger.info(f"StartTransaction from {self.id}: connector_id={connector_id}, id_tag={mask_id_tag(id_tag)}, meter_start={meter_start}")
         
         from models import Transaction, User, VehicleProfile, Charger, TransactionStatusEnum
         
@@ -500,16 +491,16 @@ class ChargePoint(OcppChargePoint):
             user = await User.filter(rfid_card_id=id_tag).first()
             
             if not user:
-                logger.error(f"OCPP StartTransaction: No user found with rfid_card_id '{id_tag}', rejecting transaction")
+                logger.error(f"OCPP StartTransaction: No user found with rfid_card_id '{mask_id_tag(id_tag)}', rejecting transaction")
                 return call_result.StartTransaction(
                     transaction_id=0,
                     id_tag_info={"status": "Invalid"}
                 )
             
-            logger.info(f"OCPP StartTransaction: Found user by rfid_card_id '{id_tag}': {user.email}")
+            logger.info(f"OCPP StartTransaction: Found user by rfid_card_id '{mask_id_tag(id_tag)}': {mask_email(user.email)}")
             
             if not user.is_active:
-                logger.error(f"OCPP StartTransaction: User {user.email} is deactivated")
+                logger.error(f"OCPP StartTransaction: User {mask_email(user.email)} is deactivated")
                 return call_result.StartTransaction(
                     transaction_id=0,
                     id_tag_info={"status": "Blocked"}
@@ -532,7 +523,7 @@ class ChargePoint(OcppChargePoint):
 
             logger.info(f"🔋 Created transaction {transaction.id} for charger {self.id} with status RUNNING")
 
-            asyncio.create_task(log_audit_event(
+            safe_create_task(log_audit_event(
                 action="transaction.status_changed",
                 entity_type="transaction",
                 entity_id=transaction.id,
@@ -593,7 +584,7 @@ class ChargePoint(OcppChargePoint):
 
             logger.info(f"🛑 ✅ Transaction stopped {transaction_id}: {transaction.energy_consumed_kwh} kWh consumed")
 
-            asyncio.create_task(log_audit_event(
+            safe_create_task(log_audit_event(
                 action="transaction.status_changed",
                 entity_type="transaction",
                 entity_id=transaction_id,
@@ -653,9 +644,6 @@ class ChargePoint(OcppChargePoint):
             transaction = await Transaction.filter(id=transaction_id).prefetch_related('charger').first()
             if not transaction:
                 logger.error(f"🔋 ❌ Transaction {transaction_id} not found in database for meter values from {self.id}")
-                # Let's also check what transactions exist
-                all_transactions = await Transaction.all().values('id', 'transaction_status')
-                logger.error(f"🔋 Available transactions: {all_transactions}")
                 return call_result.MeterValues()
                 
             logger.debug(f"🔋 ✅ Found transaction {transaction_id} for charger {transaction.charger.charge_point_string_id}")
@@ -668,7 +656,7 @@ class ChargePoint(OcppChargePoint):
                 transaction.resume_count = (transaction.resume_count or 0) + 1
                 await transaction.save()
                 logger.info(f"▶️ Auto-resumed transaction {transaction_id} via MeterValues (resume_count={transaction.resume_count})")
-                asyncio.create_task(log_audit_event(
+                safe_create_task(log_audit_event(
                     action="transaction.resumed",
                     entity_type="transaction",
                     entity_id=transaction_id,
@@ -743,7 +731,7 @@ class ChargePoint(OcppChargePoint):
                             logger.debug(f"🔋   ⚠️ Unknown measurand: {measurand} - ignoring")
                             
                     except (ValueError, TypeError) as e:
-                        logger.error(f"🔋   ❌ Error parsing {measurand} value '{value}': {e}")
+                        logger.error(f"🔋   ❌ Error parsing {measurand} value '{value}': {e}", exc_info=True)
                         continue
                 
                 # Only create meter value record if we have at least energy reading
@@ -828,11 +816,11 @@ class ChargePoint(OcppChargePoint):
 
             # Track timestamps
             if status == "Downloading" and not firmware_update.started_at:
-                firmware_update.started_at = datetime.datetime.utcnow()
+                firmware_update.started_at = datetime.datetime.now(datetime.timezone.utc)
                 logger.info(f"📦 ✅ Firmware download started for {self.id}")
 
             elif status in ["Installed", "DownloadFailed", "InstallationFailed", "InstallVerificationFailed"]:
-                firmware_update.completed_at = datetime.datetime.utcnow()
+                firmware_update.completed_at = datetime.datetime.now(datetime.timezone.utc)
 
                 if status == "Installed":
                     # Update success - update charger's firmware version
@@ -854,7 +842,7 @@ class ChargePoint(OcppChargePoint):
                 direction="IN",
                 payload={"status": status},
                 status="SUCCESS",
-                timestamp=datetime.datetime.utcnow()
+                timestamp=datetime.datetime.now(datetime.timezone.utc)
             )
 
             logger.info(f"📦 Updated firmware_update ID={firmware_update.id} to status={new_status}")
@@ -943,7 +931,7 @@ class ChargePoint(OcppChargePoint):
             return call_result.DataTransfer(status="Accepted")
 
         except json.JSONDecodeError as e:
-            logger.error(f"📡 ❌ Invalid JSON in SignalQuality data from {self.id}: {e}")
+            logger.error(f"📡 ❌ Invalid JSON in SignalQuality data from {self.id}: {e}", exc_info=True)
             return call_result.DataTransfer(status="Rejected")
         except Exception as e:
             logger.error(f"📡 ❌ Error storing SignalQuality for {self.id}: {e}", exc_info=True)
@@ -1030,7 +1018,7 @@ class ChargePoint(OcppChargePoint):
                 f"resume_count={transaction.resume_count}"
             )
 
-            asyncio.create_task(log_audit_event(
+            safe_create_task(log_audit_event(
                 action="transaction.resumed",
                 entity_type="transaction",
                 entity_id=transaction_id,
@@ -1053,7 +1041,7 @@ class ChargePoint(OcppChargePoint):
             return call_result.DataTransfer(status="Accepted", data=response_data)
 
         except json.JSONDecodeError as e:
-            logger.error(f"📡 ❌ Invalid JSON in GetLastMeterValue from {self.id}: {e}")
+            logger.error(f"📡 ❌ Invalid JSON in GetLastMeterValue from {self.id}: {e}", exc_info=True)
             return call_result.DataTransfer(
                 status="Rejected",
                 data=json.dumps({"error": "Invalid JSON"})
@@ -1079,7 +1067,7 @@ async def health_check():
 
     health_status = {
         "status": "healthy",
-        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "checks": {}
     }
 
@@ -1168,7 +1156,7 @@ def read_api_root():
 
 # Legacy endpoints - these were in your original main.py
 @app.get("/api/charge-points", response_model=List[ChargePointStatus])
-async def get_connected_charge_points():
+async def get_connected_charge_points(admin_user=Depends(require_admin())):
     """Get list of all connected charge points"""  
     from models import Charger
     charge_points = []
@@ -1190,7 +1178,7 @@ async def get_connected_charge_points():
     return charge_points
 
 @app.post("/api/charge-points/{charge_point_id}/request")
-async def send_command_to_charge_point(charge_point_id: str, command: OCPPCommand):
+async def send_command_to_charge_point(charge_point_id: str, command: OCPPCommand, admin_user=Depends(require_admin())):
     """Send OCPP command to a specific charge point"""
     success, result = await connection_manager.send_ocpp_request(charge_point_id, command.action, command.payload)
     
@@ -1204,7 +1192,7 @@ async def send_command_to_charge_point(charge_point_id: str, command: OCPPComman
         raise HTTPException(status_code=400, detail=result)
 
 @app.get("/api/logs", response_model=List[MessageLogResponse])
-async def get_message_logs(limit: int = 100):
+async def get_message_logs(limit: int = Query(100, ge=1, le=10000), admin_user=Depends(require_admin())):
     """Get recent OCPP message logs"""
     logs = await get_logs(limit)
     return [
@@ -1221,7 +1209,7 @@ async def get_message_logs(limit: int = 100):
     ]
 
 @app.get("/api/logs/{charge_point_id}", response_model=List[MessageLogResponse])
-async def get_charge_point_logs(charge_point_id: str, limit: int = 100):
+async def get_charge_point_logs(charge_point_id: str, limit: int = Query(100, ge=1, le=10000), admin_user=Depends(require_admin())):
     """Get OCPP message logs for a specific charge point"""
     logs = await get_logs_by_charge_point(charge_point_id, limit)
     return [
@@ -1260,7 +1248,9 @@ async def startup_event():
 
     # Start data retention service (cleanup old signal quality data & OCPP logs)
     from services.data_retention_service import start_data_retention_service
-    await start_data_retention_service(retention_days=90, cleanup_interval_hours=24)
+    retention_days = int(os.environ.get("RETENTION_DAYS", "90"))
+    cleanup_interval_hours = int(os.environ.get("CLEANUP_INTERVAL_HOURS", "24"))
+    await start_data_retention_service(retention_days=retention_days, cleanup_interval_hours=cleanup_interval_hours)
 
     logger.info("Database initialized with Tortoise ORM")
     logger.info("Redis connection established")
@@ -1309,4 +1299,5 @@ async def shutdown_event():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+    debug = os.environ.get("DEBUG", "false").lower() == "true"
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=debug)

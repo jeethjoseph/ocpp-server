@@ -4,6 +4,7 @@ import logging
 from typing import List
 from datetime import datetime, timedelta, timezone
 
+from utils import safe_create_task
 from services.wallet_service import WalletService
 from models import Transaction, TransactionStatusEnum, MeterValue
 
@@ -25,7 +26,7 @@ class BillingRetryService:
             return
         
         self.is_running = True
-        self._task = asyncio.create_task(self._periodic_retry_loop())
+        self._task = safe_create_task(self._periodic_retry_loop())
         logger.info(f"✅ Started billing retry service (interval: {self.retry_interval_minutes}m, max age: {self.max_retry_age_hours}h)")
     
     async def stop(self):

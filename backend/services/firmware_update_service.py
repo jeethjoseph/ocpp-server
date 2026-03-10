@@ -3,6 +3,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
+from utils import safe_create_task
 from models import FirmwareUpdate, FirmwareUpdateStatusEnum, Charger, Transaction
 
 logger = logging.getLogger(__name__)
@@ -33,7 +34,7 @@ class FirmwareUpdateService:
             return
 
         self.is_running = True
-        self._task = asyncio.create_task(self._periodic_check_loop())
+        self._task = safe_create_task(self._periodic_check_loop())
         logger.info(f"📦 ✅ Started firmware update service (interval: {self.check_interval_seconds}s)")
 
     async def stop(self):

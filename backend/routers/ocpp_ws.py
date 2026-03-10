@@ -8,6 +8,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from core.connection_manager import connection_manager, LoggingWebSocketAdapter
 from crud import validate_and_connect_charger, log_audit_event
 from redis_manager import redis_manager
+from utils import safe_create_task
 from services.monitoring_service import OCPPMetrics, SentryHelper
 
 logger = logging.getLogger("ocpp-server")
@@ -40,7 +41,7 @@ async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
     remaining_ms = connection_manager.check_tombstone(charge_point_id)
     if remaining_ms is not None:
         logger.warning(f"[CONNECTION ATTEMPT] Rejecting immediate reconnection for {charge_point_id} - tombstone expires in {remaining_ms:.1f}ms")
-        asyncio.create_task(log_audit_event(
+        safe_create_task(log_audit_event(
             action="charger.connection_rejected",
             entity_type="charger",
             entity_id=charge_point_id,
@@ -59,7 +60,7 @@ async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
     is_valid, message = await validate_and_connect_charger(charge_point_id, connection_manager.connected_charge_points)
     if not is_valid:
         logger.warning(f"[CONNECTION ATTEMPT] Validation failed for {charge_point_id}: {message}")
-        asyncio.create_task(log_audit_event(
+        safe_create_task(log_audit_event(
             action="charger.connection_rejected",
             entity_type="charger",
             entity_id=charge_point_id,
@@ -78,7 +79,7 @@ async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
     cp = ChargePoint(charge_point_id, ws_adapter)
 
     # Start heartbeat monitor task
-    heartbeat_task = asyncio.create_task(connection_manager.heartbeat_monitor(charge_point_id, websocket))
+    heartbeat_task = safe_create_task(connection_manager.heartbeat_monitor(charge_point_id, websocket))
 
     # Store connection data with heartbeat task handle for proper cleanup
     connection_data = {
@@ -95,7 +96,7 @@ async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
 
     logger.info(f"[CONNECTION ATTEMPT] {charge_point_id} connection established successfully - starting OCPP message handling")
 
-    asyncio.create_task(log_audit_event(
+    safe_create_task(log_audit_event(
         action="charger.connected",
         entity_type="charger",
         entity_id=charge_point_id,
