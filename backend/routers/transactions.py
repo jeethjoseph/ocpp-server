@@ -2,11 +2,13 @@
 from typing import List, Optional, Dict
 from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 
 from models import Transaction, MeterValue, User, Charger, WalletTransaction
 from tortoise.exceptions import IntegrityError
+from auth_middleware import require_admin
+from crud import log_audit_event
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +35,12 @@ class TransactionResponse(BaseModel):
     end_time: Optional[datetime]
     stop_reason: Optional[str]
     transaction_status: str
+    suspended_at: Optional[datetime] = None
+    resumed_at: Optional[datetime] = None
+    resume_count: int = 0
     created_at: datetime
     updated_at: datetime
-    
+
     class Config:
         from_attributes = True
 
@@ -137,6 +142,7 @@ async def list_transactions(
     summary = {
         "total_energy_consumed": sum(t.energy_consumed_kwh or 0 for t in transactions),
         "active_sessions": await Transaction.filter(transaction_status__in=["STARTED", "RUNNING"]).count(),
+        "suspended_sessions": await Transaction.filter(transaction_status="SUSPENDED").count(),
         "completed_sessions": await Transaction.filter(transaction_status="COMPLETED").count()
     }
     
@@ -176,9 +182,9 @@ async def get_transaction_details(transaction_id: int):
     )
 
 @router.post("/{transaction_id}/stop", response_model=dict)
-async def force_stop_transaction(transaction_id: int, request: StopTransactionRequest):
+async def force_stop_transaction(transaction_id: int, request: StopTransactionRequest, admin_user: User = Depends(require_admin())):
     """Force stop a transaction (admin override)"""
-    
+
     transaction = await Transaction.filter(id=transaction_id).first()
     if not transaction:
         raise HTTPException(status_code=404, detail="Transaction not found")
@@ -209,15 +215,44 @@ async def force_stop_transaction(transaction_id: int, request: StopTransactionRe
             logger.warning(f"Failed to send OCPP stop command for transaction {transaction_id}: {response}")
     
     # Force stop the transaction in database
+    previous_status = transaction.transaction_status
     transaction.transaction_status = "STOPPED"
     transaction.stop_reason = f"Force stopped by admin: {request.reason}"
-    transaction.end_time = datetime.utcnow()
+    transaction.end_time = datetime.now(timezone.utc)
     await transaction.save()
-    
+
+    await log_audit_event(
+        action="transaction.status_changed",
+        entity_type="transaction",
+        entity_id=transaction_id,
+        actor_type="admin",
+        actor=admin_user,
+        changes={"previous_status": str(previous_status), "new_status": "STOPPED", "trigger": "AdminForceStop"},
+    )
+    await log_audit_event(
+        action="transaction.force_stopped",
+        entity_type="transaction",
+        entity_id=transaction_id,
+        actor_type="admin",
+        actor=admin_user,
+        changes={"reason": request.reason},
+    )
+
+    # For SUSPENDED transactions, energy_consumed_kwh may be None — calculate from last meter value
+    if not transaction.energy_consumed_kwh or transaction.energy_consumed_kwh <= 0:
+        latest_meter_value = await MeterValue.filter(
+            transaction_id=transaction_id
+        ).order_by("-created_at").first()
+        if latest_meter_value:
+            transaction.end_meter_kwh = latest_meter_value.reading_kwh
+            transaction.energy_consumed_kwh = transaction.end_meter_kwh - (transaction.start_meter_kwh or 0)
+            await transaction.save()
+            logger.info(f"Calculated energy for force-stopped transaction {transaction_id}: {transaction.energy_consumed_kwh} kWh")
+
     # Process wallet billing
     final_amount = None
     billing_message = "No billing processed"
-    
+
     if transaction.energy_consumed_kwh and transaction.energy_consumed_kwh > 0:
         from services.wallet_service import WalletService
         try:

@@ -66,7 +66,7 @@ services:
       - REDIS_URL=redis://redis:6379
       - HOST=0.0.0.0
       - PORT=8000
-      - WORKERS=${WORKERS:-4}
+      - WORKERS=${WORKERS:-1}
       - LOG_LEVEL=${LOG_LEVEL:-warning}
       # New Relic
       - NEW_RELIC_MONITOR_MODE=${NEW_RELIC_MONITOR_MODE:-true}

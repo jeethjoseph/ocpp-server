@@ -75,19 +75,25 @@ echo ""
 echo "Starting OCPP Backend..."
 echo ""
 
+# Workers default to 1 because in-memory OCPP connection state (WebSocket
+# sessions, pending call maps) is not shared across uvicorn workers.
 # Check if New Relic is enabled
 if [ "$NEW_RELIC_MONITOR_MODE" = "true" ]; then
     echo "Starting with New Relic APM..."
     exec newrelic-admin run-program uvicorn main:app \
         --host 0.0.0.0 \
         --port ${PORT:-8000} \
-        --workers ${WORKERS:-2} \
+        --workers ${WORKERS:-1} \
+        --ws-ping-interval 20 \
+        --ws-ping-timeout 20 \
         --log-level ${LOG_LEVEL:-info}
 else
     echo "Starting without New Relic..."
     exec uvicorn main:app \
         --host 0.0.0.0 \
         --port ${PORT:-8000} \
-        --workers ${WORKERS:-2} \
+        --workers ${WORKERS:-1} \
+        --ws-ping-interval 20 \
+        --ws-ping-timeout 20 \
         --log-level ${LOG_LEVEL:-info}
 fi

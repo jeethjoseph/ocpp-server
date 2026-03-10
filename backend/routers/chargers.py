@@ -2,13 +2,14 @@
 from typing import List, Optional, Dict
 from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import uuid
 import logging
 
 from models import Charger, ChargingStation, Connector, Transaction, OCPPLog, User, ChargerError
 from tortoise.exceptions import IntegrityError
 from auth_middleware import require_admin, require_user_or_admin
+from crud import log_audit_event
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +133,6 @@ async def get_bulk_connection_status(chargers: List[Charger]) -> Dict[str, bool]
     # Get all connected chargers from Redis at once
     connected_charger_ids = set(await redis_manager.get_all_connected_chargers())
     
-    from datetime import timezone
     current_time = datetime.now(timezone.utc)
     status_dict = {}
     
@@ -291,10 +291,19 @@ async def create_charger(charger_data: ChargerCreate, admin_user: User = Depends
                 max_power_kw=connector_input.max_power_kw
             )
         
+        await log_audit_event(
+            action="charger.created",
+            entity_type="charger",
+            entity_id=charger.charge_point_string_id,
+            actor_type="admin",
+            actor=admin_user,
+            changes={"charge_point_string_id": charge_point_id, "station_id": charger_data.station_id, "name": charger_data.name},
+        )
+
         # Generate OCPP URL
         # You should configure this based on your actual domain
         ocpp_url = f"ws://your-domain.com/ocpp/{charge_point_id}"
-        
+
         # Get connection status for response (new charger won't be connected yet)
         connection_status_dict = await get_bulk_connection_status([charger])
         connection_status = connection_status_dict.get(charger.charge_point_string_id, False)
@@ -333,7 +342,6 @@ async def get_charger_details(charger_id: int, user: User = Depends(require_user
     # This helps users see billing info after remote stops by admin
     recent_transaction = None
     if not current_transaction:
-        from datetime import datetime, timezone, timedelta
         five_minutes_ago = datetime.now(timezone.utc) - timedelta(minutes=5)
         recent_transaction = await Transaction.filter(
             charger_id=charger_id,
@@ -402,6 +410,15 @@ async def update_charger(charger_id: int, update_data: ChargerUpdate, admin_user
     except IntegrityError:
         raise HTTPException(status_code=400, detail="Update failed - check external charger ID uniqueness")
 
+    await log_audit_event(
+        action="charger.updated",
+        entity_type="charger",
+        entity_id=charger.charge_point_string_id,
+        actor_type="admin",
+        actor=admin_user,
+        changes=update_dict,
+    )
+
     # Get connection status for response
     connection_status_dict = await get_bulk_connection_status([charger])
     connection_status = connection_status_dict.get(charger.charge_point_string_id, False)
@@ -418,9 +435,20 @@ async def delete_charger(charger_id: int, admin_user: User = Depends(require_adm
     if not charger:
         raise HTTPException(status_code=404, detail="Charger not found")
     
+    charge_point_string_id = charger.charge_point_string_id
+
     # Delete charger (connectors will cascade)
     await charger.delete()
-    
+
+    await log_audit_event(
+        action="charger.deleted",
+        entity_type="charger",
+        entity_id=charge_point_string_id,
+        actor_type="admin",
+        actor=admin_user,
+        changes={"charge_point_string_id": charge_point_string_id},
+    )
+
     return {"message": "Charger removed successfully"}
 
 @router.post("/{charger_id}/remote-start", response_model=dict)
@@ -592,6 +620,15 @@ async def change_charger_availability(
         # Get the OCPP response status (Accepted/Scheduled/Rejected)
         ocpp_status = getattr(response, 'status', str(response))
 
+        await log_audit_event(
+            action="charger.availability_changed",
+            entity_type="charger",
+            entity_id=charger.charge_point_string_id,
+            actor_type="admin",
+            actor=admin_user,
+            changes={"type": type, "connector_id": connector_id, "ocpp_response": ocpp_status, "previous_status": current_status},
+        )
+
         return {
             "success": True,
             "message": f"ChangeAvailability command sent",
@@ -650,6 +687,15 @@ async def reset_charger(
     )
 
     if success:
+        await log_audit_event(
+            action="charger.reset",
+            entity_type="charger",
+            entity_id=charger.charge_point_string_id,
+            actor_type="admin",
+            actor=admin_user,
+            changes={"reset_type": type},
+        )
+
         return {
             "success": True,
             "message": f"{type} reset command sent successfully",
@@ -740,7 +786,6 @@ async def get_charger_signal_quality(
     Data includes RSSI (signal strength) and BER (bit error rate) metrics.
     """
     from models import SignalQuality
-    from datetime import datetime, timedelta
 
     # Verify charger exists
     charger = await Charger.get_or_none(id=charger_id)
@@ -748,7 +793,7 @@ async def get_charger_signal_quality(
         raise HTTPException(status_code=404, detail="Charger not found")
 
     # Calculate cutoff time
-    cutoff_time = datetime.utcnow() - timedelta(hours=hours)
+    cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours)
 
     # Build query
     query = SignalQuality.filter(
@@ -850,15 +895,13 @@ async def get_charger_errors(
     Returns paginated error data including both standard OCPP error codes
     and vendor-specific error codes.
     """
-    from datetime import timedelta
-
     # Verify charger exists
     charger = await Charger.get_or_none(id=charger_id)
     if not charger:
         raise HTTPException(status_code=404, detail="Charger not found")
 
     # Calculate cutoff time
-    cutoff_time = datetime.utcnow() - timedelta(hours=hours)
+    cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours)
 
     # Build query
     query = ChargerError.filter(

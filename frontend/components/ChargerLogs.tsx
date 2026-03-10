@@ -176,14 +176,14 @@ export default function ChargerLogs({ chargePointId, chargerName }: ChargerLogsP
             />
           </div>
           <div>
-            <Label htmlFor="limit" className="text-gray-700 dark:text-gray-300">Limit (max 10,000)</Label>
+            <Label htmlFor="limit" className="text-gray-700 dark:text-gray-300">Limit (max 100,000)</Label>
             <Input
               id="limit"
               type="number"
               min="1"
-              max="10000"
+              max="100000"
               value={limit}
-              onChange={(e) => setLimit(Math.min(10000, Math.max(1, parseInt(e.target.value) || 100)))}
+              onChange={(e) => setLimit(Math.min(100000, Math.max(1, parseInt(e.target.value) || 100)))}
               className="mt-1 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-600 text-gray-900 dark:text-gray-100"
             />
           </div>

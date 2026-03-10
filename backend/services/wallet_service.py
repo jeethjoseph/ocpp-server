@@ -1,5 +1,7 @@
 # Wallet service for handling billing and wallet transactions
 import asyncio
+from utils import safe_create_task
+from crud import log_audit_event
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, Tuple
 from tortoise.transactions import atomic, in_transaction
@@ -64,6 +66,10 @@ class WalletService:
         """
         Process billing for a completed charging transaction.
 
+        Double-billing safety: @atomic() + select_for_update() serialise concurrent
+        callers at the DB level; the idempotency check (existing CHARGE_DEDUCT lookup)
+        then catches any duplicate that slips through.
+
         Returns:
             (success: bool, message: str, amount: Optional[Decimal])
         """
@@ -97,6 +103,13 @@ class WalletService:
                 await Transaction.filter(id=transaction_id).update(
                     transaction_status=TransactionStatusEnum.BILLING_FAILED
                 )
+                safe_create_task(log_audit_event(
+                    action="transaction.status_changed",
+                    entity_type="transaction",
+                    entity_id=transaction_id,
+                    actor_type="system",
+                    changes={"new_status": "BILLING_FAILED", "trigger": "BillingFailed", "reason": "No tariff configuration found"},
+                ))
                 return False, "No tariff configuration found", None
             
             # Calculate billing amount
@@ -115,6 +128,13 @@ class WalletService:
                 await Transaction.filter(id=transaction_id).update(
                     transaction_status=TransactionStatusEnum.BILLING_FAILED
                 )
+                safe_create_task(log_audit_event(
+                    action="transaction.status_changed",
+                    entity_type="transaction",
+                    entity_id=transaction_id,
+                    actor_type="system",
+                    changes={"new_status": "BILLING_FAILED", "trigger": "BillingFailed", "reason": f"Wallet not found for user {transaction.user_id}"},
+                ))
                 return False, f"Wallet not found for user {transaction.user_id}", None
             
             # Get current balance (allowing None)
@@ -169,6 +189,13 @@ class WalletService:
                 await Transaction.filter(id=transaction_id).update(
                     transaction_status=TransactionStatusEnum.BILLING_FAILED
                 )
+                safe_create_task(log_audit_event(
+                    action="transaction.status_changed",
+                    entity_type="transaction",
+                    entity_id=transaction_id,
+                    actor_type="system",
+                    changes={"new_status": "BILLING_FAILED", "trigger": "BillingFailed", "reason": str(e)},
+                ))
             except Exception as update_error:
                 logger.error(f"Failed to update transaction status: {update_error}")
 
@@ -198,6 +225,13 @@ class WalletService:
             await Transaction.filter(id=transaction_id).update(
                 transaction_status=TransactionStatusEnum.COMPLETED
             )
+            safe_create_task(log_audit_event(
+                action="transaction.status_changed",
+                entity_type="transaction",
+                entity_id=transaction_id,
+                actor_type="system",
+                changes={"previous_status": "BILLING_FAILED", "new_status": "COMPLETED", "trigger": "BillingRetry"},
+            ))
             logger.info(f"✅ Retry successful for transaction {transaction_id}")
         else:
             logger.warning(f"🔄 Retry failed for transaction {transaction_id}: {message}")
@@ -271,24 +305,26 @@ class WalletService:
                 f"₹{current_balance} + ₹{top_up_amount} = ₹{new_balance}"
             )
 
-            # Update wallet balance
-            await Wallet.filter(id=wallet.id).update(balance=new_balance)
+            # Savepoint: if either update fails, both roll back together.
+            # Without this, a failure in the metadata update would leave
+            # the balance credited with no matching transaction record.
+            async with in_transaction():
+                await Wallet.filter(id=wallet.id).update(balance=new_balance)
 
-            # Update wallet transaction metadata
-            updated_metadata = wallet_txn.payment_metadata or {}
-            updated_metadata.update({
-                "status": PaymentStatusEnum.COMPLETED.value,
-                "razorpay_payment_id": razorpay_payment_id,
-                "razorpay_signature": razorpay_signature,
-                "completed_at": int(__import__('time').time()),
-                "previous_balance": float(current_balance),
-                "new_balance": float(new_balance)
-            })
+                updated_metadata = wallet_txn.payment_metadata or {}
+                updated_metadata.update({
+                    "status": PaymentStatusEnum.COMPLETED.value,
+                    "razorpay_payment_id": razorpay_payment_id,
+                    "razorpay_signature": razorpay_signature,
+                    "completed_at": int(__import__('time').time()),
+                    "previous_balance": float(current_balance),
+                    "new_balance": float(new_balance)
+                })
 
-            await WalletTransaction.filter(id=wallet_transaction_id).update(
-                description=f"Wallet recharge - ₹{top_up_amount} (Completed)",
-                payment_metadata=updated_metadata
-            )
+                await WalletTransaction.filter(id=wallet_transaction_id).update(
+                    description=f"Wallet recharge - ₹{top_up_amount} (Completed)",
+                    payment_metadata=updated_metadata
+                )
 
             # Record topup success metrics
             MetricsCollector.record_metric("Custom/Wallet/TopupAmount", float(top_up_amount))

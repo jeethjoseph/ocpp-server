@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from datetime import datetime, timezone
 import logging
 
-from models import OCPPLog, User
+from models import OCPPLog, User, AuditLog, Charger, Transaction
 from auth_middleware import require_admin
 from tortoise.queryset import Q
 
@@ -13,6 +13,24 @@ logger = logging.getLogger(__name__)
 
 # Pydantic schemas
 from typing import Union, Any
+
+
+def _parse_date(value: str, field_name: str) -> datetime:
+    """Parse an ISO date string, rejecting ambiguous inputs without timezone info."""
+    try:
+        dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {field_name} format. Use ISO 8601 with timezone (e.g. 2026-03-10T00:00:00Z)",
+        )
+    if dt.tzinfo is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} must include timezone info (e.g. append 'Z' for UTC). Got: {value}",
+        )
+    return dt
+
 
 class LogResponse(BaseModel):
     id: int
@@ -24,7 +42,7 @@ class LogResponse(BaseModel):
     status: Optional[str]
     correlation_id: Optional[str]
     timestamp: datetime
-    
+
     class Config:
         from_attributes = True
 
@@ -41,86 +59,40 @@ router = APIRouter(prefix="/api/admin/logs", tags=["admin-logs"])
 @router.get("/charger/{charge_point_id}", response_model=LogsResponse)
 async def get_charger_logs(
     charge_point_id: str,
-    start_date: Optional[str] = Query(None, description="Start date in ISO format (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)"),
-    end_date: Optional[str] = Query(None, description="End date in ISO format (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)"),
-    limit: int = Query(100, ge=1, le=10000, description="Number of logs to return (max 10,000)"),
+    start_date: Optional[str] = Query(None, description="Start date in ISO format with timezone (e.g. 2026-03-10T00:00:00Z)"),
+    end_date: Optional[str] = Query(None, description="End date in ISO format with timezone (e.g. 2026-03-10T23:59:59Z)"),
+    limit: int = Query(100, ge=1, le=100000, description="Number of logs to return (max 100,000)"),
     admin_user: User = Depends(require_admin())
 ):
     """
     Get OCPP logs for a specific charger with optional date filtering.
-    Limited to 10,000 rows maximum. Results ordered by most recent first.
+    Limited to 100,000 rows maximum. Results ordered by most recent first.
     """
     try:
         # Build query
         query = OCPPLog.filter(charge_point_id=charge_point_id)
-        
-        # Parse and apply date filters
+
         if start_date:
-            try:
-                # Handle both date-only and datetime formats
-                if 'T' in start_date:
-                    # If timezone is provided, use as-is
-                    if start_date.endswith('Z') or '+' in start_date[-6:] or '-' in start_date[-6:]:
-                        start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-                    else:
-                        # No timezone provided - treat as local time and convert to UTC
-                        # Assume local timezone (you may want to make this configurable)
-                        from zoneinfo import ZoneInfo
-                        local_tz = ZoneInfo("Asia/Kolkata")  # Adjust to your local timezone
-                        naive_dt = datetime.fromisoformat(start_date)
-                        local_dt = naive_dt.replace(tzinfo=local_tz)
-                        start_dt = local_dt.astimezone(timezone.utc)
-                else:
-                    # Date only - treat as local date start of day
-                    from zoneinfo import ZoneInfo
-                    local_tz = ZoneInfo("Asia/Kolkata")  # Adjust to your local timezone
-                    naive_dt = datetime.fromisoformat(start_date + "T00:00:00")
-                    local_dt = naive_dt.replace(tzinfo=local_tz)
-                    start_dt = local_dt.astimezone(timezone.utc)
+            start_dt = _parse_date(start_date, "start_date")
+            query = query.filter(timestamp__gte=start_dt)
 
-                query = query.filter(timestamp__gte=start_dt)
-            except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid start_date format. Use YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS")
-        
         if end_date:
-            try:
-                # Handle both date-only and datetime formats
-                if 'T' in end_date:
-                    # If timezone is provided, use as-is
-                    if end_date.endswith('Z') or '+' in end_date[-6:] or '-' in end_date[-6:]:
-                        end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-                    else:
-                        # No timezone provided - treat as local time and convert to UTC
-                        from zoneinfo import ZoneInfo
-                        local_tz = ZoneInfo("Asia/Kolkata")  # Adjust to your local timezone
-                        naive_dt = datetime.fromisoformat(end_date)
-                        local_dt = naive_dt.replace(tzinfo=local_tz)
-                        end_dt = local_dt.astimezone(timezone.utc)
-                else:
-                    # Date only - treat as local date end of day
-                    from zoneinfo import ZoneInfo
-                    local_tz = ZoneInfo("Asia/Kolkata")  # Adjust to your local timezone
-                    naive_dt = datetime.fromisoformat(end_date + "T23:59:59")
-                    local_dt = naive_dt.replace(tzinfo=local_tz)
-                    end_dt = local_dt.astimezone(timezone.utc)
+            end_dt = _parse_date(end_date, "end_date")
+            query = query.filter(timestamp__lte=end_dt)
 
-                query = query.filter(timestamp__lte=end_dt)
-            except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid end_date format. Use YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS")
-        
         # Get total count before limiting
         total = await query.count()
-        
+
         # Check if we're hitting the limit
         has_more = total > limit
         message = None
-        if total > 10000:
-            message = "This query returns more than 10,000 logs. Please contact the database administrator for a complete export or use more specific date filters."
-            limit = min(limit, 10000)  # Enforce 10,000 row limit
-        
+        if total > 100000:
+            message = "This query returns more than 100,000 logs. Please use more specific date filters to narrow results."
+            limit = min(limit, 100000)  # Enforce 100,000 row limit
+
         # Get logs ordered by most recent first
         logs = await query.order_by('-timestamp').limit(limit)
-        
+
         return LogsResponse(
             data=[LogResponse.model_validate(log) for log in logs],
             total=total,
@@ -128,7 +100,9 @@ async def get_charger_logs(
             has_more=has_more,
             message=message
         )
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching logs for charger {charge_point_id}: {str(e)}")
         raise HTTPException(status_code=500, detail="Error fetching logs")
@@ -143,15 +117,15 @@ async def get_charger_log_summary(
     """
     try:
         total_logs = await OCPPLog.filter(charge_point_id=charge_point_id).count()
-        
+
         # Get date range
         oldest_log = await OCPPLog.filter(charge_point_id=charge_point_id).order_by('timestamp').first()
         newest_log = await OCPPLog.filter(charge_point_id=charge_point_id).order_by('-timestamp').first()
-        
+
         # Count by direction
         inbound_count = await OCPPLog.filter(charge_point_id=charge_point_id, direction="IN").count()
         outbound_count = await OCPPLog.filter(charge_point_id=charge_point_id, direction="OUT").count()
-        
+
         return {
             "charge_point_id": charge_point_id,
             "total_logs": total_logs,
@@ -160,7 +134,132 @@ async def get_charger_log_summary(
             "oldest_log_date": oldest_log.timestamp if oldest_log else None,
             "newest_log_date": newest_log.timestamp if newest_log else None,
         }
-        
+
     except Exception as e:
         logger.error(f"Error fetching log summary for charger {charge_point_id}: {str(e)}")
         raise HTTPException(status_code=500, detail="Error fetching log summary")
+
+
+# ============ Audit Log Endpoints ============
+
+class AuditLogResponse(BaseModel):
+    id: int
+    created_at: datetime
+    actor_type: str
+    actor_id: Optional[int]
+    actor_email: Optional[str]
+    action: str
+    entity_type: str
+    entity_id: str
+    changes: Optional[dict]
+
+    class Config:
+        from_attributes = True
+
+class AuditLogListResponse(BaseModel):
+    data: List[AuditLogResponse]
+    total: int
+    page: int
+    limit: int
+
+@router.get("/audit", response_model=AuditLogListResponse)
+async def get_audit_logs(
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=500),
+    entity_type: Optional[str] = Query(None, description="Filter by entity type (charger, transaction, station, firmware)"),
+    entity_id: Optional[str] = Query(None, description="Filter by entity ID"),
+    action: Optional[str] = Query(None, description="Filter by action (e.g. charger.connected)"),
+    actor_type: Optional[str] = Query(None, description="Filter by actor type (system, admin, ocpp, webhook)"),
+    start_date: Optional[str] = Query(None, description="Start date in ISO format with timezone (e.g. 2026-03-10T00:00:00Z)"),
+    end_date: Optional[str] = Query(None, description="End date in ISO format with timezone (e.g. 2026-03-10T23:59:59Z)"),
+    admin_user: User = Depends(require_admin()),
+):
+    """
+    Get audit log entries with filtering and pagination.
+    """
+    query = AuditLog.all()
+
+    if entity_type:
+        query = query.filter(entity_type=entity_type)
+    if entity_id:
+        query = query.filter(entity_id=entity_id)
+    if action:
+        query = query.filter(action=action)
+    if actor_type:
+        query = query.filter(actor_type=actor_type)
+
+    if start_date:
+        start_dt = _parse_date(start_date, "start_date")
+        query = query.filter(created_at__gte=start_dt)
+
+    if end_date:
+        end_dt = _parse_date(end_date, "end_date")
+        query = query.filter(created_at__lte=end_dt)
+
+    total = await query.count()
+
+    offset = (page - 1) * limit
+    logs = await query.order_by("-created_at").offset(offset).limit(limit)
+
+    return AuditLogListResponse(
+        data=[AuditLogResponse.model_validate(log) for log in logs],
+        total=total,
+        page=page,
+        limit=limit,
+    )
+
+
+@router.get("/audit/charger-timeline/{charge_point_id}", response_model=AuditLogListResponse)
+async def get_charger_timeline(
+    charge_point_id: str,
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=500),
+    action: Optional[str] = Query(None),
+    actor_type: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    admin_user: User = Depends(require_admin()),
+):
+    """
+    Get all audit events related to a charger: charger events + transaction events
+    for transactions that belong to this charger.
+    """
+    # Find transaction IDs belonging to this charger
+    charger = await Charger.filter(charge_point_string_id=charge_point_id).first()
+    transaction_ids = []
+    if charger:
+        transaction_ids = await Transaction.filter(charger_id=charger.id).values_list("id", flat=True)
+
+    # Build OR query: charger events + transaction events for this charger
+    if transaction_ids:
+        str_ids = [str(tid) for tid in transaction_ids]
+        query = AuditLog.filter(
+            Q(entity_type="charger", entity_id=charge_point_id)
+            | Q(entity_type="transaction", entity_id__in=str_ids)
+        )
+    else:
+        query = AuditLog.filter(entity_type="charger", entity_id=charge_point_id)
+
+    if action:
+        query = query.filter(action=action)
+    if actor_type:
+        query = query.filter(actor_type=actor_type)
+
+    if start_date:
+        start_dt = _parse_date(start_date, "start_date")
+        query = query.filter(created_at__gte=start_dt)
+
+    if end_date:
+        end_dt = _parse_date(end_date, "end_date")
+        query = query.filter(created_at__lte=end_dt)
+
+    total = await query.count()
+    offset = (page - 1) * limit
+    logs = await query.order_by("-created_at").offset(offset).limit(limit)
+
+    return AuditLogListResponse(
+        data=[AuditLogResponse.model_validate(log) for log in logs],
+        total=total,
+        page=page,
+        limit=limit,
+    )

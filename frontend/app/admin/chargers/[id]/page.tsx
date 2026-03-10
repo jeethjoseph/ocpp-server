@@ -10,6 +10,7 @@ import { QRCodeSVG, QRCodeCanvas } from "qrcode.react";
 import { AdminOnly } from "@/components/RoleWrapper";
 import { toast } from "sonner";
 import ChargerLogs from "@/components/ChargerLogs";
+import ChargerAuditLog from "@/components/ChargerAuditLog";
 import MeterValuesChart from "@/components/MeterValuesChart";
 import {
   Dialog,
@@ -1008,6 +1009,14 @@ export default function ChargerDetailPage() {
         {/* OCPP Logs Section */}
         {charger && (
           <ChargerLogs
+            chargePointId={charger.charge_point_string_id}
+            chargerName={charger.name}
+          />
+        )}
+
+        {/* Audit Log Section */}
+        {charger && (
+          <ChargerAuditLog
             chargePointId={charger.charge_point_string_id}
             chargerName={charger.name}
           />

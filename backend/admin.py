@@ -41,7 +41,7 @@ from models import (
     User, Wallet, WalletTransaction, ChargingStation, Charger,
     Connector, Tariff, Transaction, MeterValue, OCPPLog,
     FirmwareFile, FirmwareUpdate, SignalQuality, VehicleProfile,
-    PaymentGateway
+    PaymentGateway, AuditLog, WebhookEvent
 )
 
 
@@ -175,3 +175,19 @@ class PaymentGatewayAdmin(TortoiseModelAdmin):
     list_display_links = ("id", "name")
     list_filter = ("status",)
     exclude = ("api_key", "webhook_secret")  # Don't show secrets in admin
+
+
+@register(AuditLog)
+class AuditLogAdmin(TortoiseModelAdmin):
+    list_display = ("id", "created_at", "actor_type", "actor_email", "action", "entity_type", "entity_id")
+    list_display_links = ("id",)
+    search_fields = ("action", "entity_id", "actor_email")
+    list_filter = ("actor_type", "entity_type", "action")
+
+
+@register(WebhookEvent)
+class WebhookEventAdmin(TortoiseModelAdmin):
+    list_display = ("id", "created_at", "source", "event_type", "event_id", "status")
+    list_display_links = ("id",)
+    search_fields = ("event_type", "event_id")
+    list_filter = ("source", "event_type", "status")

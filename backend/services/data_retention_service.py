@@ -1,7 +1,9 @@
 # Background service for cleaning up old telemetry and log data
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+from utils import safe_create_task
 
 from models import SignalQuality, OCPPLog
 
@@ -34,7 +36,7 @@ class DataRetentionService:
             return
 
         self.is_running = True
-        self._task = asyncio.create_task(self._periodic_cleanup_loop())
+        self._task = safe_create_task(self._periodic_cleanup_loop())
         logger.info(f"✅ Started data retention service (retention: {self.retention_days} days, interval: {self.cleanup_interval_hours}h)")
 
     async def stop(self):
@@ -72,7 +74,7 @@ class DataRetentionService:
     async def _cleanup_old_data(self):
         """Delete old signal quality data and OCPP logs"""
         try:
-            cutoff_date = datetime.utcnow() - timedelta(days=self.retention_days)
+            cutoff_date = datetime.now(tz=timezone.utc) - timedelta(days=self.retention_days)
             logger.info(f"🗑️  Running data retention cleanup (deleting data older than {cutoff_date.isoformat()})")
 
             # Clean up old signal quality data

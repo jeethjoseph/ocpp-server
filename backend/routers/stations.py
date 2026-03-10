@@ -8,6 +8,7 @@ import uuid
 from models import ChargingStation, Charger, User
 from tortoise.exceptions import IntegrityError
 from auth_middleware import require_admin, get_current_user_with_db
+from crud import log_audit_event
 
 # Pydantic schemas for request/response
 class StationCreate(BaseModel):
@@ -110,6 +111,15 @@ async def create_station(station_data: StationCreate, admin_user: User = Depends
             address=station_data.address
         )
         
+        await log_audit_event(
+            action="station.created",
+            entity_type="station",
+            entity_id=station.id,
+            actor_type="admin",
+            actor=admin_user,
+            changes={"name": station_data.name},
+        )
+
         return {
             "station": StationResponse.model_validate(station, from_attributes=True),
             "message": "Station created successfully"
@@ -149,7 +159,16 @@ async def update_station(station_id: int, update_data: StationUpdate, admin_user
         setattr(station, field, value)
     
     await station.save()
-    
+
+    await log_audit_event(
+        action="station.updated",
+        entity_type="station",
+        entity_id=station_id,
+        actor_type="admin",
+        actor=admin_user,
+        changes=update_dict,
+    )
+
     return {
         "station": StationResponse.model_validate(station, from_attributes=True),
         "message": "Station updated successfully"
@@ -166,6 +185,17 @@ async def delete_station(station_id: int, admin_user: User = Depends(require_adm
     # Check if there are any active charging sessions
     # For now, we'll just delete - we can add transaction checks later
     
+    station_name = station.name
+
     await station.delete()
-    
+
+    await log_audit_event(
+        action="station.deleted",
+        entity_type="station",
+        entity_id=station_id,
+        actor_type="admin",
+        actor=admin_user,
+        changes={"name": station_name},
+    )
+
     return {"message": "Station deleted successfully"}

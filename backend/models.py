@@ -30,6 +30,7 @@ class TransactionStatusEnum(str, enum.Enum):
     STARTED = "STARTED"
     PENDING_START = "PENDING_START"
     RUNNING = "RUNNING"
+    SUSPENDED = "SUSPENDED"
     PENDING_STOP = "PENDING_STOP"
     STOPPED = "STOPPED"
     COMPLETED = "COMPLETED"
@@ -79,7 +80,11 @@ class AuthProviderEnum(str, enum.Enum):
     EMAIL = "EMAIL"
     GOOGLE = "GOOGLE"
     CLERK = "CLERK"
-   
+
+class WebhookSourceEnum(str, enum.Enum):
+    CLERK = "CLERK"
+    RAZORPAY = "RAZORPAY"
+
 
 # Models
 class User(Model):
@@ -274,7 +279,10 @@ class Transaction(Model):
     end_time = fields.DatetimeField(null=True)
     stop_reason = fields.TextField(null=True)
     transaction_status = fields.CharEnumField(TransactionStatusEnum)
-    
+    suspended_at = fields.DatetimeField(null=True)
+    resumed_at = fields.DatetimeField(null=True)
+    resume_count = fields.IntField(default=0)
+
     # Relationships
     wallet_transactions: fields.ReverseRelation["WalletTransaction"]
     meter_values: fields.ReverseRelation["MeterValue"]
@@ -385,6 +393,38 @@ class ChargerError(Model):
     class Meta:
         table = "charger_error"
 
+class AuditLog(Model):
+    id = fields.IntField(pk=True)
+    created_at = fields.DatetimeField(auto_now_add=True, index=True)
+    # Actor
+    actor_type = fields.CharField(max_length=20)       # "system", "admin", "user", "webhook", "ocpp"
+    actor_id = fields.IntField(null=True)               # User.id when applicable
+    actor_email = fields.CharField(max_length=255, null=True)
+    # What happened
+    action = fields.CharField(max_length=100, index=True)
+    # Target entity
+    entity_type = fields.CharField(max_length=50)
+    entity_id = fields.CharField(max_length=255, index=True)
+    # Context
+    changes = fields.JSONField(null=True)
+
+    class Meta:
+        table = "audit_log"
+        indexes = [("entity_type", "entity_id")]
+
+class WebhookEvent(Model):
+    id = fields.IntField(pk=True)
+    created_at = fields.DatetimeField(auto_now_add=True, index=True)
+    source = fields.CharEnumField(WebhookSourceEnum, index=True)
+    event_type = fields.CharField(max_length=100, index=True)
+    event_id = fields.CharField(max_length=255, null=True, index=True)
+    payload = fields.JSONField(null=True)
+    status = fields.CharField(max_length=20, default="processed")
+    error_message = fields.TextField(null=True)
+
+    class Meta:
+        table = "webhook_event"
+
 # Pydantic models for API serialization
 User_Pydantic = pydantic_model_creator(User, name="User")
 UserIn_Pydantic = pydantic_model_creator(User, name="UserIn", exclude_readonly=True)
@@ -392,3 +432,5 @@ Charger_Pydantic = pydantic_model_creator(Charger, name="Charger")
 OCPPLog_Pydantic = pydantic_model_creator(OCPPLog, name="OCPPLog")
 SignalQuality_Pydantic = pydantic_model_creator(SignalQuality, name="SignalQuality")
 ChargerError_Pydantic = pydantic_model_creator(ChargerError, name="ChargerError")
+AuditLog_Pydantic = pydantic_model_creator(AuditLog, name="AuditLog")
+WebhookEvent_Pydantic = pydantic_model_creator(WebhookEvent, name="WebhookEvent")
