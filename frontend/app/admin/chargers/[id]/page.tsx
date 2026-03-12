@@ -1031,7 +1031,7 @@ export default function ChargerDetailPage() {
   );
 }
 
-function PaymentQRCard({ chargerId, chargerName }: { chargerId: number; chargerName: string }) {
+function PaymentQRCard({ chargerId }: { chargerId: number; chargerName?: string }) {
   const { data: qrCode, isLoading } = useQRCodeByCharger(chargerId);
   const createMutation = useCreateQRCode();
 
