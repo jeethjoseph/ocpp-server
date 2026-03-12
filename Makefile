@@ -1,7 +1,7 @@
 # OCPP Server Makefile for Database Management
 
-# Database configuration - load from .env file
-include backend/.env
+# Database configuration - load from .env file (optional, for local dev only)
+-include backend/.env
 export
 
 # Fallback to local database if not set in .env
