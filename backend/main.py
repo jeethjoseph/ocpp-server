@@ -53,16 +53,19 @@ from services.monitoring_service import (
 initialize_monitoring()
 
 # Set root logger to INFO so service modules (services.*, routers.*, etc.)
-# emit INFO-level logs. Named loggers inherit this level.
-logging.basicConfig(level=logging.INFO)
+# emit INFO-level logs via __name__-based loggers. basicConfig is a no-op if
+# monitoring already added handlers, so we set the level directly.
+logging.getLogger().setLevel(logging.INFO)
 
-# App-specific logger with custom formatter
+# App-specific logger with custom formatter (propagate=False to avoid
+# duplicate output through root's handler)
 logger = logging.getLogger("ocpp-server")
 if not logger.handlers:
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
+logger.propagate = False
 
 # FastAPI app
 app = FastAPI(
