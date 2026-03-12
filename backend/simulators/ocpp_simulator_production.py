@@ -52,6 +52,9 @@ class OCPPChargerSimulator:
         self.meter_value_task = None
         self.signal_quality_task = None
         
+        # Queue for server CALLs received while waiting for a CALLRESULT
+        self._pending_server_calls = []
+
         # Development features
         self.auto_start = False
         self.auto_stop_after = None
@@ -71,36 +74,42 @@ class OCPPChargerSimulator:
         return msg_id
     
     def _send_message(self, action: str, payload: dict) -> dict:
-        """Send OCPP message and wait for response"""
+        """Send OCPP message and wait for response, handling interleaved server CALLs"""
         message_id = self._get_next_message_id()
         message = [2, message_id, action, payload]
-        
+
         if self.debug_mode:
             print(f"📤 [{self.charge_point_id}] Sending {action}: {json.dumps(payload, indent=2)}")
         else:
             print(f"📤 [{self.charge_point_id}] Sending {action}")
-            
+
         self.ws.send(json.dumps(message))
         self.statistics["messages_sent"] += 1
-        
-        # Set timeout for response to avoid infinite blocking
-        self.ws.settimeout(10.0)  # 10 second timeout
+
+        # Wait for CALLRESULT matching our message_id (OCPP 1.6 §4.1)
+        # The server may send its own CALLs while we wait — queue those for later.
+        self.ws.settimeout(10.0)
         try:
-            response_raw = self.ws.recv()
-            response = json.loads(response_raw)
-            self.statistics["messages_received"] += 1
-            
-            if response[0] == 3:  # CALLRESULT
-                if self.debug_mode:
-                    print(f"📥 [{self.charge_point_id}] Received response: {json.dumps(response[2], indent=2)}")
+            while True:
+                response_raw = self.ws.recv()
+                response = json.loads(response_raw)
+                self.statistics["messages_received"] += 1
+
+                if response[0] == 2:  # Server CALL — independent request, queue it
+                    self._pending_server_calls.append(response)
+                    if self.debug_mode:
+                        print(f"📥 [{self.charge_point_id}] Queued server CALL: {response[2]} (waiting for {action} response)")
+                elif response[0] == 3 and response[1] == message_id:  # CALLRESULT for our CALL
+                    if self.debug_mode:
+                        print(f"📥 [{self.charge_point_id}] Received response: {json.dumps(response[2], indent=2)}")
+                    else:
+                        print(f"📥 [{self.charge_point_id}] Response: {action} OK")
+                    return response[2]
+                elif response[0] == 4 and response[1] == message_id:  # CALLERROR for our CALL
+                    print(f"❌ [{self.charge_point_id}] OCPP Error: {response[2]} - {response[3]}")
+                    raise Exception(f"OCPP Error: {response[2]} - {response[3]}")
                 else:
-                    print(f"📥 [{self.charge_point_id}] Response: {action} OK")
-                return response[2]  # Return payload
-            elif response[0] == 4:  # CALLERROR
-                print(f"❌ [{self.charge_point_id}] OCPP Error: {response[2]} - {response[3]}")
-                raise Exception(f"OCPP Error: {response[2]} - {response[3]}")
-            else:
-                raise Exception(f"Unknown response type: {response[0]}")
+                    print(f"⚠️ [{self.charge_point_id}] Unexpected message (expected response to {message_id}): {response}")
         except websocket.WebSocketTimeoutException:
             print(f"❌ [{self.charge_point_id}] {action} error: timed out")
             raise Exception(f"{action} timed out")
@@ -485,28 +494,48 @@ class OCPPChargerSimulator:
 
         return True
 
+    def _dispatch_server_call(self, message: dict) -> bool:
+        """Dispatch a parsed server CALL to the appropriate handler. Returns True if it was a stop/reset."""
+        action = message["action"]
+        if action == "RemoteStartTransaction":
+            return self.handle_remote_start_transaction(message["message_id"], message["payload"])
+        elif action == "RemoteStopTransaction":
+            return self.handle_remote_stop_transaction(message["message_id"], message["payload"])
+        elif action == "Reset":
+            return self.handle_reset(message["message_id"], message["payload"])
+        else:
+            print(f"⚠️ [{self.charge_point_id}] Unhandled server CALL: {action}")
+            return False
+
     def process_incoming_messages(self, timeout: float = 0.1):
-        """Process any incoming messages from server"""
+        """Process any incoming messages from server (including queued ones)"""
+        # First, drain any server CALLs that were queued during _send_message
+        while self._pending_server_calls:
+            queued = self._pending_server_calls.pop(0)
+            message_id = queued[1]
+            action = queued[2]
+            payload = queued[3]
+            print(f"📥 [{self.charge_point_id}] Processing queued {action}: {payload}")
+            parsed = {"message_id": message_id, "action": action, "payload": payload}
+            result = self._dispatch_server_call(parsed)
+            if result:
+                return result
+
+        # Then check the WebSocket for new messages
         try:
             self.ws.settimeout(timeout)
             message_raw = self.ws.recv()
             message = self._handle_incoming_message(message_raw)
-            
+
             if message:
-                action = message["action"]
-                if action == "RemoteStartTransaction":
-                    return self.handle_remote_start_transaction(message["message_id"], message["payload"])
-                elif action == "RemoteStopTransaction":
-                    return self.handle_remote_stop_transaction(message["message_id"], message["payload"])
-                elif action == "Reset":
-                    return self.handle_reset(message["message_id"], message["payload"])
+                return self._dispatch_server_call(message)
 
         except websocket.WebSocketTimeoutException:
             pass
         except Exception as e:
             if self.running:
                 print(f"❌ [{self.charge_point_id}] Error processing message: {e}")
-        
+
         return False
     
     async def heartbeat_loop(self):

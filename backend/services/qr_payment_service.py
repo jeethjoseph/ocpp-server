@@ -381,24 +381,44 @@ class QRPaymentService:
 
         energy_consumed = reading_kwh - start_meter
         cost = energy_consumed * tariff_rate
+        remaining = budget_limit - cost
+
+        logger.info(
+            f"QR budget check txn {transaction_id}: "
+            f"energy={energy_consumed:.3f}kWh, cost=₹{cost:.2f}, "
+            f"budget=₹{budget_limit:.2f}, remaining=₹{remaining:.2f}"
+        )
 
         if cost >= budget_limit:
             logger.info(
                 f"QR session budget exceeded for txn {transaction_id}: "
-                f"cost=₹{cost:.2f} >= budget=₹{budget_limit:.2f}, sending RemoteStopTransaction"
+                f"cost=₹{cost:.2f} >= budget=₹{budget_limit:.2f}, scheduling RemoteStopTransaction"
             )
 
             transaction = await Transaction.filter(id=transaction_id).prefetch_related("charger").first()
             if transaction:
-                success, result = await connection_manager.send_ocpp_request(
-                    transaction.charger.charge_point_string_id,
-                    "RemoteStopTransaction",
-                    {"transaction_id": transaction_id}
+                # Schedule as background task — do NOT await here.
+                # This runs inside the MeterValues handler; awaiting would deadlock
+                # because the CALLRESULT hasn't been sent yet.
+                asyncio.create_task(
+                    QRPaymentService._send_remote_stop(transaction, transaction_id)
                 )
-                if success:
-                    logger.info(f"Auto-stop sent for QR session txn {transaction_id}")
-                else:
-                    logger.error(f"Failed to auto-stop QR session txn {transaction_id}: {result}")
+
+    @staticmethod
+    async def _send_remote_stop(transaction, transaction_id: int):
+        """Send RemoteStopTransaction as a background task (avoids MeterValues deadlock)."""
+        try:
+            success, result = await connection_manager.send_ocpp_request(
+                transaction.charger.charge_point_string_id,
+                "RemoteStopTransaction",
+                {"transaction_id": transaction_id}
+            )
+            if success:
+                logger.info(f"Auto-stop sent for QR session txn {transaction_id}")
+            else:
+                logger.error(f"Failed to auto-stop QR session txn {transaction_id}: {result}")
+        except Exception as e:
+            logger.error(f"Error sending auto-stop for QR session txn {transaction_id}: {e}")
 
     @staticmethod
     async def process_qr_session_billing(transaction_id: int):
