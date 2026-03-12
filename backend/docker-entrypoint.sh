@@ -58,15 +58,9 @@ echo ""
 echo "Running database migrations..."
 echo "------------------------------------------"
 
-# Check if aerich is initialized (aerich table exists)
-if aerich history 2>/dev/null | grep -q "No migrations"; then
-    echo "No pending migrations."
-elif aerich upgrade 2>&1; then
-    echo "Migrations completed successfully."
-else
-    echo "WARNING: Migration failed or no migrations to run."
-    echo "This might be okay for first-time setup."
-fi
+# Try aerich upgrade — it handles both fresh and existing databases
+aerich upgrade
+echo "Migrations completed successfully."
 
 echo "------------------------------------------"
 echo ""
