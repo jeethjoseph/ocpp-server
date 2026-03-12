@@ -1,7 +1,11 @@
 # OCPP Server Makefile for Database Management
 
-# Database configuration - load from .env file (optional, for local dev only)
+# Load environment - backend/.env for local dev, .env.prod for EC2 production
+# On EC2: backend/.env doesn't exist (skipped), .env.prod provides prod values
+# On local: backend/.env provides dev values, .env.prod doesn't exist (skipped)
 -include backend/.env
+-include .env.prod
+export
 
 # Fallback to local database if not set in .env
 DB_HOST ?= localhost
@@ -17,7 +21,7 @@ SCRIPTS_DIR=$(BACKEND_DIR)/scripts
 
 .PHONY: help db-reset db-reset-cloud db-first-time db-drop-user db-create-user db-drop db-create migrate seed setup-dev truncate-tables
 .PHONY: docker-dev docker-dev-detach docker-staging docker-staging-detach docker-prod docker-prod-detach docker-down docker-down-staging docker-down-prod docker-logs docker-logs-backend docker-logs-frontend docker-build docker-build-staging docker-build-prod docker-clean docker-migrate docker-staging-cert docker-prod-cert docker-cert-renew
-.PHONY: prod-push prod-pull prod-up prod-down prod-deploy prod-rebuild prod-restart prod-logs prod-logs-backend prod-logs-frontend prod-logs-nginx prod-ps prod-cert prod-migrate prod-backup-db prod-cache-clear prod-health prod-stats prod-shell prod-bash prod-db-reset prod-seed
+.PHONY: prod-push prod-pull prod-up prod-down prod-deploy prod-rebuild prod-rebuild-service prod-rebuild-clean prod-nuke prod-restart prod-logs prod-logs-backend prod-logs-frontend prod-logs-nginx prod-ps prod-cert prod-migrate prod-backup-db prod-cache-clear prod-health prod-stats prod-shell prod-bash prod-db-reset prod-seed
 
 help:
 	@echo "OCPP Server - Available Commands"
@@ -31,11 +35,14 @@ help:
 	@echo "  make prod-deploy         Pull + rebuild (full deploy)"
 	@echo "  make prod-pull           Force pull origin/deploy"
 	@echo "  make prod-rebuild        Rebuild containers"
+	@echo "  make prod-rebuild-service SERVICE=backend  Rebuild one service"
+	@echo "  make prod-rebuild-clean  Full clean rebuild (removes images)"
 	@echo ""
 	@echo "Services:"
 	@echo "  make prod-up             Start production services"
 	@echo "  make prod-down           Stop production services"
 	@echo "  make prod-restart        Restart all services"
+	@echo "  make prod-nuke           Remove everything + volumes (DANGEROUS)"
 	@echo "  make prod-ps             Show container status"
 	@echo "  make prod-stats          Resource usage snapshot"
 	@echo "  make prod-health         Health check"
@@ -213,6 +220,23 @@ prod-deploy: prod-pull prod-rebuild
 # Restart all services without rebuilding
 prod-restart:
 	$(PROD_COMPOSE) restart
+
+# Rebuild a single service (usage: make prod-rebuild-service SERVICE=backend)
+prod-rebuild-service:
+	$(PROD_COMPOSE) up -d --build --force-recreate --no-deps $(SERVICE)
+
+# Full clean rebuild (removes images, rebuilds from scratch)
+prod-rebuild-clean:
+	$(PROD_COMPOSE) down --rmi local
+	$(PROD_COMPOSE) up -d --build
+
+# Nuke everything including volumes (DANGEROUS - destroys DB data)
+prod-nuke:
+	@echo "WARNING: This will destroy ALL data including the database!"
+	@echo "Press Ctrl+C to cancel, or wait 5 seconds to continue..."
+	@sleep 5
+	$(PROD_COMPOSE) down -v --rmi local
+	@echo "All containers, volumes, and images removed."
 
 # View production logs (all services)
 prod-logs:
