@@ -30,7 +30,7 @@ async def check_db():
             user=os.getenv('DB_USER'),
             password=os.getenv('DB_PASSWORD'),
             database=os.getenv('DB_NAME'),
-            ssl='disable' if os.getenv('ENVIRONMENT', 'development') == 'development' else 'require'
+            ssl='disable'
         )
         await conn.close()
         return True

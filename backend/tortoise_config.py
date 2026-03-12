@@ -7,11 +7,10 @@ load_dotenv()
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 IS_PRODUCTION = ENVIRONMENT.lower() in ["production", "prod"]
 
-# SSL configuration: require for cloud DBs, disable for localhost
+# SSL configuration: require for cloud/external DBs, disable for local/Docker
 db_host = os.getenv("DB_HOST", "localhost")
-is_localhost = db_host in ["localhost", "127.0.0.1"]
-is_cloud_db = any(provider in db_host for provider in ["neon.tech", "aws.com", "gcp.com", "azure.com", "vultrdb.com"])
-ssl_config = "disable" if is_localhost else ("require" if (IS_PRODUCTION or is_cloud_db) else "disable")
+is_local_db = db_host in ["localhost", "127.0.0.1", "postgres"]
+ssl_config = "disable" if is_local_db else "require"
 
 TORTOISE_ORM = {
     "connections": {

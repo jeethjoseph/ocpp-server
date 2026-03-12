@@ -135,6 +135,8 @@ services:
         - NEXT_PUBLIC_NEW_RELIC_APPLICATION_ID=${NEXT_PUBLIC_NEW_RELIC_APPLICATION_ID:-}
         - NEXT_PUBLIC_NEW_RELIC_ACCOUNT_ID=${NEXT_PUBLIC_NEW_RELIC_ACCOUNT_ID:-}
     container_name: ocpp-frontend-staging
+    environment:
+      - CLERK_SECRET_KEY=${CLERK_SECRET_KEY}
     depends_on:
       - backend
     healthcheck:
