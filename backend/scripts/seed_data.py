@@ -396,7 +396,7 @@ class DatabaseSeeder:
             # Transaction status and timing
             status = random.choices(
                 list(TransactionStatusEnum),
-                weights=[1, 1, 2, 1, 8, 6, 1, 1, 1],  # Bias towards COMPLETED and STOPPED, added weight for BILLING_FAILED
+                weights=[1, 1, 2, 1, 1, 8, 6, 1, 1, 1],  # Bias towards COMPLETED and STOPPED
                 k=1
             )[0]
             
