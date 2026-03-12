@@ -52,8 +52,11 @@ from services.monitoring_service import (
 # This must happen before app = FastAPI() for proper instrumentation
 initialize_monitoring()
 
-# Configure the app logger only — avoids overriding the root logger
-# (which would strip handlers set up by uvicorn, Sentry, or New Relic).
+# Set root logger to INFO so service modules (services.*, routers.*, etc.)
+# emit INFO-level logs. Named loggers inherit this level.
+logging.basicConfig(level=logging.INFO)
+
+# App-specific logger with custom formatter
 logger = logging.getLogger("ocpp-server")
 if not logger.handlers:
     handler = logging.StreamHandler()
