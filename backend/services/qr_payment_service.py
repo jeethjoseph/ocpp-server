@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # Configuration from environment
 RAZORPAY_PLATFORM_FEE_PERCENT = Decimal(os.getenv("RAZORPAY_PLATFORM_FEE_PERCENT", "2.0"))
 MINIMUM_REFUND_AMOUNT = Decimal(os.getenv("MINIMUM_REFUND_AMOUNT", "1.0"))
-QR_PAYMENT_SAFETY_BUFFER = Decimal(os.getenv("QR_PAYMENT_SAFETY_BUFFER", "5.0"))
+QR_PAYMENT_SAFETY_BUFFER = Decimal(os.getenv("QR_PAYMENT_SAFETY_BUFFER", "1.0"))
 QR_PAYMENT_PENDING_TIMEOUT = int(os.getenv("QR_PAYMENT_PENDING_TIMEOUT", "300"))
 
 SYSTEM_GUEST_EMAIL = "guest@system.powerlync.com"
