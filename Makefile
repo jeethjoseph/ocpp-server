@@ -16,57 +16,66 @@ PG_SUPERUSER=$(shell whoami)
 BACKEND_DIR=backend
 SCRIPTS_DIR=$(BACKEND_DIR)/scripts
 
-.PHONY: help db-reset db-reset-cloud db-first-time db-drop-user db-create-user db-drop db-create migrate seed setup-dev truncate-tables deploy-dry-run deploy deploy-force restart-service docker-dev docker-dev-detach docker-staging docker-staging-detach docker-prod docker-prod-detach docker-down docker-down-staging docker-down-prod docker-logs docker-logs-backend docker-logs-frontend docker-build docker-build-staging docker-build-prod docker-clean docker-migrate docker-staging-cert docker-prod-cert docker-cert-renew
+.PHONY: help db-reset db-reset-cloud db-first-time db-drop-user db-create-user db-drop db-create migrate seed setup-dev truncate-tables
+.PHONY: docker-dev docker-dev-detach docker-staging docker-staging-detach docker-prod docker-prod-detach docker-down docker-down-staging docker-down-prod docker-logs docker-logs-backend docker-logs-frontend docker-build docker-build-staging docker-build-prod docker-clean docker-migrate docker-staging-cert docker-prod-cert docker-cert-renew
+.PHONY: prod-push prod-pull prod-up prod-down prod-deploy prod-rebuild prod-restart prod-logs prod-logs-backend prod-logs-frontend prod-logs-nginx prod-ps prod-cert prod-migrate prod-backup-db prod-cache-clear prod-health prod-stats prod-shell prod-bash prod-db-reset prod-seed
 
 help:
-	@echo "Available commands:"
+	@echo "OCPP Server - Available Commands"
 	@echo ""
-	@echo "Docker Commands - Development:"
-	@echo "  docker-dev         - Start development environment with hot-reload"
-	@echo "  docker-dev-detach  - Start development environment (detached)"
-	@echo "  docker-down        - Stop development containers"
-	@echo "  docker-build       - Build development images"
+	@echo "=============== PRODUCTION (EC2 via SSM) ==============="
 	@echo ""
-	@echo "Docker Commands - Staging:"
-	@echo "  docker-staging         - Start staging environment"
-	@echo "  docker-staging-detach  - Start staging environment (detached)"
-	@echo "  docker-down-staging    - Stop staging containers"
-	@echo "  docker-build-staging   - Build staging images"
-	@echo "  docker-staging-cert    - Obtain SSL certificate for staging"
+	@echo "Deployment (from local machine):"
+	@echo "  make prod-push           Force push current branch to origin/deploy"
 	@echo ""
-	@echo "Docker Commands - Production:"
-	@echo "  docker-prod         - Start production environment"
-	@echo "  docker-prod-detach  - Start production environment (detached)"
-	@echo "  docker-down-prod    - Stop production containers"
-	@echo "  docker-build-prod   - Build production images"
-	@echo "  docker-prod-cert    - Obtain SSL certificate for production"
+	@echo "Deployment (on EC2 server via SSM):"
+	@echo "  make prod-deploy         Pull + rebuild (full deploy)"
+	@echo "  make prod-pull           Force pull origin/deploy"
+	@echo "  make prod-rebuild        Rebuild containers"
 	@echo ""
-	@echo "Docker Commands - Common:"
-	@echo "  docker-logs          - Follow all container logs"
-	@echo "  docker-logs-backend  - Follow backend logs"
-	@echo "  docker-logs-frontend - Follow frontend logs"
-	@echo "  docker-migrate       - Run database migrations in Docker"
-	@echo "  docker-clean         - Remove containers, volumes, and images"
-	@echo "  docker-cert-renew    - Force SSL certificate renewal"
+	@echo "Services:"
+	@echo "  make prod-up             Start production services"
+	@echo "  make prod-down           Stop production services"
+	@echo "  make prod-restart        Restart all services"
+	@echo "  make prod-ps             Show container status"
+	@echo "  make prod-stats          Resource usage snapshot"
+	@echo "  make prod-health         Health check"
 	@echo ""
-	@echo "Database Management:"
-	@echo "  db-reset        - Database reset (drop, recreate, migrate, seed)"
-	@echo "  db-reset-cloud  - Cloud database reset (truncate tables, migrate, seed)"
-	@echo "  db-first-time   - First-time setup (drop, recreate, init-db, seed)"
-	@echo "  db-drop-user    - Drop database user"
-	@echo "  db-create-user  - Create database user"
-	@echo "  db-drop         - Drop database"
-	@echo "  db-create       - Create database"
-	@echo "  init-fresh-db   - Initialize fresh database with schema"
-	@echo "  migrate         - Run database migrations (for existing DB)"
-	@echo "  seed            - Run seed script"
-	@echo "  setup-dev       - Initial development setup"
+	@echo "Logs:"
+	@echo "  make prod-logs           View all logs"
+	@echo "  make prod-logs-backend   View backend logs"
+	@echo "  make prod-logs-frontend  View frontend logs"
+	@echo "  make prod-logs-nginx     View nginx logs"
 	@echo ""
-	@echo "Deployment:"
-	@echo "  deploy-dry-run  - Show what would be deployed (no changes)"
-	@echo "  deploy          - Deploy to production (with confirmation)"
-	@echo "  deploy-force    - Deploy without confirmation (use with caution!)"
-	@echo "  restart-service - Restart the production service"
+	@echo "Database & Cache:"
+	@echo "  make prod-migrate        Run database migrations"
+	@echo "  make prod-backup-db      Backup database to backups/"
+	@echo "  make prod-db-reset       Reset database (DANGEROUS)"
+	@echo "  make prod-seed           Run seed script"
+	@echo "  make prod-cache-clear    Clear all Redis cache"
+	@echo ""
+	@echo "SSL & Shell:"
+	@echo "  make prod-cert           Obtain/renew SSL certificate"
+	@echo "  make prod-shell          Open Python shell in backend"
+	@echo "  make prod-bash           Open bash in backend"
+	@echo ""
+	@echo "=============== DEVELOPMENT (local) ==============="
+	@echo ""
+	@echo "Docker:"
+	@echo "  make docker-dev          Start dev environment with hot-reload"
+	@echo "  make docker-dev-detach   Start dev environment (detached)"
+	@echo "  make docker-down         Stop dev containers"
+	@echo "  make docker-build        Build dev images"
+	@echo "  make docker-clean        Remove containers, volumes, images"
+	@echo "  make docker-logs         Follow all container logs"
+	@echo "  make docker-migrate      Run database migrations"
+	@echo ""
+	@echo "Database (local):"
+	@echo "  make db-reset            Database reset (drop, recreate, migrate, seed)"
+	@echo "  make db-first-time       First-time setup (drop, recreate, init-db, seed)"
+	@echo "  make migrate             Run database migrations"
+	@echo "  make seed                Run seed script"
+	@echo "  make setup-dev           Initial development setup"
 
 # Complete database reset (uses existing migrations)
 db-reset: db-drop db-drop-user db-create-user db-create migrate seed
@@ -152,104 +161,146 @@ truncate-tables:
 	@echo "🗑️  Truncating all tables..."
 	cd $(BACKEND_DIR) && source .venv/bin/activate && python scripts/truncate_tables.py
 
-# Deployment configuration
-REMOTE_USER=root
-REMOTE_HOST=lyncpower.com
-REMOTE_PATH=/root/ocpp_server/
-LOCAL_PATH=./backend/
-SERVICE_NAME=ocpp-server
+# =============================================================================
+# PRODUCTION DEPLOYMENT (Git-based, EC2 via SSM)
+# =============================================================================
+# Deploy branch: origin/deploy
+# Workflow: prod-push (local) -> SSM into EC2 -> prod-deploy (on server)
+# See docs/ec2-deployment-plan.md for full setup guide.
 
-# Common rsync exclusions
-RSYNC_EXCLUDES=--exclude '.git/' \
-	--exclude '.gitignore' \
-	--exclude '__pycache__/' \
-	--exclude '*.pyc' \
-	--exclude '*.pyo' \
-	--exclude '*.py[cod]' \
-	--exclude '.env' \
-	--exclude '.env.local' \
-	--exclude '.env.production' \
-	--exclude '.env.staging' \
-	--exclude '.env.example' \
-	--exclude '.venv/' \
-	--exclude 'venv/' \
-	--exclude 'env/' \
-	--exclude '.idea/' \
-	--exclude '.vscode/' \
-	--exclude 'test.html' \
-	--exclude 'dump.rdb' \
-	--exclude '.claude/' \
-	--exclude '*.sql' \
-	--exclude '*.dump' \
-	--exclude '*.log' \
-	--exclude 'logs/' \
-	--exclude 'docs/' \
-	--exclude 'firmware_files/' \
-	--exclude 'node_modules/' \
-	--exclude 'npm-debug.log' \
-	--exclude 'yarn-debug.log' \
-	--exclude 'yarn-error.log' \
-	--exclude '.next/' \
-	--exclude 'out/' \
-	--exclude 'dist/' \
-	--exclude 'build/' \
-	--exclude '.DS_Store' \
-	--exclude '._*' \
-	--exclude 'certs/' \
-	--exclude 'app/' \
-	--exclude 'frontend/'
+PROD_COMPOSE = docker compose -f docker-compose.prod.yml --env-file .env.prod
 
-# Deployment dry run (shows what would be transferred)
-deploy-dry-run:
-	@echo "🔍 Running deployment dry-run to $(REMOTE_USER)@$(REMOTE_HOST)..."
-	@echo "   This will show what files would be transferred/deleted"
-	@echo ""
-	rsync -avzcn --delete $(RSYNC_EXCLUDES) $(LOCAL_PATH) $(REMOTE_USER)@$(REMOTE_HOST):$(REMOTE_PATH)
-	@echo ""
-	@echo "✅ Dry-run complete. Review the changes above."
+# Force push current branch to origin/deploy (run from local machine)
+prod-push:
+	@echo "Force pushing current branch to origin/deploy..."
+	git push origin HEAD:deploy --force
+	@echo "Pushed to origin/deploy. Now SSM into EC2 and run: make prod-deploy"
 
-# Full deployment (with confirmation)
-deploy: deploy-dry-run
-	@echo ""
-	@echo "⚠️  Ready to deploy to production!"
-	@read -p "Do you want to proceed with deployment? (yes/no): " confirm; \
-	if [ "$$confirm" = "yes" ]; then \
-		echo "🚀 Starting deployment..."; \
-		rsync -avzc --delete $(RSYNC_EXCLUDES) $(LOCAL_PATH) $(REMOTE_USER)@$(REMOTE_HOST):$(REMOTE_PATH); \
-		if [ $$? -eq 0 ]; then \
-			echo "✅ Files deployed successfully!"; \
-			echo "🔄 Restarting service $(SERVICE_NAME)..."; \
-			ssh $(REMOTE_USER)@$(REMOTE_HOST) "systemctl restart $(SERVICE_NAME) && systemctl status $(SERVICE_NAME) --no-pager"; \
-			if [ $$? -eq 0 ]; then \
-				echo "✅ Service restarted successfully!"; \
-				echo "✅ Deployment complete!"; \
-			else \
-				echo "⚠️  Service restart failed! Check logs with: ssh $(REMOTE_USER)@$(REMOTE_HOST) 'systemctl status $(SERVICE_NAME)'"; \
-				exit 1; \
-			fi \
-		else \
-			echo "❌ Deployment failed!"; \
-			exit 1; \
-		fi \
+# Force pull from origin/deploy (run on EC2 server)
+prod-pull:
+	@echo "Pulling from origin/deploy..."
+	git fetch origin
+	git reset --hard origin/deploy
+	@echo "Updated to origin/deploy"
+
+# Start production services
+prod-up:
+	$(PROD_COMPOSE) up -d
+
+# Stop production services
+prod-down:
+	$(PROD_COMPOSE) down
+
+# Rebuild and restart production (after pull)
+prod-rebuild:
+	$(PROD_COMPOSE) up -d --build --force-recreate
+	@echo "Waiting for services to stabilize..."
+	@sleep 5
+	@if ! $(PROD_COMPOSE) exec -T nginx test -d /etc/letsencrypt/archive 2>/dev/null; then \
+		echo ""; \
+		echo "=============================================="; \
+		echo "WARNING: No Let's Encrypt certificate found!"; \
+		echo "Currently using self-signed certificate."; \
+		echo "Run 'make prod-cert' to obtain a real certificate."; \
+		echo "=============================================="; \
 	else \
-		echo "❌ Deployment cancelled."; \
-		exit 1; \
+		echo "Let's Encrypt certificate found."; \
 	fi
 
-# Quick deploy (no confirmation - use with caution!)
-deploy-force:
-	@echo "🚀 Deploying to $(REMOTE_USER)@$(REMOTE_HOST) (no confirmation)..."
-	rsync -avzc --delete $(RSYNC_EXCLUDES) $(LOCAL_PATH) $(REMOTE_USER)@$(REMOTE_HOST):$(REMOTE_PATH)
-	@echo "✅ Files deployed successfully!"
-	@echo "🔄 Restarting service $(SERVICE_NAME)..."
-	@ssh $(REMOTE_USER)@$(REMOTE_HOST) "systemctl restart $(SERVICE_NAME) && systemctl status $(SERVICE_NAME) --no-pager"
-	@echo "✅ Deployment complete!"
+# Full deploy sequence (run on EC2 after SSM)
+prod-deploy: prod-pull prod-rebuild
+	@echo "Production deployment complete!"
 
-# Restart the production service
-restart-service:
-	@echo "🔄 Restarting service $(SERVICE_NAME) on $(REMOTE_HOST)..."
-	@ssh $(REMOTE_USER)@$(REMOTE_HOST) "systemctl restart $(SERVICE_NAME) && systemctl status $(SERVICE_NAME) --no-pager"
-	@echo "✅ Service restarted!"
+# Restart all services without rebuilding
+prod-restart:
+	$(PROD_COMPOSE) restart
+
+# View production logs (all services)
+prod-logs:
+	$(PROD_COMPOSE) logs -f
+
+# View specific service logs
+prod-logs-backend:
+	$(PROD_COMPOSE) logs -f backend
+
+prod-logs-frontend:
+	$(PROD_COMPOSE) logs -f frontend
+
+prod-logs-nginx:
+	$(PROD_COMPOSE) logs -f nginx
+
+# Run migrations on production
+prod-migrate:
+	$(PROD_COMPOSE) exec backend aerich upgrade
+
+# Open Python shell on production backend
+prod-shell:
+	$(PROD_COMPOSE) exec backend python -c "import IPython; IPython.start_ipython()" 2>/dev/null || \
+	$(PROD_COMPOSE) exec backend python
+
+# Open bash on production backend container
+prod-bash:
+	$(PROD_COMPOSE) exec backend bash
+
+# Show production container status
+prod-ps:
+	$(PROD_COMPOSE) ps
+
+# Resource monitoring (single snapshot)
+prod-stats:
+	docker stats --no-stream
+
+# Health check
+prod-health:
+	@curl -sf http://localhost/health && echo " Health check passed" || echo " Health check failed"
+
+# Obtain/renew Let's Encrypt SSL certificate
+prod-cert:
+	@echo "Obtaining SSL certificate..."
+	@echo "Clearing any existing certificates..."
+	$(PROD_COMPOSE) run --rm --entrypoint "" certbot \
+		sh -c "rm -rf /etc/letsencrypt/live/$${DOMAIN_NAME}* /etc/letsencrypt/renewal/$${DOMAIN_NAME}* /etc/letsencrypt/archive/$${DOMAIN_NAME}*"
+	@echo "Requesting certificate from Let's Encrypt..."
+	$(PROD_COMPOSE) run --rm --entrypoint "" certbot \
+		certbot certonly --webroot --webroot-path=/var/www/certbot \
+		--email $${CERTBOT_EMAIL} --agree-tos --no-eff-email \
+		-d $${DOMAIN_NAME}
+	@echo "Restarting nginx to load new certificate..."
+	$(PROD_COMPOSE) restart nginx
+	@echo "SSL certificate installed!"
+
+# Clear all Redis cache
+prod-cache-clear:
+	@echo "Clearing ALL Redis cache on production..."
+	@echo "Press Ctrl+C to cancel, or wait 3 seconds to continue..."
+	@sleep 3
+	$(PROD_COMPOSE) exec redis redis-cli FLUSHALL
+	@echo "Cache cleared!"
+
+# Backup production database (saves to host filesystem)
+prod-backup-db:
+	@echo "Backing up production database..."
+	@mkdir -p backups
+	$(PROD_COMPOSE) exec -T postgres sh -c 'pg_dump -U $$POSTGRES_USER $$POSTGRES_DB' > backups/prod_backup_$$(date +%Y%m%d_%H%M%S).sql
+	@echo "Backup saved to backups/"
+	@ls -lh backups/prod_backup_*.sql | tail -1
+
+# Reset production database (DANGEROUS - requires confirmation)
+prod-db-reset:
+	@echo "WARNING: This will delete the production database!"
+	@echo "Press Ctrl+C to cancel, or wait 5 seconds to continue..."
+	@sleep 5
+	@echo "Stopping backend to release DB connections..."
+	$(PROD_COMPOSE) stop backend
+	$(PROD_COMPOSE) exec postgres sh -c 'psql -U $$POSTGRES_USER -d postgres -c "DROP DATABASE IF EXISTS $$POSTGRES_DB;"'
+	$(PROD_COMPOSE) exec postgres sh -c 'psql -U $$POSTGRES_USER -d postgres -c "CREATE DATABASE $$POSTGRES_DB OWNER $$POSTGRES_USER;"'
+	@echo "Database reset. Rebuilding backend (entrypoint runs migrations)..."
+	$(PROD_COMPOSE) up -d --build backend
+	@echo "Database reset complete!"
+
+# Run seed script on production
+prod-seed:
+	$(PROD_COMPOSE) exec backend python scripts/seed_data.py
 
 # ===========================================
 # Docker Commands
