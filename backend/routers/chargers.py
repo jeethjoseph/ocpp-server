@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import uuid
 import logging
 
-from models import Charger, ChargingStation, Connector, Transaction, OCPPLog, User, ChargerError
+from models import Charger, ChargingStation, Connector, Transaction, OCPPLog, User, ChargerError, Tariff
 from tortoise.exceptions import IntegrityError
 from auth_middleware import require_admin, require_user_or_admin
 from crud import log_audit_event
@@ -27,6 +27,7 @@ class ChargerCreate(BaseModel):
     serial_number: Optional[str] = None
     external_charger_id: Optional[str] = None
     connectors: List[ConnectorInput]
+    tariff_per_kwh: Optional[float] = None
 
 class ChargerUpdate(BaseModel):
     name: Optional[str] = None
@@ -34,6 +35,7 @@ class ChargerUpdate(BaseModel):
     vendor: Optional[str] = None
     latest_status: Optional[str] = None
     external_charger_id: Optional[str] = None
+    tariff_per_kwh: Optional[float] = None
 
 class LatestErrorInfo(BaseModel):
     """Summary of latest unresolved error for a charger"""
@@ -290,7 +292,11 @@ async def create_charger(charger_data: ChargerCreate, admin_user: User = Depends
                 connector_type=connector_input.connector_type,
                 max_power_kw=connector_input.max_power_kw
             )
-        
+
+        # Create charger-specific tariff if provided
+        if charger_data.tariff_per_kwh is not None:
+            await Tariff.create(charger=charger, rate_per_kwh=charger_data.tariff_per_kwh)
+
         await log_audit_event(
             action="charger.created",
             entity_type="charger",
@@ -402,6 +408,15 @@ async def update_charger(charger_id: int, update_data: ChargerUpdate, admin_user
 
     # Update only provided fields
     update_dict = update_data.model_dump(exclude_unset=True)
+
+    # Handle tariff separately (not a Charger model field)
+    tariff_per_kwh = update_dict.pop("tariff_per_kwh", None)
+    if tariff_per_kwh is not None:
+        await Tariff.update_or_create(
+            defaults={"rate_per_kwh": tariff_per_kwh},
+            charger_id=charger_id
+        )
+
     for field, value in update_dict.items():
         setattr(charger, field, value)
 

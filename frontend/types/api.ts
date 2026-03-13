@@ -56,6 +56,7 @@ export interface ChargerCreate {
   serial_number?: string;
   external_charger_id?: string;
   connectors: ConnectorInput[];
+  tariff_per_kwh?: number;
 }
 
 export interface ConnectorInput {
@@ -70,6 +71,7 @@ export interface ChargerUpdate {
   vendor?: string;
   latest_status?: string;
   external_charger_id?: string;
+  tariff_per_kwh?: number;
 }
 
 export interface ChargerListResponse {

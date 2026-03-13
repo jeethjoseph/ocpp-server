@@ -375,6 +375,14 @@ export default function ChargerDetailPage() {
                   </Badge>
                 </div>
               </div>
+              <div className="flex justify-between items-center">
+                <span className="text-sm font-medium">Tariff:</span>
+                <Badge variant="outline">
+                  {charger.tariff_per_kwh != null
+                    ? `₹${charger.tariff_per_kwh}/kWh`
+                    : "Global"}
+                </Badge>
+              </div>
               {/* Latest Error */}
               {charger.latest_error && (
                 <div className="mt-4 p-3 bg-destructive/10 border border-destructive/20 rounded-lg">
