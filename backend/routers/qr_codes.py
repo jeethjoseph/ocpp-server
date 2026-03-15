@@ -34,8 +34,6 @@ async def create_qr_code(request: CreateQRCodeRequest, admin_user=Depends(requir
 
     try:
         result = razorpay_service.create_qr_code(
-            charger_id=charger.id,
-            charge_point_string_id=charger.charge_point_string_id,
             name=charger.name or charger.charge_point_string_id,
         )
 

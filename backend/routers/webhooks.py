@@ -135,6 +135,12 @@ async def handle_user_created(data: dict):
                 existing_user.clerk_user_id = clerk_user_id
                 await existing_user.save()
                 logger.info(f"Updated existing user {primary_email} with Clerk ID")
+            elif existing_user.clerk_user_id != clerk_user_id:
+                logger.error(
+                    f"Clerk ID mismatch for {primary_email}: "
+                    f"existing DB user (ID={existing_user.id}) has a different Clerk account. "
+                    f"User record NOT updated. Manually resolve this conflict."
+                )
             return
         
         # Generate unique RFID/ID tag for OCPP

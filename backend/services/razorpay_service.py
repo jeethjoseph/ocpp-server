@@ -204,12 +204,7 @@ class RazorpayService:
             logger.error(f"Failed to fetch order {order_id}: {e}")
             return None
 
-    def create_qr_code(
-        self,
-        charger_id: int,
-        charge_point_string_id: str,
-        name: str
-    ) -> Optional[Dict]:
+    def create_qr_code(self, name: str) -> Optional[Dict]:
         """Create a Razorpay QR code for a charger (static, variable amount)"""
         if not self.is_configured():
             raise Exception("Razorpay is not configured")
@@ -219,14 +214,10 @@ class RazorpayService:
                 "name": f"EV Charging - {name}",
                 "usage": "multiple_use",
                 "fixed_amount": False,
-                "description": f"Pay for EV charging at {name} ({charge_point_string_id})",
-                "notes": {
-                    "charger_id": str(charger_id),
-                    "charge_point_string_id": charge_point_string_id
-                }
+                "description": f"Pay for EV charging at {name}",
             }
             qr_code = self.client.qrcode.create(data=qr_data)
-            logger.info(f"Razorpay QR code created: {qr_code.get('id')} for charger {charge_point_string_id}")
+            logger.info(f"Razorpay QR code created: {qr_code.get('id')} for {name}")
             return qr_code
         except Exception as e:
             logger.error(f"Failed to create Razorpay QR code: {e}", exc_info=True)
