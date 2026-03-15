@@ -25,9 +25,9 @@ async def create_qr_code(request: CreateQRCodeRequest, admin_user=Depends(requir
         raise HTTPException(status_code=404, detail="Charger not found")
 
     # Check if QR already exists
-    existing = await ChargerQRCode.filter(charger=charger).first()
+    existing = await ChargerQRCode.filter(charger=charger, is_active=True).first()
     if existing:
-        raise HTTPException(status_code=400, detail="QR code already exists for this charger")
+        raise HTTPException(status_code=400, detail="Active QR code already exists for this charger")
 
     if not razorpay_service.is_configured():
         raise HTTPException(status_code=503, detail="Razorpay not configured")
@@ -114,7 +114,7 @@ async def list_qr_codes(
 @router.get("/charger/{charger_id}")
 async def get_qr_code_by_charger(charger_id: int, admin_user=Depends(require_admin())):
     """Get QR code for a specific charger"""
-    qr = await ChargerQRCode.filter(charger_id=charger_id).prefetch_related("charger").first()
+    qr = await ChargerQRCode.filter(charger_id=charger_id).prefetch_related("charger").order_by("-is_active", "-created_at").first()
     if not qr:
         return None
 

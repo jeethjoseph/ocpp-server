@@ -1054,7 +1054,7 @@ function PaymentQRCard({ chargerId }: { chargerId: number; chargerName?: string 
         </CardTitle>
       </CardHeader>
       <CardContent>
-        {qrCode ? (
+        {qrCode && qrCode.is_active ? (
           <div className="flex items-center gap-4">
             {qrCode.image_url && (
               <img
@@ -1065,9 +1065,7 @@ function PaymentQRCard({ chargerId }: { chargerId: number; chargerName?: string 
             )}
             <div className="flex-1 space-y-1">
               <div className="flex items-center gap-2">
-                <Badge variant={qrCode.is_active ? "default" : "destructive"}>
-                  {qrCode.is_active ? "Active" : "Inactive"}
-                </Badge>
+                <Badge variant="default">Active</Badge>
                 <span className="text-xs text-muted-foreground font-mono">
                   {qrCode.razorpay_qr_code_id}
                 </span>
@@ -1083,7 +1081,7 @@ function PaymentQRCard({ chargerId }: { chargerId: number; chargerName?: string 
         ) : (
           <div className="flex items-center justify-between">
             <p className="text-sm text-muted-foreground">
-              No payment QR code generated yet. Create one to enable appless charging.
+              {qrCode ? "Payment QR code is inactive." : "No payment QR code generated yet."} Create one to enable appless charging.
             </p>
             <Button
               size="sm"

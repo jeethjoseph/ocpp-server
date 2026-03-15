@@ -30,7 +30,6 @@ TORTOISE_ORM = {
         "models": {
             "models": [
                 "models",
-                "admin",  # FastAdmin models
                 "aerich.models"
             ],
             "default_connection": "default",

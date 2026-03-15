@@ -33,7 +33,6 @@ TORTOISE_ORM = {
         "models": {
             "models": [
                 "models",
-                "admin",  # FastAdmin models
                 "aerich.models"  # Migration tracking
             ],
             "default_connection": "default",

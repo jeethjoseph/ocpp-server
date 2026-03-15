@@ -440,7 +440,7 @@ class WebhookEvent(Model):
 
 class ChargerQRCode(Model):
     id = fields.IntField(pk=True)
-    charger = fields.OneToOneField("models.Charger", related_name="qr_code")
+    charger = fields.ForeignKeyField("models.Charger", related_name="qr_codes")
     razorpay_qr_code_id = fields.CharField(max_length=255, unique=True, index=True)
     image_url = fields.CharField(max_length=500)
     short_url = fields.CharField(max_length=500, null=True)

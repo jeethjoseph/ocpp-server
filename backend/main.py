@@ -35,9 +35,6 @@ SUSPEND_TIMEOUT_SECONDS = int(os.environ.get("SUSPEND_TIMEOUT_SECONDS", "300"))
 # Import routers
 from routers import stations, chargers, transactions, auth, webhooks, users, public_stations, logs, wallet_payments, firmware
 
-# Import admin panel
-from admin import admin_app
-
 # Import monitoring service
 from services.monitoring_service import (
     initialize_monitoring,
@@ -1169,9 +1166,6 @@ app.include_router(qr_codes.router)
 # OCPP WebSocket endpoint (connection management + message handling)
 from routers import ocpp_ws
 app.include_router(ocpp_ws.router)
-
-# Mount admin panel
-app.mount("/admin", admin_app)
 
 # ============ Basic API Endpoints ============
 
