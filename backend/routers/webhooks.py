@@ -371,8 +371,11 @@ async def handle_payment_captured(event_data: dict):
             f"Amount {amount_in_paise} paise, Status {status}"
         )
 
-        if not order_id or not payment_id:
-            raise ValueError("Missing order_id or payment_id in webhook payload")
+        if not order_id:
+            logger.info(f"Payment {payment_id} has no order_id (likely a QR payment), skipping payment.captured handler")
+            return
+        if not payment_id:
+            raise ValueError("Missing payment_id in webhook payload")
 
         # Find the wallet transaction by order_id
         # TODO: Add indexed razorpay_order_id column to avoid in-Python filtering

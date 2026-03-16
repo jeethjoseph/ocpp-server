@@ -132,7 +132,10 @@ class QRPaymentService:
         amount_paid = Decimal(str(amount_paise)) / 100
         vpa = payment_entity.get("vpa")
         contact = payment_entity.get("contact")
-        customer_name = payment_entity.get("notes", {}).get("customer_name") or payment_entity.get("email")
+        notes = payment_entity.get("notes", {})
+        if not isinstance(notes, dict):
+            notes = {}
+        customer_name = notes.get("customer_name") or payment_entity.get("email")
         qr_code_id = qr_code_entity.get("id") or payment_entity.get("description", "").split("|")[-1].strip()
 
         logger.info(f"QR payment received: payment_id={payment_id}, amount=₹{amount_paid}, qr_code={qr_code_id}, vpa={vpa}")
