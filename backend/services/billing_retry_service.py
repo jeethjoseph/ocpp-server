@@ -51,6 +51,7 @@ class BillingRetryService:
             try:
                 await self._process_failed_billing_transactions()
                 await self._process_failed_qr_refunds()
+                await self._cleanup_orphaned_qr_payments()
                 await self._cleanup_stale_suspended_transactions()
                 await asyncio.sleep(self.retry_interval_minutes * 60)
             except asyncio.CancelledError:
@@ -150,6 +151,47 @@ class BillingRetryService:
 
         if success_count > 0 or failure_count > 0:
             logger.info(f"🔄 QR refund retry completed: {success_count} successful, {failure_count} failed")
+
+    async def _cleanup_orphaned_qr_payments(self):
+        """Refund QR payments stuck in PAID or CHARGING with no linked transaction.
+
+        This catches edge cases where:
+        - handle_payment_without_plug task died (server restart)
+        - RemoteStart succeeded but StartTransaction never came
+        - Any other gap between payment and charging
+        """
+        from services.qr_payment_service import QRPaymentService, QR_PAYMENT_PENDING_TIMEOUT
+
+        # PAID payments older than 2x the pending timeout are definitely orphaned
+        stale_cutoff = datetime.now(timezone.utc) - timedelta(seconds=QR_PAYMENT_PENDING_TIMEOUT * 2)
+
+        orphaned_payments = await QRPayment.filter(
+            status=QRPaymentStatusEnum.PAID,
+            transaction_id__isnull=True,
+            created_at__lt=stale_cutoff,
+        ).all()
+
+        if not orphaned_payments:
+            return
+
+        logger.info(f"🧹 Found {len(orphaned_payments)} orphaned QR payments to refund")
+
+        for qr_payment in orphaned_payments:
+            try:
+                age_minutes = (datetime.now(timezone.utc) - qr_payment.created_at).total_seconds() / 60
+                logger.info(
+                    f"Refunding orphaned QR payment {qr_payment.id}: "
+                    f"₹{qr_payment.amount_paid}, status={qr_payment.status.value}, "
+                    f"age={age_minutes:.0f}m"
+                )
+                qr_payment.status = QRPaymentStatusEnum.EXPIRED
+                qr_payment.failure_reason = "Orphaned payment - no transaction linked"
+                await qr_payment.save()
+                await QRPaymentService._full_refund(qr_payment, "Orphaned payment cleanup")
+            except Exception as e:
+                logger.error(f"Failed to refund orphaned QR payment {qr_payment.id}: {e}", exc_info=True)
+
+            await asyncio.sleep(0.1)
 
     async def _cleanup_stale_suspended_transactions(self):
         """Auto-stop SUSPENDED transactions orphaned by server restarts.

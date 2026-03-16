@@ -279,9 +279,12 @@ class ConnectionManager:
                 logger.warning(f"Action {action} not implemented in send_ocpp_request")
                 return False, f"Action {action} not implemented"
 
-            response = await cp.call(req)
+            response = await asyncio.wait_for(cp.call(req), timeout=30)
             logger.info(f"Sent {action} request to {charge_point_id}")
             return True, response
+        except asyncio.TimeoutError:
+            logger.warning(f"OCPP timeout (30s) sending {action} to {charge_point_id}")
+            return False, f"OCPP timeout: {action}"
         except Exception as e:
             logger.error(f"Error sending request to {charge_point_id}: {e}", exc_info=True)
             return False, str(e)

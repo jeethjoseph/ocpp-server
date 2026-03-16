@@ -261,10 +261,16 @@ class QRPaymentService:
 
         return {"status": "processed", "qr_payment_id": qr_payment.id}
 
+    MAX_START_RETRIES = 2
+    START_RETRY_DELAY = 5  # seconds
+
     @staticmethod
     async def _start_charging(charger: Charger, user: User, qr_payment: QRPayment):
-        """Send RemoteStartTransaction to charger"""
-        from ocpp.v16 import call as ocpp_call
+        """Send RemoteStartTransaction to charger with retry on communication failure"""
+        # Guard against concurrent calls (e.g. handle_payment_without_plug + direct path)
+        if qr_payment.status != QRPaymentStatusEnum.PAID:
+            logger.warning(f"QR payment {qr_payment.id} status is {qr_payment.status.value}, skipping _start_charging")
+            return
 
         try:
             id_tag = user.rfid_card_id
@@ -273,31 +279,38 @@ class QRPaymentService:
                 user.rfid_card_id = id_tag
                 await user.save()
 
-            logger.info(f"Sending RemoteStartTransaction to {charger.charge_point_string_id} with id_tag={id_tag}")
+            result = None
+            for attempt in range(1, QRPaymentService.MAX_START_RETRIES + 1):
+                logger.info(f"Sending RemoteStartTransaction to {charger.charge_point_string_id} (attempt {attempt}/{QRPaymentService.MAX_START_RETRIES})")
 
-            success, result = await connection_manager.send_ocpp_request(
-                charger.charge_point_string_id,
-                "RemoteStartTransaction",
-                {"id_tag": id_tag, "connector_id": 1}
-            )
+                success, result = await connection_manager.send_ocpp_request(
+                    charger.charge_point_string_id,
+                    "RemoteStartTransaction",
+                    {"id_tag": id_tag, "connector_id": 1}
+                )
 
-            if success:
-                status_value = getattr(result, 'status', None)
-                if status_value and str(status_value).lower() == "accepted":
-                    logger.info(f"RemoteStartTransaction accepted for charger {charger.id}")
-                    # Status will transition to CHARGING when StartTransaction is received
+                if success:
+                    status_value = str(getattr(result, 'status', '')).lower()
+                    if status_value == "accepted":
+                        logger.info(f"RemoteStartTransaction accepted for charger {charger.id}")
+                        return  # Success — done
+                    else:
+                        # Charger explicitly rejected — no point retrying
+                        logger.warning(f"RemoteStartTransaction rejected: {result}")
+                        break
+
+                # Communication failure — retry if attempts remain
+                if attempt < QRPaymentService.MAX_START_RETRIES:
+                    logger.warning(f"RemoteStart attempt {attempt} failed: {result}, retrying in {QRPaymentService.START_RETRY_DELAY}s")
+                    await asyncio.sleep(QRPaymentService.START_RETRY_DELAY)
                 else:
-                    logger.warning(f"RemoteStartTransaction rejected: {result}")
-                    qr_payment.status = QRPaymentStatusEnum.FAILED
-                    qr_payment.failure_reason = f"RemoteStart rejected: {result}"
-                    await qr_payment.save()
-                    await QRPaymentService._full_refund(qr_payment, "RemoteStart rejected by charger")
-            else:
-                logger.error(f"Failed to send RemoteStartTransaction: {result}")
-                qr_payment.status = QRPaymentStatusEnum.FAILED
-                qr_payment.failure_reason = f"RemoteStart failed: {result}"
-                await qr_payment.save()
-                await QRPaymentService._full_refund(qr_payment, "RemoteStart communication failed")
+                    logger.error(f"RemoteStart failed after {QRPaymentService.MAX_START_RETRIES} attempts: {result}")
+
+            # All attempts failed or rejected — refund
+            qr_payment.status = QRPaymentStatusEnum.FAILED
+            qr_payment.failure_reason = f"RemoteStart failed: {result}"
+            await qr_payment.save()
+            await QRPaymentService._full_refund(qr_payment, "RemoteStart failed")
 
         except Exception as e:
             logger.error(f"Error starting charging for QR payment {qr_payment.id}: {e}", exc_info=True)
@@ -559,6 +572,11 @@ class QRPaymentService:
     async def _full_refund(qr_payment: QRPayment, reason: str):
         """Issue a full refund for a QR payment"""
         try:
+            # Idempotency: skip if already refunded
+            if qr_payment.razorpay_refund_id:
+                logger.info(f"QR payment {qr_payment.id} already refunded ({qr_payment.razorpay_refund_id}), skipping")
+                return
+
             platform_fee = (qr_payment.amount_paid * RAZORPAY_PLATFORM_FEE_PERCENT / 100).quantize(
                 Decimal('0.01'), rounding=ROUND_HALF_UP
             )
