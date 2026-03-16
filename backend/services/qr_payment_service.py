@@ -3,6 +3,7 @@ import os
 import asyncio
 import logging
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, Tuple, Dict
 
@@ -145,6 +146,43 @@ class QRPaymentService:
         if existing:
             logger.info(f"Duplicate webhook for payment {payment_id}, skipping")
             return {"status": "duplicate", "qr_payment_id": existing.id}
+
+        # Staleness check — if payment is older than the pending timeout,
+        # the user has long gone. Create record and refund immediately.
+        payment_created_at = payment_entity.get("created_at")
+        if payment_created_at:
+            payment_time = datetime.fromtimestamp(payment_created_at, tz=timezone.utc)
+            age_seconds = (datetime.now(timezone.utc) - payment_time).total_seconds()
+            if age_seconds > QR_PAYMENT_PENDING_TIMEOUT:
+                logger.warning(
+                    f"Stale QR payment {payment_id}: {age_seconds:.0f}s old "
+                    f"(threshold {QR_PAYMENT_PENDING_TIMEOUT}s), refunding"
+                )
+                # Still need to look up charger for the record
+                charger_qr = await ChargerQRCode.filter(
+                    razorpay_qr_code_id=qr_code_id, is_active=True
+                ).prefetch_related("charger").first()
+                if not charger_qr:
+                    logger.error(f"No active ChargerQRCode for stale payment {payment_id}")
+                    return {"status": "error", "reason": "QR code not found"}
+
+                user = await find_or_create_user_from_payment(contact, vpa, customer_name)
+                qr_payment = await QRPayment.create(
+                    charger=charger_qr.charger,
+                    charger_qr_code=charger_qr,
+                    user=user,
+                    razorpay_payment_id=payment_id,
+                    razorpay_qr_code_id=qr_code_id,
+                    amount_paid=amount_paid,
+                    customer_vpa=vpa,
+                    customer_name=customer_name,
+                    customer_contact=contact,
+                    status=QRPaymentStatusEnum.EXPIRED,
+                    failure_reason=f"Stale webhook: payment was {age_seconds:.0f}s old",
+                    metadata=webhook_data,
+                )
+                await QRPaymentService._full_refund(qr_payment, "Stale payment - webhook delayed")
+                return {"status": "refunded_stale", "qr_payment_id": qr_payment.id}
 
         # Look up ChargerQRCode
         charger_qr = await ChargerQRCode.filter(
