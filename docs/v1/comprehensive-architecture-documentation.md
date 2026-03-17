@@ -4,13 +4,14 @@
 
 This document provides comprehensive technical documentation for a production-ready **Open Charge Point Protocol (OCPP) 1.6** compliant Charging Station Management System (CSMS). The system implements a full-stack solution for managing Electric Vehicle (EV) charging stations with real-time monitoring, remote control capabilities, role-based access control, and integrated financial management.
 
-**System Version**: 2.3
+**System Version**: 3.0
 **OCPP Compliance**: OCPP 1.6 Full Implementation
 **Architecture**: Modern async Python backend with React web frontend + Capacitor mobile apps
-**Authentication**: Clerk-powered JWT authentication with RBAC
-**Deployment**: Production-ready on Render (backend) + Vercel (web) + App Stores (mobile)
-**Current Branch**: 47-new-relic
-**Last Updated**: January 2025  
+**Authentication**: Clerk-powered JWT authentication with RBAC + UPI_GUEST for appless users
+**Payments**: Razorpay (wallet top-up + QR-based appless charging with auto-refunds)
+**Deployment**: Production-ready on AWS EC2 with Docker Compose (backend + frontend + nginx + Redis + PostgreSQL)
+**Current Branch**: 57-qr-based-appless-transaction
+**Last Updated**: March 2025
 
 ---
 
@@ -21,20 +22,22 @@ This document provides comprehensive technical documentation for a production-re
 3. [Architecture Design](#architecture-design)
 4. [Backend Components](#backend-components)
 5. [Frontend Components](#frontend-components)
-6. [**NEW**: Mobile App Components](#mobile-app-components)
-7. [Database Schema](#database-schema)
-8. [OCPP 1.6 Implementation](#ocpp-16-implementation)
-9. [Authentication & Authorization](#authentication--authorization)
-10. [API Documentation](#api-documentation)
-11. [Real-Time Features](#real-time-features)
-12. [User Experience Features](#user-experience-features)
-13. [Security & Compliance](#security--compliance)
-14. [Testing Framework](#testing-framework)
-15. [Performance & Scalability](#performance--scalability)
-16. [Technical Debt & Known Issues](#technical-debt--known-issues)
-17. [Deployment & Operations](#deployment--operations)
-18. [Recent Changes & Updates](#recent-changes--updates)
-19. [Future Roadmap](#future-roadmap)
+6. [Mobile App Components](#mobile-app-components)
+7. [**NEW**: QR-Based Appless Charging](#qr-based-appless-charging)
+8. [Database Schema](#database-schema)
+9. [OCPP 1.6 Implementation](#ocpp-16-implementation)
+10. [Authentication & Authorization](#authentication--authorization)
+11. [API Documentation](#api-documentation)
+12. [Real-Time Features](#real-time-features)
+13. [User Experience Features](#user-experience-features)
+14. [**NEW**: Docker Deployment & Infrastructure](#docker-deployment--infrastructure)
+15. [Security & Compliance](#security--compliance)
+16. [Testing Framework](#testing-framework)
+17. [Performance & Scalability](#performance--scalability)
+18. [Technical Debt & Known Issues](#technical-debt--known-issues)
+19. [Deployment & Operations](#deployment--operations)
+20. [Recent Changes & Updates](#recent-changes--updates)
+21. [Future Roadmap](#future-roadmap)
 
 ---
 
@@ -60,9 +63,13 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 - ✅ **Transaction Lifecycle Management** - From start to completion with detailed energy tracking
 - ✅ **Remote Operations** - Start/stop charging, availability control via OCPP commands
 - ✅ **Financial Integration** - Wallet system with automated billing and retry service
+- ✅ **QR-Based Appless Charging** - Scan-and-pay UPI QR codes at chargers without needing an app or account
+- ✅ **Budget Enforcement** - Real-time budget checking during MeterValues with auto-stop when budget exceeded
+- ✅ **Automated Refunds** - Unused payment balance automatically refunded to customer via Razorpay
 - ✅ **User Experience Features** - Interactive maps, QR scanning, mobile-responsive design
 - ✅ **Scalable Architecture** - Redis-based connection management for horizontal scaling
-- ✅ **Production-Ready** - Comprehensive testing, error handling, and monitoring
+- ✅ **Docker Production Deployment** - Complete Docker Compose stack with nginx, SSL, PostgreSQL, Redis
+- ✅ **Production-Ready** - Comprehensive testing, error handling, Sentry monitoring, structured logging
 
 ---
 
@@ -102,11 +109,13 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 
 ### Infrastructure & DevOps
 - **Database**: PostgreSQL with SSL (Tortoise ORM, AsyncPG driver)
-- **Cache/Queue**: Redis for real-time connection state
-- **Authentication**: Clerk for user management and JWT
-- **Deployment**: Render (backend), Vercel (frontend)
-- **Monitoring**: Structured logging with correlation IDs
+- **Cache/Queue**: Redis for real-time connection state + QR session caching
+- **Authentication**: Clerk for user management and JWT + UPI_GUEST for appless users
+- **Deployment**: AWS EC2 with Docker Compose (backend, frontend, nginx, redis, postgres)
+- **Reverse Proxy**: Nginx with SSL termination, WebSocket proxying, rate limiting
+- **Monitoring**: Sentry (error tracking) + New Relic (APM) + structured logging with correlation IDs
 - **Error Handling**: Comprehensive async error boundaries
+- **Containerization**: Docker multi-stage builds for backend (Python) and frontend (Next.js)
 
 ---
 
@@ -142,11 +151,13 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 
 1. **OCPP Charging Stations** connect via WebSocket to `/ocpp/{charge_point_id}`
 2. **Central System** validates connections against registered chargers in database
-3. **Redis** tracks connection states for real-time status monitoring
-4. **PostgreSQL** stores all persistent data (transactions, logs, user data, configurations)
+3. **Redis** tracks connection states for real-time status monitoring + QR session budget caching
+4. **PostgreSQL** stores all persistent data (transactions, logs, user data, QR payments, configurations)
 5. **Clerk** manages user authentication and role-based access control
-6. **Next.js Frontend** provides both admin dashboard and user interfaces
-7. **Real-time Updates** flow through WebSocket (OCPP) and polling (frontend)
+6. **Razorpay** handles UPI QR code generation, payment processing, webhooks, and refunds
+7. **Next.js Frontend** provides both admin dashboard and user interfaces
+8. **Real-time Updates** flow through WebSocket (OCPP) and polling (frontend)
+9. **QR Payment Flow**: Customer scans UPI QR → Razorpay webhook → user resolution → RemoteStartTransaction → budget-enforced charging → auto-refund of unused balance
 
 ### Design Patterns
 - **Event-Driven Architecture**: OCPP message handlers with async processing
@@ -184,14 +195,19 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 **Purpose**: Complete database schema with OCPP-compliant enums and relationships
 
 **Model Categories**:
-1. **User Management**: User, AdminUser, Wallet, WalletTransaction, VehicleProfile
+1. **User Management**: User, Wallet, WalletTransaction, VehicleProfile
 2. **Infrastructure**: ChargingStation, Charger, Connector, Tariff
 3. **Operations**: Transaction, MeterValue
-4. **System**: OCPPLog, PaymentGateway
+4. **QR Payments**: ChargerQRCode, QRPayment
+5. **Firmware**: FirmwareFile, FirmwareUpdate
+6. **Monitoring**: SignalQuality, ChargerError, AuditEvent, WebhookEvent
+7. **System**: OCPPLog
 
 **Key Enums**:
 - `ChargerStatusEnum`: OCPP 1.6 compliant charge point statuses
 - `TransactionStatusEnum`: Complete transaction lifecycle including BILLING_FAILED
+- `QRPaymentStatusEnum`: PAID, CHARGING, COMPLETED, REFUNDED, REFUND_FAILED, EXPIRED, FAILED
+- `AuthProviderEnum`: EMAIL, GOOGLE, CLERK, UPI_GUEST
 - `MessageDirectionEnum`: OCPP message direction tracking
 - `UserRoleEnum`: USER and ADMIN roles for RBAC
 
@@ -272,11 +288,30 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 3. Downloads and verifies firmware
 4. Installs and reboots with new version
 
+#### QR Code Management (`backend/routers/qr_codes.py`)
+**Endpoints**: `/api/admin/qr-codes/*`
+**Purpose**: **NEW** - Admin CRUD for Razorpay UPI QR codes linked to chargers
+
+**Endpoints**:
+- `POST /api/admin/qr-codes` - Create QR code for a charger (calls Razorpay API)
+- `GET /api/admin/qr-codes` - List QR codes with pagination, search, status filter
+- `GET /api/admin/qr-codes/{qr_id}` - QR code detail with payment stats (count, revenue, refunds)
+- `POST /api/admin/qr-codes/{qr_id}/close` - Deactivate QR code (closes on Razorpay)
+- `GET /api/admin/qr-codes/{qr_id}/payments` - Paginated payment history for a QR code
+- `GET /api/admin/qr-codes/charger/{charger_id}` - Get QR code for a specific charger
+
+**Key Features**:
+- Revenue aggregation per QR code (sum of COMPLETED, REFUNDED, CHARGING payments)
+- Status badges: PAID, CHARGING, COMPLETED, REFUNDED, FAILED, REFUND_FAILED, EXPIRED
+- QR code image URL and short URL from Razorpay for printing/display
+
 #### Webhook Handler (`backend/routers/webhooks.py`)
 **Endpoints**: `/webhooks/*`
-**Purpose**: Clerk webhook processing for user lifecycle events
-- User creation and role assignment automation
-- Webhook signature validation
+**Purpose**: Clerk webhook processing for user lifecycle events + Razorpay payment webhooks
+- User creation and role assignment automation (Clerk)
+- Webhook signature validation (Clerk SVIX + Razorpay HMAC-SHA256)
+- **NEW**: `POST /webhooks/razorpay` - Handles `payment.captured`, `payment.failed`, `order.paid`, **`qr_code.credited`**
+- Routes `qr_code.credited` events to `QRPaymentService.handle_qr_payment()` for appless charging
 
 ### Business Logic Services (`backend/services/`)
 
@@ -319,6 +354,53 @@ if energy_consumed_kwh == 0:
 - Transaction status: COMPLETED (not BILLING_FAILED)
 - Handles test/aborted sessions without billing errors
 
+#### QR Payment Service (`backend/services/qr_payment_service.py`)
+**Purpose**: **NEW** - Complete lifecycle management for QR-based appless charging sessions
+
+**Key Methods**:
+```python
+class QRPaymentService:
+    async def handle_qr_payment(webhook_data: dict) -> dict
+        """Main entry point: idempotency check → staleness check → user resolution → charging trigger"""
+
+    async def find_or_create_user_from_payment(phone, vpa, name) -> User
+        """Priority: phone match → VPA match → create UPI_GUEST → system guest fallback"""
+
+    async def link_transaction_to_qr_payment(transaction_id, charger_id, user_id) -> QRPayment
+        """Called from StartTransaction: links OCPP transaction to QR payment, caches budget in Redis"""
+
+    async def check_budget_and_auto_stop(transaction_id, reading_kwh)
+        """Called from MeterValues: calculates cost vs budget, schedules RemoteStop if exceeded"""
+
+    async def process_qr_session_billing(transaction_id)
+        """Called from StopTransaction: calculates final cost, issues partial refund for unused balance"""
+
+    async def handle_charging_failure(transaction_id)
+        """Handles failures: sets status=FAILED, issues full refund"""
+```
+
+**Configuration**:
+- `RAZORPAY_PLATFORM_FEE_PERCENT`: 2.0% (env var)
+- `MINIMUM_REFUND_AMOUNT`: ₹1.0 (env var)
+- `QR_PAYMENT_PENDING_TIMEOUT`: 300 seconds (env var)
+
+**Error Handling**:
+- **Idempotency**: Checks `razorpay_payment_id` uniqueness before processing
+- **Stale payments**: Refunds payments older than 5 minutes (customer likely left)
+- **Double-payment guard**: Refunds if charger already has active transaction or pending QR payment
+- **Charger disconnection**: Full refund if charger not connected
+- **Plug-in timeout**: Background task polls 10s intervals for 5 minutes, refunds on timeout
+- **RemoteStart failure**: Up to 2 retries with 5s delay, full refund if all fail
+- **Budget exceeded**: Schedules RemoteStopTransaction as asyncio.create_task (avoids deadlock)
+- **Refund below minimum**: Amounts <₹1.0 absorbed as operator credit (Razorpay fee > refund)
+
+**Redis Session Cache**:
+```
+Key: qr_session:{transaction_id}
+Value: {qr_payment_id, amount_paid, platform_fee, budget_limit, tariff_rate, start_meter_kwh, charger_id}
+TTL: 86400 seconds (24 hours)
+```
+
 #### Razorpay Payment Service (`backend/services/razorpay_service.py`)
 **Purpose**: **NEW** - Razorpay payment gateway integration for wallet recharge
 
@@ -350,6 +432,15 @@ class RazorpayService:
 
     def fetch_payment(payment_id: str) -> Optional[Dict]
         """Get payment details for reconciliation"""
+
+    def create_qr_code(charger_id: int, usage: str = "multiple_use") -> Dict
+        """NEW: Create Razorpay UPI QR code linked to a charger"""
+
+    def close_qr_code(qr_code_id: str) -> bool
+        """NEW: Close/deactivate a Razorpay QR code"""
+
+    def refund_payment(payment_id: str, amount: int = None) -> Dict
+        """NEW: Issue full or partial refund via Razorpay"""
 ```
 
 **Integration Points**:
@@ -441,13 +532,15 @@ await start_data_retention_service(
 ### Infrastructure Components
 
 #### Redis Manager (`backend/redis_manager.py`)
-**Purpose**: Real-time connection state management
+**Purpose**: Real-time connection state management + QR session caching
 
 **Features**:
 - **Connection Tracking**: Add/remove chargers from active connection registry
 - **Bulk Status Queries**: Efficient dashboard status checking
 - **Graceful Degradation**: Fallback mode when Redis unavailable
 - **Automatic Cleanup**: Connection state cleanup on disconnect
+- **QR Session Caching**: `set_qr_session()`, `get_qr_session()`, `delete_qr_session()` for budget enforcement during MeterValues
+- **Cache Fallback**: If Redis miss on QR session, rebuilds from DB (Tortoise query)
 
 #### Database Configuration (`backend/tortoise_config.py`)
 **Purpose**: Environment-aware database configuration
@@ -483,11 +576,15 @@ frontend/
 │   ├── admin/             # Admin-only pages
 │   │   ├── chargers/      # Charger management
 │   │   ├── stations/      # Station management
+│   │   ├── firmware/      # Firmware OTA management
+│   │   ├── qr-codes/      # **NEW** QR code management for appless charging
+│   │   │   ├── page.tsx   # QR code list with create/close actions
+│   │   │   └── [id]/page.tsx  # QR detail with payment history & stats
 │   │   └── users/         # User management
 │   │       └── [id]/      # User detail pages
 │   │           ├── page.tsx            # User profile
-│   │           ├── transactions/       # **NEW** Charging transactions
-│   │           └── wallet/             # **NEW** Wallet history
+│   │           ├── transactions/       # Charging transactions
+│   │           └── wallet/             # Wallet history
 │   ├── stations/          # Station finder and maps
 │   ├── scanner/           # QR code scanning
 │   ├── my-sessions/       # **NEW** User's sessions & wallet
@@ -1076,6 +1173,137 @@ npx cap open android  # Open in Android Studio
 
 ---
 
+## QR-Based Appless Charging
+
+### Overview
+The QR-based appless charging feature enables customers to charge their EV by scanning a Razorpay UPI QR code at the charger and paying any amount via their UPI app (Google Pay, PhonePe, etc.) — **without needing to download an app or create an account**. The system automatically starts charging, enforces a budget limit, and refunds any unused balance after the session.
+
+### Payment & Charging Flow
+
+```
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│  Customer     │    │  Razorpay    │    │  Backend     │    │  Charger     │
+│  (UPI App)    │    │  (Webhook)   │    │  (CSMS)      │    │  (OCPP 1.6)  │
+└──────┬───────┘    └──────┬───────┘    └──────┬───────┘    └──────┬───────┘
+       │ Scan QR & Pay ₹X  │                    │                    │
+       │──────────────────►│                    │                    │
+       │                    │ qr_code.credited   │                    │
+       │                    │───────────────────►│                    │
+       │                    │                    │ Resolve user       │
+       │                    │                    │ (phone/VPA/guest)  │
+       │                    │                    │                    │
+       │                    │                    │ RemoteStartTxn     │
+       │                    │                    │───────────────────►│
+       │                    │                    │                    │
+       │                    │                    │◄─ StartTransaction │
+       │                    │                    │  Link QR payment   │
+       │                    │                    │  Cache budget in   │
+       │                    │                    │  Redis             │
+       │                    │                    │                    │
+       │                    │                    │◄─ MeterValues      │
+       │                    │                    │  Check budget      │
+       │                    │                    │  Auto-stop if      │
+       │                    │                    │  exceeded          │
+       │                    │                    │                    │
+       │                    │                    │◄─ StopTransaction  │
+       │                    │                    │  Calculate cost    │
+       │                    │  Refund unused ₹   │  Issue refund      │
+       │◄───────────────────│◄───────────────────│                    │
+```
+
+### Step-by-Step Implementation
+
+#### Step 1: Admin Creates QR Code
+- `POST /api/admin/qr-codes` with `charger_id`
+- Backend calls `razorpay_service.create_qr_code()` → Razorpay returns `qr_code_id`, `image_url`, `short_url`
+- QR code stored in `ChargerQRCode` table, printed/displayed at charger
+
+#### Step 2: Customer Pays via UPI
+- Customer scans QR with any UPI app (Google Pay, PhonePe, etc.)
+- Enters amount (e.g., ₹500) and confirms payment
+- Razorpay captures payment and sends `qr_code.credited` webhook
+
+#### Step 3: Webhook Processing (Idempotent)
+- `POST /webhooks/razorpay` receives webhook with HMAC-SHA256 signature verification
+- **Idempotency check**: Skip if `razorpay_payment_id` already exists in `QRPayment` table
+- **Staleness check**: Refund if payment is >5 minutes old (`QR_PAYMENT_PENDING_TIMEOUT`)
+- **Double-payment guard**: Refund if charger already has active transaction or pending QR payment
+
+#### Step 4: User Resolution (Priority-based)
+1. **Phone match**: If customer phone matches existing user → use that user
+2. **VPA match**: If customer UPI VPA matches existing user → use that user
+3. **Create UPI_GUEST**: New user with email `upi_{vpa}@guest.powerlync.com`, auth_provider=`UPI_GUEST`
+4. **System guest fallback**: `guest@system.powerlync.com` if no identifiers available
+
+#### Step 5: Charging Trigger
+- **If charger is PREPARING + connected**: Immediately send `RemoteStartTransaction`
+- **If charger is connected but not PREPARING**: Background task polls every 10s for 5 minutes
+- **If charger is disconnected**: Full refund, status=FAILED
+- **RemoteStart retry**: Up to 2 attempts with 5s delay; full refund if all fail
+
+#### Step 6: Transaction Linking (`on_start_transaction`)
+- When charger sends `StartTransaction`, backend calls `link_transaction_to_qr_payment()`
+- Links `transaction_id` to `QRPayment`, sets status=CHARGING
+- **Caches session in Redis** (`qr_session:{transaction_id}`) with budget_limit, tariff_rate, start_meter
+
+#### Step 7: Budget Enforcement (`on_meter_values`)
+- On each `MeterValues`, calls `check_budget_and_auto_stop()`
+- Retrieves session from Redis (or rebuilds from DB on cache miss)
+- Calculates: `cost = (reading_kwh - start_meter) × tariff_rate`
+- **If cost >= budget_limit**: Schedules `RemoteStopTransaction` as `asyncio.create_task()` (non-blocking to avoid deadlock)
+
+#### Step 8: Billing & Refund (`on_stop_transaction`)
+- Calls `process_qr_session_billing(transaction_id)`
+- Calculates: `energy_cost = energy_consumed × tariff_rate`
+- Calculates: `platform_fee = amount_paid × 2%` (configurable)
+- Calculates: `refund = amount_paid - energy_cost - platform_fee`
+- **If refund >= ₹1.0**: Issues partial refund via Razorpay, sets status=REFUNDED
+- **If refund < ₹1.0**: Absorbed as operator credit, sets status=COMPLETED
+- Deletes Redis session cache
+
+### QR Payment Status Lifecycle
+```
+PAID → CHARGING → COMPLETED → REFUNDED
+  ↓         ↓         ↑
+FAILED   EXPIRED   (no refund needed, amount < ₹1)
+  ↓
+REFUND_FAILED
+```
+
+### Admin QR Management Pages
+
+**QR Code List** (`/admin/qr-codes`):
+- Table: Charger, Charge Point ID, QR Code ID, Status, Payments, Revenue, Created, Actions
+- Filters: Search by charger name, Status (Active/Inactive/All)
+- Actions: Create QR, View details, Close QR
+- Create dialog: Select charger from dropdown
+
+**QR Code Detail** (`/admin/qr-codes/[id]`):
+- QR code image display with Download, Print, Close buttons
+- Stats cards: Total Payments, Total Revenue, Total Refunds
+- Payment history table: Date, Amount, Customer VPA, Energy Cost, Platform Fee, Refund, Status
+- Color-coded status badges
+
+### Configuration
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `RAZORPAY_PLATFORM_FEE_PERCENT` | 2.0 | Platform fee percentage on payment amount |
+| `MINIMUM_REFUND_AMOUNT` | 1.0 | Minimum refund amount in ₹ (below this, absorbed) |
+| `QR_PAYMENT_PENDING_TIMEOUT` | 300 | Seconds before a payment is considered stale |
+
+### Test Script
+```bash
+# Simulate Razorpay webhook locally
+docker compose exec backend python scripts/test_qr_webhook.py \
+  --charger-id 10 --amount 500 --vpa testuser@okaxis --phone +919876543210
+
+# Dry run (print payload + curl command)
+docker compose exec backend python scripts/test_qr_webhook.py \
+  --charger-id 10 --amount 500 --dry-run
+```
+
+---
+
 ## Database Schema
 
 ### Entity Relationship Overview
@@ -1084,31 +1312,36 @@ npx cap open android  # Open in Android Studio
 ┌─────────────┐    ┌─────────────────┐    ┌─────────────┐
 │    User     │◄──►│     Wallet      │◄──►│WalletTrans  │
 │ (Clerk ID)  │    │                 │    │             │
-└─────┬───────┘    └─────────────────┘    └─────────────┘
-      │                                           │
+│ (UPI_GUEST) │    └─────────────────┘    └─────────────┘
+└─────┬───────┘                                   │
       │            ┌─────────────────┐           │
-      └───────────►│  Transaction    │◄──────────┘
-                   │ (OCPP Session)  │
-                   └─────┬───────────┘
-                         │
-      ┌──────────────────┼──────────────────┐
-      │                  │                  │
-┌─────▼───────┐    ┌────▼────┐       ┌─────▼─────┐
-│MeterValue   │    │Charger  │       │Vehicle    │
-│(Energy Data)│    │(OCPP CP)│       │Profile    │
-└─────────────┘    └────┬────┘       └───────────┘
-                        │
-                   ┌────▼────┐
-                   │Station  │
-                   │(Location│
-                   └─────────┘
+      ├───────────►│  Transaction    │◄──────────┘
+      │            │ (OCPP Session)  │
+      │            └─────┬───────────┘
+      │                  │
+      │   ┌──────────────┼──────────────────┐
+      │   │              │                  │
+      │ ┌─▼───────────┐ │ ┌────▼────┐ ┌────▼──────┐
+      │ │MeterValue   │ │ │Charger  │ │Vehicle    │
+      │ │(Energy Data)│ │ │(OCPP CP)│ │Profile    │
+      │ └─────────────┘ │ └────┬────┘ └───────────┘
+      │                  │      │
+      │   ┌──────────────┘ ┌───▼─────┐
+      │   │                │Station  │
+      │   │                │(Location)│
+      │   │                └─────────┘
+      │   │
+      │ ┌─▼──────────────┐    ┌─────────────────┐
+      └►│  QRPayment     │◄──►│ ChargerQRCode   │
+        │ (Appless Pay)  │    │ (Razorpay QR)   │
+        └────────────────┘    └─────────────────┘
 ```
 
 ### Core Tables with File References
 
 #### User Management Tables
 ```sql
--- User profiles integrated with Clerk
+-- User profiles integrated with Clerk (+ UPI_GUEST for appless users)
 -- Defined in: backend/models.py:25-38
 CREATE TABLE user (
     id SERIAL PRIMARY KEY,
@@ -1117,6 +1350,8 @@ CREATE TABLE user (
     full_name VARCHAR(255),
     email VARCHAR(255),
     rfid_card_id VARCHAR(255) UNIQUE,
+    upi_vpa VARCHAR(255) UNIQUE,        -- NEW: UPI address for QR user lookup
+    auth_provider VARCHAR(20),           -- NEW: EMAIL, GOOGLE, CLERK, UPI_GUEST
     role UserRoleEnum DEFAULT 'USER',  -- RBAC support
     is_active BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMP DEFAULT NOW(),
@@ -1274,6 +1509,63 @@ CREATE INDEX idx_charger_error_created ON charger_error(created_at);
 
 **Resolution Logic**: When charger sends StatusNotification with `error_code="NoError"`, all unresolved errors for that connector are marked as resolved.
 
+#### QR Payment Tables (NEW)
+```sql
+-- Razorpay UPI QR codes linked to chargers
+-- Defined in: backend/models.py (ChargerQRCode)
+CREATE TABLE charger_qr_code (
+    id SERIAL PRIMARY KEY,
+    charger_id INTEGER REFERENCES charger(id) ON DELETE CASCADE,
+    razorpay_qr_code_id VARCHAR(255) UNIQUE NOT NULL,  -- Razorpay's QR identifier
+    image_url VARCHAR(500) NOT NULL,                    -- QR code image from Razorpay
+    short_url VARCHAR(500),                             -- Short URL for sharing
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_charger_qr_code_razorpay ON charger_qr_code(razorpay_qr_code_id);
+
+-- QR-based appless payment records
+-- Defined in: backend/models.py (QRPayment)
+CREATE TABLE qr_payment (
+    id SERIAL PRIMARY KEY,
+    charger_id INTEGER REFERENCES charger(id) ON DELETE CASCADE,
+    charger_qr_code_id INTEGER REFERENCES charger_qr_code(id) ON DELETE CASCADE,
+    user_id INTEGER REFERENCES app_user(id) ON DELETE SET NULL,     -- UPI_GUEST or discovered user
+    transaction_id INTEGER REFERENCES transaction(id) ON DELETE SET NULL,  -- Linked OCPP transaction
+    razorpay_payment_id VARCHAR(255) UNIQUE NOT NULL,    -- Razorpay payment identifier
+    razorpay_qr_code_id VARCHAR(255) NOT NULL,           -- Denormalized QR code reference
+    amount_paid DECIMAL(10,2) NOT NULL,                  -- Customer's payment in ₹
+    customer_vpa VARCHAR(255),                           -- UPI VPA (e.g., user@okaxis)
+    customer_name VARCHAR(255),                          -- Payer name from Razorpay
+    customer_contact VARCHAR(255),                       -- Phone number from webhook
+    energy_cost DECIMAL(10,2),                           -- Calculated after charging
+    platform_fee DECIMAL(10,2),                          -- Razorpay fee (2% default)
+    refund_amount DECIMAL(10,2),                         -- Amount refunded to customer
+    razorpay_refund_id VARCHAR(255),                     -- Refund transaction ID
+    status VARCHAR(20) NOT NULL,                         -- QRPaymentStatusEnum
+    failure_reason TEXT,                                  -- Error description on failure
+    metadata JSONB,                                      -- Raw webhook payload for debugging
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_qr_payment_razorpay ON qr_payment(razorpay_payment_id);
+CREATE INDEX idx_qr_payment_qr_code ON qr_payment(razorpay_qr_code_id);
+```
+
+**QRPaymentStatusEnum Values**:
+- `PAID` - Payment received, awaiting charging start
+- `CHARGING` - Transaction linked and charging in progress
+- `COMPLETED` - Charging done, no refund needed (or refund below minimum)
+- `REFUNDED` - Charging done, unused balance refunded to customer
+- `REFUND_FAILED` - Refund API call to Razorpay failed
+- `EXPIRED` - Payment too old (>5 min) or plug-in timeout
+- `FAILED` - Charger disconnected, RemoteStart rejected, or other failure
+
+**User Model Extensions** (for QR):
+- `upi_vpa VARCHAR(255)` - Unique nullable UPI address for VPA-based user lookup
+- `auth_provider VARCHAR(20)` - Extended from VARCHAR(6) to support `UPI_GUEST` (was EMAIL, GOOGLE, CLERK)
+
 #### Transaction Management
 ```sql
 -- OCPP charging transactions
@@ -1332,14 +1624,26 @@ CREATE TABLE log (
 
 ### Migration Management
 - **Migration System**: Aerich-based schema versioning
-- **Current Migrations**: 
+- **Current Migrations** (13 total):
   - `0_20250810160500_init.py`: Initial schema creation
   - `1_20250812140852_add_billing_failed_status.py`: Billing system enhancement
-- **Migration Commands**: 
+  - `2_20251107131429_add_firmware_models.py`: Firmware file and update tables
+  - `3_20251121122920_add_signal_quality_table.py`: Signal quality monitoring
+  - `4_*_firmware_update_redesign_unique_charger_firmware.py`: Firmware uniqueness
+  - `5_20260105100057_add_external_charger_id.py`: External charger ID
+  - `6_20260113163547_add_admin_and_charger_error.py`: Admin + charger error tables
+  - `7_20260303073846_add_audit_and_webhook_tables.py`: Audit events + webhook events
+  - `8_20260305050220_add_transaction_resume_fields.py`: Transaction resume/suspend
+  - `9_20260306093240_add_audit_composite_index.py`: Audit table indexing
+  - **`10_20260310000000_add_qr_payment_models.py`**: ChargerQRCode + QRPayment tables + upi_vpa column
+  - **`11_20260310000100_widen_auth_provider_column.py`**: auth_provider VARCHAR(6) → VARCHAR(20) for UPI_GUEST
+  - **`12_20260315154019_allow_qr_regeneration_drop_admin.py`**: Drop unique charger QR constraint + drop admin_user table
+- **Migration Commands**:
   ```bash
   # Located in: backend/pyproject.toml
   aerich migrate --name "description"  # Generate
   aerich upgrade                       # Apply
+  # Docker: make prod-migrate
   ```
 
 ---
@@ -1409,7 +1713,7 @@ async def on_status_notification(self, connector_id, status, error_code=None, in
 
 #### 4. StartTransaction Handler
 ```python
-# Implementation: backend/main.py:142-204
+# Implementation: backend/main.py
 @on('StartTransaction')
 async def on_start_transaction(self, connector_id, id_tag, meter_start, timestamp, **kwargs):
 ```
@@ -1419,11 +1723,12 @@ async def on_start_transaction(self, connector_id, id_tag, meter_start, timestam
 - Vehicle profile creation/retrieval
 - Transaction record creation with RUNNING status
 - Energy meter initialization (Wh to kWh conversion)
+- **QR Integration**: Calls `QRPaymentService.link_transaction_to_qr_payment()` to link OCPP transaction to pending QR payment and cache budget in Redis
 - Comprehensive error handling and logging
 
 #### 5. StopTransaction Handler
 ```python
-# Implementation: backend/main.py:206-261
+# Implementation: backend/main.py
 @on('StopTransaction')
 async def on_stop_transaction(self, transaction_id, meter_stop, timestamp, **kwargs):
 ```
@@ -1433,6 +1738,7 @@ async def on_stop_transaction(self, transaction_id, meter_stop, timestamp, **kwa
 - Energy consumption calculation
 - Status update to COMPLETED
 - **Billing Integration**: Automatic wallet billing via WalletService
+- **QR Billing**: Calls `QRPaymentService.process_qr_session_billing()` to calculate final cost and issue partial refund for unused balance
 - Error handling for billing failures (sets BILLING_FAILED status)
 
 #### 6. MeterValues Handler
@@ -1453,6 +1759,7 @@ async def on_meter_values(self, connector_id, meter_value, transaction_id=None, 
 - Unit conversion automation
 - Database persistence for energy analytics
 - Transaction association validation
+- **QR Budget Check**: Calls `QRPaymentService.check_budget_and_auto_stop()` to compare current cost against customer's prepaid budget; schedules RemoteStopTransaction as background task if budget exceeded
 
 #### 7. FirmwareStatusNotification Handler
 ```python
@@ -2737,6 +3044,87 @@ const nextConfig = {
 
 ---
 
+## Docker Deployment & Infrastructure
+
+### Docker Compose Architecture
+The system is deployed as a multi-container Docker application on AWS EC2:
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│  AWS EC2 Instance (app.voltlync.com)                           │
+│                                                                 │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   │
+│  │  Nginx   │──►│ Backend  │──►│PostgreSQL│   │  Redis   │   │
+│  │  (SSL)   │   │ (FastAPI)│──►│  (DB)    │   │  (Cache) │   │
+│  │  :80/443 │   │  :8000   │   │  :5432   │   │  :6379   │   │
+│  └──────────┘   └──────────┘   └──────────┘   └──────────┘   │
+│       │              │                                          │
+│       │         ┌──────────┐                                   │
+│       └────────►│ Frontend │                                   │
+│                 │ (Next.js)│                                   │
+│                 │  :3000   │                                   │
+│                 └──────────┘                                   │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Container Configuration
+
+**Backend** (`backend/Dockerfile`):
+- Multi-stage build with Python 3.11
+- Runs migrations on startup via `docker-entrypoint.sh`
+- Health check: `curl http://localhost:8000/health`
+- Environment: DATABASE_URL, REDIS_URL, Clerk keys, Razorpay keys, QR payment config
+
+**Frontend** (`frontend/Dockerfile`):
+- Multi-stage Next.js build with standalone output
+- Node.js 18 Alpine runtime
+- Environment: NEXT_PUBLIC_API_URL, NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY
+
+**Nginx** (`nginx/`):
+- SSL termination with Let's Encrypt certificates
+- WebSocket proxying for `/ocpp/` path
+- Rate limiting and security headers
+- Separate configs: `default.conf` (dev), `staging.conf`, `prod.conf`
+- Static file caching for firmware downloads
+
+**PostgreSQL**:
+- Persistent volume for data
+- Automatic backup support
+
+**Redis**:
+- `--maxmemory 256mb --maxmemory-policy allkeys-lru`
+- Used for: charger connection state, QR session budget cache
+
+### Docker Compose Files
+- `docker-compose.yml` - Local development
+- `docker-compose.staging.yml` - Staging environment
+- `docker-compose.prod.yml` - Production environment
+
+### Makefile Targets
+Key deployment and management commands:
+```bash
+make prod-up          # Start production stack
+make prod-down        # Stop production stack
+make prod-migrate     # Run database migrations in container
+make prod-logs        # Tail all container logs
+make docker-build     # Build all images
+make docker-seed      # Seed database with test data
+```
+
+### Environment Configuration
+Separate `.env` files for each environment:
+- `.env.docker.example` - Local Docker development
+- `.env.staging.example` - Staging
+- `.env.prod.example` - Production (includes Razorpay, Sentry, New Relic keys)
+
+### Monitoring Stack
+- **Sentry**: Error tracking with ASGI middleware integration
+- **New Relic**: APM with custom transaction tracing (`@trace_transaction` decorator)
+- **Structured Logging**: Timestamp-prefixed logs with correlation IDs
+- **Health Check**: `GET /health` endpoint for container orchestration
+
+---
+
 ## Security & Compliance
 
 ### Authentication Security
@@ -2784,18 +3172,18 @@ const nextConfig = {
 
 #### CORS Configuration
 ```python
-# Implementation: backend/main.py:47-54
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",           # Development
-        "http://127.0.0.1:3000", 
-        "https://ocpp-frontend-mu.vercel.app"  # Production
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Implementation: backend/main.py
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",           # Local development - Next.js
+    "http://localhost:5173",           # Local development - Vite (mobile app)
+    "http://frontend:3000",            # Docker internal network
+    "https://powerlync.com",           # Production frontend
+    "https://www.powerlync.com",       # Production frontend (www)
+    "https://lyncpower.com",           # Backend domain
+    "https://www.lyncpower.com",       # Backend domain (www)
+]
+# Explicit allow_methods and allow_headers (not wildcard)
+# Custom OptionsMiddleware handles CORS preflight to avoid auth middleware conflicts
 ```
 
 #### Environment Security
@@ -3854,7 +4242,79 @@ CORS_ORIGINS = [
 
 ## Recent Changes & Updates
 
-### Latest Release - January 2025 (Branch: 47-new-relic)
+### Latest Release - March 2025 (Branch: 57-qr-based-appless-transaction)
+
+#### New Features Implemented
+
+**1. QR-Based Appless Charging** (Major Feature)
+- **Feature**: Customers can scan a Razorpay UPI QR code at a charger and pay any amount to start charging — no app or account needed
+- **Implementation**:
+  - New `ChargerQRCode` model linking Razorpay QR codes to chargers
+  - New `QRPayment` model tracking payment lifecycle (PAID → CHARGING → COMPLETED → REFUNDED)
+  - `QRPaymentService` with full lifecycle: webhook → user resolution → RemoteStart → budget enforcement → billing → refund
+  - Redis-cached session data (`qr_session:{txn_id}`) for budget checking during MeterValues
+  - Budget enforcement: auto-stops charging when cost >= budget limit
+  - Automated partial refund of unused balance via Razorpay
+  - UPI_GUEST user creation for new customers (phone/VPA-based lookup)
+- **Safety & Error Handling**:
+  - Idempotent webhook processing (razorpay_payment_id uniqueness)
+  - Stale payment detection (>5 min old → auto-refund)
+  - Double-payment guard (refund if charger already active)
+  - Charger disconnect detection with auto-refund
+  - Plug-in timeout (5 min polling, then refund)
+  - RemoteStart retry (2 attempts, 5s delay)
+  - Refund below ₹1 absorbed as operator credit
+- **Admin UI**:
+  - `/admin/qr-codes` - QR code list with create/close actions, revenue stats
+  - `/admin/qr-codes/[id]` - Detail page with QR image, payment history, refund tracking
+- **API Endpoints**:
+  - `POST /api/admin/qr-codes` - Create QR code for charger
+  - `GET /api/admin/qr-codes` - List with pagination, search, status filter
+  - `GET /api/admin/qr-codes/{id}` - Detail with payment stats
+  - `POST /api/admin/qr-codes/{id}/close` - Deactivate QR code
+  - `GET /api/admin/qr-codes/{id}/payments` - Payment history
+  - `POST /webhooks/razorpay` (qr_code.credited event) - Webhook handler
+- **Database Migrations**: 3 new migrations (10, 11, 12)
+- **Configuration**: `RAZORPAY_PLATFORM_FEE_PERCENT`, `MINIMUM_REFUND_AMOUNT`, `QR_PAYMENT_PENDING_TIMEOUT`
+- **Files Added**:
+  - `backend/services/qr_payment_service.py` - Core service (~600 lines)
+  - `backend/routers/qr_codes.py` - Admin API router
+  - `backend/scripts/test_qr_webhook.py` - Local webhook simulation
+  - `frontend/app/admin/qr-codes/page.tsx` - QR list page
+  - `frontend/app/admin/qr-codes/[id]/page.tsx` - QR detail page
+  - `frontend/lib/queries/qr-codes.ts` - TanStack Query hooks
+- **Files Modified**:
+  - `backend/main.py` - StartTransaction (link QR), MeterValues (budget check), StopTransaction (billing)
+  - `backend/models.py` - ChargerQRCode, QRPayment, QRPaymentStatusEnum, AuthProviderEnum
+  - `backend/routers/webhooks.py` - Added qr_code.credited routing
+  - `backend/redis_manager.py` - Added QR session cache methods
+  - `frontend/lib/api-services.ts` - qrCodeService
+  - `frontend/types/api.ts` - ChargerQRCode, QRPayment types
+
+**2. Docker Compose Production Deployment**
+- Complete containerized deployment with Docker Compose
+- Multi-stage Docker builds for backend (Python) and frontend (Next.js)
+- Nginx reverse proxy with SSL, WebSocket proxying, rate limiting
+- Separate configs: docker-compose.yml (dev), staging, prod
+- Makefile with 30+ management targets
+- Environment templates: .env.docker.example, .env.staging.example, .env.prod.example
+
+**3. Monitoring & Observability**
+- Sentry integration with ASGI middleware for error tracking
+- New Relic APM with custom `@trace_transaction` decorator for OCPP messages
+- Structured logging with timestamps and correlation IDs
+- Connection manager refactored to `core/connection_manager.py`
+- Monitoring service: `services/monitoring_service.py`
+
+**4. Logging Improvements**
+- Root logger configured with timestamps (`force=True`)
+- App-specific logger with `propagate=False` to avoid duplicate output
+- Timezone-aware log timestamps
+- Better visibility into OCPP message flow
+
+---
+
+### Previous Release - January 2025 (Branch: 47-new-relic)
 
 #### New Features Implemented
 
@@ -4014,7 +4474,7 @@ GET /users/my-sessions                # Current user's all transactions
    - Automatic cleanup for orphaned transactions
 
 2. **Enhanced OCPP Command Support**
-   - `Reset` command for remote charger reset
+   - ✅ `Reset` command - Implemented (Hard/Soft with safety validation)
    - `GetConfiguration/ChangeConfiguration` for dynamic settings
    - `UnlockConnector` for emergency release
    - `ClearCache` for authorization management
@@ -4307,9 +4767,9 @@ The system demonstrates production-grade characteristics through:
 - Optimistic UI updates with rollback capabilities
 - Structured logging with correlation tracking
 
-**Current Status**: Actively deployed and managing real-world charging infrastructure  
-**Document Version**: 2.0  
-**Last Updated**: January 2025  
-**Maintainer**: OCPP Development Team  
+**Current Status**: Actively deployed on AWS EC2 with Docker Compose, managing real-world charging infrastructure with QR-based appless charging
+**Document Version**: 3.0
+**Last Updated**: March 2025
+**Maintainer**: OCPP Development Team
 
 This architecture documentation serves as both a technical reference and a strategic foundation for the continued evolution of EV charging infrastructure management, positioning the system for long-term success in the rapidly advancing electric vehicle ecosystem.

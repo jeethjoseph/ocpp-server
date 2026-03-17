@@ -49,13 +49,19 @@ from services.monitoring_service import (
 # This must happen before app = FastAPI() for proper instrumentation
 initialize_monitoring()
 
-# Set root logger to INFO so service modules (services.*, routers.*, etc.)
-# Configure root logger with timestamps so all loggers (uvicorn, services, etc.) get them
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    force=True,
-)
+# Configure root logger with timestamps, preserving any existing handlers (e.g. New Relic)
+root = logging.getLogger()
+root.setLevel(logging.INFO)
+if not root.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    root.addHandler(handler)
+else:
+    # Preserve existing handlers, but add our formatter to any without one
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    for h in root.handlers:
+        if not h.formatter:
+            h.setFormatter(fmt)
 
 # App-specific logger with custom formatter (propagate=False to avoid
 # duplicate output through root's handler)
@@ -461,12 +467,17 @@ class ChargePoint(OcppChargePoint):
                             else:
                                 logger.warning(f"💰 Cannot bill failed transaction {transaction.id} - no energy consumed (energy: {transaction.energy_consumed_kwh} kWh)")
 
-                            # Handle QR payment refund on charging failure
+                            # Handle QR payment: bill for energy used, refund the rest
                             try:
                                 from services.qr_payment_service import QRPaymentService
-                                await QRPaymentService.handle_charging_failure(transaction.id)
+                                if transaction.energy_consumed_kwh is not None and transaction.energy_consumed_kwh > 0:
+                                    # Energy was consumed — do proper billing (charge for usage, refund remainder)
+                                    await QRPaymentService.process_qr_session_billing(transaction.id)
+                                else:
+                                    # No energy consumed — full refund
+                                    await QRPaymentService.handle_charging_failure(transaction.id)
                             except Exception as qr_err:
-                                logger.warning(f"QR failure handling error (non-fatal): {qr_err}")
+                                logger.warning(f"QR payment handling error (non-fatal): {qr_err}")
                     else:
                         logger.debug(f"Status {status} indicates not charging but no ongoing transactions found for charger {self.id}")
                         

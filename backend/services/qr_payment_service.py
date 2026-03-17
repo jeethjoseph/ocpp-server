@@ -24,7 +24,6 @@ logger = logging.getLogger(__name__)
 # Configuration from environment
 RAZORPAY_PLATFORM_FEE_PERCENT = Decimal(os.getenv("RAZORPAY_PLATFORM_FEE_PERCENT", "2.0"))
 MINIMUM_REFUND_AMOUNT = Decimal(os.getenv("MINIMUM_REFUND_AMOUNT", "1.0"))
-QR_PAYMENT_SAFETY_BUFFER = Decimal(os.getenv("QR_PAYMENT_SAFETY_BUFFER", "0"))
 QR_PAYMENT_PENDING_TIMEOUT = int(os.getenv("QR_PAYMENT_PENDING_TIMEOUT", "300"))
 
 SYSTEM_GUEST_EMAIL = "guest@system.powerlync.com"
@@ -160,10 +159,10 @@ class QRPaymentService:
                 )
                 # Still need to look up charger for the record
                 charger_qr = await ChargerQRCode.filter(
-                    razorpay_qr_code_id=qr_code_id, is_active=True
+                    razorpay_qr_code_id=qr_code_id
                 ).prefetch_related("charger").first()
                 if not charger_qr:
-                    logger.error(f"No active ChargerQRCode for stale payment {payment_id}")
+                    logger.error(f"No ChargerQRCode for stale payment {payment_id}")
                     return {"status": "error", "reason": "QR code not found"}
 
                 user = await find_or_create_user_from_payment(contact, vpa, customer_name)
@@ -197,7 +196,7 @@ class QRPaymentService:
         # Find or create user
         user = await find_or_create_user_from_payment(contact, vpa, customer_name)
 
-        # Check for double payment (active transaction on this charger)
+        # Check for double payment (active transaction or pending QR payment on this charger)
         active_txn = await Transaction.filter(
             charger=charger,
             transaction_status__in=[
@@ -206,8 +205,14 @@ class QRPaymentService:
                 TransactionStatusEnum.PENDING_START,
             ]
         ).first()
-        if active_txn:
-            logger.warning(f"Active transaction {active_txn.id} exists on charger {charger.id}, refunding")
+        pending_qr = await QRPayment.filter(
+            charger=charger,
+            status=QRPaymentStatusEnum.PAID,
+            transaction_id__isnull=True,
+        ).first()
+        if active_txn or pending_qr:
+            reason = f"Active transaction {active_txn.id}" if active_txn else f"Pending QR payment {pending_qr.id} already waiting"
+            logger.warning(f"{reason} on charger {charger.id}, refunding new payment")
             qr_payment = await QRPayment.create(
                 charger=charger,
                 charger_qr_code=charger_qr,
@@ -375,7 +380,7 @@ class QRPaymentService:
         platform_fee = (qr_payment.amount_paid * RAZORPAY_PLATFORM_FEE_PERCENT / 100).quantize(
             Decimal('0.01'), rounding=ROUND_HALF_UP
         )
-        budget_limit = float(qr_payment.amount_paid - platform_fee - QR_PAYMENT_SAFETY_BUFFER)
+        budget_limit = float(qr_payment.amount_paid - platform_fee)
 
         transaction = await Transaction.filter(id=transaction_id).first()
 
@@ -412,7 +417,7 @@ class QRPaymentService:
             platform_fee = (qr_payment.amount_paid * RAZORPAY_PLATFORM_FEE_PERCENT / 100).quantize(
                 Decimal('0.01'), rounding=ROUND_HALF_UP
             )
-            budget_limit = float(qr_payment.amount_paid - platform_fee - QR_PAYMENT_SAFETY_BUFFER)
+            budget_limit = float(qr_payment.amount_paid - platform_fee)
 
             transaction = await Transaction.filter(id=transaction_id).first()
             session = {
@@ -505,7 +510,7 @@ class QRPaymentService:
             Decimal('0.01'), rounding=ROUND_HALF_UP
         )
 
-        refund = qr_payment.amount_paid - energy_cost - platform_fee
+        refund = max(Decimal('0'), qr_payment.amount_paid - energy_cost - platform_fee)
 
         qr_payment.energy_cost = energy_cost
         qr_payment.platform_fee = platform_fee
@@ -580,7 +585,7 @@ class QRPaymentService:
             platform_fee = (qr_payment.amount_paid * RAZORPAY_PLATFORM_FEE_PERCENT / 100).quantize(
                 Decimal('0.01'), rounding=ROUND_HALF_UP
             )
-            refund_amount = qr_payment.amount_paid - platform_fee - QR_PAYMENT_SAFETY_BUFFER
+            refund_amount = qr_payment.amount_paid - platform_fee
 
             if refund_amount < MINIMUM_REFUND_AMOUNT:
                 logger.info(f"Refund amount ₹{refund_amount} below minimum, skipping")
