@@ -50,9 +50,12 @@ from services.monitoring_service import (
 initialize_monitoring()
 
 # Set root logger to INFO so service modules (services.*, routers.*, etc.)
-# emit INFO-level logs via __name__-based loggers. basicConfig is a no-op if
-# monitoring already added handlers, so we set the level directly.
-logging.getLogger().setLevel(logging.INFO)
+# Configure root logger with timestamps so all loggers (uvicorn, services, etc.) get them
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    force=True,
+)
 
 # App-specific logger with custom formatter (propagate=False to avoid
 # duplicate output through root's handler)
