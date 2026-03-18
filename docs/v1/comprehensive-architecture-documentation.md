@@ -1665,9 +1665,9 @@ async def on_boot_notification(self, charge_point_vendor, charge_point_model, **
 
 **Business Logic**:
 - Validates charger registration in database
-- **❗ Known Issue**: Currently fails ongoing transactions immediately (see Technical Debt section)
 - Sets 30-second heartbeat interval (changed from 300s in January 2025)
 - Updates charger firmware_version, vendor, model from BootNotification payload
+- **Transaction Suspend/Resume**: Ongoing transactions are marked SUSPENDED (not FAILED) on reboot. A background `_suspend_timeout` task auto-stops the transaction after `SUSPEND_TIMEOUT_SECONDS` (default 300s) if the charger doesn't resume, with full wallet billing + QR payment billing/refund
 - Comprehensive connection logging
 
 **Response**: OCPP-compliant BootNotificationResponse with "Accepted" status
@@ -1704,7 +1704,13 @@ async def on_status_notification(self, connector_id, status, error_code=None, in
 - `Unavailable`: Not available for charging
 - `Faulted`: Error condition present
 
-**Error Tracking (NEW)**:
+**Transaction Failure Detection**:
+- When status transitions to a non-charging state while a transaction is RUNNING/STARTED/PENDING, the transaction is auto-failed with billing + QR refund
+- **Charging states** (no auto-fail): `Charging`, `SuspendedEVSE`, `SuspendedEV`, `Finishing`
+- **Non-charging states** (triggers auto-fail): `Available`, `Preparing`, `Reserved`, `Unavailable`, `Faulted`
+- `Preparing` is treated as non-charging because a charger going `Charging → Preparing` during a RUNNING transaction indicates the session ended (firmware may have skipped `Finishing` or failed to send `StopTransaction`)
+
+**Error Tracking**:
 - Captures standard OCPP error codes (e.g., `GroundFailure`, `HighTemperature`)
 - Captures vendor-specific error codes via `vendorErrorCode` field
 - Stores errors in `charger_error` table with timestamps
@@ -1740,6 +1746,11 @@ async def on_stop_transaction(self, transaction_id, meter_stop, timestamp, **kwa
 - **Billing Integration**: Automatic wallet billing via WalletService
 - **QR Billing**: Calls `QRPaymentService.process_qr_session_billing()` to calculate final cost and issue partial refund for unused balance
 - Error handling for billing failures (sets BILLING_FAILED status)
+
+**Invalid Stop Reason Handling**:
+- The `ChargePoint.route_message()` override sanitizes non-standard `reason` values (e.g., firmware sending `"AppStop"`) to `"Other"` before OCPP schema validation
+- Prevents the `ocpp` library from rejecting the entire `StopTransaction` message due to a `FormatViolationError` on an invalid enum value
+- Valid OCPP 1.6 reasons: `EmergencyStop`, `EVDisconnected`, `HardReset`, `Local`, `Other`, `PowerLoss`, `Reboot`, `Remote`, `SoftReset`, `UnlockCommand`, `DeAuthorized`
 
 #### 6. MeterValues Handler
 ```python
@@ -3775,66 +3786,21 @@ const useInfiniteTransactions = () => {
 
 ### Critical Issues
 
-#### 1. Boot Notification Transaction Handling
-**Location**: `backend/main.py:69-94`
-**Issue**: Premature transaction failure on charger reboot
+#### 1. Boot Notification Transaction Handling — ✅ RESOLVED
+**Location**: `backend/main.py:163-224`
+**Resolution**: Implemented suspend/resume mechanism
 
-**Current Problematic Behavior**:
-```python
-@on('BootNotification')
-async def on_boot_notification(self, charge_point_vendor, charge_point_model, **kwargs):
-    # ❌ PROBLEMATIC: Immediately fails all ongoing transactions
-    ongoing_transactions = await Transaction.filter(
-        charger__charge_point_string_id=self.id,
-        transaction_status__in=[
-            TransactionStatusEnum.RUNNING,
-            TransactionStatusEnum.STARTED,
-            TransactionStatusEnum.PENDING_START,
-            TransactionStatusEnum.PENDING_STOP
-        ]
-    ).all()
-    
-    if ongoing_transactions:
-        for transaction in ongoing_transactions:
-            transaction.transaction_status = TransactionStatusEnum.FAILED
-            transaction.stop_reason = "REBOOT"
-            await transaction.save()
-```
+**Current Behavior**:
+- On `BootNotification`, ongoing transactions are marked `SUSPENDED` (not FAILED)
+- A background `_suspend_timeout` task waits `SUSPEND_TIMEOUT_SECONDS` (default 300s)
+- If the charger resumes the transaction (sends MeterValues or StartTransaction for same id_tag), the transaction is resumed to RUNNING
+- If the timeout fires while still SUSPENDED: transaction is auto-stopped with energy calculation from last MeterValue, wallet billing, and QR payment billing/refund
+- Handles double-boot race conditions via `suspended_at` timestamp comparison
 
-**Problems**:
-1. **Premature Failure**: Transactions are marked as FAILED before knowing actual charger state
-2. **Data Loss**: Valid charging sessions may be terminated unnecessarily
-3. **OCPP Violation**: Should wait for StatusNotification to determine actual state
-4. **Poor User Experience**: Users lose active charging sessions on charger reboot
-
-**Recommended Solution**:
-```python
-@on('BootNotification')
-async def on_boot_notification(self, charge_point_vendor, charge_point_model, **kwargs):
-    # ✅ IMPROVED: Mark transactions for reconciliation instead of failing
-    ongoing_transactions = await Transaction.filter(
-        charger__charge_point_string_id=self.id,
-        transaction_status__in=[
-            TransactionStatusEnum.RUNNING,
-            TransactionStatusEnum.STARTED,
-            TransactionStatusEnum.PENDING_START,
-            TransactionStatusEnum.PENDING_STOP
-        ]
-    ).all()
-    
-    if ongoing_transactions:
-        logger.info(f"Marking {len(ongoing_transactions)} transactions for reconciliation after boot")
-        for transaction in ongoing_transactions:
-            transaction.transaction_status = TransactionStatusEnum.PENDING_RECONCILIATION
-            transaction.reconciliation_deadline = datetime.now() + timedelta(minutes=5)
-            await transaction.save()
-    
-    # Wait for StatusNotification to determine actual charger state
-    return call_result.BootNotification(...)
-```
-
-**Impact**: High - Affects transaction reliability and user experience
-**Effort**: Medium - Requires new reconciliation logic and status tracking
+**Defense-in-depth layers**:
+1. **StopTransaction reason sanitization**: `route_message()` override replaces non-standard reason values (e.g., `"AppStop"`) with `"Other"` to prevent OCPP validation rejection
+2. **StatusNotification failure detection**: `Preparing` removed from `charging_states` — if charger goes `Charging → Preparing` during a RUNNING transaction, it triggers auto-fail with billing + QR refund
+3. **Suspend timeout**: Safety net — QR billing/refund processed alongside wallet billing when suspended transactions time out
 
 ### Minor Technical Debt
 

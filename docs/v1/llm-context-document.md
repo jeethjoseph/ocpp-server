@@ -318,15 +318,17 @@ log (id, charge_point_id, direction, payload, correlation_id) -- All OCPP messag
 ### Message Handlers in `main.py`
 
 **Core OCPP Messages Implemented**:
-1. **BootNotification** (`main.py:163-224`) - Charger registration with 30s heartbeat interval, **❗ Known Issue**: fails ongoing transactions immediately
+1. **BootNotification** (`main.py:163-224`) - Charger registration with 30s heartbeat interval, **suspends ongoing transactions** for possible resume (auto-stops after `SUSPEND_TIMEOUT_SECONDS` with QR billing/refund)
 2. **Heartbeat** (`main.py:226-241`) - Connection liveness (90s timeout)
-3. **StatusNotification** (`main.py:243-377`) - Updates charger.latest_status + **error tracking with vendor codes**
+3. **StatusNotification** (`main.py:243-377`) - Updates charger.latest_status + **error tracking with vendor codes** + **transaction failure detection**
    - Captures standard OCPP error codes (GroundFailure, HighTemperature, etc.)
    - Captures vendor-specific error codes (vendorErrorCode field)
    - Stores errors in `charger_error` table with resolution tracking
    - Auto-resolves errors when "NoError" status received
+   - **Transaction failure detection**: If status transitions to a non-charging state (`Available`, `Preparing`, `Faulted`, etc.) while a transaction is RUNNING, auto-fails the transaction with billing + QR refund
+   - Charging states (no auto-fail): `Charging`, `SuspendedEVSE`, `SuspendedEV`, `Finishing`
 4. **StartTransaction** - Creates Transaction with RUNNING status + **links QR payment** via `QRPaymentService.link_transaction_to_qr_payment()` (caches budget in Redis)
-5. **StopTransaction** - Finalizes transaction with automated billing via WalletService + **QR billing** via `QRPaymentService.process_qr_session_billing()` (calculates cost, issues refund)
+5. **StopTransaction** - Finalizes transaction with automated billing via WalletService + **QR billing** via `QRPaymentService.process_qr_session_billing()` (calculates cost, issues refund). **Invalid stop reasons** (e.g., firmware sending non-standard values like `"AppStop"`) are sanitized to `"Other"` via `route_message` override to prevent OCPP validation rejection
 6. **MeterValues** - Stores real-time energy data (kWh, current, voltage, power) + **QR budget check** via `QRPaymentService.check_budget_and_auto_stop()` (schedules RemoteStop if budget exceeded)
 7. **FirmwareStatusNotification** (`main.py:522-597`) - **Firmware update progress tracking**
    - Maps OCPP status (Downloading → Downloaded → Installing → Installed) to database
@@ -397,6 +399,9 @@ TTL: 86400s (24h)
 | Plug-in timeout (5min) | Refund |
 | RemoteStart fails (2 retries) | Refund |
 | Budget exceeded during charging | Auto-stop via RemoteStop |
+| Invalid StopTransaction reason | Sanitized to "Other", processed normally |
+| Charger → Preparing during RUNNING txn | Transaction failed + QR billing/refund |
+| Charger reboot (BootNotification) | Transaction suspended → auto-stop after timeout with QR billing |
 | Refund <₹1 | Absorbed (operator credit) |
 | Redis cache miss | Rebuild from DB |
 

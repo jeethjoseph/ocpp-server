@@ -155,8 +155,37 @@ app.mount("/firmware", StaticFiles(directory=FIRMWARE_DIR), name="firmware")
 # reads/writes (including `from main import connected_charge_points`) work unchanged.
 connected_charge_points = connection_manager.connected_charge_points
 
+# Valid OCPP 1.6 StopTransaction reason values
+VALID_STOP_REASONS = {
+    "EmergencyStop", "EVDisconnected", "HardReset", "Local", "Other",
+    "PowerLoss", "Reboot", "Remote", "SoftReset", "UnlockCommand", "DeAuthorized",
+}
+
 # Define a ChargePoint class using python-ocpp
 class ChargePoint(OcppChargePoint):
+
+    async def route_message(self, raw_msg):
+        """Override to sanitize invalid StopTransaction reason values before validation."""
+        try:
+            parsed = json.loads(raw_msg)
+            # Call messages: [2, uniqueId, action, payload]
+            if isinstance(parsed, list) and len(parsed) == 4 and parsed[0] == 2:
+                action = parsed[2]
+                payload = parsed[3]
+                if action == "StopTransaction" and "reason" in payload:
+                    if payload["reason"] not in VALID_STOP_REASONS:
+                        original = payload["reason"]
+                        payload["reason"] = "Other"
+                        raw_msg = json.dumps(parsed)
+                        logger.warning(
+                            f"Sanitized invalid StopTransaction reason '{original}' → 'Other' "
+                            f"from {self.id}"
+                        )
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass  # Let the parent handle malformed messages
+
+        await super().route_message(raw_msg)
+
     @on('BootNotification')
     @trace_transaction(name="OCPP/BootNotification", group="OCPP/Messages")
     async def on_boot_notification(self, charge_point_vendor, charge_point_model, **kwargs):
@@ -313,6 +342,16 @@ class ChargePoint(OcppChargePoint):
             else:
                 logger.info(f"💰 No energy consumed for timed-out transaction {transaction_id} - skipping billing")
 
+            # Process QR payment billing (refund unused amount or full refund)
+            try:
+                from services.qr_payment_service import QRPaymentService
+                if transaction.energy_consumed_kwh is not None and transaction.energy_consumed_kwh > 0:
+                    await QRPaymentService.process_qr_session_billing(transaction_id)
+                else:
+                    await QRPaymentService.handle_charging_failure(transaction_id)
+            except Exception as qr_err:
+                logger.error(f"QR billing error for suspended-timeout transaction {transaction_id}: {qr_err}", exc_info=True)
+
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -399,8 +438,10 @@ class ChargePoint(OcppChargePoint):
                 logger.error(f"Error tracking charger error: {error_tracking_error}", exc_info=True)
 
             # Check if status indicates not charging and fail ongoing transactions
-            # Charging states: Charging, Preparing, SuspendedEVSE, SuspendedEV, Finishing
-            charging_states = {"Charging", "Preparing", "SuspendedEVSE", "SuspendedEV", "Finishing"}
+            # Preparing is NOT included: a charger going Charging → Preparing during
+            # a RUNNING transaction means the session ended (firmware may have skipped
+            # Finishing or failed to send StopTransaction).
+            charging_states = {"Charging", "SuspendedEVSE", "SuspendedEV", "Finishing"}
             
             if status not in charging_states:
                 from models import Transaction, TransactionStatusEnum, MeterValue
