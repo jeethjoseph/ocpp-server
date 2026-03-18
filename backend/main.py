@@ -438,10 +438,8 @@ class ChargePoint(OcppChargePoint):
                 logger.error(f"Error tracking charger error: {error_tracking_error}", exc_info=True)
 
             # Check if status indicates not charging and fail ongoing transactions
-            # Preparing is NOT included: a charger going Charging → Preparing during
-            # a RUNNING transaction means the session ended (firmware may have skipped
-            # Finishing or failed to send StopTransaction).
-            charging_states = {"Charging", "SuspendedEVSE", "SuspendedEV", "Finishing"}
+            # Charging states: Charging, Preparing, SuspendedEVSE, SuspendedEV, Finishing
+            charging_states = {"Charging", "Preparing", "SuspendedEVSE", "SuspendedEV", "Finishing"}
             
             if status not in charging_states:
                 from models import Transaction, TransactionStatusEnum, MeterValue

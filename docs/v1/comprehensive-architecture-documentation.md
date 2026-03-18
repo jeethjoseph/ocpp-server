@@ -1706,9 +1706,8 @@ async def on_status_notification(self, connector_id, status, error_code=None, in
 
 **Transaction Failure Detection**:
 - When status transitions to a non-charging state while a transaction is RUNNING/STARTED/PENDING, the transaction is auto-failed with billing + QR refund
-- **Charging states** (no auto-fail): `Charging`, `SuspendedEVSE`, `SuspendedEV`, `Finishing`
-- **Non-charging states** (triggers auto-fail): `Available`, `Preparing`, `Reserved`, `Unavailable`, `Faulted`
-- `Preparing` is treated as non-charging because a charger going `Charging → Preparing` during a RUNNING transaction indicates the session ended (firmware may have skipped `Finishing` or failed to send `StopTransaction`)
+- **Charging states** (no auto-fail): `Charging`, `Preparing`, `SuspendedEVSE`, `SuspendedEV`, `Finishing`
+- **Non-charging states** (triggers auto-fail): `Available`, `Reserved`, `Unavailable`, `Faulted`
 
 **Error Tracking**:
 - Captures standard OCPP error codes (e.g., `GroundFailure`, `HighTemperature`)
@@ -3799,8 +3798,7 @@ const useInfiniteTransactions = () => {
 
 **Defense-in-depth layers**:
 1. **StopTransaction reason sanitization**: `route_message()` override replaces non-standard reason values (e.g., `"AppStop"`) with `"Other"` to prevent OCPP validation rejection
-2. **StatusNotification failure detection**: `Preparing` removed from `charging_states` — if charger goes `Charging → Preparing` during a RUNNING transaction, it triggers auto-fail with billing + QR refund
-3. **Suspend timeout**: Safety net — QR billing/refund processed alongside wallet billing when suspended transactions time out
+2. **Suspend timeout**: Safety net — QR billing/refund processed alongside wallet billing when suspended transactions time out
 
 ### Minor Technical Debt
 
