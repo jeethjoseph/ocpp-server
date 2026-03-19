@@ -153,11 +153,13 @@ class BillingRetryService:
             logger.info(f"🔄 QR refund retry completed: {success_count} successful, {failure_count} failed")
 
     async def _cleanup_orphaned_qr_payments(self):
-        """Refund QR payments stuck in PAID or CHARGING with no linked transaction.
+        """Refund QR payments stuck in PAID or CHARGING with no active transaction.
 
         This catches edge cases where:
         - handle_payment_without_plug task died (server restart)
         - RemoteStart succeeded but StartTransaction never came
+        - StopTransaction was rejected (e.g. invalid reason) leaving QR in CHARGING
+        - Suspend timeout didn't process QR billing (server restart)
         - Any other gap between payment and charging
         """
         from services.qr_payment_service import QRPaymentService, QR_PAYMENT_PENDING_TIMEOUT
@@ -165,31 +167,63 @@ class BillingRetryService:
         # PAID payments older than 2x the pending timeout are definitely orphaned
         stale_cutoff = datetime.now(timezone.utc) - timedelta(seconds=QR_PAYMENT_PENDING_TIMEOUT * 2)
 
-        orphaned_payments = await QRPayment.filter(
+        orphaned_paid = await QRPayment.filter(
             status=QRPaymentStatusEnum.PAID,
             transaction_id__isnull=True,
             created_at__lt=stale_cutoff,
         ).all()
 
+        # CHARGING payments whose linked transaction is already terminal
+        orphaned_charging = []
+        charging_payments = await QRPayment.filter(
+            status=QRPaymentStatusEnum.CHARGING,
+            created_at__lt=stale_cutoff,
+        ).all()
+        for qr_payment in charging_payments:
+            if qr_payment.transaction_id:
+                txn = await Transaction.filter(id=qr_payment.transaction_id).first()
+                if txn and txn.transaction_status in (
+                    TransactionStatusEnum.COMPLETED,
+                    TransactionStatusEnum.FAILED,
+                    TransactionStatusEnum.STOPPED,
+                    TransactionStatusEnum.BILLING_FAILED,
+                ):
+                    orphaned_charging.append(qr_payment)
+            else:
+                # CHARGING with no transaction_id — shouldn't happen but handle it
+                orphaned_charging.append(qr_payment)
+
+        orphaned_payments = orphaned_paid + orphaned_charging
+
         if not orphaned_payments:
             return
 
-        logger.info(f"🧹 Found {len(orphaned_payments)} orphaned QR payments to refund")
+        logger.info(f"🧹 Found {len(orphaned_payments)} orphaned QR payments to process ({len(orphaned_paid)} PAID, {len(orphaned_charging)} CHARGING)")
 
         for qr_payment in orphaned_payments:
             try:
                 age_minutes = (datetime.now(timezone.utc) - qr_payment.created_at).total_seconds() / 60
                 logger.info(
-                    f"Refunding orphaned QR payment {qr_payment.id}: "
+                    f"Processing orphaned QR payment {qr_payment.id}: "
                     f"₹{qr_payment.amount_paid}, status={qr_payment.status.value}, "
-                    f"age={age_minutes:.0f}m"
+                    f"transaction_id={qr_payment.transaction_id}, age={age_minutes:.0f}m"
                 )
-                qr_payment.status = QRPaymentStatusEnum.EXPIRED
-                qr_payment.failure_reason = "Orphaned payment - no transaction linked"
-                await qr_payment.save()
-                await QRPaymentService._full_refund(qr_payment, "Orphaned payment cleanup")
+
+                if qr_payment.status == QRPaymentStatusEnum.CHARGING and qr_payment.transaction_id:
+                    # Has a linked transaction — do proper billing (charge for energy, refund rest)
+                    txn = await Transaction.filter(id=qr_payment.transaction_id).first()
+                    if txn and txn.energy_consumed_kwh and txn.energy_consumed_kwh > 0:
+                        await QRPaymentService.process_qr_session_billing(qr_payment.transaction_id)
+                    else:
+                        await QRPaymentService.handle_charging_failure(qr_payment.transaction_id)
+                else:
+                    # No transaction — full refund
+                    qr_payment.status = QRPaymentStatusEnum.EXPIRED
+                    qr_payment.failure_reason = "Orphaned payment - no transaction linked"
+                    await qr_payment.save()
+                    await QRPaymentService._full_refund(qr_payment, "Orphaned payment cleanup")
             except Exception as e:
-                logger.error(f"Failed to refund orphaned QR payment {qr_payment.id}: {e}", exc_info=True)
+                logger.error(f"Failed to process orphaned QR payment {qr_payment.id}: {e}", exc_info=True)
 
             await asyncio.sleep(0.1)
 
@@ -260,6 +294,16 @@ class BillingRetryService:
                         logger.info(f"💰 Billed stale transaction {transaction.id}: ₹{billing_amount}")
                     else:
                         logger.warning(f"💰 Billing failed for stale transaction {transaction.id}: {message}")
+
+                # Process QR payment billing (refund unused amount or full refund)
+                try:
+                    from services.qr_payment_service import QRPaymentService
+                    if transaction.energy_consumed_kwh is not None and transaction.energy_consumed_kwh > 0:
+                        await QRPaymentService.process_qr_session_billing(transaction.id)
+                    else:
+                        await QRPaymentService.handle_charging_failure(transaction.id)
+                except Exception as qr_err:
+                    logger.error(f"QR billing error for stale suspended transaction {transaction.id}: {qr_err}", exc_info=True)
 
             except Exception as e:
                 logger.error(f"Error cleaning up stale SUSPENDED transaction {transaction.id}: {e}", exc_info=True)
