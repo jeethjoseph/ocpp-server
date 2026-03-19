@@ -308,6 +308,13 @@ class QRPaymentService:
                 if attempt < QRPaymentService.MAX_START_RETRIES:
                     logger.warning(f"RemoteStart attempt {attempt} failed: {result}, retrying in {QRPaymentService.START_RETRY_DELAY}s")
                     await asyncio.sleep(QRPaymentService.START_RETRY_DELAY)
+
+                    # Check if transaction already started despite the timeout
+                    # (e.g. AT command corrupted the response but charger started anyway)
+                    await qr_payment.refresh_from_db()
+                    if qr_payment.status == QRPaymentStatusEnum.CHARGING:
+                        logger.info(f"QR payment {qr_payment.id} already linked to transaction (status=CHARGING), skipping retry")
+                        return
                 else:
                     logger.error(f"RemoteStart failed after {QRPaymentService.MAX_START_RETRIES} attempts: {result}")
 
