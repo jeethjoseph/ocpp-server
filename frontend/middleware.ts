@@ -16,6 +16,7 @@ const isPublicRoute = createRouteMatcher([
   '/auth(.*)',
   '/sign-up(.*)',
   '/sign-in(.*)',
+  '/my-charges(.*)',
 ])
 
 async function assignDefaultRole(userId: string) {

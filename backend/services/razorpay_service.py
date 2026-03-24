@@ -255,6 +255,19 @@ class RazorpayService:
             logger.error(f"Failed to fetch payments for QR code {qr_code_id}: {e}")
             return None
 
+    def validate_vpa(self, vpa: str) -> Optional[Dict]:
+        """Validate a UPI VPA and return account holder name."""
+        if not self.is_configured():
+            logger.error("Cannot validate VPA - Razorpay not configured")
+            return None
+        try:
+            result = self.client.utility.validate_vpa({"vpa": vpa})
+            logger.info(f"VPA validation for {vpa}: success={result.get('success')}")
+            return result
+        except Exception as e:
+            logger.error(f"Failed to validate VPA {vpa}: {e}")
+            return None
+
     def refund_payment(
         self,
         payment_id: str,

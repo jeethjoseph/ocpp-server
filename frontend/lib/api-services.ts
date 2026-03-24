@@ -224,11 +224,62 @@ export interface PublicStationsListResponse {
 }
 
 export const publicStationService = {
-  getAll: () => 
+  getAll: () =>
     api.get<PublicStationsListResponse>(`/api/public/stations`),
-  
-  getById: (id: number) => 
+
+  getById: (id: number) =>
     api.get<PublicStationResponse>(`/api/public/stations/${id}`)
+};
+
+// Public QR Transaction History (no auth required)
+export interface QRTransactionItem {
+  id: number;
+  created_at: string;
+  amount_paid: string;
+  status: string;
+  energy_consumed_kwh: number | null;
+  energy_cost: string | null;
+  platform_fee: string | null;
+  refund_amount: string | null;
+  charger_name: string | null;
+  duration_minutes: number | null;
+  start_time: string | null;
+  end_time: string | null;
+  failure_reason: string | null;
+}
+
+export interface QRTransactionListResponse {
+  data: QRTransactionItem[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+export interface VPALookupResponse {
+  masked_name: string;
+}
+
+export interface VPAVerifyResponse {
+  token: string;
+  expires_in: number;
+}
+
+export const publicQRTransactionService = {
+  lookup: (vpa: string) =>
+    api.post<VPALookupResponse>("/api/public/qr-transactions/lookup", { vpa }),
+
+  verify: (vpa: string, full_name: string) =>
+    api.post<VPAVerifyResponse>("/api/public/qr-transactions/verify", { vpa, full_name }),
+
+  getByToken: (params: { token: string; page?: number; limit?: number; status?: string }) => {
+    const searchParams = new URLSearchParams();
+    searchParams.set("token", params.token);
+    if (params.page) searchParams.set("page", params.page.toString());
+    if (params.limit) searchParams.set("limit", params.limit.toString());
+    if (params.status) searchParams.set("status", params.status);
+    const query = searchParams.toString();
+    return api.get<QRTransactionListResponse>(`/api/public/qr-transactions?${query}`);
+  },
 };
 
 // Log service

@@ -485,8 +485,13 @@ async def remote_start_charging(charger_id: int, connector_id: int = 1, user: Us
         raise HTTPException(status_code=404, detail="Charger not found")
     
     # Check if charger status is suitable for remote start
-    if charger.latest_status != "Preparing":
-        raise HTTPException(status_code=409, detail=f"Cannot start charging. Charger status is {charger.latest_status}, should be Preparing")
+    # Socket chargers may not transition to Preparing (no CP signal), allow Available
+    from services.charger_type_service import is_socket_charger
+    charger_is_socket = await is_socket_charger(charger.charge_point_string_id)
+    allowed_statuses = {"Preparing", "Available"} if charger_is_socket else {"Preparing"}
+    if charger.latest_status not in allowed_statuses:
+        expected = "Preparing or Available" if charger_is_socket else "Preparing"
+        raise HTTPException(status_code=409, detail=f"Cannot start charging. Charger status is {charger.latest_status}, should be {expected}")
     
     # Check if charger is connected (via Redis - works across all workers)
     if not await is_charger_connected(charger.charge_point_string_id):

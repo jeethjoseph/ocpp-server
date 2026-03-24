@@ -275,6 +275,8 @@ class ConnectionManager:
                 req = call.UpdateFirmware(**(payload or {}))
             elif action == "Reset":
                 req = call.Reset(**(payload or {}))
+            elif action == "DataTransfer":
+                req = call.DataTransfer(**(payload or {}))
             else:
                 logger.warning(f"Action {action} not implemented in send_ocpp_request")
                 return False, f"Action {action} not implemented"

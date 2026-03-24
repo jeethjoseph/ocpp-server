@@ -182,8 +182,11 @@ export const ChargeScreen = () => {
 
   const charger = chargerData.charger;
   const station = chargerData.station;
-  // Can start charging when status is "Preparing" and charger is connected
-  const canStartCharging = charger.latest_status === 'Preparing' && charger.connection_status && !currentTransactionId;
+  const connectors = chargerData.connectors;
+  const isSocketCharger = connectors?.some((c: { connector_type: string }) => c.connector_type.toLowerCase() === 'socket') ?? false;
+  // Socket chargers can start from Available (no CP signal for Preparing)
+  const statusReady = charger.latest_status === 'Preparing' || (isSocketCharger && charger.latest_status === 'Available');
+  const canStartCharging = statusReady && charger.connection_status && !currentTransactionId;
   const latestMeter = meterData?.meter_values?.[meterData.meter_values.length - 1];
   const transaction = transactionData?.transaction;
 
@@ -498,7 +501,7 @@ export const ChargeScreen = () => {
             <p className="text-center text-sm text-gray-600 mt-2">
               {!charger.connection_status
                 ? 'Charger is offline'
-                : charger.latest_status !== 'Preparing'
+                : !statusReady
                 ? `Charger is currently ${charger.latest_status.toLowerCase()}`
                 : 'Charger is not ready'}
             </p>

@@ -25,12 +25,15 @@ from utils import safe_create_task, mask_id_tag, mask_email
 
 from ocpp.v16 import ChargePoint as OcppChargePoint
 from ocpp.v16 import call, call_result
-from ocpp.routing import on
+from ocpp.routing import on, after
 import logging
 import json
 
 # Transaction resume constants
 SUSPEND_TIMEOUT_SECONDS = int(os.environ.get("SUSPEND_TIMEOUT_SECONDS", "300"))
+
+# Socket charger grace period (seconds) before failing txn on Available status
+SOCKET_GRACE_PERIOD_SECONDS = int(os.environ.get("SOCKET_GRACE_PERIOD_SECONDS", "300"))
 
 # Import routers
 from routers import stations, chargers, transactions, auth, webhooks, users, public_stations, logs, wallet_payments, firmware
@@ -235,6 +238,12 @@ class ChargePoint(OcppChargePoint):
                 charger.meter_serial_number = meter_serial_number
 
             await charger.save()
+
+            # Cache connector type for socket-aware StatusNotification handling
+            from models import Connector
+            connector = await Connector.filter(charger=charger).first()
+            if connector and self.id in connected_charge_points:
+                connected_charge_points[self.id]["connector_type"] = connector.connector_type
         except Exception as e:
             logger.error(f"❌ Error updating charger info from BootNotification: {e}", exc_info=True)
 
@@ -282,6 +291,82 @@ class ChargePoint(OcppChargePoint):
             interval=30,
             status="Accepted"
         )
+
+    @after('BootNotification')
+    async def after_boot_notification(self, charge_point_vendor, charge_point_model, **kwargs):
+        """Push post-boot state (meter value + pending transaction) to charger after BootNotification response."""
+        from models import Transaction, TransactionStatusEnum
+        try:
+            suspended_txns = await Transaction.filter(
+                charger__charge_point_string_id=self.id,
+                transaction_status=TransactionStatusEnum.SUSPENDED,
+            ).all()
+
+            if suspended_txns:
+                logger.info(f"📡 Pushing PostBootState for {len(suspended_txns)} suspended transaction(s) to {self.id}")
+                for txn in suspended_txns:
+                    await self._push_post_boot_state(transaction=txn)
+            else:
+                logger.info(f"📡 Pushing PostBootState (meter restore only) to {self.id}")
+                await self._push_post_boot_state(transaction=None)
+
+        except Exception as e:
+            logger.error(f"Error in after_boot_notification for {self.id}: {e}", exc_info=True)
+
+    async def _push_post_boot_state(self, transaction=None):
+        """Send PostBootState DataTransfer to charger with meter value and optional transaction info."""
+        from models import Transaction, TransactionStatusEnum, MeterValue
+        try:
+            if transaction:
+                latest_mv = await MeterValue.filter(
+                    transaction_id=transaction.id
+                ).order_by("-created_at").first()
+
+                start_kwh = transaction.start_meter_kwh or 0
+                last_kwh = latest_mv.reading_kwh if latest_mv else start_kwh
+                energy_kwh = last_kwh - start_kwh
+
+                payload_data = json.dumps({
+                    "hasPendingTransaction": True,
+                    "transactionId": transaction.id,
+                    "startMeterValueWh": int(round(start_kwh * 1000)),
+                    "lastMeterValueWh": int(round(last_kwh * 1000)),
+                    "energyConsumedWh": int(round(energy_kwh * 1000)),
+                })
+            else:
+                last_meter_wh = await self._get_charger_last_meter_wh()
+                payload_data = json.dumps({
+                    "hasPendingTransaction": False,
+                    "lastMeterValueWh": last_meter_wh,
+                })
+
+            req = call.DataTransfer(
+                vendor_id="VOLTLYNC",
+                message_id="PostBootState",
+                data=payload_data,
+            )
+            response = await asyncio.wait_for(self.call(req), timeout=15)
+
+            logger.info(f"📡 PostBootState push to {self.id}: status={response.status}, data={payload_data}")
+            if response.status != "Accepted":
+                logger.warning(f"📡 Charger {self.id} did not accept PostBootState: status={response.status}")
+
+        except asyncio.TimeoutError:
+            logger.warning(f"📡 PostBootState push timed out for {self.id}")
+        except Exception as e:
+            logger.error(f"📡 Error pushing PostBootState to {self.id}: {e}", exc_info=True)
+
+    async def _get_charger_last_meter_wh(self):
+        """Get the last known meter value (Wh) for this charger from the most recent transaction with end meter data."""
+        from models import Transaction
+        last_txn = await Transaction.filter(
+            charger__charge_point_string_id=self.id,
+            end_meter_kwh__isnull=False,
+        ).order_by("-end_time").first()
+
+        if last_txn and last_txn.end_meter_kwh:
+            return int(round(last_txn.end_meter_kwh * 1000))
+        return 0
 
     async def _suspend_timeout(self, transaction_id: int, original_suspended_at, timeout_seconds: int = 300):
         """Auto-stop a SUSPENDED transaction if the charger doesn't resume it in time."""
@@ -356,6 +441,120 @@ class ChargePoint(OcppChargePoint):
             pass
         except Exception as e:
             logger.error(f"Error in suspend timeout for transaction {transaction_id}: {e}", exc_info=True)
+
+    async def _start_socket_grace_period(self, transactions):
+        """Start a grace period for socket charger reporting Available during active transactions."""
+        # Check if grace period already active to avoid duplicates
+        existing = await redis_manager.get_socket_grace_period(self.id)
+        if existing:
+            logger.info(f"Socket grace period already active for {self.id}, skipping duplicate")
+            return
+
+        txn_ids = [t.id for t in transactions]
+        grace_started = datetime.datetime.now(datetime.timezone.utc)
+        await redis_manager.set_socket_grace_period(self.id, txn_ids, ttl=SOCKET_GRACE_PERIOD_SECONDS)
+        logger.info(
+            f"Socket charger {self.id}: Available during active transactions {txn_ids} "
+            f"— starting {SOCKET_GRACE_PERIOD_SECONDS}s grace period"
+        )
+
+        for transaction in transactions:
+            safe_create_task(
+                self._socket_grace_timeout(transaction.id, grace_started, SOCKET_GRACE_PERIOD_SECONDS)
+            )
+
+    async def _socket_grace_timeout(self, transaction_id, grace_started_at, timeout_seconds=300):
+        """After grace period, fail the transaction if no MeterValues arrived."""
+        try:
+            await asyncio.sleep(timeout_seconds)
+
+            transaction = await Transaction.filter(id=transaction_id).first()
+            if not transaction:
+                return
+
+            # CAS guard: only act if transaction is still in an active state
+            active_statuses = {
+                TransactionStatusEnum.RUNNING, TransactionStatusEnum.STARTED,
+                TransactionStatusEnum.PENDING_START, TransactionStatusEnum.PENDING_STOP,
+                TransactionStatusEnum.SUSPENDED,
+            }
+            if transaction.transaction_status not in active_statuses:
+                logger.info(f"Socket grace timeout for txn {transaction_id} — status already {transaction.transaction_status}, skipping")
+                return
+
+            # Check if MeterValues arrived since grace period started
+            recent_mv = await MeterValue.filter(
+                transaction_id=transaction_id,
+                created_at__gte=grace_started_at,
+            ).first()
+            if recent_mv:
+                logger.info(f"Socket grace timeout for txn {transaction_id} — MeterValues arrived, keeping alive")
+                return
+
+            logger.info(f"Socket grace timeout expired for txn {transaction_id} — no MeterValues, failing")
+            await self._fail_transaction_with_billing(transaction, "SOCKET_GRACE_TIMEOUT")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Error in socket grace timeout for txn {transaction_id}: {e}", exc_info=True)
+
+    async def _fail_transaction_with_billing(self, transaction, stop_reason):
+        """Fail a transaction, process billing and QR refunds."""
+        previous_status = transaction.transaction_status.value
+
+        # Calculate energy from latest meter value if not already set
+        if transaction.end_meter_kwh is None:
+            latest_mv = await MeterValue.filter(
+                transaction_id=transaction.id
+            ).order_by("-created_at").first()
+            if latest_mv:
+                transaction.end_meter_kwh = latest_mv.reading_kwh
+                transaction.energy_consumed_kwh = transaction.end_meter_kwh - (transaction.start_meter_kwh or 0)
+                logger.info(f"Calculated energy for failed txn {transaction.id}: {transaction.energy_consumed_kwh} kWh")
+            else:
+                logger.warning(f"No meter values for failed txn {transaction.id}")
+
+        transaction.transaction_status = TransactionStatusEnum.FAILED
+        transaction.stop_reason = stop_reason
+        transaction.end_time = datetime.datetime.now(datetime.timezone.utc)
+        await transaction.save()
+        logger.info(f"Marked transaction {transaction.id} as FAILED: {stop_reason}")
+
+        safe_create_task(log_audit_event(
+            action="transaction.status_changed",
+            entity_type="transaction",
+            entity_id=transaction.id,
+            actor_type="system",
+            changes={"previous_status": previous_status, "new_status": "FAILED", "trigger": stop_reason},
+        ))
+
+        await self._process_failure_billing(transaction)
+
+    async def _process_failure_billing(self, transaction):
+        """Process wallet billing and QR refunds for a failed transaction."""
+        if transaction.energy_consumed_kwh is not None and transaction.energy_consumed_kwh > 0:
+            try:
+                success, message, billing_amount = await WalletService.process_transaction_billing(transaction.id)
+                if success:
+                    logger.info(f"Billed failed txn {transaction.id}: {billing_amount}")
+                else:
+                    logger.warning(f"Billing failed for txn {transaction.id}: {message}")
+            except Exception as billing_error:
+                logger.error(f"Billing error for txn {transaction.id}: {billing_error}", exc_info=True)
+                await Transaction.filter(id=transaction.id).update(
+                    transaction_status=TransactionStatusEnum.BILLING_FAILED
+                )
+        else:
+            logger.warning(f"Cannot bill txn {transaction.id} - no energy consumed")
+
+        try:
+            from services.qr_payment_service import QRPaymentService
+            if transaction.energy_consumed_kwh is not None and transaction.energy_consumed_kwh > 0:
+                await QRPaymentService.process_qr_session_billing(transaction.id)
+            else:
+                await QRPaymentService.handle_charging_failure(transaction.id)
+        except Exception as qr_err:
+            logger.warning(f"QR payment handling error (non-fatal): {qr_err}")
 
     @on('Heartbeat')
     async def on_heartbeat(self, **kwargs):
@@ -440,9 +639,10 @@ class ChargePoint(OcppChargePoint):
             # Check if status indicates not charging and fail ongoing transactions
             # Charging states: Charging, Preparing, SuspendedEVSE, SuspendedEV, Finishing
             charging_states = {"Charging", "Preparing", "SuspendedEVSE", "SuspendedEV", "Finishing"}
-            
+
             if status not in charging_states:
                 from models import Transaction, TransactionStatusEnum, MeterValue
+                from services.charger_type_service import is_socket_charger_cached, should_use_grace_period
                 try:
                     ongoing_transactions = await Transaction.filter(
                         charger__charge_point_string_id=self.id,
@@ -454,72 +654,21 @@ class ChargePoint(OcppChargePoint):
                             TransactionStatusEnum.SUSPENDED,
                         ]
                     ).all()
-                    
+
                     if ongoing_transactions:
-                        logger.info(f"Status {status} indicates not charging - found {len(ongoing_transactions)} ongoing transactions for charger {self.id} - marking as FAILED")
-                        from services.wallet_service import WalletService
-                        
-                        for transaction in ongoing_transactions:
-                            # Calculate energy consumption from latest meter value if not already set
-                            if transaction.end_meter_kwh is None:
-                                latest_meter_value = await MeterValue.filter(
-                                    transaction_id=transaction.id
-                                ).order_by("-created_at").first()
-                                
-                                if latest_meter_value:
-                                    transaction.end_meter_kwh = latest_meter_value.reading_kwh
-                                    transaction.energy_consumed_kwh = transaction.end_meter_kwh - (transaction.start_meter_kwh or 0)
-                                    logger.info(f"Calculated energy consumption for failed transaction {transaction.id}: {transaction.energy_consumed_kwh} kWh (from latest meter value: {latest_meter_value.reading_kwh} kWh)")
-                                else:
-                                    logger.warning(f"No meter values found for failed transaction {transaction.id} - cannot calculate energy consumption")
-                            
-                            transaction.transaction_status = TransactionStatusEnum.FAILED
-                            transaction.stop_reason = f"STATUS_CHANGE_TO_{status}"
-                            transaction.end_time = datetime.datetime.now(datetime.timezone.utc)
-                            await transaction.save()
-                            logger.info(f"Marked transaction {transaction.id} as FAILED due to status change to {status}")
+                        is_socket = await is_socket_charger_cached(self.id, connected_charge_points)
 
-                            safe_create_task(log_audit_event(
-                                action="transaction.status_changed",
-                                entity_type="transaction",
-                                entity_id=transaction.id,
-                                actor_type="system",
-                                changes={"previous_status": "RUNNING", "new_status": "FAILED", "trigger": "StatusNotification"},
-                            ))
-
-                            # Process billing if we have energy consumption data
-                            if transaction.energy_consumed_kwh is not None and transaction.energy_consumed_kwh > 0:
-                                try:
-                                    success, message, billing_amount = await WalletService.process_transaction_billing(transaction.id)
-                                    if success:
-                                        if billing_amount and billing_amount > 0:
-                                            logger.info(f"💰 Billing successful for failed transaction {transaction.id}: ${billing_amount}")
-                                        else:
-                                            logger.info(f"💰 {message} for failed transaction {transaction.id}")
-                                    else:
-                                        logger.warning(f"💰 Billing failed for failed transaction {transaction.id}: {message}")
-                                except Exception as billing_error:
-                                    logger.error(f"💰 Unexpected error in billing for failed transaction {transaction.id}: {billing_error}", exc_info=True)
-                                    await Transaction.filter(id=transaction.id).update(
-                                        transaction_status=TransactionStatusEnum.BILLING_FAILED
-                                    )
-                            else:
-                                logger.warning(f"💰 Cannot bill failed transaction {transaction.id} - no energy consumed (energy: {transaction.energy_consumed_kwh} kWh)")
-
-                            # Handle QR payment: bill for energy used, refund the rest
-                            try:
-                                from services.qr_payment_service import QRPaymentService
-                                if transaction.energy_consumed_kwh is not None and transaction.energy_consumed_kwh > 0:
-                                    # Energy was consumed — do proper billing (charge for usage, refund remainder)
-                                    await QRPaymentService.process_qr_session_billing(transaction.id)
-                                else:
-                                    # No energy consumed — full refund
-                                    await QRPaymentService.handle_charging_failure(transaction.id)
-                            except Exception as qr_err:
-                                logger.warning(f"QR payment handling error (non-fatal): {qr_err}")
+                        if is_socket and should_use_grace_period(status):
+                            await self._start_socket_grace_period(ongoing_transactions)
+                        else:
+                            logger.info(f"Status {status} indicates not charging - found {len(ongoing_transactions)} ongoing transactions for charger {self.id} - marking as FAILED")
+                            for transaction in ongoing_transactions:
+                                await self._fail_transaction_with_billing(
+                                    transaction, f"STATUS_CHANGE_TO_{status}"
+                                )
                     else:
                         logger.debug(f"Status {status} indicates not charging but no ongoing transactions found for charger {self.id}")
-                        
+
                 except Exception as e:
                     logger.error(f"Error checking ongoing transactions for {self.id} on status change to {status}: {e}", exc_info=True)
             
@@ -655,6 +804,14 @@ class ChargePoint(OcppChargePoint):
             await transaction.save()
 
             logger.info(f"🛑 ✅ Transaction stopped {transaction_id}: {transaction.energy_consumed_kwh} kWh consumed")
+
+            # Cancel any active socket grace period for this charger
+            try:
+                if await redis_manager.get_socket_grace_period(self.id):
+                    await redis_manager.delete_socket_grace_period(self.id)
+                    logger.info(f"Cancelled socket grace period for {self.id} on StopTransaction")
+            except Exception as e:
+                logger.debug(f"Grace period cleanup error (non-fatal): {e}")
 
             safe_create_task(log_audit_event(
                 action="transaction.status_changed",
@@ -848,6 +1005,15 @@ class ChargePoint(OcppChargePoint):
                     await QRPaymentService.check_budget_and_auto_stop(transaction_id, meter_data['reading_kwh'])
                 except Exception as qr_err:
                     logger.warning(f"QR budget check failed (non-fatal): {qr_err}")
+
+            # Cancel socket grace period if MeterValues arrived (charger is alive)
+            try:
+                grace_data = await redis_manager.get_socket_grace_period(self.id)
+                if grace_data:
+                    logger.info(f"MeterValues received during socket grace period for {self.id} — cancelling")
+                    await redis_manager.delete_socket_grace_period(self.id)
+            except Exception as e:
+                logger.debug(f"Grace period check error (non-fatal): {e}")
 
             return call_result.MeterValues()
             
@@ -1213,8 +1379,9 @@ app.include_router(logs.router)
 app.include_router(firmware.router)
 app.include_router(firmware.public_router)
 
-from routers import qr_codes
+from routers import qr_codes, public_qr_transactions
 app.include_router(qr_codes.router)
+app.include_router(public_qr_transactions.router)
 
 # OCPP WebSocket endpoint (connection management + message handling)
 from routers import ocpp_ws

@@ -692,6 +692,7 @@ function ChargerModal({ stations, onSubmit, onClose }: ChargerModalProps) {
                       <option value="Type2">Type 2</option>
                       <option value="CCS">CCS</option>
                       <option value="CHAdeMO">CHAdeMO</option>
+                      <option value="Socket">Socket</option>
                     </select>
                   </div>
                   <div>
@@ -705,7 +706,7 @@ function ChargerModal({ stations, onSubmit, onClose }: ChargerModalProps) {
                         updateConnector(
                           index,
                           "max_power_kw",
-                          parseFloat(e.target.value)
+                          e.target.value === "" ? 0 : parseFloat(e.target.value)
                         )
                       }
                       className="w-full px-2 py-1 text-sm border border-border bg-input text-foreground rounded focus:outline-none focus:ring-1 focus:ring-primary transition-colors"

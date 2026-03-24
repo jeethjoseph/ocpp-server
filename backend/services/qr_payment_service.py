@@ -246,10 +246,15 @@ class QRPaymentService:
             metadata=webhook_data,
         )
 
-        # Check if charger is in Preparing state and connected
+        # Check if charger is in a suitable state and connected
+        # Socket chargers may remain Available (no CP signal for Preparing)
+        from services.charger_type_service import is_socket_charger as _is_socket
         is_connected = await redis_manager.is_charger_connected(charger.charge_point_string_id)
+        start_statuses = {ChargerStatusEnum.PREPARING}
+        if await _is_socket(charger.charge_point_string_id):
+            start_statuses.add(ChargerStatusEnum.AVAILABLE)
 
-        if charger.latest_status == ChargerStatusEnum.PREPARING and is_connected:
+        if charger.latest_status in start_statuses and is_connected:
             # Start charging immediately
             await QRPaymentService._start_charging(charger, user, qr_payment)
         elif is_connected:
@@ -333,7 +338,8 @@ class QRPaymentService:
 
     @staticmethod
     async def handle_payment_without_plug(charger_id: int, qr_payment_id: int):
-        """Wait for charger to enter Preparing state, then start. Timeout -> refund."""
+        """Wait for charger to enter a startable state, then start. Timeout -> refund."""
+        from services.charger_type_service import is_socket_charger as _is_socket
         timeout = QR_PAYMENT_PENDING_TIMEOUT
         poll_interval = 10
         elapsed = 0
@@ -350,7 +356,12 @@ class QRPaymentService:
             if qr_payment.status != QRPaymentStatusEnum.PAID:
                 return  # Already handled
 
-            if charger.latest_status == ChargerStatusEnum.PREPARING:
+            # Socket chargers may stay Available (no CP signal for Preparing)
+            start_statuses = {ChargerStatusEnum.PREPARING}
+            if await _is_socket(charger.charge_point_string_id):
+                start_statuses.add(ChargerStatusEnum.AVAILABLE)
+
+            if charger.latest_status in start_statuses:
                 user = await User.filter(id=qr_payment.user_id).first()
                 if user:
                     await QRPaymentService._start_charging(charger, user, qr_payment)
@@ -361,7 +372,7 @@ class QRPaymentService:
         if qr_payment and qr_payment.status == QRPaymentStatusEnum.PAID:
             logger.info(f"QR payment {qr_payment_id} timed out waiting for plug-in, refunding")
             qr_payment.status = QRPaymentStatusEnum.EXPIRED
-            qr_payment.failure_reason = "Charger not in Preparing state within timeout"
+            qr_payment.failure_reason = "Charger not in startable state within timeout"
             await qr_payment.save()
             await QRPaymentService._full_refund(qr_payment, "Plug-in timeout")
 

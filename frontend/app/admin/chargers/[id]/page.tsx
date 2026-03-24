@@ -10,6 +10,7 @@ import { QRCodeSVG, QRCodeCanvas } from "qrcode.react";
 import { AdminOnly } from "@/components/RoleWrapper";
 import Link from "next/link";
 import { toast } from "sonner";
+import { isSocketCharger as checkSocketCharger } from "@/lib/utils";
 import ChargerLogs from "@/components/ChargerLogs";
 import ChargerAuditLog from "@/components/ChargerAuditLog";
 import MeterValuesChart from "@/components/MeterValuesChart";
@@ -96,6 +97,8 @@ export default function ChargerDetailPage() {
   // Extract data from charger query
   const charger = chargerData?.charger;
   const station = chargerData?.station;
+  const connectors = chargerData?.connectors;
+  const isSocketCharger = checkSocketCharger(connectors);
   const currentTransactionId = chargerData?.current_transaction?.transaction_id;
   const recentTransactionId = chargerData?.recent_transaction?.transaction_id;
 
@@ -237,12 +240,9 @@ export default function ChargerDetailPage() {
   };
 
   const canStartCharging = () => {
-    return (
-      charger &&
-      charger.latest_status === "Preparing" &&
-      charger.connection_status &&
-      !currentTransactionId
-    );
+    const statusReady = charger?.latest_status === "Preparing" ||
+      (isSocketCharger && charger?.latest_status === "Available");
+    return charger && statusReady && charger.connection_status && !currentTransactionId;
   };
 
   const canStopCharging = () => {
@@ -454,8 +454,8 @@ export default function ChargerDetailPage() {
                 <p className="text-sm text-muted-foreground text-center">
                   {!charger.connection_status
                     ? "Charger is disconnected"
-                    : charger.latest_status !== "Preparing" &&
-                      !currentTransactionId
+                    : !currentTransactionId && charger.latest_status !== "Preparing" &&
+                      !(isSocketCharger && charger.latest_status === "Available")
                     ? `Cannot start - status is ${charger.latest_status}`
                     : "No actions available"}
                 </p>
