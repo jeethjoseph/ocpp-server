@@ -261,7 +261,7 @@ class RazorpayService:
             logger.error("Cannot validate VPA - Razorpay not configured")
             return None
         try:
-            result = self.client.utility.validate_vpa({"vpa": vpa})
+            result = self.client.payment.validateVpa({"vpa": vpa})
             logger.info(f"VPA validation for {vpa}: success={result.get('success')}")
             return result
         except Exception as e:
