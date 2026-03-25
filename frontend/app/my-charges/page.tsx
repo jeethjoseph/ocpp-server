@@ -21,10 +21,9 @@ import {
   ChevronRight,
   AlertCircle,
   RefreshCw,
-  ShieldCheck,
 } from "lucide-react";
 import { usePublicQRTransactions } from "@/lib/queries/public-qr-transactions";
-import { publicQRTransactionService, QRTransactionItem } from "@/lib/api-services";
+import { QRTransactionItem } from "@/lib/api-services";
 
 const STATUS_OPTIONS = [
   { value: "ALL", label: "All Statuses" },
@@ -36,8 +35,6 @@ const STATUS_OPTIONS = [
   { value: "REFUND_FAILED", label: "Refund Failed" },
   { value: "EXPIRED", label: "Expired" },
 ];
-
-type Step = "idle" | "looking_up" | "verify" | "verifying" | "verified";
 
 function getStatusBadgeClass(status: string) {
   switch (status) {
@@ -90,11 +87,8 @@ function formatINR(val: string | null): string | null {
 function getErrorMessage(error: Error): string {
   const msg = error.message;
   if (msg.includes("429")) return "Too many requests. Please wait a moment and try again.";
-  if (msg.includes("403")) return "Name does not match. Please try again.";
   if (msg.includes("404")) return "No transactions found for this UPI ID.";
-  if (msg.includes("401")) return "Session expired. Please verify again.";
   if (msg.includes("400")) return "Please enter a valid UPI ID (e.g. name@bank)";
-  if (msg.includes("503")) return "Payment service unavailable. Please try later.";
   if (msg.includes("500")) return "Server error. Please try again later.";
   return "Something went wrong. Please try again.";
 }
@@ -195,18 +189,13 @@ function TransactionCard({ txn }: { txn: QRTransactionItem }) {
 
 export default function MyChargesPage() {
   const [vpaInput, setVpaInput] = useState("");
-  const [nameInput, setNameInput] = useState("");
-  const [step, setStep] = useState<Step>("idle");
-  const [maskedName, setMaskedName] = useState("");
-  const [verifiedVpa, setVerifiedVpa] = useState("");
-  const [token, setToken] = useState("");
-  const [errorMsg, setErrorMsg] = useState("");
+  const [searchedVpa, setSearchedVpa] = useState("");
   const [statusFilter, setStatusFilter] = useState("ALL");
   const [currentPage, setCurrentPage] = useState(1);
   const limit = 10;
 
   const { data, isLoading, error } = usePublicQRTransactions({
-    token,
+    vpa: searchedVpa,
     page: currentPage,
     limit,
     status: statusFilter !== "ALL" ? statusFilter : undefined,
@@ -214,51 +203,18 @@ export default function MyChargesPage() {
 
   const totalPages = data ? Math.ceil(data.total / limit) : 1;
 
-  const handleLookup = async (e: React.FormEvent) => {
+  const handleSearch = (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const trimmed = vpaInput.trim().toLowerCase();
     if (!trimmed) return;
-
-    setErrorMsg("");
-    setStep("looking_up");
-
-    try {
-      const result = await publicQRTransactionService.lookup(trimmed);
-      setMaskedName(result.masked_name);
-      setVerifiedVpa(trimmed);
-      setStep("verify");
-    } catch (err) {
-      setErrorMsg(getErrorMessage(err as Error));
-      setStep("idle");
-    }
-  };
-
-  const handleVerify = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!nameInput.trim()) return;
-
-    setErrorMsg("");
-    setStep("verifying");
-
-    try {
-      const result = await publicQRTransactionService.verify(verifiedVpa, nameInput.trim());
-      setToken(result.token);
-      setCurrentPage(1);
-      setStep("verified");
-    } catch (err) {
-      setErrorMsg(getErrorMessage(err as Error));
-      setStep("verify");
-    }
+    setSearchedVpa(trimmed);
+    setCurrentPage(1);
+    setStatusFilter("ALL");
   };
 
   const handleReset = () => {
-    setStep("idle");
     setVpaInput("");
-    setNameInput("");
-    setMaskedName("");
-    setVerifiedVpa("");
-    setToken("");
-    setErrorMsg("");
+    setSearchedVpa("");
     setStatusFilter("ALL");
     setCurrentPage(1);
   };
@@ -276,89 +232,38 @@ export default function MyChargesPage() {
           </p>
         </div>
 
+        {/* Search form */}
+        <form onSubmit={handleSearch} className="flex gap-2">
+          <Input
+            type="text"
+            placeholder="your-upi@bank"
+            value={vpaInput}
+            onChange={(e) => setVpaInput(e.target.value)}
+            className="flex-1"
+          />
+          <Button type="submit" disabled={!vpaInput.trim()}>
+            <Search className="h-4 w-4" />
+          </Button>
+        </form>
+
         {/* Error display */}
-        {errorMsg && (
+        {error && (
           <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-700 p-4 rounded-lg text-center">
             <AlertCircle className="h-5 w-5 text-red-600 dark:text-red-400 mx-auto mb-2" />
-            <p className="text-sm text-red-800 dark:text-red-300">{errorMsg}</p>
+            <p className="text-sm text-red-800 dark:text-red-300">
+              {getErrorMessage(error)}
+            </p>
           </div>
         )}
 
-        {/* Step 1: Enter VPA */}
-        {(step === "idle" || step === "looking_up") && (
-          <form onSubmit={handleLookup} className="space-y-3">
-            <div className="flex gap-2">
-              <Input
-                type="text"
-                placeholder="your-upi@bank"
-                value={vpaInput}
-                onChange={(e) => setVpaInput(e.target.value)}
-                className="flex-1"
-                disabled={step === "looking_up"}
-              />
-              <Button type="submit" disabled={!vpaInput.trim() || step === "looking_up"}>
-                {step === "looking_up" ? (
-                  <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white" />
-                ) : (
-                  <Search className="h-4 w-4" />
-                )}
-              </Button>
-            </div>
-          </form>
-        )}
-
-        {/* Step 2: Verify name */}
-        {(step === "verify" || step === "verifying") && (
-          <Card className="border-0 shadow-lg bg-card">
-            <CardContent className="p-4 space-y-4">
-              <div className="flex items-center gap-2 text-card-foreground">
-                <ShieldCheck className="h-5 w-5 text-primary" />
-                <span className="font-medium">Verify your identity</span>
-              </div>
-              <p className="text-sm text-muted-foreground">
-                Account found for <span className="font-semibold text-card-foreground">{maskedName}</span>.
-                Enter the full name registered with your UPI ID to continue.
-              </p>
-              <form onSubmit={handleVerify} className="space-y-3">
-                <Input
-                  type="text"
-                  placeholder="Enter your full name"
-                  value={nameInput}
-                  onChange={(e) => { setNameInput(e.target.value); setErrorMsg(""); }}
-                  disabled={step === "verifying"}
-                  autoFocus
-                />
-                <div className="flex gap-2">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={handleReset}
-                    className="flex-1"
-                    disabled={step === "verifying"}
-                  >
-                    Back
-                  </Button>
-                  <Button
-                    type="submit"
-                    className="flex-1"
-                    disabled={!nameInput.trim() || step === "verifying"}
-                  >
-                    {step === "verifying" ? "Verifying..." : "Verify"}
-                  </Button>
-                </div>
-              </form>
-            </CardContent>
-          </Card>
-        )}
-
-        {/* Step 3: Verified — show transactions */}
-        {step === "verified" && (
+        {/* Results */}
+        {searchedVpa && (
           <>
-            {/* Verified badge + change VPA */}
+            {/* VPA badge + change */}
             <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2 text-sm text-green-700 dark:text-green-400">
-                <ShieldCheck className="h-4 w-4" />
-                <span>Verified: {verifiedVpa}</span>
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Zap className="h-4 w-4" />
+                <span>{searchedVpa}</span>
               </div>
               <Button variant="ghost" size="sm" onClick={handleReset}>
                 Change
@@ -387,21 +292,6 @@ export default function MyChargesPage() {
               <div className="text-center py-12">
                 <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-primary mx-auto" />
                 <p className="text-muted-foreground mt-4">Loading transactions...</p>
-              </div>
-            )}
-
-            {/* Query error (e.g., token expired) */}
-            {error && (
-              <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-700 p-4 rounded-lg text-center">
-                <AlertCircle className="h-5 w-5 text-red-600 dark:text-red-400 mx-auto mb-2" />
-                <p className="text-sm text-red-800 dark:text-red-300">
-                  {getErrorMessage(error)}
-                </p>
-                {error.message.includes("401") && (
-                  <Button variant="outline" size="sm" className="mt-3" onClick={handleReset}>
-                    Verify again
-                  </Button>
-                )}
               </div>
             )}
 
@@ -451,7 +341,7 @@ export default function MyChargesPage() {
         )}
 
         {/* Initial state */}
-        {step === "idle" && !errorMsg && (
+        {!searchedVpa && !error && (
           <div className="text-center py-12">
             <Zap className="h-12 w-12 text-muted-foreground/40 mx-auto mb-4" />
             <p className="text-muted-foreground">

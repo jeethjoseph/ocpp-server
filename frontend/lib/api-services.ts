@@ -255,25 +255,10 @@ export interface QRTransactionListResponse {
   limit: number;
 }
 
-export interface VPALookupResponse {
-  masked_name: string;
-}
-
-export interface VPAVerifyResponse {
-  token: string;
-  expires_in: number;
-}
-
 export const publicQRTransactionService = {
-  lookup: (vpa: string) =>
-    api.post<VPALookupResponse>("/api/public/qr-transactions/lookup", { vpa }),
-
-  verify: (vpa: string, full_name: string) =>
-    api.post<VPAVerifyResponse>("/api/public/qr-transactions/verify", { vpa, full_name }),
-
-  getByToken: (params: { token: string; page?: number; limit?: number; status?: string }) => {
+  getByVpa: (params: { vpa: string; page?: number; limit?: number; status?: string }) => {
     const searchParams = new URLSearchParams();
-    searchParams.set("token", params.token);
+    searchParams.set("vpa", params.vpa);
     if (params.page) searchParams.set("page", params.page.toString());
     if (params.limit) searchParams.set("limit", params.limit.toString());
     if (params.status) searchParams.set("status", params.status);

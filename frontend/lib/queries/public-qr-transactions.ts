@@ -8,15 +8,15 @@ export const publicQRTransactionKeys = {
 };
 
 export function usePublicQRTransactions(params: {
-  token: string;
+  vpa: string;
   page?: number;
   limit?: number;
   status?: string;
 }) {
   return useQuery<QRTransactionListResponse, Error>({
     queryKey: publicQRTransactionKeys.list(params),
-    queryFn: () => publicQRTransactionService.getByToken(params),
-    enabled: !!params.token,
+    queryFn: () => publicQRTransactionService.getByVpa(params),
+    enabled: !!params.vpa,
     staleTime: 30000,
   });
 }
