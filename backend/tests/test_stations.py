@@ -1,57 +1,16 @@
 # tests/test_stations.py
 import pytest
-from httpx import AsyncClient, ASGITransport
+from httpx import AsyncClient
 from fastapi import status
-from tortoise import Tortoise
 
-from main import app, connected_charge_points
-from models import ChargingStation, Charger, Connector, Transaction, OCPPLog
-
-# Test database URL - use a separate test database
-TEST_DB_URL = "postgres://test_user:test_pass@localhost:5432/test_ocpp_db"
-@pytest.fixture(scope="module")
-def anyio_backend():
-    return "asyncio"
-
-@pytest.fixture(scope="function")
-async def client():
-    # Initialize Tortoise with test database
-    config = {
-        "connections": {"default": TEST_DB_URL},
-        "apps": {
-            "models": {
-                "models": ["models"],
-                "default_connection": "default",
-            }
-        },
-    }
-    await Tortoise.init(config=config)
-    await Tortoise.generate_schemas()
-    
-    # Clean up database before each test (after initialization)
-    await Transaction.all().delete()
-    await Connector.all().delete()
-    await Charger.all().delete()
-    await ChargingStation.all().delete()
-    await OCPPLog.all().delete()
-    # Clear connected charge points
-    connected_charge_points.clear()
-    
-    async with AsyncClient(
-        transport=ASGITransport(app=app), 
-        base_url="http://test"
-    ) as ac:
-        yield ac
-    
-    # Close connections
-    await Tortoise.close_connections()
+from models import ChargingStation, Charger, Connector, ChargerStatusEnum
 
 @pytest.mark.unit
 class TestStationEndpoints:
     """Integration tests for Station Management API"""
     
     @pytest.mark.asyncio
-    async def test_create_station(self, client: AsyncClient):
+    async def test_create_station(self, client_admin: AsyncClient):
         """Test creating a new station"""
         station_data = {
             "name": "Test Station",
@@ -60,7 +19,7 @@ class TestStationEndpoints:
             "address": "123 Test Street, Bangalore"
         }
         
-        response = await client.post("/api/admin/stations", json=station_data)
+        response = await client_admin.post("/api/admin/stations", json=station_data)
         
         assert response.status_code == status.HTTP_201_CREATED
         data = response.json()
@@ -75,9 +34,9 @@ class TestStationEndpoints:
         assert station.name == station_data["name"]
     
     @pytest.mark.asyncio
-    async def test_list_stations_empty(self, client: AsyncClient):
+    async def test_list_stations_empty(self, client_admin: AsyncClient):
         """Test listing stations when none exist"""
-        response = await client.get("/api/admin/stations")
+        response = await client_admin.get("/api/admin/stations")
         
         assert response.status_code == status.HTTP_200_OK
         data = response.json()
@@ -87,7 +46,7 @@ class TestStationEndpoints:
         assert data["limit"] == 10
     
     @pytest.mark.asyncio
-    async def test_list_stations_with_pagination(self, client: AsyncClient):
+    async def test_list_stations_with_pagination(self, client_admin: AsyncClient):
         """Test station listing with pagination"""
         # Create multiple stations
         for i in range(15):
@@ -99,7 +58,7 @@ class TestStationEndpoints:
             )
         
         # Test first page
-        response = await client.get("/api/admin/stations?page=1&limit=10")
+        response = await client_admin.get("/api/admin/stations?page=1&limit=10")
         assert response.status_code == status.HTTP_200_OK
         data = response.json()
         assert data["total"] == 15
@@ -107,13 +66,13 @@ class TestStationEndpoints:
         assert data["page"] == 1
         
         # Test second page
-        response = await client.get("/api/admin/stations?page=2&limit=10")
+        response = await client_admin.get("/api/admin/stations?page=2&limit=10")
         data = response.json()
         assert len(data["data"]) == 5
         assert data["page"] == 2
     
     @pytest.mark.asyncio
-    async def test_list_stations_with_search(self, client: AsyncClient):
+    async def test_list_stations_with_search(self, client_admin: AsyncClient):
         """Test station search functionality"""
         # Create test stations
         await ChargingStation.create(name="Bangalore Central", latitude=12.97, longitude=77.59, address="Central")
@@ -121,13 +80,13 @@ class TestStationEndpoints:
         await ChargingStation.create(name="Delhi Hub", latitude=28.61, longitude=77.20, address="Delhi")
         
         # Search for "Central"
-        response = await client.get("/api/admin/stations?search=Central")
+        response = await client_admin.get("/api/admin/stations?search=Central")
         data = response.json()
         assert data["total"] == 1
         assert data["data"][0]["name"] == "Bangalore Central"
     
     @pytest.mark.asyncio
-    async def test_get_station_details(self, client: AsyncClient):
+    async def test_get_station_details(self, client_admin: AsyncClient):
         """Test getting station details with chargers"""
         # Create station
         station = await ChargingStation.create(
@@ -142,34 +101,34 @@ class TestStationEndpoints:
             charge_point_string_id="charger-1",
             station_id=station.id,
             name="Charger 1",
-            latest_status="AVAILABLE"
+            latest_status=ChargerStatusEnum.AVAILABLE
         )
         await Charger.create(
             charge_point_string_id="charger-2",
             station_id=station.id,
             name="Charger 2",
-            latest_status="CHARGING"
+            latest_status=ChargerStatusEnum.CHARGING
         )
-        
-        response = await client.get(f"/api/admin/stations/{station.id}")
-        
+
+        response = await client_admin.get(f"/api/admin/stations/{station.id}")
+
         assert response.status_code == status.HTTP_200_OK
         data = response.json()
         assert data["station"]["name"] == "Test Station"
         assert len(data["chargers"]) == 2
         assert data["chargers"][0]["name"] == "Charger 1"
-        assert data["chargers"][1]["latest_status"] == "CHARGING"
+        assert data["chargers"][1]["latest_status"] == ChargerStatusEnum.CHARGING.value
     
     @pytest.mark.asyncio
-    async def test_get_station_not_found(self, client: AsyncClient):
+    async def test_get_station_not_found(self, client_admin: AsyncClient):
         """Test getting non-existent station"""
-        response = await client.get("/api/admin/stations/9999")
+        response = await client_admin.get("/api/admin/stations/9999")
         
         assert response.status_code == status.HTTP_404_NOT_FOUND
         assert response.json()["detail"] == "Station not found"
     
     @pytest.mark.asyncio
-    async def test_update_station(self, client: AsyncClient):
+    async def test_update_station(self, client_admin: AsyncClient):
         """Test updating station information"""
         # Create station
         station = await ChargingStation.create(
@@ -184,7 +143,7 @@ class TestStationEndpoints:
             "name": "New Name",
             "address": "New Address"
         }
-        response = await client.put(f"/api/admin/stations/{station.id}", json=update_data)
+        response = await client_admin.put(f"/api/admin/stations/{station.id}", json=update_data)
         
         assert response.status_code == status.HTTP_200_OK
         data = response.json()
@@ -197,7 +156,7 @@ class TestStationEndpoints:
         assert updated_station.name == "New Name"
     
     @pytest.mark.asyncio
-    async def test_update_station_partial(self, client: AsyncClient):
+    async def test_update_station_partial(self, client_admin: AsyncClient):
         """Test partial update of station"""
         station = await ChargingStation.create(
             name="Original",
@@ -207,14 +166,14 @@ class TestStationEndpoints:
         )
         
         # Update only latitude
-        response = await client.put(f"/api/admin/stations/{station.id}", json={"latitude": 13.0000})
+        response = await client_admin.put(f"/api/admin/stations/{station.id}", json={"latitude": 13.0000})
         
         data = response.json()
         assert data["station"]["latitude"] == 13.0000
         assert data["station"]["name"] == "Original"  # Unchanged
     
     @pytest.mark.asyncio
-    async def test_delete_station(self, client: AsyncClient):
+    async def test_delete_station(self, client_admin: AsyncClient):
         """Test deleting a station"""
         # Create station with charger
         station = await ChargingStation.create(
@@ -227,10 +186,10 @@ class TestStationEndpoints:
             charge_point_string_id="charger-delete",
             station_id=station.id,
             name="Charger to Delete",
-            latest_status="AVAILABLE"
+            latest_status=ChargerStatusEnum.AVAILABLE
         )
         
-        response = await client.delete(f"/api/admin/stations/{station.id}")
+        response = await client_admin.delete(f"/api/admin/stations/{station.id}")
         
         assert response.status_code == status.HTTP_200_OK
         assert response.json()["message"] == "Station deleted successfully"
@@ -240,9 +199,9 @@ class TestStationEndpoints:
         assert await Charger.filter(id=charger.id).first() is None
     
     @pytest.mark.asyncio
-    async def test_delete_station_not_found(self, client: AsyncClient):
+    async def test_delete_station_not_found(self, client_admin: AsyncClient):
         """Test deleting non-existent station"""
-        response = await client.delete("/api/admin/stations/9999")
+        response = await client_admin.delete("/api/admin/stations/9999")
         
         assert response.status_code == status.HTTP_404_NOT_FOUND
         assert response.json()["detail"] == "Station not found"

@@ -273,8 +273,9 @@ class Tariff(Model):
     updated_at = fields.DatetimeField(auto_now=True)
     charger = fields.ForeignKeyField("models.Charger", related_name="tariffs", null=True)
     rate_per_kwh = fields.DecimalField(max_digits=5, decimal_places=2)
+    gst_percent = fields.DecimalField(max_digits=5, decimal_places=2, default=18.00)
     is_global = fields.BooleanField(default=False)
-    
+
     class Meta:
         table = "tariff"
 
@@ -296,10 +297,15 @@ class Transaction(Model):
     resumed_at = fields.DatetimeField(null=True)
     resume_count = fields.IntField(default=0)
 
+    # Billing fields (populated after StopTransaction)
+    energy_charge = fields.DecimalField(max_digits=10, decimal_places=2, null=True)  # Pre-GST energy cost
+    gst_amount = fields.DecimalField(max_digits=10, decimal_places=2, null=True)     # GST on energy_charge
+    total_billed = fields.DecimalField(max_digits=10, decimal_places=2, null=True)   # energy_charge + gst
+
     # Relationships
     wallet_transactions: fields.ReverseRelation["WalletTransaction"]
     meter_values: fields.ReverseRelation["MeterValue"]
-    
+
     class Meta:
         table = "transaction"
 
@@ -466,7 +472,8 @@ class QRPayment(Model):
     customer_vpa = fields.CharField(max_length=255, null=True)
     customer_name = fields.CharField(max_length=255, null=True)
     customer_contact = fields.CharField(max_length=255, null=True)
-    energy_cost = fields.DecimalField(max_digits=10, decimal_places=2, null=True)
+    energy_cost = fields.DecimalField(max_digits=10, decimal_places=2, null=True)   # Pre-GST energy charge
+    gst_amount = fields.DecimalField(max_digits=10, decimal_places=2, null=True)    # GST on energy_cost
     platform_fee = fields.DecimalField(max_digits=10, decimal_places=2, null=True)
     refund_amount = fields.DecimalField(max_digits=10, decimal_places=2, null=True)
     razorpay_refund_id = fields.CharField(max_length=255, null=True)

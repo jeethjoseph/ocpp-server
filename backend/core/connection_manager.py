@@ -40,6 +40,14 @@ class ConnectionManager:
         self._cleanup_locks: Dict[str, asyncio.Lock] = {}
         self._recently_disconnected: Dict[str, datetime.datetime] = {}
         self._cleanup_task: Optional[asyncio.Task] = None
+        self._on_disconnect_callbacks: list = []
+
+    def register_on_disconnect(self, callback):
+        """Register an async callback to fire on charger disconnect.
+
+        Callback signature: async def callback(charge_point_id: str) -> None
+        """
+        self._on_disconnect_callbacks.append(callback)
 
     # --- helpers ---
 
@@ -117,6 +125,10 @@ class ConnectionManager:
             self._cleanup_locks.pop(charge_point_id, None)
 
             logger.warning(f"[DISCONNECT] Force disconnected {charge_point_id}: {reason}")
+
+            # 7. Fire disconnect callbacks (e.g. suspend active transactions)
+            for cb in self._on_disconnect_callbacks:
+                safe_create_task(cb(charge_point_id))
 
             safe_create_task(log_audit_event(
                 action="charger.disconnected",

@@ -238,6 +238,9 @@ export default function QRCodeDetailPage() {
                         Energy Cost
                       </th>
                       <th className="text-right py-3 px-2 font-medium">
+                        GST
+                      </th>
+                      <th className="text-right py-3 px-2 font-medium">
                         Platform Fee
                       </th>
                       <th className="text-right py-3 px-2 font-medium">
@@ -266,6 +269,11 @@ export default function QRCodeDetailPage() {
                         <td className="py-3 px-2 text-right">
                           {payment.energy_cost
                             ? `₹${Number(payment.energy_cost).toFixed(2)}`
+                            : "-"}
+                        </td>
+                        <td className="py-3 px-2 text-right">
+                          {payment.gst_amount
+                            ? `₹${Number(payment.gst_amount).toFixed(2)}`
                             : "-"}
                         </td>
                         <td className="py-3 px-2 text-right">

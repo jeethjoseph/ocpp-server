@@ -139,6 +139,51 @@ class RedisConnectionManager:
             logger.error(f"Failed to delete QR session for transaction {transaction_id}: {e}")
             return False
 
+    # Zero-energy watchdog methods
+    ZERO_ENERGY_PREFIX = "zero_energy:"
+
+    async def set_zero_energy_state(self, transaction_id: int, data: Dict, ttl: int = 7200) -> bool:
+        """Cache zero-energy tracking state for a transaction.
+
+        TTL of 2h is well above the longest plausible charging session and
+        bounds any leak from missed cleanup paths."""
+        if not self.redis_client:
+            logger.error("Redis client not initialized")
+            return False
+        try:
+            key = f"{self.ZERO_ENERGY_PREFIX}{transaction_id}"
+            await self.redis_client.set(key, json.dumps(data), ex=ttl)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set zero-energy state for transaction {transaction_id}: {e}")
+            return False
+
+    async def get_zero_energy_state(self, transaction_id: int) -> Optional[Dict]:
+        """Get zero-energy tracking state"""
+        if not self.redis_client:
+            return None
+        try:
+            key = f"{self.ZERO_ENERGY_PREFIX}{transaction_id}"
+            data = await self.redis_client.get(key)
+            if data:
+                return json.loads(data)
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get zero-energy state for transaction {transaction_id}: {e}")
+            return None
+
+    async def delete_zero_energy_state(self, transaction_id: int) -> bool:
+        """Delete zero-energy tracking state"""
+        if not self.redis_client:
+            return False
+        try:
+            key = f"{self.ZERO_ENERGY_PREFIX}{transaction_id}"
+            await self.redis_client.delete(key)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete zero-energy state for transaction {transaction_id}: {e}")
+            return False
+
     # Socket charger grace period methods
     SOCKET_GRACE_PREFIX = "socket_grace:"
 

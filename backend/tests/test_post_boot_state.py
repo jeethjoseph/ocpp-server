@@ -173,58 +173,69 @@ class TestPushPostBootStateErrorHandling:
 
 # --- Integration Tests ---
 
-WS_URL = "ws://localhost:8000"
-
-
 @pytest.mark.integration
 class TestPostBootStateIntegration:
-    """Integration tests — require server running at localhost:8000."""
+    """Integration tests using FastAPI TestClient (in-process WebSocket).
 
-    def _connect(self, charge_point_id: str):
-        try:
-            ws = websocket.create_connection(f"{WS_URL}/ocpp/{charge_point_id}", timeout=10)
-            return ws
-        except (ConnectionRefusedError, websocket.WebSocketException):
-            pytest.skip("Server not running at localhost:8000")
+    Drives the OCPP WebSocket route end-to-end via TestClient instead of a
+    live external server. Uses the sync_client_admin + sync_db fixtures from
+    conftest.py to seed chargers and bypass admin auth.
+    """
 
-    def _send_and_recv(self, ws, action: str, payload: dict, msg_id: str = "1"):
-        ws.send(json.dumps([2, msg_id, action, payload]))
-        while True:
-            raw = ws.recv()
-            response = json.loads(raw)
-            if response[0] == 3 and response[1] == msg_id:
-                return response[2]
-            if response[0] == 2:
-                # Server CALL — accept it and continue waiting
-                ws.send(json.dumps([3, response[1], {"status": "Accepted"}]))
+    def _drain_for_data_transfer(self, ws, max_messages: int = 10):
+        """Read messages until a server-initiated DataTransfer CALL appears."""
+        for _ in range(max_messages):
+            raw = ws.receive_text()
+            parsed = json.loads(raw)
+            if parsed[0] == 2 and parsed[2] == "DataTransfer":
+                return parsed
+        return None
 
-    def _wait_for_data_transfer(self, ws, timeout: float = 15.0):
-        """Wait for a DataTransfer CALL from the server."""
-        ws.settimeout(timeout)
-        try:
-            while True:
-                raw = ws.recv()
-                parsed = json.loads(raw)
-                if parsed[0] == 2 and parsed[2] == "DataTransfer":
-                    return {"message_id": parsed[1], "payload": parsed[3]}
-        except websocket.WebSocketTimeoutException:
-            return None
-
-    def test_post_boot_state_no_transaction(self):
+    def test_post_boot_state_no_transaction(self, sync_client_admin):
         """BootNotification with no active transactions should receive meter-only PostBootState."""
-        charge_point_id = "test-postboot-no-txn"
-        ws = self._connect(charge_point_id)
+        import uuid
 
-        try:
-            self._send_and_recv(ws, "BootNotification", {
+        # Seed station + charger via TestClient HTTP — runs on the same
+        # event loop as the WebSocket request, sharing Tortoise's pool.
+        station_resp = sync_client_admin.post(
+            "/api/admin/stations",
+            json={
+                "name": f"PostBoot Station {uuid.uuid4().hex[:6]}",
+                "latitude": 12.9716,
+                "longitude": 77.5946,
+                "address": "Test Address",
+            },
+        )
+        assert station_resp.status_code == 201, station_resp.text
+        station_id = station_resp.json()["station"]["id"]
+
+        cp_id = f"test-postboot-{uuid.uuid4().hex[:8]}"
+        charger_resp = sync_client_admin.post(
+            "/api/admin/chargers",
+            json={
+                "station_id": station_id,
+                "name": "PostBoot Test Charger",
+                "model": "TestModel",
+                "vendor": "VOLTLYNC",
+                "external_charger_id": cp_id,
+                "connectors": [{"connector_id": 1, "connector_type": "Type2", "max_power_kw": 22.0}],
+            },
+        )
+        assert charger_resp.status_code == 201, charger_resp.text
+        cp_string_id = charger_resp.json()["charger"]["charge_point_string_id"]
+
+        with sync_client_admin.websocket_connect(
+            f"/ocpp/{cp_string_id}", subprotocols=["ocpp1.6"]
+        ) as ws:
+            ws.send_text(json.dumps([2, "boot1", "BootNotification", {
                 "chargePointModel": "TestModel",
                 "chargePointVendor": "VOLTLYNC",
-            }, msg_id="boot1")
+            }]))
 
-            msg = self._wait_for_data_transfer(ws, timeout=10)
+            msg = self._drain_for_data_transfer(ws)
             assert msg is not None, "No DataTransfer received after BootNotification"
 
-            payload = msg["payload"]
+            payload = msg[3]
             assert payload["vendorId"] == "VOLTLYNC"
             assert payload["messageId"] == "PostBootState"
 
@@ -232,7 +243,5 @@ class TestPostBootStateIntegration:
             assert data["hasPendingTransaction"] is False
             assert "lastMeterValueWh" in data
 
-            # Accept it
-            ws.send(json.dumps([3, msg["message_id"], {"status": "Accepted"}]))
-        finally:
-            ws.close()
+            # Accept the DataTransfer CALL
+            ws.send_text(json.dumps([3, msg[1], {"status": "Accepted"}]))

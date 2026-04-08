@@ -45,6 +45,7 @@ export interface Charger {
   created_at: string;
   updated_at: string;
   tariff_per_kwh?: number;
+  tariff_gst_percent?: number;
   latest_error?: LatestErrorInfo;
 }
 
@@ -481,6 +482,7 @@ export interface QRPayment {
   customer_name?: string;
   customer_contact?: string;
   energy_cost?: string;
+  gst_amount?: string;
   platform_fee?: string;
   refund_amount?: string;
   status: QRPaymentStatus;

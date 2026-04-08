@@ -239,6 +239,7 @@ export interface QRTransactionItem {
   status: string;
   energy_consumed_kwh: number | null;
   energy_cost: string | null;
+  gst_amount: string | null;
   platform_fee: string | null;
   refund_amount: string | null;
   charger_name: string | null;

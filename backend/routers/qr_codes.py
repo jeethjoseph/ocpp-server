@@ -228,6 +228,7 @@ async def get_qr_payments(
             "customer_name": p.customer_name,
             "customer_contact": p.customer_contact,
             "energy_cost": str(p.energy_cost) if p.energy_cost else None,
+            "gst_amount": str(p.gst_amount) if p.gst_amount else None,
             "platform_fee": str(p.platform_fee) if p.platform_fee else None,
             "refund_amount": str(p.refund_amount) if p.refund_amount else None,
             "status": p.status.value,

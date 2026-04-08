@@ -374,13 +374,13 @@ export const ChargeScreen = () => {
                   <div className="flex items-center space-x-1 text-blue-900">
                     <IndianRupee className="w-5 h-5" />
                     <span className="text-xl font-bold">
-                      {((latestMeter?.reading_kwh || 0) * (charger.tariff_per_kwh || 0)).toFixed(2)}
+                      {((latestMeter?.reading_kwh || 0) * (charger.tariff_per_kwh || 0) * (1 + (charger.tariff_gst_percent ?? 18) / 100)).toFixed(2)}
                     </span>
                   </div>
                 </div>
                 <p className="text-xs text-blue-700">
                   Wallet will be debited after session ends
-                  {charger.tariff_per_kwh && ` at ₹${charger.tariff_per_kwh}/kWh`}
+                  {charger.tariff_per_kwh && ` at ₹${charger.tariff_per_kwh}/kWh + ${charger.tariff_gst_percent ?? 18}% GST`}
                 </p>
               </div>
             )}

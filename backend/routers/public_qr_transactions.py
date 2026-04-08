@@ -83,6 +83,7 @@ async def get_transactions_by_vpa(
             "status": p.status.value,
             "energy_consumed_kwh": txn.energy_consumed_kwh if txn else None,
             "energy_cost": str(p.energy_cost) if p.energy_cost else None,
+            "gst_amount": str(p.gst_amount) if p.gst_amount else None,
             "platform_fee": str(p.platform_fee) if p.platform_fee else None,
             "refund_amount": str(p.refund_amount) if p.refund_amount else None,
             "charger_name": charger.name if charger else None,

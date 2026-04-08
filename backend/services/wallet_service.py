@@ -11,7 +11,7 @@ from models import (
     Wallet, WalletTransaction, Transaction, Tariff, User,
     TransactionTypeEnum, TransactionStatusEnum, PaymentStatusEnum
 )
-from services.monitoring_service import trace_function, MetricsCollector, SentryHelper
+from services.monitoring_service import trace_function, MetricsCollector, SentryHelper, OCPPMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -19,45 +19,51 @@ class WalletService:
     """Service for handling wallet operations with proper locking and transactions"""
     
     @staticmethod
-    async def get_applicable_tariff(charger_id: int) -> Optional[Decimal]:
+    async def get_applicable_tariff(charger_id: int) -> Optional[Tariff]:
         """
-        Get the applicable tariff rate for a charger.
+        Get the applicable tariff for a charger.
         Priority: Charger-specific tariff -> Global tariff -> None
+        Returns the full Tariff object (rate_per_kwh + gst_percent).
         """
-        # First try to get charger-specific tariff
         charger_tariff = await Tariff.filter(charger_id=charger_id).first()
         if charger_tariff:
-            logger.info(f"Using charger-specific tariff: ₹{charger_tariff.rate_per_kwh}/kWh for charger {charger_id}")
-            return charger_tariff.rate_per_kwh
-        
-        # Fallback to global tariff
+            logger.info(f"Using charger-specific tariff: ₹{charger_tariff.rate_per_kwh}/kWh (GST {charger_tariff.gst_percent}%) for charger {charger_id}")
+            return charger_tariff
+
         global_tariff = await Tariff.filter(is_global=True).first()
         if global_tariff:
-            logger.info(f"Using global tariff: ₹{global_tariff.rate_per_kwh}/kWh for charger {charger_id}")
-            return global_tariff.rate_per_kwh
-        
+            logger.info(f"Using global tariff: ₹{global_tariff.rate_per_kwh}/kWh (GST {global_tariff.gst_percent}%) for charger {charger_id}")
+            return global_tariff
+
         logger.warning(f"No tariff found for charger {charger_id}")
         return None
     
     @staticmethod
-    def calculate_billing_amount(energy_consumed_kwh: float, rate_per_kwh: Decimal) -> Decimal:
+    def calculate_billing_amount(
+        energy_consumed_kwh: float, rate_per_kwh: Decimal, gst_percent: Decimal
+    ) -> Tuple[Decimal, Decimal, Decimal]:
         """
-        Calculate the billing amount with proper rounding to 2 decimal places.
+        Calculate billing with GST added on top of tariff.
+        Returns: (energy_charge, gst_amount, total_billed)
         """
         if energy_consumed_kwh <= 0:
-            return Decimal('0.00')
-        
-        # Convert to Decimal for precise calculation
+            return Decimal('0.00'), Decimal('0.00'), Decimal('0.00')
+
         energy_decimal = Decimal(str(energy_consumed_kwh))
-        
-        # Calculate amount and round to 2 decimal places
-        amount = (energy_decimal * rate_per_kwh).quantize(
-            Decimal('0.01'), 
-            rounding=ROUND_HALF_UP
+
+        energy_charge = (energy_decimal * rate_per_kwh).quantize(
+            Decimal('0.01'), rounding=ROUND_HALF_UP
         )
-        
-        logger.info(f"Calculated billing: {energy_consumed_kwh} kWh × ₹{rate_per_kwh}/kWh = ₹{amount}")
-        return amount
+        gst_amount = (energy_charge * gst_percent / Decimal('100')).quantize(
+            Decimal('0.01'), rounding=ROUND_HALF_UP
+        )
+        total_billed = energy_charge + gst_amount
+
+        logger.info(
+            f"Calculated billing: {energy_consumed_kwh} kWh × ₹{rate_per_kwh}/kWh = ₹{energy_charge} "
+            f"+ GST {gst_percent}% ₹{gst_amount} = ₹{total_billed}"
+        )
+        return energy_charge, gst_amount, total_billed
     
     @staticmethod
     @atomic()
@@ -105,8 +111,8 @@ class WalletService:
                 return True, "No energy consumed - no billing required", Decimal('0.00')
             
             # Get applicable tariff
-            tariff_rate = await WalletService.get_applicable_tariff(transaction.charger_id)
-            if not tariff_rate:
+            tariff = await WalletService.get_applicable_tariff(transaction.charger_id)
+            if not tariff:
                 await Transaction.filter(id=transaction_id).update(
                     transaction_status=TransactionStatusEnum.BILLING_FAILED
                 )
@@ -117,18 +123,23 @@ class WalletService:
                     actor_type="system",
                     changes={"new_status": "BILLING_FAILED", "trigger": "BillingFailed", "reason": "No tariff configuration found"},
                 ))
+                safe_create_task(OCPPMetrics.record_billing_failed(transaction_id, "no_tariff"))
                 return False, "No tariff configuration found", None
-            
-            # Calculate billing amount
-            billing_amount = WalletService.calculate_billing_amount(
-                transaction.energy_consumed_kwh, 
-                tariff_rate
+
+            tariff_rate = tariff.rate_per_kwh
+            gst_percent = tariff.gst_percent
+
+            # Calculate billing amount with GST
+            energy_charge, gst_amount, billing_amount = WalletService.calculate_billing_amount(
+                transaction.energy_consumed_kwh,
+                tariff_rate,
+                gst_percent,
             )
-            
+
             if billing_amount <= 0:
                 logger.info(f"Transaction {transaction_id} calculated amount is ₹0, skipping wallet deduction")
                 return True, "Zero amount - no billing required", Decimal('0.00')
-            
+
             # Get user's wallet with lock
             wallet = await Wallet.filter(user_id=transaction.user_id).select_for_update().first()
             if not wallet:
@@ -142,6 +153,7 @@ class WalletService:
                     actor_type="system",
                     changes={"new_status": "BILLING_FAILED", "trigger": "BillingFailed", "reason": f"Wallet not found for user {transaction.user_id}"},
                 ))
+                safe_create_task(OCPPMetrics.record_billing_failed(transaction_id, "no_wallet"))
                 return False, f"Wallet not found for user {transaction.user_id}", None
             
             # Get current balance (allowing None)
@@ -166,15 +178,26 @@ class WalletService:
                     wallet=wallet,
                     amount=-billing_amount,  # Negative for deduction
                     type=TransactionTypeEnum.CHARGE_DEDUCT,
-                    description=f"Charging session - {transaction.energy_consumed_kwh:.2f} kWh @ ₹{tariff_rate}/kWh",
+                    description=f"Charging session - {transaction.energy_consumed_kwh:.2f} kWh @ ₹{tariff_rate}/kWh + GST {gst_percent}%",
                     charging_transaction=transaction,
                     payment_metadata={
                         "energy_consumed_kwh": transaction.energy_consumed_kwh,
                         "rate_per_kwh": float(tariff_rate),
-                        "calculated_amount": float(billing_amount),
+                        "energy_charge": float(energy_charge),
+                        "gst_percent": float(gst_percent),
+                        "gst_amount": float(gst_amount),
+                        "total_billed": float(billing_amount),
                         "previous_balance": float(current_balance),
                         "new_balance": float(new_balance)
                     }
+                )
+
+                # Store billing breakdown on transaction — inside savepoint so it
+                # rolls back atomically with the wallet deduction if anything fails.
+                await Transaction.filter(id=transaction_id).update(
+                    energy_charge=energy_charge,
+                    gst_amount=gst_amount,
+                    total_billed=billing_amount,
                 )
 
             # Record billing success metrics
@@ -189,6 +212,7 @@ class WalletService:
 
             # Record billing failure metrics
             MetricsCollector.increment_counter("Custom/Billing/Failed")
+            safe_create_task(OCPPMetrics.record_billing_failed(transaction_id, type(e).__name__))
             SentryHelper.capture_exception(e, extra={"transaction_id": transaction_id})
 
             # Mark transaction as billing failed

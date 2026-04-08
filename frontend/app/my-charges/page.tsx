@@ -155,6 +155,12 @@ function TransactionCard({ txn }: { txn: QRTransactionItem }) {
               <span>Energy cost</span>
               <span>{formatINR(txn.energy_cost)}</span>
             </div>
+            {txn.gst_amount && (
+              <div className="flex justify-between text-muted-foreground">
+                <span>GST</span>
+                <span>{formatINR(txn.gst_amount)}</span>
+              </div>
+            )}
             {txn.platform_fee && (
               <div className="flex justify-between text-muted-foreground">
                 <span>Platform fee</span>

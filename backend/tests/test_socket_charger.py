@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models import (
     ChargingStation, Charger, Connector, Transaction, MeterValue,
-    TransactionStatusEnum, User,
+    TransactionStatusEnum, User, ChargerStatusEnum,
 )
 from main import connected_charge_points
 from services.charger_type_service import (
@@ -41,7 +41,7 @@ class TestChargerTypeService:
             charge_point_string_id="socket-charger-1",
             station_id=test_station.id,
             name="Socket Charger",
-            latest_status="AVAILABLE",
+            latest_status=ChargerStatusEnum.AVAILABLE,
         )
         await Connector.create(
             charger_id=charger.id,
@@ -75,7 +75,7 @@ class TestChargerTypeService:
             charge_point_string_id="socket-cached-test",
             station_id=test_station.id,
             name="Socket DB",
-            latest_status="AVAILABLE",
+            latest_status=ChargerStatusEnum.AVAILABLE,
         )
         await Connector.create(
             charger_id=charger.id,
@@ -114,7 +114,7 @@ class TestSocketGracePeriod:
             charge_point_string_id="socket-sn-test",
             station_id=test_station.id,
             name="Socket SN Test",
-            latest_status="CHARGING",
+            latest_status=ChargerStatusEnum.CHARGING,
         )
         await Connector.create(
             charger_id=charger.id,
@@ -291,7 +291,7 @@ class TestSocketRemoteStart:
     """Test remote start status checks for socket vs Type 2 chargers."""
 
     @pytest.mark.asyncio
-    async def test_remote_start_socket_from_available(self, client, test_station, test_user):
+    async def test_remote_start_socket_from_available(self, client_admin, test_station, test_user):
         """Socket charger in Available should allow remote start."""
         charger = await Charger.create(
             charge_point_string_id="socket-rs-test",
@@ -315,18 +315,20 @@ class TestSocketRemoteStart:
             "connector_type": "Socket",
         }
 
-        with patch('routers.chargers.send_ocpp_request', new_callable=AsyncMock) as mock_send, \
+        # send_ocpp_request lives in main.py and is lazy-imported by the chargers
+        # router, so the patch target must be `main.send_ocpp_request`.
+        with patch('main.send_ocpp_request', new_callable=AsyncMock) as mock_send, \
              patch('routers.chargers.is_charger_connected', new_callable=AsyncMock) as mock_connected:
             mock_connected.return_value = True
             mock_send.return_value = (True, {"status": "Accepted"})
 
-            response = await client.post(f"/api/admin/chargers/{charger.id}/remote-start")
+            response = await client_admin.post(f"/api/admin/chargers/{charger.id}/remote-start")
             assert response.status_code == 200
 
         connected_charge_points.pop("socket-rs-test", None)
 
     @pytest.mark.asyncio
-    async def test_remote_start_type2_from_available_fails(self, client, test_charger, test_user):
+    async def test_remote_start_type2_from_available_fails(self, client_admin, test_charger, test_user):
         """Type 2 charger in Available should reject remote start."""
         test_charger.latest_status = "Available"
         await test_charger.save()
@@ -342,7 +344,7 @@ class TestSocketRemoteStart:
         with patch('routers.chargers.is_charger_connected', new_callable=AsyncMock) as mock_connected:
             mock_connected.return_value = True
 
-            response = await client.post(f"/api/admin/chargers/{test_charger.id}/remote-start")
+            response = await client_admin.post(f"/api/admin/chargers/{test_charger.id}/remote-start")
             assert response.status_code == 409
             assert "Preparing" in response.json()["detail"]
 
@@ -356,7 +358,7 @@ class TestCreateSocketCharger:
     """Test creating a charger with Socket connector type."""
 
     @pytest.mark.asyncio
-    async def test_create_charger_with_socket_connector(self, client, test_station):
+    async def test_create_charger_with_socket_connector(self, client_admin, test_station):
         charger_data = {
             "station_id": test_station.id,
             "name": "Socket Charger",
@@ -370,7 +372,7 @@ class TestCreateSocketCharger:
                 }
             ],
         }
-        response = await client.post("/api/admin/chargers", json=charger_data)
+        response = await client_admin.post("/api/admin/chargers", json=charger_data)
         assert response.status_code == 201
 
         data = response.json()

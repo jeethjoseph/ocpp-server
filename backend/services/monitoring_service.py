@@ -469,3 +469,49 @@ class OCPPMetrics:
     async def record_billing_amount(amount: float):
         """Record billing amount"""
         MetricsCollector.record_metric("Custom/OCPP/Billing/Amount", amount)
+
+    @staticmethod
+    async def record_disconnect_suspended(charger_id: str, transaction_id: int):
+        """Record a transaction being suspended due to charger disconnect"""
+        MetricsCollector.increment_counter("Custom/OCPP/Disconnect/Suspended")
+        MetricsCollector.record_event("OCPPDisconnectSuspended", {
+            "charger_id": charger_id,
+            "transaction_id": transaction_id,
+        })
+
+    @staticmethod
+    async def record_disconnect_stopped(charger_id: str, transaction_id: int, energy_kwh: float):
+        """Record a transaction being auto-stopped after disconnect timeout"""
+        MetricsCollector.increment_counter("Custom/OCPP/Disconnect/Stopped")
+        MetricsCollector.record_event("OCPPDisconnectStopped", {
+            "charger_id": charger_id,
+            "transaction_id": transaction_id,
+            "energy_kwh": energy_kwh,
+        })
+
+    @staticmethod
+    async def record_zero_energy_stopped(transaction_id: int, charger_id: str, stalled_seconds: float):
+        """Record a transaction being auto-stopped because energy register stalled"""
+        MetricsCollector.increment_counter("Custom/OCPP/ZeroEnergy/Stopped")
+        MetricsCollector.record_event("OCPPZeroEnergyStopped", {
+            "transaction_id": transaction_id,
+            "charger_id": charger_id,
+            "stalled_seconds": stalled_seconds,
+        })
+
+    @staticmethod
+    async def record_billing_failed(transaction_id: int, reason: str):
+        """Record a billing attempt failure"""
+        MetricsCollector.increment_counter("Custom/OCPP/Billing/Failed")
+        MetricsCollector.record_event("OCPPBillingFailed", {
+            "transaction_id": transaction_id,
+            "reason": reason,
+        })
+
+    @staticmethod
+    async def record_stale_suspended_swept(count: int):
+        """Record startup sweep of orphaned SUSPENDED transactions"""
+        MetricsCollector.increment_counter("Custom/OCPP/Suspended/StaleSwept", value=count)
+        MetricsCollector.record_event("OCPPStaleSuspendedSwept", {
+            "count": count,
+        })

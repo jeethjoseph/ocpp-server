@@ -67,6 +67,7 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 - ✅ **Budget Enforcement** - Real-time budget checking during MeterValues with auto-stop when budget exceeded
 - ✅ **Automated Refunds** - Unused payment balance automatically refunded to customer via Razorpay
 - ✅ **Transaction Resume** - Transactions survive charger reboots via SUSPENDED state with auto-stop timeout
+- ✅ **Disconnect Handler** - Automatic transaction suspension on charger disconnect with configurable timeout and auto-stop billing
 - ✅ **PostBootState Push** - Server pushes meter values and pending transaction state after every charger reboot
 - ✅ **User Experience Features** - Interactive maps, QR scanning, mobile-responsive design
 - ✅ **Scalable Architecture** - Redis-based connection management for horizontal scaling
@@ -347,8 +348,11 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 
 **Methods**:
 - `process_transaction_billing()`: Main billing workflow with atomic database transactions
-- `calculate_billing_amount()`: Energy-based cost calculation (energy_kwh × rate_per_kwh)
-- `deduct_from_wallet()`: Secure balance deduction with SELECT FOR UPDATE locking
+- `calculate_billing_amount()`: Energy-based cost calculation with GST:
+  - `energy_charge = energy_kwh × rate_per_kwh`
+  - `gst_amount = energy_charge × gst_percent / 100` (default 18%)
+  - `total_billed = energy_charge + gst_amount`
+- `deduct_from_wallet()`: Secure balance deduction with SELECT FOR UPDATE locking (deducts `total_billed`)
 - `process_wallet_topup()`: **NEW** - Handle wallet recharge from payment gateway
 
 **Billing Logic**:
@@ -356,6 +360,9 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 if energy_consumed_kwh == 0:
     return (True, "No energy consumed", Decimal('0.00'))
 # Proceed with normal billing for energy > 0
+energy_charge = energy_kwh * rate_per_kwh
+gst_amount = energy_charge * gst_percent / 100   # GST on energy cost only
+total_billed = energy_charge + gst_amount         # Wallet deducts total_billed
 ```
 
 #### Billing Retry Service (`backend/services/billing_retry_service.py`)
@@ -418,7 +425,7 @@ class QRPaymentService:
 **Redis Session Cache**:
 ```
 Key: qr_session:{transaction_id}
-Value: {qr_payment_id, amount_paid, platform_fee, budget_limit, tariff_rate, start_meter_kwh, charger_id}
+Value: {qr_payment_id, amount_paid, platform_fee, budget_limit, tariff_rate, gst_percent, start_meter_kwh, charger_id}
 TTL: 86400 seconds (24 hours)
 ```
 
@@ -557,6 +564,114 @@ await start_data_retention_service(
 - Logs cleanup operations with record counts
 - Error handling with retry logic (1 hour retry interval on failure)
 - Graceful shutdown on service stop
+
+#### Disconnect Handler (`backend/services/disconnect_handler.py`)
+**Purpose**: Manages transaction suspension and auto-stop when a charger disconnects unexpectedly (power failure, network loss)
+
+**Key Functions**:
+```python
+async def suspend_transactions_on_disconnect(charge_point_id: str) -> None
+    """Called by ConnectionManager on charger disconnect. Suspends all active
+    transactions (RUNNING, STARTED, PENDING_START, PENDING_STOP) and starts
+    a configurable timeout for each."""
+
+async def sweep_stale_suspended_transactions() -> None
+    """Safety net called once at server startup. Finds SUSPENDED transactions
+    older than the max timeout and auto-stops them (covers server restarts
+    where in-memory timeout tasks were lost)."""
+```
+
+**Disconnect Flow**:
+1. Heartbeat monitor detects charger silence (120s inactivity)
+2. `ConnectionManager.force_disconnect()` fires registered callbacks
+3. `suspend_transactions_on_disconnect()` sets all active transactions to SUSPENDED, records `suspended_at`
+4. Starts a `DISCONNECT_SUSPEND_TIMEOUT` (default 180s) timer per transaction
+5. **If charger reconnects** (BootNotification): timeout is invalidated via CAS guard (`suspended_at` comparison), and a new resume window starts
+6. **If timeout expires**: transaction is auto-stopped with `stop_reason=DISCONNECT_TIMEOUT`, energy is calculated from the last MeterValue, and billing is processed
+
+**Auto-Stop Billing** — delegated to `transaction_finalizer.finalize_stopped_transaction` (see below):
+- Calculates energy from the last `MeterValue` record
+- Processes wallet billing via `WalletService.process_transaction_billing()`
+- Processes QR payment billing/refund via `QRPaymentService`
+- Sets `BILLING_FAILED` status if billing errors occur
+- Skips billing for zero-energy sessions
+- Cleans up zero-energy redis state and pathological-flap counter
+
+**CAS Guard for Timeout Safety**:
+The disconnect timeout task uses a Compare-And-Swap pattern: it only acts if the transaction is still SUSPENDED with the same `suspended_at` timestamp. When BootNotification resets `suspended_at`, the old timeout becomes a no-op.
+
+**Pathological-Flap Detection** (W5):
+A naive disconnect cap would falsely terminate legitimate long sessions on flaky cellular sites (overnight charging on grid that drops every hour). Instead, the disconnect handler tracks **consecutive disconnects without energy progress** via an in-memory dict `_disconnect_reset_count[txn_id]`. The counter is:
+- Initialized to 0 on first disconnect-suspend
+- Incremented on every BootNotification reset of `suspended_at` (in `main.py` BootNotification handler)
+- Zeroed by `zero_energy_watchdog.check_zero_energy` whenever MeterValues show real energy advancing
+- Popped from the dict on transaction finalization
+
+If the counter reaches `MAX_RESETS_WITHOUT_PROGRESS` (default 3), BootNotification stops resetting `suspended_at` and lets the existing timer fire. This caps the worst-case stuck-time at `3 × DISCONNECT_SUSPEND_TIMEOUT_SECONDS` for genuinely broken sessions while allowing healthy long sessions to flap freely.
+
+**Configuration**:
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `DISCONNECT_SUSPEND_TIMEOUT_SECONDS` | 180 | Seconds to wait after disconnect before auto-stopping |
+| `SUSPEND_TIMEOUT_SECONDS` | 300 | Resume window after BootNotification resets the timeout |
+| `MAX_DISCONNECT_RESETS_WITHOUT_PROGRESS` | 3 | Max BootNotification resets allowed without energy progress |
+
+**Integration Points**:
+- `ConnectionManager.register_on_disconnect()` -- wires up the callback
+- `main.py` startup -- calls `sweep_stale_suspended_transactions()`
+- `on_boot_notification()` -- resets `suspended_at` for already-SUSPENDED transactions (with W5 cap)
+
+#### Transaction Finalizer (`backend/services/transaction_finalizer.py`)
+**Purpose**: Single source of truth for stopping a transaction that timed out (rather than being stopped by a normal StopTransaction OCPP message). Replaces duplicated stop-and-bill logic that previously lived in `main.py:_suspend_timeout` and `disconnect_handler._stop_and_bill_transaction`.
+
+**Public API**:
+```python
+async def finalize_stopped_transaction(
+    transaction: Transaction,
+    stop_reason: str,
+) -> None
+```
+
+**Idempotent**: a transaction already in STOPPED / COMPLETED / BILLING_FAILED / FAILED is a no-op.
+
+**Sequence**:
+1. Calculate final energy from the latest `MeterValue`
+2. Mark `transaction_status = STOPPED`, set `end_time` and `stop_reason`
+3. Audit-log the transition
+4. Record `OCPPDisconnectStopped` metric if `stop_reason == "DISCONNECT_TIMEOUT"`
+5. Process wallet billing (skip if zero energy)
+6. Process QR billing/refund
+7. Clean up zero-energy redis state
+8. Pop the disconnect-flap counter
+
+**Used by**:
+- `main.py:ChargePoint._suspend_timeout` (BootNotification suspend timeout, stop_reason=`SUSPENDED_TIMEOUT`)
+- `disconnect_handler._disconnect_suspend_timeout` (disconnect timeout, stop_reason=`DISCONNECT_TIMEOUT`)
+- `disconnect_handler.sweep_stale_suspended_transactions` (startup safety net, stop_reason=`STALE_SUSPEND_SWEEP`)
+
+#### Zero-Energy Watchdog (`backend/services/zero_energy_watchdog.py`)
+**Purpose**: Auto-stop charging sessions where energy register has stalled. Detects vehicle BMS issues, charger meter regressions, and stuck handshakes.
+
+**Operation**:
+- Hooked into `MeterValues` handler
+- Tracks per-transaction state in Redis (`zero_energy:{txn_id}`)
+- Skips check during initial grace period (`ZERO_ENERGY_GRACE_PERIOD_SECONDS`, default 60s)
+- If energy hasn't advanced for `ZERO_ENERGY_TIMEOUT_SECONDS` (default 120s), schedules `RemoteStopTransaction`
+- **W5 hook**: when energy advances, also pops `disconnect_handler._disconnect_reset_count` for the transaction (zeros the flap counter)
+
+**Cleanup**: `clear_zero_energy_tracking(transaction_id)` is called from `transaction_finalizer.finalize_stopped_transaction`, ensuring state is removed on every stop path.
+
+**Redis TTL**: 7200 seconds (2h) — well above the longest plausible session, bounded leak in case of missed cleanup.
+
+#### Operational Runbooks (`docs/runbooks/`)
+**Purpose**: Single source of truth for on-call triage. Each runbook is linked from a New Relic alert condition via `runbook_url`, so the on-call engineer gets a one-click path from page → triage steps.
+
+**Runbooks**:
+- `stale-suspended-transactions.md` — `OCPPStaleSuspendedSwept` event at startup
+- `disconnect-stop-spike.md` — surge in `OCPPDisconnectStopped` events
+- `zero-energy-stop-spike.md` — surge in `OCPPZeroEnergyStopped` events
+
+All runbooks follow the same H2 structure (Symptom / What it means / When it's normal / Triage / Mitigation / What NOT to do / Customer impact / Escalation / Related). Triage steps are copy-pasteable docker/psql/NRQL commands tailored to the EC2 + Docker Compose deployment.
 
 ### Infrastructure Components
 
@@ -1290,19 +1405,20 @@ The QR-based appless charging feature enables customers to charge their EV by sc
 #### Step 6: Transaction Linking (`on_start_transaction`)
 - When charger sends `StartTransaction`, backend calls `link_transaction_to_qr_payment()`
 - Links `transaction_id` to `QRPayment`, sets status=CHARGING
-- **Caches session in Redis** (`qr_session:{transaction_id}`) with budget_limit, tariff_rate, start_meter
+- **Caches session in Redis** (`qr_session:{transaction_id}`) with budget_limit, tariff_rate, gst_percent, start_meter
 
 #### Step 7: Budget Enforcement (`on_meter_values`)
 - On each `MeterValues`, calls `check_budget_and_auto_stop()`
 - Retrieves session from Redis (or rebuilds from DB on cache miss)
-- Calculates: `cost = (reading_kwh - start_meter) × tariff_rate`
+- Calculates: `cost = (reading_kwh - start_meter) × tariff_rate × (1 + gst_percent/100)` (cost now includes GST)
 - **If cost >= budget_limit**: Schedules `RemoteStopTransaction` as `asyncio.create_task()` (non-blocking to avoid deadlock)
 
 #### Step 8: Billing & Refund (`on_stop_transaction`)
 - Calls `process_qr_session_billing(transaction_id)`
 - Calculates: `energy_cost = energy_consumed × tariff_rate`
+- Calculates: `gst_amount = energy_cost × gst_percent / 100` (GST on energy cost only)
 - Calculates: `platform_fee = amount_paid × 2%` (configurable)
-- Calculates: `refund = amount_paid - energy_cost - platform_fee`
+- Calculates: `refund = amount_paid - energy_cost - gst_amount - platform_fee`
 - **If refund >= ₹1.0**: Issues partial refund via Razorpay, sets status=REFUNDED
 - **If refund < ₹1.0**: Absorbed as operator credit, sets status=COMPLETED
 - Deletes Redis session cache
@@ -1443,6 +1559,17 @@ CREATE TABLE charger (
     firmware_version VARCHAR(100),
     latest_status ChargerStatusEnum NOT NULL,  -- OCPP 1.6 statuses
     last_heart_beat_time TIMESTAMP,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Tariff configuration per charger
+-- Defined in: backend/models.py (Tariff)
+CREATE TABLE tariff (
+    id SERIAL PRIMARY KEY,
+    charger_id INTEGER REFERENCES charger(id),
+    rate_per_kwh DECIMAL(10, 2) NOT NULL,
+    gst_percent DECIMAL(5, 2) DEFAULT 18.00,  -- GST percentage applied on energy cost
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
@@ -1587,6 +1714,7 @@ CREATE TABLE qr_payment (
     customer_name VARCHAR(255),                          -- Payer name from Razorpay
     customer_contact VARCHAR(255),                       -- Phone number from webhook
     energy_cost DECIMAL(10,2),                           -- Calculated after charging
+    gst_amount DECIMAL(10,2),                            -- GST on energy_cost (18% default)
     platform_fee DECIMAL(10,2),                          -- Razorpay fee (2% default)
     refund_amount DECIMAL(10,2),                         -- Amount refunded to customer
     razorpay_refund_id VARCHAR(255),                     -- Refund transaction ID
@@ -1625,6 +1753,9 @@ CREATE TABLE transaction (
     start_meter_kwh DECIMAL(10, 3),
     end_meter_kwh DECIMAL(10, 3),
     energy_consumed_kwh DECIMAL(10, 3),
+    energy_charge DECIMAL(10, 2),       -- energy_kwh × rate_per_kwh
+    gst_amount DECIMAL(10, 2),          -- GST on energy_charge (18% default)
+    total_billed DECIMAL(10, 2),        -- energy_charge + gst_amount
     start_time TIMESTAMP DEFAULT NOW(),
     end_time TIMESTAMP,
     stop_reason VARCHAR(50),
@@ -1717,7 +1848,7 @@ async def on_boot_notification(self, charge_point_vendor, charge_point_model, **
 - Validates charger registration in database
 - Sets 30-second heartbeat interval
 - Updates charger firmware_version, vendor, model from BootNotification payload
-- **Transaction Suspend/Resume**: Ongoing transactions are marked SUSPENDED (not FAILED) on reboot. A background `_suspend_timeout` task auto-stops the transaction after `SUSPEND_TIMEOUT_SECONDS` (default 300s) if the charger doesn't resume, with full wallet billing + QR payment billing/refund
+- **Transaction Suspend/Resume**: On disconnect, `disconnect_handler.py` suspends active transactions with a 180s timeout (`DISCONNECT_SUSPEND_TIMEOUT_SECONDS`). On BootNotification, already-SUSPENDED transactions get their timeout reset (CAS guard invalidates old timeout), and a new 300s resume window starts (`SUSPEND_TIMEOUT_SECONDS`). Still-active transactions (edge case) are suspended as before. Auto-stop with billing + QR refund on timeout expiry
 - Resume fields tracked: `suspended_at`, `resumed_at`, `resume_count`
 - Comprehensive connection logging
 
@@ -2001,6 +2132,7 @@ curl https://server.com/api/firmware/latest
 - **Timeout**: 120 seconds of inactivity
 - **Check Frequency**: Every 15 seconds
 - **Cleanup Trigger**: Automatic dead connection removal with `force_disconnect()`
+- **Disconnect Callbacks**: `force_disconnect()` fires registered callbacks (e.g. transaction suspension) via `register_on_disconnect()`
 - **Periodic Cleanup**: Every 5 minutes, scans all connections for staleness
 
 #### Connection Validation
@@ -3494,6 +3626,53 @@ async def test_availability_changes():
             await simulator.send_status_notification(new_status)
 ```
 
+#### Disconnect/Power Failure Simulator (`backend/simulators/ocpp_simulator_disconnect.py`)
+**Purpose**: Synchronous websocket-based simulator for testing charger disconnect and transaction suspend/resume scenarios
+
+**Architecture**: Uses the `websocket-client` library (synchronous) rather than `websockets` (async) for simpler sequential test flows. Manages message routing between client CALLs and server-initiated CALLs (RemoteStartTransaction, DataTransfer).
+
+**Test Modes**:
+
+| Mode | Flag | Behavior | Expected Outcome |
+|------|------|----------|-----------------|
+| No Reconnect | `--test-no-reconnect` | Disconnects mid-charge, never reconnects | Transaction: SUSPENDED -> STOPPED after ~180s timeout |
+| Reconnect | `--test-reconnect` | Disconnects mid-charge, reconnects after `--reconnect-delay` seconds | Transaction: SUSPENDED -> timeout reset on BootNotification -> PostBootState -> resume charging |
+| No Transaction | `--test-no-transaction` | Disconnects with no active transaction | Clean disconnect, no transaction changes |
+
+**Reconnect Flow**:
+1. Connects, sends BootNotification, waits for RemoteStartTransaction from server
+2. Charges for 30s with periodic MeterValues and Heartbeats
+3. Kills TCP connection (simulates power failure -- no WebSocket close frame)
+4. Waits `--reconnect-delay` seconds, then reconnects
+5. Sends BootNotification, receives PostBootState DataTransfer
+6. Parses `hasPendingTransaction` from PostBootState
+7. If pending: resumes charging with Preparing -> Charging -> MeterValues -> StopTransaction
+8. If not pending (timeout already expired): sends Available status
+
+**Key Implementation Details**:
+- `disconnect_hard()`: Closes raw TCP socket without WebSocket close frame to simulate power failure
+- `_wait_for_remote_start()`: Polls for server-initiated RemoteStartTransaction, sending heartbeats while waiting
+- `_pending_server_calls`: Queue for server CALLs that arrive while waiting for a CALLRESULT
+- PostBootState parsing: Reads `hasPendingTransaction`, `transactionId`, and `lastMeterValueWh` to resume from correct meter reading
+
+**Usage**:
+```bash
+# Never reconnect (test full timeout flow)
+python ocpp_simulator_disconnect.py --charger-id <id> --test-no-reconnect
+
+# Reconnect within timeout window (60s)
+python ocpp_simulator_disconnect.py --charger-id <id> --test-reconnect --reconnect-delay 60
+
+# Reconnect after timeout expires (200s > 180s disconnect timeout)
+python ocpp_simulator_disconnect.py --charger-id <id> --test-reconnect --reconnect-delay 200
+
+# Disconnect with no active transaction
+python ocpp_simulator_disconnect.py --charger-id <id> --test-no-transaction
+
+# Against production
+python ocpp_simulator_disconnect.py --charger-id <id> --server wss://app.voltlync.com --test-reconnect
+```
+
 ### Test Configuration & Execution
 
 #### Pytest Configuration (`backend/pyproject.toml`)
@@ -4046,8 +4225,9 @@ RAZORPAY_KEY_ID=rzp_live_...
 RAZORPAY_KEY_SECRET=...
 RAZORPAY_PLATFORM_FEE_PERCENT=2.0
 
-# Transaction Resume
-SUSPEND_TIMEOUT_SECONDS=300
+# Transaction Suspend/Resume
+DISCONNECT_SUSPEND_TIMEOUT_SECONDS=180  # Timeout after charger disconnect (before marking STOPPED)
+SUSPEND_TIMEOUT_SECONDS=300              # Timeout after BootNotification (resume window)
 
 # Monitoring
 SENTRY_ENABLED=true
@@ -4288,16 +4468,24 @@ CORS_ORIGINS = [
 - Connection manager refactored to `core/connection_manager.py`
 - Monitoring service: `services/monitoring_service.py`
 
-**4. Transaction Suspend/Resume**
-- **Feature**: Charging transactions survive charger reboots instead of being lost
+**4. Transaction Suspend/Resume + Disconnect Handling**
+- **Feature**: Charging transactions survive charger reboots and power failures instead of being lost
 - **Implementation**:
-  - BootNotification marks ongoing transactions as SUSPENDED (not FAILED)
-  - Background `_suspend_timeout` task auto-stops after `SUSPEND_TIMEOUT_SECONDS` (default 300s) if charger doesn't resume
+  - **Disconnect handler** (`services/disconnect_handler.py`): When charger disconnects (heartbeat timeout), active transactions are immediately SUSPENDED with a 180s timeout. If charger doesn't reconnect, transactions are STOPPED with billing + QR refund.
+  - **BootNotification**: Already-SUSPENDED transactions get their timeout reset (CAS guard invalidates old disconnect timeout), and a new 300s resume window starts. Still-active transactions (edge case) are suspended as before.
+  - **Startup sweep**: `sweep_stale_suspended_transactions()` catches orphaned SUSPENDED transactions from server restarts.
   - DataTransfer `GetLastMeterValue` handler allows charger to request last meter reading for seamless resume
   - Transaction model extended with `suspended_at`, `resumed_at`, `resume_count` fields
   - Auto-stop processes full wallet billing + QR payment billing/refund
+  - ConnectionManager `register_on_disconnect()` callback hook fires on `force_disconnect()`
 - **Migration**: `8_20260305050220_add_transaction_resume_fields.py`
-- **Configuration**: `SUSPEND_TIMEOUT_SECONDS` environment variable (default 300)
+- **Configuration**: `DISCONNECT_SUSPEND_TIMEOUT_SECONDS` (default 180), `SUSPEND_TIMEOUT_SECONDS` (default 300)
+- **Files Added**:
+  - `backend/services/disconnect_handler.py` - Transaction suspension, timeout, auto-stop with billing
+  - `backend/simulators/ocpp_simulator_disconnect.py` - Synchronous simulator with 3 test modes (no-reconnect, reconnect, no-transaction)
+- **Files Modified**:
+  - `backend/core/connection_manager.py` - `register_on_disconnect()` callback hook, `force_disconnect()` fires callbacks
+  - `backend/main.py` - Startup wiring for disconnect callback + `sweep_stale_suspended_transactions()`
 
 **5. StopTransaction Reason Sanitization**
 - **Feature**: Prevents OCPP validation rejection when charger firmware sends non-standard stop reason values

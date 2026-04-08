@@ -14,6 +14,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - ocpp-network-prod
     restart: always
@@ -38,6 +43,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - ocpp-network-prod
     restart: always
@@ -80,7 +90,10 @@ services:
       - MINIMUM_REFUND_AMOUNT=${MINIMUM_REFUND_AMOUNT:-1.0}
       - QR_PAYMENT_PENDING_TIMEOUT=${QR_PAYMENT_PENDING_TIMEOUT:-300}
       # OCPP & Server Tuning
+      - DISCONNECT_SUSPEND_TIMEOUT_SECONDS=${DISCONNECT_SUSPEND_TIMEOUT_SECONDS:-180}
       - SUSPEND_TIMEOUT_SECONDS=${SUSPEND_TIMEOUT_SECONDS:-300}
+      - ZERO_ENERGY_TIMEOUT_SECONDS=${ZERO_ENERGY_TIMEOUT_SECONDS:-120}
+      - ZERO_ENERGY_GRACE_PERIOD_SECONDS=${ZERO_ENERGY_GRACE_PERIOD_SECONDS:-60}
       - OCPP_TIMEOUT=${OCPP_TIMEOUT:-120}
       - RETENTION_DAYS=${RETENTION_DAYS:-90}
       - CLEANUP_INTERVAL_HOURS=${CLEANUP_INTERVAL_HOURS:-24}
@@ -107,6 +120,11 @@ services:
       timeout: 10s
       start_period: 40s
       retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     networks:
       - ocpp-network-prod
     restart: always
@@ -145,6 +163,11 @@ services:
       timeout: 10s
       start_period: 30s
       retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - ocpp-network-prod
     restart: always
@@ -181,6 +204,11 @@ services:
       timeout: 10s
       start_period: 10s
       retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - ocpp-network-prod
     restart: always
@@ -193,6 +221,11 @@ services:
       - certbot_conf_prod:/etc/letsencrypt
       - certbot_www_prod:/var/www/certbot
     entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
     networks:
       - ocpp-network-prod
     restart: always

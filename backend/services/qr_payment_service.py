@@ -394,7 +394,9 @@ class QRPaymentService:
         await qr_payment.save()
 
         # Cache session data in Redis for MeterValues budget check
-        tariff_rate = await WalletService.get_applicable_tariff(charger_id)
+        tariff = await WalletService.get_applicable_tariff(charger_id)
+        tariff_rate = tariff.rate_per_kwh if tariff else Decimal('0')
+        gst_percent = tariff.gst_percent if tariff else Decimal('18')
         platform_fee = (qr_payment.amount_paid * RAZORPAY_PLATFORM_FEE_PERCENT / 100).quantize(
             Decimal('0.01'), rounding=ROUND_HALF_UP
         )
@@ -407,7 +409,8 @@ class QRPaymentService:
             "amount_paid": float(qr_payment.amount_paid),
             "platform_fee": float(platform_fee),
             "budget_limit": budget_limit,
-            "tariff_rate": float(tariff_rate) if tariff_rate else 0,
+            "tariff_rate": float(tariff_rate),
+            "gst_percent": float(gst_percent),
             "start_meter_kwh": transaction.start_meter_kwh if transaction else 0,
             "charger_id": charger_id,
         }
@@ -431,7 +434,9 @@ class QRPaymentService:
                 return  # Not a QR session
 
             # Rebuild cache
-            tariff_rate = await WalletService.get_applicable_tariff(qr_payment.charger_id)
+            tariff = await WalletService.get_applicable_tariff(qr_payment.charger_id)
+            tariff_rate = tariff.rate_per_kwh if tariff else Decimal('0')
+            gst_percent = tariff.gst_percent if tariff else Decimal('18')
             platform_fee = (qr_payment.amount_paid * RAZORPAY_PLATFORM_FEE_PERCENT / 100).quantize(
                 Decimal('0.01'), rounding=ROUND_HALF_UP
             )
@@ -443,7 +448,8 @@ class QRPaymentService:
                 "amount_paid": float(qr_payment.amount_paid),
                 "platform_fee": float(platform_fee),
                 "budget_limit": budget_limit,
-                "tariff_rate": float(tariff_rate) if tariff_rate else 0,
+                "tariff_rate": float(tariff_rate),
+                "gst_percent": float(gst_percent),
                 "start_meter_kwh": transaction.start_meter_kwh if transaction else 0,
                 "charger_id": qr_payment.charger_id,
             }
@@ -451,18 +457,20 @@ class QRPaymentService:
 
         budget_limit = session["budget_limit"]
         tariff_rate = session["tariff_rate"]
+        gst_percent = session.get("gst_percent", 18.0)
         start_meter = session["start_meter_kwh"]
 
         if tariff_rate <= 0:
             return
 
         energy_consumed = reading_kwh - start_meter
-        cost = energy_consumed * tariff_rate
+        gst_multiplier = 1 + (gst_percent / 100)
+        cost = energy_consumed * tariff_rate * gst_multiplier
         remaining = budget_limit - cost
 
         logger.info(
             f"QR budget check txn {transaction_id}: "
-            f"energy={energy_consumed:.3f}kWh, cost=₹{cost:.2f}, "
+            f"energy={energy_consumed:.3f}kWh, cost=₹{cost:.2f} (incl GST {gst_percent}%), "
             f"budget=₹{budget_limit:.2f}, remaining=₹{remaining:.2f}"
         )
 
@@ -515,29 +523,43 @@ class QRPaymentService:
             return
 
         energy_kwh = transaction.energy_consumed_kwh or 0
-        tariff_rate = await WalletService.get_applicable_tariff(qr_payment.charger_id)
+        tariff = await WalletService.get_applicable_tariff(qr_payment.charger_id)
+        tariff_rate = tariff.rate_per_kwh if tariff else Decimal('0')
+        gst_percent = tariff.gst_percent if tariff else Decimal('18')
 
         if tariff_rate:
             energy_cost = (Decimal(str(energy_kwh)) * tariff_rate).quantize(
                 Decimal('0.01'), rounding=ROUND_HALF_UP
             )
+            gst_amount = (energy_cost * gst_percent / Decimal('100')).quantize(
+                Decimal('0.01'), rounding=ROUND_HALF_UP
+            )
         else:
             energy_cost = Decimal('0.00')
+            gst_amount = Decimal('0.00')
 
         platform_fee = (qr_payment.amount_paid * RAZORPAY_PLATFORM_FEE_PERCENT / 100).quantize(
             Decimal('0.01'), rounding=ROUND_HALF_UP
         )
 
-        refund = max(Decimal('0'), qr_payment.amount_paid - energy_cost - platform_fee)
+        refund = max(Decimal('0'), qr_payment.amount_paid - energy_cost - gst_amount - platform_fee)
 
         qr_payment.energy_cost = energy_cost
+        qr_payment.gst_amount = gst_amount
         qr_payment.platform_fee = platform_fee
         qr_payment.status = QRPaymentStatusEnum.COMPLETED
+
+        # Store billing breakdown on transaction
+        await Transaction.filter(id=transaction_id).update(
+            energy_charge=energy_cost,
+            gst_amount=gst_amount,
+            total_billed=energy_cost + gst_amount,
+        )
 
         logger.info(
             f"QR billing for txn {transaction_id}: "
             f"paid=₹{qr_payment.amount_paid}, energy_cost=₹{energy_cost}, "
-            f"platform_fee=₹{platform_fee}, refund=₹{refund}"
+            f"GST({gst_percent}%)=₹{gst_amount}, platform_fee=₹{platform_fee}, refund=₹{refund}"
         )
 
         if refund >= MINIMUM_REFUND_AMOUNT:
@@ -570,6 +592,7 @@ class QRPaymentService:
             actor_type="system",
             changes={
                 "energy_cost": float(energy_cost),
+                "gst_amount": float(gst_amount),
                 "platform_fee": float(platform_fee),
                 "refund_amount": float(qr_payment.refund_amount or 0),
                 "status": qr_payment.status.value,

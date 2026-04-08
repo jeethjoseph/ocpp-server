@@ -60,6 +60,7 @@ class ChargerResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     tariff_per_kwh: Optional[float] = None
+    tariff_gst_percent: Optional[float] = None
     latest_error: Optional[LatestErrorInfo] = None
 
     class Config:
@@ -336,7 +337,8 @@ async def get_charger_details(charger_id: int, user: User = Depends(require_user
 
     # Get applicable tariff for this charger
     from services.wallet_service import WalletService
-    tariff_rate = await WalletService.get_applicable_tariff(charger_id)
+    tariff = await WalletService.get_applicable_tariff(charger_id)
+    tariff_rate = tariff.rate_per_kwh if tariff else None
 
     # Get current active transaction if any
     current_transaction = await Transaction.filter(
@@ -369,6 +371,7 @@ async def get_charger_details(charger_id: int, user: User = Depends(require_user
     charger_response = charger_to_response(charger, connection_status, latest_error)
     charger_dict = charger_response.model_dump()
     charger_dict['tariff_per_kwh'] = float(tariff_rate) if tariff_rate else None
+    charger_dict['tariff_gst_percent'] = float(tariff.gst_percent) if tariff else None
 
     # Build response
     response = ChargerDetailResponse(
