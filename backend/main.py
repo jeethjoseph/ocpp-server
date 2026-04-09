@@ -267,57 +267,8 @@ class ChargePoint(OcppChargePoint):
                 now = datetime.datetime.now(datetime.timezone.utc)
                 logger.warning(f"⚠️ BootNotification from {self.id} — handling {len(ongoing_transactions)} ongoing transaction(s)")
 
-                from services.disconnect_handler import (
-                    _disconnect_reset_count,
-                    MAX_RESETS_WITHOUT_PROGRESS,
-                )
-
                 for transaction in ongoing_transactions:
-                    previous_status = transaction.transaction_status
-
-                    if previous_status == TransactionStatusEnum.SUSPENDED:
-                        # Already suspended from disconnect — would normally reset
-                        # timeout window. Pathological-flap guard (W5): if we've
-                        # already reset this txn's suspended_at
-                        # MAX_RESETS_WITHOUT_PROGRESS times without any energy
-                        # progress in between, do NOT reset — let the existing
-                        # timer fire and finalize the transaction.
-                        count = _disconnect_reset_count.get(transaction.id, 0)
-                        if count >= MAX_RESETS_WITHOUT_PROGRESS:
-                            logger.warning(
-                                f"Transaction {transaction.id}: {count} consecutive "
-                                f"BootNotification resets without energy progress — "
-                                f"letting existing timer fire"
-                            )
-                            continue
-                        transaction.suspended_at = now
-                        await transaction.save()
-                        _disconnect_reset_count[transaction.id] = count + 1
-                        logger.info(
-                            f"⏸️ Transaction {transaction.id} already SUSPENDED — "
-                            f"resetting timeout for resume (reset count={count + 1})"
-                        )
-                    else:
-                        # Edge case: still active when BootNotification arrives
-                        transaction.transaction_status = TransactionStatusEnum.SUSPENDED
-                        transaction.suspended_at = now
-                        await transaction.save()
-                        logger.info(f"⏸️ Suspended transaction {transaction.id} (was {previous_status}) due to charger reboot")
-
-                    safe_create_task(log_audit_event(
-                        action="transaction.suspended",
-                        entity_type="transaction",
-                        entity_id=transaction.id,
-                        actor_type="system",
-                        changes={
-                            "previous_status": str(previous_status),
-                            "new_status": "SUSPENDED",
-                            "trigger": "BootNotification",
-                        },
-                    ))
-
-                    # Start resume timeout — will auto-stop if charger doesn't resume
-                    safe_create_task(self._suspend_timeout(transaction.id, now, SUSPEND_TIMEOUT_SECONDS))
+                    await self._handle_ongoing_transaction_on_boot(transaction, now)
         except Exception as e:
             logger.error(f"Error handling transactions on BootNotification for {self.id}: {e}", exc_info=True)
 
@@ -402,6 +353,99 @@ class ChargePoint(OcppChargePoint):
         if last_txn and last_txn.end_meter_kwh:
             return int(round(last_txn.end_meter_kwh * 1000))
         return 0
+
+    async def _handle_ongoing_transaction_on_boot(self, transaction, now: datetime.datetime) -> None:
+        """
+        Process a single ongoing transaction during BootNotification.
+
+        Decides between:
+        - Refuse + finalize (gap is too stale — defense-in-depth guard)
+        - Reset suspended_at (already-SUSPENDED, normal flap)
+        - Skip without action (already-SUSPENDED, pathological flap)
+        - Suspend a still-running txn (edge case: disconnect handler missed it)
+
+        Then audit-logs and schedules the suspend timer when applicable.
+        Extracted from on_boot_notification for testability.
+        """
+        from services.transaction_finalizer import (
+            is_resume_too_stale,
+            finalize_stopped_transaction,
+        )
+        from services.disconnect_handler import (
+            _disconnect_reset_count,
+            MAX_RESETS_WITHOUT_PROGRESS,
+        )
+
+        previous_status = transaction.transaction_status
+
+        # Staleness guard — applies to both branches below. Catches the case
+        # where suspend_transactions_on_disconnect failed to run, OR where its
+        # _disconnect_suspend_timeout task died (process restart) before firing.
+        is_stale, gap = await is_resume_too_stale(transaction)
+        if is_stale:
+            logger.warning(
+                f"⏰ Refusing to resume stale transaction {transaction.id} on "
+                f"BootNotification (was {previous_status}) — gap={gap:.0f}s"
+            )
+            safe_create_task(log_audit_event(
+                action="transaction.resume_blocked",
+                entity_type="transaction",
+                entity_id=transaction.id,
+                actor_type="system",
+                changes={
+                    "previous_status": str(previous_status),
+                    "trigger": "BootNotification",
+                    "gap_seconds": gap,
+                    "reason": "STALE_RECONNECT",
+                },
+            ))
+            await finalize_stopped_transaction(transaction, "STALE_RECONNECT")
+            _disconnect_reset_count.pop(transaction.id, None)
+            return
+
+        if previous_status == TransactionStatusEnum.SUSPENDED:
+            # Already suspended from disconnect — would normally reset
+            # timeout window. Pathological-flap guard (W5): if we've
+            # already reset this txn's suspended_at
+            # MAX_RESETS_WITHOUT_PROGRESS times without any energy
+            # progress in between, do NOT reset — let the existing
+            # timer fire and finalize the transaction.
+            count = _disconnect_reset_count.get(transaction.id, 0)
+            if count >= MAX_RESETS_WITHOUT_PROGRESS:
+                logger.warning(
+                    f"Transaction {transaction.id}: {count} consecutive "
+                    f"BootNotification resets without energy progress — "
+                    f"letting existing timer fire"
+                )
+                return
+            transaction.suspended_at = now
+            await transaction.save()
+            _disconnect_reset_count[transaction.id] = count + 1
+            logger.info(
+                f"⏸️ Transaction {transaction.id} already SUSPENDED — "
+                f"resetting timeout for resume (reset count={count + 1})"
+            )
+        else:
+            # Edge case: still active when BootNotification arrives
+            transaction.transaction_status = TransactionStatusEnum.SUSPENDED
+            transaction.suspended_at = now
+            await transaction.save()
+            logger.info(f"⏸️ Suspended transaction {transaction.id} (was {previous_status}) due to charger reboot")
+
+        safe_create_task(log_audit_event(
+            action="transaction.suspended",
+            entity_type="transaction",
+            entity_id=transaction.id,
+            actor_type="system",
+            changes={
+                "previous_status": str(previous_status),
+                "new_status": "SUSPENDED",
+                "trigger": "BootNotification",
+            },
+        ))
+
+        # Start resume timeout — will auto-stop if charger doesn't resume
+        safe_create_task(self._suspend_timeout(transaction.id, now, SUSPEND_TIMEOUT_SECONDS))
 
     async def _suspend_timeout(self, transaction_id: int, original_suspended_at, timeout_seconds: int = 300):
         """Auto-stop a SUSPENDED transaction if the charger doesn't resume it in time."""
@@ -879,6 +923,30 @@ class ChargePoint(OcppChargePoint):
 
             # Auto-resume SUSPENDED transactions on MeterValues receipt
             if transaction.transaction_status == TransactionStatusEnum.SUSPENDED:
+                from services.transaction_finalizer import (
+                    is_resume_too_stale,
+                    finalize_stopped_transaction,
+                )
+                is_stale, gap = await is_resume_too_stale(transaction)
+                if is_stale:
+                    logger.warning(
+                        f"⏰ Refusing to resume stale transaction {transaction_id} "
+                        f"via MeterValues — gap={gap:.0f}s exceeds MAX_RESUME_GAP_SECONDS"
+                    )
+                    safe_create_task(log_audit_event(
+                        action="transaction.resume_blocked",
+                        entity_type="transaction",
+                        entity_id=transaction_id,
+                        actor_type="system",
+                        changes={
+                            "trigger": "MeterValues",
+                            "gap_seconds": gap,
+                            "reason": "STALE_RECONNECT",
+                        },
+                    ))
+                    await finalize_stopped_transaction(transaction, "STALE_RECONNECT")
+                    return call_result.MeterValues()
+
                 now = datetime.datetime.now(datetime.timezone.utc)
                 transaction.transaction_status = TransactionStatusEnum.RUNNING
                 transaction.resumed_at = now
@@ -1244,6 +1312,34 @@ class ChargePoint(OcppChargePoint):
                 return call_result.DataTransfer(
                     status="Rejected",
                     data=json.dumps({"error": f"Transaction is {transaction.transaction_status}, not SUSPENDED"})
+                )
+
+            # Staleness guard — refuse resume if last activity is too old
+            from services.transaction_finalizer import (
+                is_resume_too_stale,
+                finalize_stopped_transaction,
+            )
+            is_stale, gap = await is_resume_too_stale(transaction)
+            if is_stale:
+                logger.warning(
+                    f"⏰ Refusing to resume stale transaction {transaction_id} via "
+                    f"GetLastMeterValue — gap={gap:.0f}s"
+                )
+                safe_create_task(log_audit_event(
+                    action="transaction.resume_blocked",
+                    entity_type="transaction",
+                    entity_id=transaction_id,
+                    actor_type="system",
+                    changes={
+                        "trigger": "GetLastMeterValue",
+                        "gap_seconds": gap,
+                        "reason": "STALE_RECONNECT",
+                    },
+                ))
+                await finalize_stopped_transaction(transaction, "STALE_RECONNECT")
+                return call_result.DataTransfer(
+                    status="Rejected",
+                    data=json.dumps({"error": "Transaction expired due to long disconnect"})
                 )
 
             # Get last meter value (fall back to start_meter_kwh)

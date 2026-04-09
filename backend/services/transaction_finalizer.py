@@ -21,7 +21,8 @@ Idempotent against already-stopped transactions.
 """
 import datetime
 import logging
-from typing import Optional
+import os
+from typing import Optional, Tuple
 
 from models import Transaction, TransactionStatusEnum, MeterValue
 from services.wallet_service import WalletService
@@ -30,6 +31,44 @@ from crud import log_audit_event
 from utils import safe_create_task
 
 logger = logging.getLogger("ocpp-server")
+
+# Defense-in-depth staleness threshold for transaction resume.
+# If the gap between a txn's last activity and a resume attempt exceeds this,
+# we finalize the txn (STALE_RECONNECT) instead of resuming. This only fires
+# when the primary disconnect/suspend timer chain has failed — it must be
+# larger than DISCONNECT_SUSPEND_TIMEOUT_SECONDS (180s) and SUSPEND_TIMEOUT_SECONDS
+# (300s) to avoid racing with the existing finalize chain.
+MAX_RESUME_GAP_SECONDS = int(os.environ.get("MAX_RESUME_GAP_SECONDS", "900"))
+
+
+async def is_resume_too_stale(
+    transaction: Transaction,
+) -> Tuple[bool, Optional[float]]:
+    """
+    Decide whether a transaction's last activity is too stale to safely resume.
+
+    Returns (is_stale, gap_seconds). gap_seconds is the age of the most recent
+    activity signal we found, or None if we couldn't find any.
+
+    Looks at the most recent of: suspended_at, latest MeterValue.created_at,
+    falling back to start_time. Threshold is MAX_RESUME_GAP_SECONDS.
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    candidates = []
+    if transaction.suspended_at:
+        candidates.append(transaction.suspended_at)
+    latest_mv = await MeterValue.filter(
+        transaction_id=transaction.id
+    ).order_by("-created_at").first()
+    if latest_mv:
+        candidates.append(latest_mv.created_at)
+    if not candidates and transaction.start_time:
+        candidates.append(transaction.start_time)
+    if not candidates:
+        return False, None
+    most_recent = max(candidates)
+    gap = (now - most_recent).total_seconds()
+    return gap > MAX_RESUME_GAP_SECONDS, gap
 
 
 async def finalize_stopped_transaction(

@@ -648,6 +648,40 @@ async def finalize_stopped_transaction(
 - `main.py:ChargePoint._suspend_timeout` (BootNotification suspend timeout, stop_reason=`SUSPENDED_TIMEOUT`)
 - `disconnect_handler._disconnect_suspend_timeout` (disconnect timeout, stop_reason=`DISCONNECT_TIMEOUT`)
 - `disconnect_handler.sweep_stale_suspended_transactions` (startup safety net, stop_reason=`STALE_SUSPEND_SWEEP`)
+- `main.py:ChargePoint._handle_ongoing_transaction_on_boot` (BootNotification staleness guard, stop_reason=`STALE_RECONNECT`)
+- `main.py:ChargePoint.on_meter_values` (MeterValues staleness guard, stop_reason=`STALE_RECONNECT`)
+- `main.py:ChargePoint._handle_get_last_meter_value` (GetLastMeterValue staleness guard, stop_reason=`STALE_RECONNECT`)
+
+##### Resume Staleness Guard
+
+**Purpose**: defense-in-depth against the failure mode where `suspend_transactions_on_disconnect` does not run (swallowed exception in the broad `except`, callback not wired, race) or where its 180s `_disconnect_suspend_timeout` task dies (process restart) before firing. Without this guard, a charger that drops for an hour and reconnects can have its transaction suspended on BootNotification (edge-case branch) and immediately resumed by the next MeterValues — billing whatever the post-disconnect meter reads against the original session.
+
+**Helper**:
+```python
+async def is_resume_too_stale(
+    transaction: Transaction,
+) -> Tuple[bool, Optional[float]]
+```
+
+Returns `(is_stale, gap_seconds)`. The gap is computed against the most recent of:
+1. `transaction.suspended_at`
+2. Latest `MeterValue.created_at` for this transaction
+3. `transaction.start_time` (fallback when neither of the above exists)
+
+A txn with no signals at all returns `(False, None)` — the helper defers to the caller's existing state checks rather than refusing speculatively.
+
+**Threshold**: `MAX_RESUME_GAP_SECONDS=900` (15 min, configurable via env). Chosen to be comfortably above the existing 360s startup sweep cutoff so the guard never races with the primary finalize chain, yet small enough to prevent meaningful overcharging when it does fire.
+
+**Call sites and behavior on stale**:
+| Call site | Action when stale |
+|---|---|
+| `_handle_ongoing_transaction_on_boot` (BootNotification) | finalize, pop flap counter, return — no audit `transaction.suspended` log, no `_suspend_timeout` scheduled |
+| `on_meter_values` (auto-resume) | finalize, return `call_result.MeterValues()` — the trailing meter value is **not** stored (would create `reading_kwh > end_meter_kwh` since `_calculate_final_energy` already snapshotted) |
+| `_handle_get_last_meter_value` | finalize, return `DataTransfer(status="Rejected", data={"error": "Transaction expired due to long disconnect"})` so the firmware stops retrying |
+
+**Audit log**: every guard hit emits `transaction.resume_blocked` with `actor_type=system`, `changes={trigger, gap_seconds, reason: "STALE_RECONNECT"[, previous_status]}`. Pair this with the existing `transaction.finalized` event (stop_reason `STALE_RECONNECT`) to forensically reconstruct which resume path tripped.
+
+**Operational signal**: any production hit of `⏰ Refusing to resume stale transaction` in backend logs is a signal that the primary disconnect handler chain failed for that session — investigate the disconnect handler error logs around the same charger ID.
 
 #### Zero-Energy Watchdog (`backend/services/zero_energy_watchdog.py`)
 **Purpose**: Auto-stop charging sessions where energy register has stalled. Detects vehicle BMS issues, charger meter regressions, and stuck handshakes.
@@ -1848,7 +1882,8 @@ async def on_boot_notification(self, charge_point_vendor, charge_point_model, **
 - Validates charger registration in database
 - Sets 30-second heartbeat interval
 - Updates charger firmware_version, vendor, model from BootNotification payload
-- **Transaction Suspend/Resume**: On disconnect, `disconnect_handler.py` suspends active transactions with a 180s timeout (`DISCONNECT_SUSPEND_TIMEOUT_SECONDS`). On BootNotification, already-SUSPENDED transactions get their timeout reset (CAS guard invalidates old timeout), and a new 300s resume window starts (`SUSPEND_TIMEOUT_SECONDS`). Still-active transactions (edge case) are suspended as before. Auto-stop with billing + QR refund on timeout expiry
+- **Transaction Suspend/Resume**: On disconnect, `disconnect_handler.py` suspends active transactions with a 180s timeout (`DISCONNECT_SUSPEND_TIMEOUT_SECONDS`). On BootNotification, already-SUSPENDED transactions get their timeout reset (CAS guard invalidates old timeout), and a new 300s resume window starts (`SUSPEND_TIMEOUT_SECONDS`). Still-active transactions (edge case) are suspended as before. Auto-stop with billing + QR refund on timeout expiry. The per-txn loop body is extracted into `_handle_ongoing_transaction_on_boot()` for testability.
+- **Resume staleness guard**: every BootNotification per-txn handler call (and the MeterValues + GetLastMeterValue resume points) goes through `transaction_finalizer.is_resume_too_stale()` first. If the gap exceeds `MAX_RESUME_GAP_SECONDS` (default 900s), the txn is finalized with stop_reason `STALE_RECONNECT` instead of being suspended/resumed. This is defense-in-depth for the case where the disconnect handler silently failed to mark SUSPENDED — see the "Resume Staleness Guard" subsection under Transaction Finalizer above.
 - Resume fields tracked: `suspended_at`, `resumed_at`, `resume_count`
 - Comprehensive connection logging
 

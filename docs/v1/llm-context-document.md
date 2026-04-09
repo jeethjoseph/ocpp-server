@@ -112,8 +112,9 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
   - Config: `DISCONNECT_SUSPEND_TIMEOUT_SECONDS=180`, `MAX_DISCONNECT_RESETS_WITHOUT_PROGRESS=3`
 - **`transaction_finalizer.py`** - **NEW**: Single source of truth for stopping transactions on timeout
   - `finalize_stopped_transaction(transaction, stop_reason)` - Idempotent: calculates final energy from latest MeterValue, marks STOPPED, audit-logs, processes wallet billing, processes QR billing/refund, cleans up zero-energy redis state and flap counter
+  - `is_resume_too_stale(transaction)` - **Defense-in-depth resume staleness guard.** Returns `(is_stale, gap_seconds)` based on the most recent of `suspended_at`, latest MeterValue.created_at, or `start_time`. Threshold `MAX_RESUME_GAP_SECONDS=900` (configurable). Called at all three resume points in `main.py` so a txn whose primary suspend/timeout chain failed cannot be silently resumed and overcharged. Stop reason on stale finalize: `STALE_RECONNECT`. Audit action: `transaction.resume_blocked` (with `trigger`, `gap_seconds`, `previous_status` in changes payload).
   - Replaces duplicated stop-and-bill logic that previously lived in both `main.py:_suspend_timeout` and `disconnect_handler._stop_and_bill_transaction`
-  - Used by: `main.py` BootNotification suspend timeout, `disconnect_handler` disconnect timeout, `disconnect_handler` startup sweep
+  - Used by: `main.py` BootNotification suspend timeout, `disconnect_handler` disconnect timeout, `disconnect_handler` startup sweep, all three resume points (MeterValues auto-resume, BootNotification per-txn handler, GetLastMeterValue DataTransfer)
 - **`zero_energy_watchdog.py`** - Auto-stop for stalled charging sessions
   - `check_zero_energy()` - Called from MeterValues handler. Tracks energy progress in Redis, schedules `RemoteStopTransaction` if energy hasn't advanced for `ZERO_ENERGY_TIMEOUT_SECONDS` (120s) after `ZERO_ENERGY_GRACE_PERIOD_SECONDS` (60s) grace
   - **W5 hook**: when energy advances, pops `disconnect_handler._disconnect_reset_count` for the transaction, allowing long sessions with intermittent disconnects to never trip the flap detector
@@ -748,6 +749,7 @@ GET /api/logs/{charge_point_id} - Logs for specific charger
   - BootNotification from reconnecting charger resets the suspend timeout
   - Startup sweep (`sweep_stale_suspended_transactions()`) catches orphaned SUSPENDED transactions after server restart
   - Disconnect callback registered via `connection_manager.register_on_disconnect()`
+  - **Resume staleness guard** (defense-in-depth): every resume entry point — MeterValues auto-resume, BootNotification per-txn handler (`_handle_ongoing_transaction_on_boot`), and GetLastMeterValue DataTransfer — calls `transaction_finalizer.is_resume_too_stale()` before allowing the resume. If the gap between the txn's last activity (suspended_at, latest MeterValue, or start_time) and now exceeds `MAX_RESUME_GAP_SECONDS=900`, the txn is finalized with stop_reason `STALE_RECONNECT` instead. This catches the case where the disconnect handler silently failed (swallowed exception, process restart killing the in-memory timer) and a charger reconnects an hour later — without this guard the BootNotification edge-case branch would suspend the still-RUNNING txn, MeterValues would auto-resume it, and the user would be billed for whatever the meter reported on the post-disconnect side. Audit action `transaction.resume_blocked` records each guard hit with `gap_seconds` and `trigger`.
 ✅ **QR-Based Appless Charging** - Scan UPI QR, pay, charge without app/account
   - Razorpay UPI QR code generation and management
   - Webhook-driven payment processing with idempotency
