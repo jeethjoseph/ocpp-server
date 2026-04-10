@@ -6,8 +6,6 @@ import dynamic from "next/dynamic";
 
 import { Button } from "@/components/ui/button";
 import { usePublicStations } from "@/lib/queries/public-stations";
-import type { PublicStationResponse } from "@/lib/api-services";
-
 import type { StationWithDistance } from "@/components/StationMap";
 
 // Dynamic import for Leaflet to avoid SSR issues
