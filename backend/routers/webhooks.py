@@ -382,7 +382,8 @@ async def handle_payment_captured(event_data: dict):
         wallet_txn = await _find_txn_by_order_id(order_id)
 
         if not wallet_txn:
-            raise ValueError(f"Wallet transaction not found for order {order_id}")
+            logger.warning(f"Wallet transaction not found for order {order_id} — skipping (may belong to another environment)")
+            return
 
         # Check if already completed (idempotency)
         current_status = wallet_txn.payment_metadata.get("status")
@@ -446,13 +447,15 @@ async def handle_payment_failed(event_data: dict):
         )
 
         if not order_id:
-            raise ValueError("Missing order_id in payment.failed webhook payload")
+            logger.warning("Missing order_id in payment.failed webhook — skipping")
+            return
 
         # Find the wallet transaction
         wallet_txn = await _find_txn_by_order_id(order_id)
 
         if not wallet_txn:
-            raise ValueError(f"Wallet transaction not found for failed order {order_id}")
+            logger.warning(f"Wallet transaction not found for failed order {order_id} — skipping (may belong to another environment)")
+            return
 
         # Mark as failed
         updated_metadata = wallet_txn.payment_metadata or {}
@@ -496,13 +499,15 @@ async def handle_order_paid(event_data: dict):
         )
 
         if not order_id:
-            raise ValueError("Missing order_id in order.paid webhook payload")
+            logger.warning("Missing order_id in order.paid webhook — skipping")
+            return
 
         # Find the wallet transaction
         wallet_txn = await _find_txn_by_order_id(order_id)
 
         if not wallet_txn:
-            raise ValueError(f"Wallet transaction not found for order {order_id}")
+            logger.warning(f"Wallet transaction not found for order {order_id} — skipping (may belong to another environment)")
+            return
 
         # Check if already completed
         current_status = wallet_txn.payment_metadata.get("status")

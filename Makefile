@@ -1,10 +1,12 @@
 # OCPP Server Makefile for Database Management
 
-# Load environment - backend/.env for local dev, .env.prod for EC2 production
-# On EC2: backend/.env doesn't exist (skipped), .env.prod provides prod values
-# On local: backend/.env provides dev values, .env.prod doesn't exist (skipped)
+# Load environment - backend/.env for local dev, .env.prod/.env.staging for EC2
+# On EC2 prod: backend/.env doesn't exist (skipped), .env.prod provides prod values
+# On EC2 staging: backend/.env doesn't exist (skipped), .env.staging provides staging values
+# On local: backend/.env provides dev values, .env.prod/.env.staging don't exist (skipped)
 -include backend/.env
 -include .env.prod
+-include .env.staging
 export
 
 # Fallback to local database if not set in .env
@@ -22,6 +24,7 @@ SCRIPTS_DIR=$(BACKEND_DIR)/scripts
 .PHONY: help db-reset db-reset-cloud db-first-time db-drop-user db-create-user db-drop db-create migrate seed setup-dev truncate-tables
 .PHONY: docker-dev docker-dev-detach docker-staging docker-staging-detach docker-prod docker-prod-detach docker-down docker-down-staging docker-down-prod docker-logs docker-logs-backend docker-logs-frontend docker-build docker-build-staging docker-build-prod docker-clean docker-migrate docker-staging-cert docker-prod-cert docker-cert-renew
 .PHONY: prod-push prod-pull prod-up prod-down prod-deploy prod-rebuild prod-rebuild-service prod-rebuild-clean prod-nuke prod-restart prod-logs prod-logs-backend prod-logs-frontend prod-logs-nginx prod-ps prod-cert prod-migrate prod-backup-db prod-cache-clear prod-health prod-stats prod-shell prod-bash prod-db-reset prod-seed
+.PHONY: staging-push staging-pull staging-up staging-down staging-deploy staging-rebuild staging-rebuild-service staging-rebuild-clean staging-nuke staging-restart staging-logs staging-logs-backend staging-logs-frontend staging-logs-nginx staging-ps staging-cert staging-migrate staging-backup-db staging-cache-clear staging-health staging-stats staging-shell staging-bash staging-db-reset staging-seed
 
 help:
 	@echo "OCPP Server - Available Commands"
@@ -64,6 +67,45 @@ help:
 	@echo "  make prod-cert           Obtain/renew SSL certificate"
 	@echo "  make prod-shell          Open Python shell in backend"
 	@echo "  make prod-bash           Open bash in backend"
+	@echo ""
+	@echo "=============== STAGING (EC2 via SSM) ==============="
+	@echo ""
+	@echo "Deployment (from local machine):"
+	@echo "  make staging-push           Force push current branch to origin/develop"
+	@echo ""
+	@echo "Deployment (on staging EC2 via SSM):"
+	@echo "  make staging-deploy         Pull + rebuild (full deploy)"
+	@echo "  make staging-pull           Force pull origin/develop"
+	@echo "  make staging-rebuild        Rebuild containers"
+	@echo "  make staging-rebuild-service SERVICE=backend  Rebuild one service"
+	@echo "  make staging-rebuild-clean  Full clean rebuild (removes images)"
+	@echo ""
+	@echo "Services:"
+	@echo "  make staging-up             Start staging services"
+	@echo "  make staging-down           Stop staging services"
+	@echo "  make staging-restart        Restart all services"
+	@echo "  make staging-nuke           Remove everything + volumes (DANGEROUS)"
+	@echo "  make staging-ps             Show container status"
+	@echo "  make staging-stats          Resource usage snapshot"
+	@echo "  make staging-health         Health check"
+	@echo ""
+	@echo "Logs:"
+	@echo "  make staging-logs           View all logs"
+	@echo "  make staging-logs-backend   View backend logs"
+	@echo "  make staging-logs-frontend  View frontend logs"
+	@echo "  make staging-logs-nginx     View nginx logs"
+	@echo ""
+	@echo "Database & Cache:"
+	@echo "  make staging-migrate        Run database migrations"
+	@echo "  make staging-backup-db      Backup database to backups/"
+	@echo "  make staging-db-reset       Reset database (DANGEROUS)"
+	@echo "  make staging-seed           Run seed script"
+	@echo "  make staging-cache-clear    Clear all Redis cache"
+	@echo ""
+	@echo "SSL & Shell:"
+	@echo "  make staging-cert           Obtain/renew SSL certificate"
+	@echo "  make staging-shell          Open Python shell in backend"
+	@echo "  make staging-bash           Open bash in backend"
 	@echo ""
 	@echo "=============== DEVELOPMENT (local) ==============="
 	@echo ""
@@ -324,6 +366,161 @@ prod-db-reset:
 # Run seed script on production
 prod-seed:
 	$(PROD_COMPOSE) exec backend python scripts/seed_data.py
+
+# =============================================================================
+# STAGING DEPLOYMENT (Git-based, EC2 via SSM)
+# =============================================================================
+# Deploy branch: origin/develop
+# Workflow: staging-push (local) -> SSM into staging EC2 -> staging-deploy (on server)
+
+STAGING_COMPOSE = docker compose -f docker-compose.staging.yml --env-file .env.staging
+
+# Force push current branch to origin/develop (run from local machine)
+staging-push:
+	@echo "Force pushing current branch to origin/develop..."
+	git push origin HEAD:develop --force
+	@echo "Pushed to origin/develop. Now SSM into staging EC2 and run: make staging-deploy"
+
+# Force pull from origin/develop (run on staging EC2 server)
+staging-pull:
+	@echo "Pulling from origin/develop..."
+	git fetch origin
+	git reset --hard origin/develop
+	@echo "Updated to origin/develop"
+
+# Start staging services
+staging-up:
+	$(STAGING_COMPOSE) up -d
+
+# Stop staging services
+staging-down:
+	$(STAGING_COMPOSE) down
+
+# Rebuild and restart staging (after pull)
+staging-rebuild:
+	$(STAGING_COMPOSE) up -d --build --force-recreate
+	@echo "Waiting for services to stabilize..."
+	@sleep 5
+	@if ! $(STAGING_COMPOSE) exec -T nginx test -d /etc/letsencrypt/archive 2>/dev/null; then \
+		echo ""; \
+		echo "=============================================="; \
+		echo "WARNING: No Let's Encrypt certificate found!"; \
+		echo "Currently using self-signed certificate."; \
+		echo "Run 'make staging-cert' to obtain a real certificate."; \
+		echo "=============================================="; \
+	else \
+		echo "Let's Encrypt certificate found."; \
+	fi
+
+# Full deploy sequence (run on staging EC2 after SSM)
+staging-deploy: staging-pull staging-rebuild
+	@echo "Staging deployment complete!"
+
+# Restart all services without rebuilding
+staging-restart:
+	$(STAGING_COMPOSE) restart
+
+# Rebuild a single service (usage: make staging-rebuild-service SERVICE=backend)
+staging-rebuild-service:
+	$(STAGING_COMPOSE) up -d --build --force-recreate --no-deps $(SERVICE)
+
+# Full clean rebuild (removes images, rebuilds from scratch)
+staging-rebuild-clean:
+	$(STAGING_COMPOSE) down --rmi local
+	$(STAGING_COMPOSE) up -d --build
+
+# Nuke everything including volumes (DANGEROUS - destroys DB data)
+staging-nuke:
+	@echo "WARNING: This will destroy ALL staging data including the database!"
+	@echo "Press Ctrl+C to cancel, or wait 5 seconds to continue..."
+	@sleep 5
+	$(STAGING_COMPOSE) down -v --rmi local
+	@echo "All staging containers, volumes, and images removed."
+
+# View staging logs (all services)
+staging-logs:
+	$(STAGING_COMPOSE) logs -f
+
+# View specific service logs
+staging-logs-backend:
+	$(STAGING_COMPOSE) logs -f backend
+
+staging-logs-frontend:
+	$(STAGING_COMPOSE) logs -f frontend
+
+staging-logs-nginx:
+	$(STAGING_COMPOSE) logs -f nginx
+
+# Run migrations on staging
+staging-migrate:
+	$(STAGING_COMPOSE) exec backend aerich upgrade
+
+# Open Python shell on staging backend
+staging-shell:
+	$(STAGING_COMPOSE) exec backend python -c "import IPython; IPython.start_ipython()" 2>/dev/null || \
+	$(STAGING_COMPOSE) exec backend python
+
+# Open bash on staging backend container
+staging-bash:
+	$(STAGING_COMPOSE) exec backend bash
+
+# Show staging container status
+staging-ps:
+	$(STAGING_COMPOSE) ps
+
+# Resource monitoring (single snapshot)
+staging-stats:
+	docker stats --no-stream
+
+# Health check
+staging-health:
+	@curl -sf http://localhost/health && echo " Health check passed" || echo " Health check failed"
+
+# Obtain/renew Let's Encrypt SSL certificate
+staging-cert:
+	@echo "Obtaining SSL certificate for staging..."
+	@echo "Clearing any existing certificates..."
+	$(STAGING_COMPOSE) run --rm --entrypoint "" certbot \
+		sh -c "rm -rf /etc/letsencrypt/live/$${DOMAIN_NAME}* /etc/letsencrypt/renewal/$${DOMAIN_NAME}* /etc/letsencrypt/archive/$${DOMAIN_NAME}*"
+	@echo "Requesting certificate from Let's Encrypt..."
+	$(STAGING_COMPOSE) run --rm --entrypoint "" certbot \
+		certbot certonly --webroot --webroot-path=/var/www/certbot \
+		--email $${CERTBOT_EMAIL} --agree-tos --no-eff-email \
+		-d $${DOMAIN_NAME}
+	@echo "Restarting nginx to load new certificate..."
+	$(STAGING_COMPOSE) restart nginx
+	@echo "SSL certificate installed for staging!"
+
+# Clear all Redis cache
+staging-cache-clear:
+	@echo "Clearing ALL Redis cache on staging..."
+	$(STAGING_COMPOSE) exec redis redis-cli FLUSHALL
+	@echo "Staging cache cleared!"
+
+# Backup staging database (saves to host filesystem)
+staging-backup-db:
+	@echo "Backing up staging database..."
+	@mkdir -p backups
+	$(STAGING_COMPOSE) exec -T postgres sh -c 'pg_dump -U $$POSTGRES_USER $$POSTGRES_DB' > backups/staging_backup_$$(date +%Y%m%d_%H%M%S).sql
+	@echo "Backup saved to backups/"
+	@ls -lh backups/staging_backup_*.sql | tail -1
+
+# Reset staging database (DANGEROUS - requires confirmation)
+staging-db-reset:
+	@echo "WARNING: This will delete the staging database!"
+	@echo "Press Ctrl+C to cancel, or wait 3 seconds to continue..."
+	@sleep 3
+	@echo "Stopping backend to release DB connections..."
+	$(STAGING_COMPOSE) stop backend
+	$(STAGING_COMPOSE) exec postgres sh -c 'psql -U $$POSTGRES_USER -d postgres -c "DROP DATABASE IF EXISTS $$POSTGRES_DB;"'
+	$(STAGING_COMPOSE) exec postgres sh -c 'psql -U $$POSTGRES_USER -d postgres -c "CREATE DATABASE $$POSTGRES_DB OWNER $$POSTGRES_USER;"'
+	@echo "Database reset. Rebuilding backend (entrypoint runs migrations)..."
+	$(STAGING_COMPOSE) up -d --build backend
+	@echo "Staging database reset complete!"
+
+# Run seed script on staging
+staging-seed:
+	$(STAGING_COMPOSE) exec backend python scripts/seed_data.py
 
 # ===========================================
 # Docker Commands

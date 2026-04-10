@@ -6,11 +6,10 @@ import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import type { PublicStationResponse } from "@/lib/api-services";
 
-interface StationWithDistance extends PublicStationResponse {
+export interface StationWithDistance extends PublicStationResponse {
   distance?: number;
 }
 
-// Fix for default markers in React Leaflet
 // Fix for default markers in React Leaflet
 delete (L.Icon.Default.prototype as { _getIconUrl?: unknown })._getIconUrl;
 L.Icon.Default.mergeOptions({

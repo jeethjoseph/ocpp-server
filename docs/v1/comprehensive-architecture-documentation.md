@@ -311,10 +311,18 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 
 #### Public Stations (`backend/routers/public_stations.py`)
 **Endpoints**: `/api/public/stations/*`
-**Purpose**: Unauthenticated station and charger discovery for user-facing pages
-- List stations with charger availability counts
-- Search stations by location
-- Get charger details by string ID for charge page
+**Purpose**: Authenticated station and charger discovery for user-facing pages
+- List stations with charger availability counts (requires USER auth)
+- Get station details by ID (requires USER auth)
+- Shared helper `_fetch_stations_with_availability()` provides Redis+heartbeat filtering, connector aggregation, and tariff lookup for both authenticated and public endpoints
+
+#### Public Station Map (`backend/routers/public_station_map.py`)
+**Endpoints**: `GET /api/public/stations/map`
+**Purpose**: Public (no auth) charger map data with real-time availability
+- Returns station-level aggregated data (no individual charger IDs exposed)
+- In-memory per-IP rate limiting (20 requests per 60-second window)
+- Reuses `_fetch_stations_with_availability()` from `public_stations.py`
+- Frontend: Leaflet map on `/my-charges` page
 
 #### Public QR Transaction History (`backend/routers/public_qr_transactions.py`)
 **Endpoints**: `GET /api/public/qr-transactions?vpa=xxx&page=1&limit=10&status=COMPLETED`
@@ -332,6 +340,7 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 - Webhook signature validation (Clerk SVIX + Razorpay HMAC-SHA256)
 - **NEW**: `POST /webhooks/razorpay` - Handles `payment.captured`, `payment.failed`, `order.paid`, **`qr_code.credited`**
 - Routes `qr_code.credited` events to `QRPaymentService.handle_qr_payment()` for appless charging
+- **Cross-environment handling**: All handlers gracefully skip "not found" transactions (return 200, log warning) since production and staging share the same Razorpay live keys and both receive all webhook events. Only real errors (DB, API) return 500 for Razorpay retry.
 
 ### Business Logic Services (`backend/services/`)
 
@@ -766,7 +775,7 @@ frontend/
 │   ├── stations/          # Station finder and maps
 │   ├── scanner/           # QR code scanning
 │   ├── my-sessions/       # **NEW** User's sessions & wallet
-│   ├── my-charges/        # Public QR transaction history (no auth)
+│   ├── my-charges/        # Public charger map + QR transaction history (no auth)
 │   └── charge/            # Individual charger pages
 ├── components/            # Reusable React components
 │   ├── ui/               # Shadcn/ui components
@@ -825,12 +834,14 @@ frontend/
 - Distance-based sorting and filtering
 - Mobile-responsive design
 
-##### Station Map Component (`app/stations/StationMap.tsx`)
-**Purpose**: Interactive Leaflet map with station markers
+##### Station Map Component (`components/StationMap.tsx`)
+**Purpose**: Shared interactive Leaflet map with station markers (moved from `app/stations/`)
+**Used by**: `/stations` page (authenticated) and `/my-charges` page (public)
 **Features**:
-- Real-time station status indicators
-- Click-to-navigate functionality
-- Responsive map controls
+- Color-coded markers: green (available), yellow (all busy), red (offline)
+- User location with pulsing blue dot
+- Popup with station name, address, availability, price, connectors
+- Exports `StationWithDistance` interface for consumers
 
 #### Admin Management Interface
 
@@ -3290,7 +3301,11 @@ const nextConfig = {
 ## Docker Deployment & Infrastructure
 
 ### Docker Compose Architecture
-The system is deployed as a multi-container Docker application on AWS EC2:
+The system is deployed as a multi-container Docker application on AWS EC2, with separate production and staging environments:
+
+- **Production**: `app.voltlync.com` — EC2 t3.medium, `deploy` branch, `docker-compose.prod.yml` + `.env.prod`
+- **Staging**: `staging.voltlync.com` — EC2 t3.medium (cloned from production AMI), `develop` branch, `docker-compose.staging.yml` + `.env.staging`
+- **Shared keys**: Both environments use the same Clerk app and Razorpay live keys (QR payments require live mode)
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
@@ -3346,10 +3361,23 @@ The system is deployed as a multi-container Docker application on AWS EC2:
 ### Makefile Targets
 Key deployment and management commands:
 ```bash
+# Production (app.voltlync.com, branch: deploy)
+make prod-push        # Push current branch to origin/deploy
+make prod-deploy      # Pull + rebuild on EC2
 make prod-up          # Start production stack
 make prod-down        # Stop production stack
 make prod-migrate     # Run database migrations in container
 make prod-logs        # Tail all container logs
+
+# Staging (staging.voltlync.com, branch: develop)
+make staging-push     # Push current branch to origin/develop
+make staging-deploy   # Pull + rebuild on staging EC2
+make staging-up       # Start staging stack
+make staging-down     # Stop staging stack
+make staging-migrate  # Run staging database migrations
+make staging-logs     # Tail staging container logs
+
+# Development
 make docker-build     # Build all images
 make docker-seed      # Seed database with test data
 ```

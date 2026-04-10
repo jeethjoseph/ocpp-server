@@ -231,6 +231,12 @@ export const publicStationService = {
     api.get<PublicStationResponse>(`/api/public/stations/${id}`)
 };
 
+// Public station map service (no auth required)
+export const publicStationMapService = {
+  getAll: () =>
+    api.get<PublicStationsListResponse>(`/api/public/stations/map`),
+};
+
 // Public QR Transaction History (no auth required)
 export interface QRTransactionItem {
   id: number;

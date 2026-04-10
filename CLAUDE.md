@@ -8,3 +8,9 @@
 - At the start of every session refer to /Users/raalshasan/makaratech/idofthings/ocpp-server/docs/v1/llm-context-document.md
 - For larger context and architecture related context refer to this /Users/raalshasan/makaratech/idofthings/ocpp-server/docs/v1/comprehensive-architecture-documentation.md
 - When you are done with making changes, update these documents - Users/raalshasan/makaratech/idofthings/ocpp-server/docs/v1/llm-context-document.md, /Users/raalshasan/makaratech/idofthings/ocpp-server/docs/v1/comprehensive-architecture-documentation.md
+
+## Environments
+- **Production**: `app.voltlync.com` — branch `deploy`, `docker-compose.prod.yml` + `.env.prod`, `make prod-*` targets
+- **Staging**: `staging.voltlync.com` — branch `develop`, `docker-compose.staging.yml` + `.env.staging`, `make staging-*` targets
+- Both share the same Clerk app and Razorpay **live** keys (QR payments require live mode)
+- Razorpay webhook handlers gracefully skip "not found" transactions (cross-environment events) — do not change this to raise errors

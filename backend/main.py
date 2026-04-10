@@ -1476,9 +1476,10 @@ app.include_router(logs.router)
 app.include_router(firmware.router)
 app.include_router(firmware.public_router)
 
-from routers import qr_codes, public_qr_transactions
+from routers import qr_codes, public_qr_transactions, public_station_map
 app.include_router(qr_codes.router)
 app.include_router(public_qr_transactions.router)
+app.include_router(public_station_map.router)
 
 # OCPP WebSocket endpoint (connection management + message handling)
 from routers import ocpp_ws

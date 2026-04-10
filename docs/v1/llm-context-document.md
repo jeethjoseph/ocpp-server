@@ -149,7 +149,8 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
 - **`app/admin/`** - Complete admin interface for station/charger/user management
   - **`app/admin/qr-codes/page.tsx`** - **NEW** QR code list with create/close actions, revenue stats
   - **`app/admin/qr-codes/[id]/page.tsx`** - **NEW** QR detail with payment history, refund tracking, QR image
-- **`app/my-charges/page.tsx`** - Public (no auth) transaction history for QR users — enter UPI ID to see paginated transactions, refund status, energy consumed
+- **`app/my-charges/page.tsx`** - Public (no auth) page with charger map + transaction history. Top section: Leaflet map showing all stations with real-time availability (color-coded markers), user location, popup details, "Get Directions" to Google Maps. Bottom section: UPI ID lookup for paginated QR transactions, refund status, energy consumed
+- **`components/StationMap.tsx`** - Shared Leaflet map component (moved from `app/stations/`), used by both `/stations` and `/my-charges` pages
   - **`app/admin/users/[id]/transactions/page.tsx`** - User charging transaction history
   - **`app/admin/users/[id]/wallet/page.tsx`** - Wallet transaction history with running balance
   - **`app/admin/firmware/page.tsx`** - Firmware management dashboard
@@ -586,7 +587,10 @@ GET /api/admin/firmware/chargers/{id}/history - Get update history
 GET /api/admin/firmware/updates/status - Real-time dashboard
   Response: { "in_progress": [...], "summary": { pending, downloading, installing, completed_today, failed_today } }
 
-# Public Endpoint (NO authentication)
+# Public Endpoints (NO authentication)
+GET /api/public/stations/map - Charger map data with real-time availability (rate limited: 20 req/60s per IP)
+  Response: { "data": [{ id, name, latitude, longitude, address, available_chargers, total_chargers, connector_types, connector_details, price_per_kwh }], "total" }
+
 GET /api/firmware/latest - Get latest firmware for non-OCPP charge points
   Response: { "version", "filename", "download_url", "checksum", "file_size" }
   Response: 404 if no active firmware
@@ -632,6 +636,8 @@ POST /webhooks/razorpay - Razorpay payment events (HMAC-SHA256 signature verifie
   Events: payment.captured, payment.failed, order.paid, qr_code.credited
   QR Flow: qr_code.credited → QRPaymentService.handle_qr_payment() → user resolution → RemoteStart → budget enforcement → billing → refund
 ```
+
+**Cross-Environment Webhook Handling**: Production and staging share the same Razorpay live keys. Both environments receive all webhook events. Handlers gracefully skip "not found" transactions (return 200, log warning) instead of raising errors — this prevents Razorpay retries for events that belong to the other environment. Only DB/API errors return 500.
 
 ### Legacy APIs (Backward Compatibility)
 ```
@@ -725,6 +731,13 @@ GET /api/logs/{charge_point_id} - Logs for specific charger
 - **Mobile App**: Ready for App Store submission (iOS App Store + Google Play Store)
   - App configured with bundle ID: com.lyncpower.user
 - **Monitoring**: Sentry + New Relic + health check endpoints
+
+### Staging Deployment
+- **Infrastructure**: AWS EC2 t3.medium (staging.voltlync.com), cloned from production AMI
+- **Branch**: `develop` (pushed via `make staging-push`, deployed via `make staging-deploy`)
+- **Compose**: `docker-compose.staging.yml` + `.env.staging`
+- **Shared keys**: Same Clerk app and Razorpay live keys as production (QR payments don't work in test mode)
+- **Makefile targets**: `staging-*` mirrors `prod-*` (staging-push, staging-deploy, staging-logs, staging-migrate, etc.)
 
 ### Known Working Features
 ✅ Complete OCPP 1.6 message handling with all core messages
