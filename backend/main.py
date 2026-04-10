@@ -1471,15 +1471,18 @@ app.include_router(auth.router)
 app.include_router(webhooks.router)
 app.include_router(wallet_payments.router)
 app.include_router(users.router)
+# Map router must be registered before public_stations so
+# /api/public/stations/map matches before /{station_id} catch-all
+from routers import public_station_map
+app.include_router(public_station_map.router)
 app.include_router(public_stations.router)
 app.include_router(logs.router)
 app.include_router(firmware.router)
 app.include_router(firmware.public_router)
 
-from routers import qr_codes, public_qr_transactions, public_station_map
+from routers import qr_codes, public_qr_transactions
 app.include_router(qr_codes.router)
 app.include_router(public_qr_transactions.router)
-app.include_router(public_station_map.router)
 
 # OCPP WebSocket endpoint (connection management + message handling)
 from routers import ocpp_ws
