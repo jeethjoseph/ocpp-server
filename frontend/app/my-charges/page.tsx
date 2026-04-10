@@ -298,6 +298,10 @@ export default function MyChargesPage() {
   return (
     <div className="min-h-screen bg-background">
       {/* Map section */}
+      <div className="px-4 py-3 border-b border-border">
+        <h2 className="text-lg font-semibold text-foreground">Charging Stations Nearby</h2>
+        <p className="text-sm text-muted-foreground">Tap a station to see details and get directions</p>
+      </div>
       <div className="w-full h-[40vh]">
         {isLoadingStations ? (
           <div className="w-full h-full bg-muted flex items-center justify-center">
