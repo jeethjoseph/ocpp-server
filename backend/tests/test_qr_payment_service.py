@@ -16,8 +16,8 @@ import pytest
 from decimal import Decimal
 from unittest.mock import patch, AsyncMock, MagicMock
 
-from services.qr_payment_service import QRPaymentService, find_or_create_user_from_payment
-from services.razorpay_service import RazorpayAlreadyRefundedError
+from services.qr_payment_service import QRPaymentService, find_or_create_user_from_payment, _resolve_platform_fee
+from services.razorpay_service import RazorpayAlreadyRefundedError, extract_fee_from_payment
 from models import (
     User, Charger, ChargingStation, Connector, ChargerQRCode, QRPayment,
     QRPaymentStatusEnum, AuthProviderEnum, ChargerStatusEnum, Transaction,
@@ -80,17 +80,24 @@ async def qr_tariff(qr_charger):
     )
 
 
-def _webhook_payload(payment_id: str, qr_code_id: str, amount_paise: int, vpa: str = "test@okhdfc"):
+def _webhook_payload(
+    payment_id: str, qr_code_id: str, amount_paise: int,
+    vpa: str = "test@okhdfc", fee_paise: int = None, tax_paise: int = None,
+):
+    entity = {
+        "id": payment_id,
+        "amount": amount_paise,
+        "vpa": vpa,
+        "contact": "+919999999999",
+        "email": "user@example.com",
+        "notes": {"customer_name": "Test User"},
+        "created_at": 9999999999,  # Future timestamp — no staleness
+    }
+    if fee_paise is not None:
+        entity["fee"] = fee_paise
+        entity["tax"] = tax_paise if tax_paise is not None else 0
     return {
-        "payment": {"entity": {
-            "id": payment_id,
-            "amount": amount_paise,
-            "vpa": vpa,
-            "contact": "+919999999999",
-            "email": "user@example.com",
-            "notes": {"customer_name": "Test User"},
-            "created_at": 9999999999,  # Future timestamp — no staleness
-        }},
+        "payment": {"entity": entity},
         "qr_code": {"entity": {"id": qr_code_id}},
     }
 
@@ -227,6 +234,7 @@ async def test_full_refund_reconciles_already_refunded_error(client, qr_charger,
         payment_id, Exception("The payment has been refunded fully")
     )
     mock_razorpay.find_refund_for_payment.return_value = {"id": "rfnd_PREVIOUS"}
+    mock_razorpay.fetch_payment_fees.return_value = None
 
     with patch("services.qr_payment_service.razorpay_service", mock_razorpay):
         await QRPaymentService._full_refund(qr_payment, "Reconciliation test")
@@ -260,6 +268,7 @@ async def test_full_refund_fails_cleanly_when_reconciliation_finds_no_refund(cli
         payment_id, Exception("fully refunded")
     )
     mock_razorpay.find_refund_for_payment.return_value = None
+    mock_razorpay.fetch_payment_fees.return_value = None
 
     with patch("services.qr_payment_service.razorpay_service", mock_razorpay):
         await QRPaymentService._full_refund(qr_payment, "Edge case")
@@ -294,6 +303,7 @@ async def test_concurrent_payment_rejected_when_active_txn(client, qr_charger, q
 
     mock_razorpay = MagicMock()
     mock_razorpay.refund_payment.return_value = {"id": "rfnd_REJECTED"}
+    mock_razorpay.fetch_payment_fees.return_value = None
 
     with patch("services.qr_payment_service.razorpay_service", mock_razorpay), \
          patch("services.qr_payment_service.redis_manager") as mock_redis:
@@ -308,3 +318,161 @@ async def test_concurrent_payment_rejected_when_active_txn(client, qr_charger, q
     assert rejected is not None
     assert rejected.status == QRPaymentStatusEnum.REFUNDED
     assert rejected.razorpay_refund_id == "rfnd_REJECTED"
+
+
+# ============================================================================
+# extract_fee_from_payment helper
+# ============================================================================
+
+def test_extract_fee_from_payment_with_fee_and_tax():
+    """Extracts fee and tax from paise to rupees."""
+    result = extract_fee_from_payment({"fee": 236, "tax": 36})
+    assert result == (Decimal("2.36"), Decimal("0.36"))
+
+
+def test_extract_fee_from_payment_zero_fee():
+    """fee=0 is valid (common for UPI) — returns (0, 0), not None."""
+    result = extract_fee_from_payment({"fee": 0, "tax": 0})
+    assert result == (Decimal("0"), Decimal("0"))
+
+
+def test_extract_fee_from_payment_missing_fee():
+    """Missing fee field returns None (data unavailable)."""
+    assert extract_fee_from_payment({"amount": 10000}) is None
+
+
+def test_extract_fee_from_payment_none_fee():
+    """fee=None returns None (data unavailable)."""
+    assert extract_fee_from_payment({"fee": None, "tax": None}) is None
+
+
+# ============================================================================
+# Webhook fee extraction into QRPayment
+# ============================================================================
+
+@pytest.mark.asyncio
+async def test_qr_payment_stores_webhook_fee(client, qr_charger, qr_code, qr_tariff):
+    """QR payment created from webhook with fee/tax stores actual Razorpay fee."""
+    payload = _webhook_payload("pay_FEE001", "qr_TEST123", 10000, fee_paise=0, tax_paise=0)
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment.return_value = {"id": "rfnd_FEE001"}
+
+    with patch("services.qr_payment_service.razorpay_service", mock_razorpay), \
+         patch("services.qr_payment_service.redis_manager") as mock_redis:
+        mock_redis.is_charger_connected = AsyncMock(return_value=False)
+        result = await QRPaymentService.handle_qr_payment(payload)
+
+    qr = await QRPayment.filter(razorpay_payment_id="pay_FEE001").first()
+    assert qr is not None
+    assert qr.platform_fee == Decimal("0.00")
+    assert qr.razorpay_commission == Decimal("0.00")
+    assert qr.razorpay_gst == Decimal("0.00")
+    assert qr.fee_source == "webhook"
+
+
+@pytest.mark.asyncio
+async def test_qr_payment_no_fee_in_webhook_uses_fallback(client, qr_charger, qr_code, qr_tariff):
+    """QR payment without fee/tax in webhook falls back to estimate during refund."""
+    payload = _webhook_payload("pay_NOFEE001", "qr_TEST123", 10000)
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment.return_value = {"id": "rfnd_NOFEE"}
+    mock_razorpay.fetch_payment_fees.return_value = None
+
+    with patch("services.qr_payment_service.razorpay_service", mock_razorpay), \
+         patch("services.qr_payment_service.redis_manager") as mock_redis:
+        mock_redis.is_charger_connected = AsyncMock(return_value=False)
+        await QRPaymentService.handle_qr_payment(payload)
+
+    qr = await QRPayment.filter(razorpay_payment_id="pay_NOFEE001").first()
+    assert qr is not None
+    # No fee in webhook + API returned None → falls back to 2% estimate
+    assert qr.fee_source == "estimated"
+    assert qr.platform_fee == Decimal("2.00")  # 2% of ₹100
+
+
+# ============================================================================
+# _resolve_platform_fee helper
+# ============================================================================
+
+@pytest.mark.asyncio
+async def test_resolve_fee_uses_stored_webhook_fee(client, qr_charger, qr_code):
+    """When fee_source is 'webhook', returns stored platform_fee without API call."""
+    import uuid
+    user = await User.create(
+        email=f"resolve_{uuid.uuid4().hex[:6]}@voltlync.test",
+        phone_number=f"9{uuid.uuid4().int % 1000000000:09d}",
+    )
+    qr_payment = await QRPayment.create(
+        charger=qr_charger, charger_qr_code=qr_code, user=user,
+        razorpay_payment_id=f"pay_{uuid.uuid4().hex[:12]}",
+        razorpay_qr_code_id="qr_TEST123",
+        amount_paid=Decimal("200.00"),
+        platform_fee=Decimal("0.00"),
+        razorpay_commission=Decimal("0.00"),
+        razorpay_gst=Decimal("0.00"),
+        fee_source="webhook",
+        status=QRPaymentStatusEnum.PAID,
+    )
+
+    mock_razorpay = MagicMock()
+    with patch("services.qr_payment_service.razorpay_service", mock_razorpay):
+        fee = await _resolve_platform_fee(qr_payment)
+
+    assert fee == Decimal("0.00")
+    mock_razorpay.fetch_payment_fees.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_fee_falls_back_to_api(client, qr_charger, qr_code):
+    """When no stored fee, fetches from Razorpay API and updates fields."""
+    import uuid
+    user = await User.create(
+        email=f"api_{uuid.uuid4().hex[:6]}@voltlync.test",
+        phone_number=f"9{uuid.uuid4().int % 1000000000:09d}",
+    )
+    qr_payment = await QRPayment.create(
+        charger=qr_charger, charger_qr_code=qr_code, user=user,
+        razorpay_payment_id=f"pay_{uuid.uuid4().hex[:12]}",
+        razorpay_qr_code_id="qr_TEST123",
+        amount_paid=Decimal("100.00"),
+        status=QRPaymentStatusEnum.PAID,
+    )
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.fetch_payment_fees.return_value = (Decimal("2.36"), Decimal("0.36"))
+
+    with patch("services.qr_payment_service.razorpay_service", mock_razorpay):
+        fee = await _resolve_platform_fee(qr_payment)
+
+    assert fee == Decimal("2.36")
+    assert qr_payment.razorpay_commission == Decimal("2.00")
+    assert qr_payment.razorpay_gst == Decimal("0.36")
+    assert qr_payment.fee_source == "api"
+
+
+@pytest.mark.asyncio
+async def test_resolve_fee_falls_back_to_estimate(client, qr_charger, qr_code):
+    """When both webhook and API fail, uses 2% estimate."""
+    import uuid
+    user = await User.create(
+        email=f"est_{uuid.uuid4().hex[:6]}@voltlync.test",
+        phone_number=f"9{uuid.uuid4().int % 1000000000:09d}",
+    )
+    qr_payment = await QRPayment.create(
+        charger=qr_charger, charger_qr_code=qr_code, user=user,
+        razorpay_payment_id=f"pay_{uuid.uuid4().hex[:12]}",
+        razorpay_qr_code_id="qr_TEST123",
+        amount_paid=Decimal("100.00"),
+        status=QRPaymentStatusEnum.PAID,
+    )
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.fetch_payment_fees.return_value = None
+
+    with patch("services.qr_payment_service.razorpay_service", mock_razorpay):
+        fee = await _resolve_platform_fee(qr_payment)
+
+    assert fee == Decimal("2.00")
+    assert qr_payment.fee_source == "estimated"

@@ -278,7 +278,10 @@ export default function QRCodeDetailPage() {
                         </td>
                         <td className="py-3 px-2 text-right">
                           {payment.platform_fee
-                            ? `₹${Number(payment.platform_fee).toFixed(2)}`
+                            ? <span title={payment.fee_source === 'estimated' ? 'Estimated (2%)' : `Commission: ₹${Number(payment.razorpay_commission || 0).toFixed(2)} + GST: ₹${Number(payment.razorpay_gst || 0).toFixed(2)}`}>
+                                {`₹${Number(payment.platform_fee).toFixed(2)}`}
+                                {payment.fee_source === 'estimated' && <span className="text-xs text-muted-foreground ml-1">(est.)</span>}
+                              </span>
                             : "-"}
                         </td>
                         <td className="py-3 px-2 text-right">

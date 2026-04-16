@@ -476,6 +476,9 @@ class QRPayment(Model):
     energy_cost = fields.DecimalField(max_digits=10, decimal_places=2, null=True)   # Pre-GST energy charge
     gst_amount = fields.DecimalField(max_digits=10, decimal_places=2, null=True)    # GST on energy_cost
     platform_fee = fields.DecimalField(max_digits=10, decimal_places=2, null=True)
+    razorpay_commission = fields.DecimalField(max_digits=10, decimal_places=2, null=True)  # Base Razorpay commission (fee - tax), rupees
+    razorpay_gst = fields.DecimalField(max_digits=10, decimal_places=2, null=True)         # GST on Razorpay commission (tax), rupees
+    fee_source = fields.CharField(max_length=20, null=True)                                 # 'webhook', 'api', or 'estimated'
     refund_amount = fields.DecimalField(max_digits=10, decimal_places=2, null=True)
     razorpay_refund_id = fields.CharField(max_length=255, null=True)
     status = fields.CharEnumField(QRPaymentStatusEnum)

@@ -94,7 +94,9 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
   - `link_transaction_to_qr_payment()` - Called from StartTransaction, caches budget in Redis
   - `check_budget_and_auto_stop()` - Called from MeterValues, schedules RemoteStop if budget exceeded
   - `process_qr_session_billing()` - Called from StopTransaction, calculates cost with GST, issues refund. Formula: `energy_charge = energy_kwh * rate`, `gst = energy_charge * gst_percent / 100`, `refund = amount_paid - energy_charge - gst - platform_fee`
-  - Config: `RAZORPAY_PLATFORM_FEE_PERCENT=2.0`, `MINIMUM_REFUND_AMOUNT=1.0`, `QR_PAYMENT_PENDING_TIMEOUT=300`
+  - `_resolve_platform_fee()` - Resolves actual Razorpay fee: webhook payload → API fetch → 2% estimate fallback
+  - Fee fields on QRPayment: `platform_fee` (total fee), `razorpay_commission` (fee - tax), `razorpay_gst` (tax), `fee_source` ('webhook'|'api'|'estimated')
+  - Config: `RAZORPAY_PLATFORM_FEE_PERCENT=2.0` (fallback only), `MINIMUM_REFUND_AMOUNT=1.0`, `QR_PAYMENT_PENDING_TIMEOUT=300`
 - **`wallet_service.py`** - Billing calculations and automated payment processing
   - Zero energy transaction handling (no billing for 0 kWh)
   - Wallet top-up processing with idempotency (`process_wallet_topup()`)
@@ -336,7 +338,7 @@ charger_error (id, charger_id, connector_id, status, error_code, vendor_error_co
 
 -- QR-Based Appless Payments (NEW)
 charger_qr_code (id, charger_id, razorpay_qr_code_id, image_url, short_url, is_active) -- Razorpay UPI QR codes
-qr_payment (id, charger_id, charger_qr_code_id, user_id, transaction_id, razorpay_payment_id, amount_paid, customer_vpa, customer_name, customer_contact, energy_cost, gst_amount, platform_fee, refund_amount, razorpay_refund_id, status, failure_reason, metadata) -- Payment lifecycle
+qr_payment (id, charger_id, charger_qr_code_id, user_id, transaction_id, razorpay_payment_id, amount_paid, customer_vpa, customer_name, customer_contact, energy_cost, gst_amount, platform_fee, razorpay_commission, razorpay_gst, fee_source, refund_amount, razorpay_refund_id, status, failure_reason, metadata) -- Payment lifecycle with actual Razorpay fee tracking
 
 -- Audit & Webhooks
 audit_event (id, event_type, entity_type, entity_id, details, created_at) -- System audit trail

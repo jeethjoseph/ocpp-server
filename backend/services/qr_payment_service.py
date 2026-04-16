@@ -14,7 +14,7 @@ from models import (
     QRPaymentStatusEnum, AuthProviderEnum, ChargerStatusEnum,
     TransactionStatusEnum, UserRoleEnum
 )
-from services.razorpay_service import razorpay_service, RazorpayAlreadyRefundedError
+from services.razorpay_service import razorpay_service, RazorpayAlreadyRefundedError, extract_fee_from_payment
 from services.wallet_service import WalletService
 from redis_manager import redis_manager
 from core.connection_manager import connection_manager
@@ -29,6 +29,31 @@ MINIMUM_REFUND_AMOUNT = Decimal(os.getenv("MINIMUM_REFUND_AMOUNT", "1.0"))
 QR_PAYMENT_PENDING_TIMEOUT = int(os.getenv("QR_PAYMENT_PENDING_TIMEOUT", "300"))
 
 SYSTEM_GUEST_EMAIL = "guest@system.powerlync.com"
+
+
+async def _resolve_platform_fee(qr_payment: QRPayment) -> Decimal:
+    """Get the best available platform fee for a QR payment.
+
+    Priority: stored actual fee > Razorpay API fetch > 2% estimate.
+    Side effect: updates fee fields on qr_payment (caller must save).
+    """
+    if qr_payment.fee_source in ("webhook", "api") and qr_payment.platform_fee is not None:
+        return qr_payment.platform_fee
+
+    fee_data = razorpay_service.fetch_payment_fees(qr_payment.razorpay_payment_id)
+    if fee_data:
+        total_fee, tax = fee_data
+        qr_payment.platform_fee = total_fee
+        qr_payment.razorpay_commission = total_fee - tax
+        qr_payment.razorpay_gst = tax
+        qr_payment.fee_source = "api"
+        return total_fee
+
+    estimated = (qr_payment.amount_paid * RAZORPAY_PLATFORM_FEE_PERCENT / 100).quantize(
+        Decimal('0.01'), rounding=ROUND_HALF_UP
+    )
+    qr_payment.fee_source = "estimated"
+    return estimated
 
 
 async def ensure_guest_user():
@@ -140,6 +165,18 @@ class QRPaymentService:
         customer_name = notes.get("customer_name") or payment_entity.get("email")
         qr_code_id = qr_code_entity.get("id") or payment_entity.get("description", "").split("|")[-1].strip()
 
+        # Extract actual Razorpay fee from webhook payload
+        fee_data = extract_fee_from_payment(payment_entity)
+        fee_fields = {}
+        if fee_data:
+            total_fee, tax = fee_data
+            fee_fields = {
+                "platform_fee": total_fee,
+                "razorpay_commission": total_fee - tax,
+                "razorpay_gst": tax,
+                "fee_source": "webhook",
+            }
+
         logger.info(
             "QR payment received: payment_id=%s amount=₹%s qr_code=%s vpa=%s",
             mask_payment_id(payment_id), amount_paid, qr_code_id, mask_vpa(vpa),
@@ -184,6 +221,7 @@ class QRPaymentService:
                     status=QRPaymentStatusEnum.EXPIRED,
                     failure_reason=f"Stale webhook: payment was {age_seconds:.0f}s old",
                     metadata=webhook_data,
+                    **fee_fields,
                 )
                 await QRPaymentService._full_refund(qr_payment, "Stale payment - webhook delayed")
                 return {"status": "refunded_stale", "qr_payment_id": qr_payment.id}
@@ -246,6 +284,7 @@ class QRPaymentService:
                     status=QRPaymentStatusEnum.FAILED,
                     failure_reason="Concurrent payment rejected — charger busy",
                     metadata=webhook_data,
+                    **fee_fields,
                 )
                 rejection_qr_payment_id = rejected.id
             else:
@@ -261,6 +300,7 @@ class QRPaymentService:
                     customer_contact=contact,
                     status=QRPaymentStatusEnum.PAID,
                     metadata=webhook_data,
+                    **fee_fields,
                 )
 
         # Refund rejected payment outside the lock (Razorpay call is slow)
@@ -414,16 +454,14 @@ class QRPaymentService:
 
         qr_payment.transaction_id = transaction_id
         qr_payment.status = QRPaymentStatusEnum.CHARGING
-        await qr_payment.save()
 
         # Cache session data in Redis for MeterValues budget check
         tariff = await WalletService.get_applicable_tariff(charger_id)
         tariff_rate = tariff.rate_per_kwh if tariff else Decimal('0')
         gst_percent = tariff.gst_percent if tariff else Decimal('18')
-        platform_fee = (qr_payment.amount_paid * RAZORPAY_PLATFORM_FEE_PERCENT / 100).quantize(
-            Decimal('0.01'), rounding=ROUND_HALF_UP
-        )
+        platform_fee = await _resolve_platform_fee(qr_payment)
         budget_limit = float(qr_payment.amount_paid - platform_fee)
+        await qr_payment.save()
 
         transaction = await Transaction.filter(id=transaction_id).first()
 
@@ -460,9 +498,8 @@ class QRPaymentService:
             tariff = await WalletService.get_applicable_tariff(qr_payment.charger_id)
             tariff_rate = tariff.rate_per_kwh if tariff else Decimal('0')
             gst_percent = tariff.gst_percent if tariff else Decimal('18')
-            platform_fee = (qr_payment.amount_paid * RAZORPAY_PLATFORM_FEE_PERCENT / 100).quantize(
-                Decimal('0.01'), rounding=ROUND_HALF_UP
-            )
+            platform_fee = await _resolve_platform_fee(qr_payment)
+            await qr_payment.save()
             budget_limit = float(qr_payment.amount_paid - platform_fee)
 
             transaction = await Transaction.filter(id=transaction_id).first()
@@ -563,9 +600,7 @@ class QRPaymentService:
             energy_cost = Decimal('0.00')
             gst_amount = Decimal('0.00')
 
-        platform_fee = (qr_payment.amount_paid * RAZORPAY_PLATFORM_FEE_PERCENT / 100).quantize(
-            Decimal('0.01'), rounding=ROUND_HALF_UP
-        )
+        platform_fee = await _resolve_platform_fee(qr_payment)
 
         refund = max(Decimal('0'), qr_payment.amount_paid - energy_cost - gst_amount - platform_fee)
 
@@ -659,9 +694,7 @@ class QRPaymentService:
                 )
                 return
 
-            platform_fee = (locked.amount_paid * RAZORPAY_PLATFORM_FEE_PERCENT / 100).quantize(
-                Decimal('0.01'), rounding=ROUND_HALF_UP
-            )
+            platform_fee = await _resolve_platform_fee(locked)
             refund_amount = locked.amount_paid - platform_fee
 
             if refund_amount < MINIMUM_REFUND_AMOUNT:

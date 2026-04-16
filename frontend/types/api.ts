@@ -484,6 +484,9 @@ export interface QRPayment {
   energy_cost?: string;
   gst_amount?: string;
   platform_fee?: string;
+  razorpay_commission?: string;
+  razorpay_gst?: string;
+  fee_source?: string;
   refund_amount?: string;
   status: QRPaymentStatus;
   failure_reason?: string;
