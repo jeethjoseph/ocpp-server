@@ -247,6 +247,9 @@ export interface QRTransactionItem {
   energy_cost: string | null;
   gst_amount: string | null;
   platform_fee: string | null;
+  razorpay_commission: string | null;
+  razorpay_gst: string | null;
+  fee_source: string | null;
   refund_amount: string | null;
   charger_name: string | null;
   duration_minutes: number | null;

@@ -179,7 +179,7 @@ function TransactionCard({ txn }: { txn: QRTransactionItem }) {
             )}
             {txn.platform_fee && (
               <div className="flex justify-between text-muted-foreground">
-                <span>Platform fee</span>
+                <span>Platform fee{txn.fee_source === 'estimated' ? ' (est.)' : ''}</span>
                 <span>{formatINR(txn.platform_fee)}</span>
               </div>
             )}

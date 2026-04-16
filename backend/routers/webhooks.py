@@ -8,7 +8,7 @@ import logging
 import json
 import os
 from clerk_backend_api import Clerk
-from services.razorpay_service import razorpay_service
+from services.razorpay_service import razorpay_service, extract_fee_from_payment
 from services.wallet_service import WalletService
 from crud import log_webhook_event
 from models import WebhookSourceEnum
@@ -415,6 +415,21 @@ async def handle_payment_captured(event_data: dict):
         )
 
         if success:
+            # Store Razorpay fee breakdown for GST compliance
+            fee_data = extract_fee_from_payment(payment)
+            if fee_data:
+                total_fee, tax = fee_data
+                txn = await WalletTransaction.get(id=wallet_txn.id)
+                meta = txn.payment_metadata or {}
+                meta.update({
+                    "razorpay_fee": float(total_fee),
+                    "razorpay_tax": float(tax),
+                    "razorpay_commission": float(total_fee - tax),
+                    "fee_source": "webhook",
+                })
+                txn.payment_metadata = meta
+                await txn.save()
+
             logger.info(
                 f"✅ Webhook: Successfully processed payment for order {order_id}, "
                 f"Amount ₹{wallet_txn.amount}, New balance ₹{new_balance}"

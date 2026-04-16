@@ -19,6 +19,25 @@ class RazorpayAlreadyRefundedError(Exception):
         super().__init__(f"Payment {payment_id} is already refunded: {original_error}")
 
 
+def extract_fee_from_payment(payment_data: dict) -> Optional[Tuple[Decimal, Decimal]]:
+    """Extract actual Razorpay fee and tax from a payment object.
+
+    Args:
+        payment_data: Razorpay payment entity dict (from webhook or API).
+
+    Returns:
+        (total_fee_rupees, tax_rupees) or None if fee data is unavailable.
+        fee=0 is valid (common for UPI) and returns (Decimal('0'), Decimal('0')).
+    """
+    fee_paise = payment_data.get("fee")
+    tax_paise = payment_data.get("tax")
+    if fee_paise is None:
+        return None
+    total_fee = Decimal(str(fee_paise)) / 100
+    tax = Decimal(str(tax_paise or 0)) / 100
+    return (total_fee, tax)
+
+
 def _is_already_refunded_error(err: Exception) -> bool:
     """Detect Razorpay 'already refunded' / 'fully refunded' responses."""
     msg = str(err).lower()
@@ -196,6 +215,17 @@ class RazorpayService:
         except Exception as e:
             logger.error(f"Failed to fetch payment {payment_id}: {e}")
             return None
+
+    def fetch_payment_fees(self, payment_id: str) -> Optional[Tuple[Decimal, Decimal]]:
+        """Fetch payment from Razorpay and extract fee/tax.
+
+        Returns:
+            (total_fee_rupees, tax_rupees) or None if unavailable.
+        """
+        payment = self.fetch_payment(payment_id)
+        if payment:
+            return extract_fee_from_payment(payment)
+        return None
 
     def fetch_order(self, order_id: str) -> Optional[Dict]:
         """

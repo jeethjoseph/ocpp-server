@@ -417,7 +417,7 @@ class QRPaymentService:
 ```
 
 **Configuration**:
-- `RAZORPAY_PLATFORM_FEE_PERCENT`: 2.0% (env var)
+- `RAZORPAY_PLATFORM_FEE_PERCENT`: 2.0% fallback (actual fee extracted from Razorpay webhook/API)
 - `MINIMUM_REFUND_AMOUNT`: ₹1.0 (env var)
 - `QR_PAYMENT_PENDING_TIMEOUT`: 300 seconds (env var)
 
@@ -1471,7 +1471,7 @@ The QR-based appless charging feature enables customers to charge their EV by sc
 - Calls `process_qr_session_billing(transaction_id)`
 - Calculates: `energy_cost = energy_consumed × tariff_rate`
 - Calculates: `gst_amount = energy_cost × gst_percent / 100` (GST on energy cost only)
-- Calculates: `platform_fee = amount_paid × 2%` (configurable)
+- Resolves `platform_fee` via `_resolve_platform_fee()`: actual Razorpay fee from webhook/API, fallback to 2% estimate
 - Calculates: `refund = amount_paid - energy_cost - gst_amount - platform_fee`
 - **If refund >= ₹1.0**: Issues partial refund via Razorpay, sets status=REFUNDED
 - **If refund < ₹1.0**: Absorbed as operator credit, sets status=COMPLETED
@@ -1503,7 +1503,7 @@ REFUND_FAILED
 ### Configuration
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `RAZORPAY_PLATFORM_FEE_PERCENT` | 2.0 | Platform fee percentage on payment amount |
+| `RAZORPAY_PLATFORM_FEE_PERCENT` | 2.0 | Fallback fee estimate (%) when actual Razorpay fee unavailable |
 | `MINIMUM_REFUND_AMOUNT` | 1.0 | Minimum refund amount in ₹ (below this, absorbed) |
 | `QR_PAYMENT_PENDING_TIMEOUT` | 300 | Seconds before a payment is considered stale |
 
@@ -1769,7 +1769,10 @@ CREATE TABLE qr_payment (
     customer_contact VARCHAR(255),                       -- Phone number from webhook
     energy_cost DECIMAL(10,2),                           -- Calculated after charging
     gst_amount DECIMAL(10,2),                            -- GST on energy_cost (18% default)
-    platform_fee DECIMAL(10,2),                          -- Razorpay fee (2% default)
+    platform_fee DECIMAL(10,2),                          -- Actual Razorpay fee (from webhook/API, fallback to 2% estimate)
+    razorpay_commission DECIMAL(10,2),                   -- Base Razorpay commission (fee - tax)
+    razorpay_gst DECIMAL(10,2),                          -- GST on Razorpay commission
+    fee_source VARCHAR(20),                              -- 'webhook', 'api', or 'estimated'
     refund_amount DECIMAL(10,2),                         -- Amount refunded to customer
     razorpay_refund_id VARCHAR(255),                     -- Refund transaction ID
     status VARCHAR(20) NOT NULL,                         -- QRPaymentStatusEnum
@@ -4303,7 +4306,7 @@ CLERK_WEBHOOK_SECRET=whsec_...
 # Razorpay Payment Gateway
 RAZORPAY_KEY_ID=rzp_live_...
 RAZORPAY_KEY_SECRET=...
-RAZORPAY_PLATFORM_FEE_PERCENT=2.0
+RAZORPAY_PLATFORM_FEE_PERCENT=2.0  # Fallback only; actual fee from Razorpay webhook/API
 
 # Transaction Suspend/Resume
 DISCONNECT_SUSPEND_TIMEOUT_SECONDS=180  # Timeout after charger disconnect (before marking STOPPED)

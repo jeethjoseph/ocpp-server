@@ -93,6 +93,8 @@ async def main():
                     "contact": args.phone,
                     "email": None,
                     "notes": {},
+                    "fee": 0,
+                    "tax": 0,
                     "description": f"QR payment test for {charger.charge_point_string_id}",
                 }
             },
