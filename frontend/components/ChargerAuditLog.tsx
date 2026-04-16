@@ -102,8 +102,8 @@ export default function ChargerAuditLog({ chargePointId, chargerName }: ChargerA
       limit,
       action: actionFilter || undefined,
       actor_type: actorTypeFilter || undefined,
-      start_date: startDate || undefined,
-      end_date: endDate || undefined,
+      start_date: startDate ? new Date(startDate).toISOString() : undefined,
+      end_date: endDate ? new Date(endDate).toISOString() : undefined,
     }
   );
 

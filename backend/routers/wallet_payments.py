@@ -152,6 +152,7 @@ async def create_recharge_order(
             amount=amount,
             type=TransactionTypeEnum.TOP_UP,
             description=f"Wallet recharge - ₹{amount} (Pending)",
+            razorpay_order_id=order["id"],
             payment_metadata={
                 "status": PaymentStatusEnum.PENDING.value,
                 "razorpay_order_id": order["id"],

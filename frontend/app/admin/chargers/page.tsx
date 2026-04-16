@@ -463,6 +463,7 @@ function ChargerModal({ stations, onSubmit, onClose }: ChargerModalProps) {
     vendor: "",
     serial_number: "",
     external_charger_id: "",
+    tariff_per_kwh: "",
     connectors: [
       { connector_id: 1, connector_type: "Type2", max_power_kw: 22 },
     ],
@@ -477,6 +478,7 @@ function ChargerModal({ stations, onSubmit, onClose }: ChargerModalProps) {
       vendor: formData.vendor || undefined,
       serial_number: formData.serial_number || undefined,
       external_charger_id: formData.external_charger_id || undefined,
+      tariff_per_kwh: formData.tariff_per_kwh ? parseFloat(formData.tariff_per_kwh) : undefined,
     });
   };
 
@@ -614,6 +616,23 @@ function ChargerModal({ stations, onSubmit, onClose }: ChargerModalProps) {
           </div>
 
           <div>
+            <label className="block text-sm font-medium text-card-foreground mb-1">
+              Tariff (₹/kWh)
+            </label>
+            <input
+              type="number"
+              step="0.01"
+              min="0"
+              value={formData.tariff_per_kwh}
+              onChange={(e) =>
+                setFormData({ ...formData, tariff_per_kwh: e.target.value })
+              }
+              placeholder="Leave empty to use global tariff"
+              className="w-full px-3 py-2 border border-border bg-input text-foreground rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 transition-colors"
+            />
+          </div>
+
+          <div>
             <div className="flex justify-between items-center mb-2">
               <label className="block text-sm font-medium text-card-foreground">
                 Connectors
@@ -673,6 +692,7 @@ function ChargerModal({ stations, onSubmit, onClose }: ChargerModalProps) {
                       <option value="Type2">Type 2</option>
                       <option value="CCS">CCS</option>
                       <option value="CHAdeMO">CHAdeMO</option>
+                      <option value="Socket">Socket</option>
                     </select>
                   </div>
                   <div>
@@ -686,7 +706,7 @@ function ChargerModal({ stations, onSubmit, onClose }: ChargerModalProps) {
                         updateConnector(
                           index,
                           "max_power_kw",
-                          parseFloat(e.target.value)
+                          e.target.value === "" ? 0 : parseFloat(e.target.value)
                         )
                       }
                       className="w-full px-2 py-1 text-sm border border-border bg-input text-foreground rounded focus:outline-none focus:ring-1 focus:ring-primary transition-colors"
@@ -728,6 +748,7 @@ function EditChargerModal({ charger, onSubmit, onClose }: EditChargerModalProps)
     model: charger.model || "",
     vendor: charger.vendor || "",
     external_charger_id: charger.external_charger_id || "",
+    tariff_per_kwh: charger.tariff_per_kwh != null ? String(charger.tariff_per_kwh) : "",
   });
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -737,6 +758,7 @@ function EditChargerModal({ charger, onSubmit, onClose }: EditChargerModalProps)
       model: formData.model || undefined,
       vendor: formData.vendor || undefined,
       external_charger_id: formData.external_charger_id || undefined,
+      tariff_per_kwh: formData.tariff_per_kwh ? parseFloat(formData.tariff_per_kwh) : undefined,
     });
   };
 
@@ -801,6 +823,23 @@ function EditChargerModal({ charger, onSubmit, onClose }: EditChargerModalProps)
                 setFormData({ ...formData, external_charger_id: e.target.value })
               }
               placeholder="Unique identifier"
+              className="w-full px-3 py-2 border border-border bg-input text-foreground rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 transition-colors"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-card-foreground mb-1">
+              Tariff (₹/kWh)
+            </label>
+            <input
+              type="number"
+              step="0.01"
+              min="0"
+              value={formData.tariff_per_kwh}
+              onChange={(e) =>
+                setFormData({ ...formData, tariff_per_kwh: e.target.value })
+              }
+              placeholder="Leave empty to use global tariff"
               className="w-full px-3 py-2 border border-border bg-input text-foreground rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 transition-colors"
             />
           </div>

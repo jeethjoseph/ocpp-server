@@ -6,7 +6,8 @@ from datetime import datetime, timedelta, timezone
 
 from utils import safe_create_task
 from services.wallet_service import WalletService
-from models import Transaction, TransactionStatusEnum, MeterValue
+from services.razorpay_service import razorpay_service
+from models import Transaction, TransactionStatusEnum, MeterValue, QRPayment, QRPaymentStatusEnum
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,8 @@ class BillingRetryService:
         while self.is_running:
             try:
                 await self._process_failed_billing_transactions()
+                await self._process_failed_qr_refunds()
+                await self._cleanup_orphaned_qr_payments()
                 await self._cleanup_stale_suspended_transactions()
                 await asyncio.sleep(self.retry_interval_minutes * 60)
             except asyncio.CancelledError:
@@ -101,6 +104,129 @@ class BillingRetryService:
         if success_count > 0 or failure_count > 0:
             logger.info(f"🔄 Billing retry completed: {success_count} successful, {failure_count} failed")
     
+    async def _process_failed_qr_refunds(self):
+        """Retry failed QR payment refunds (e.g. insufficient Razorpay balance)"""
+        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=self.max_retry_age_hours)
+
+        failed_refunds = await QRPayment.filter(
+            status=QRPaymentStatusEnum.REFUND_FAILED,
+            updated_at__gte=cutoff_time,
+        ).all()
+
+        if not failed_refunds:
+            logger.debug("No failed QR refunds to retry")
+            return
+
+        logger.info(f"🔄 Retrying {len(failed_refunds)} failed QR refunds")
+
+        success_count = 0
+        failure_count = 0
+
+        for qr_payment in failed_refunds:
+            try:
+                refund_amount = qr_payment.refund_amount
+                if not refund_amount or refund_amount <= 0:
+                    logger.warning(f"QR payment {qr_payment.id} has no refund_amount, skipping")
+                    continue
+
+                refund_result = razorpay_service.refund_payment(
+                    qr_payment.razorpay_payment_id,
+                    amount=refund_amount,
+                    notes={"qr_payment_id": str(qr_payment.id), "reason": "Retry: " + (qr_payment.failure_reason or "unknown")},
+                )
+                qr_payment.razorpay_refund_id = refund_result.get("id")
+                qr_payment.status = QRPaymentStatusEnum.REFUNDED
+                qr_payment.failure_reason = None
+                await qr_payment.save()
+                success_count += 1
+                logger.info(f"✅ QR refund retry successful: payment {qr_payment.id}, ₹{refund_amount}")
+
+            except Exception as e:
+                failure_count += 1
+                qr_payment.failure_reason = str(e)
+                await qr_payment.save()
+                logger.warning(f"❌ QR refund retry failed for payment {qr_payment.id}: {e}")
+
+            await asyncio.sleep(0.1)
+
+        if success_count > 0 or failure_count > 0:
+            logger.info(f"🔄 QR refund retry completed: {success_count} successful, {failure_count} failed")
+
+    async def _cleanup_orphaned_qr_payments(self):
+        """Refund QR payments stuck in PAID or CHARGING with no active transaction.
+
+        This catches edge cases where:
+        - handle_payment_without_plug task died (server restart)
+        - RemoteStart succeeded but StartTransaction never came
+        - StopTransaction was rejected (e.g. invalid reason) leaving QR in CHARGING
+        - Suspend timeout didn't process QR billing (server restart)
+        - Any other gap between payment and charging
+        """
+        from services.qr_payment_service import QRPaymentService, QR_PAYMENT_PENDING_TIMEOUT
+
+        # PAID payments older than 2x the pending timeout are definitely orphaned
+        stale_cutoff = datetime.now(timezone.utc) - timedelta(seconds=QR_PAYMENT_PENDING_TIMEOUT * 2)
+
+        orphaned_paid = await QRPayment.filter(
+            status=QRPaymentStatusEnum.PAID,
+            transaction_id__isnull=True,
+            created_at__lt=stale_cutoff,
+        ).all()
+
+        # CHARGING payments whose linked transaction is already terminal
+        orphaned_charging = []
+        charging_payments = await QRPayment.filter(
+            status=QRPaymentStatusEnum.CHARGING,
+            created_at__lt=stale_cutoff,
+        ).all()
+        for qr_payment in charging_payments:
+            if qr_payment.transaction_id:
+                txn = await Transaction.filter(id=qr_payment.transaction_id).first()
+                if txn and txn.transaction_status in (
+                    TransactionStatusEnum.COMPLETED,
+                    TransactionStatusEnum.FAILED,
+                    TransactionStatusEnum.STOPPED,
+                    TransactionStatusEnum.BILLING_FAILED,
+                ):
+                    orphaned_charging.append(qr_payment)
+            else:
+                # CHARGING with no transaction_id — shouldn't happen but handle it
+                orphaned_charging.append(qr_payment)
+
+        orphaned_payments = orphaned_paid + orphaned_charging
+
+        if not orphaned_payments:
+            return
+
+        logger.info(f"🧹 Found {len(orphaned_payments)} orphaned QR payments to process ({len(orphaned_paid)} PAID, {len(orphaned_charging)} CHARGING)")
+
+        for qr_payment in orphaned_payments:
+            try:
+                age_minutes = (datetime.now(timezone.utc) - qr_payment.created_at).total_seconds() / 60
+                logger.info(
+                    f"Processing orphaned QR payment {qr_payment.id}: "
+                    f"₹{qr_payment.amount_paid}, status={qr_payment.status.value}, "
+                    f"transaction_id={qr_payment.transaction_id}, age={age_minutes:.0f}m"
+                )
+
+                if qr_payment.status == QRPaymentStatusEnum.CHARGING and qr_payment.transaction_id:
+                    # Has a linked transaction — do proper billing (charge for energy, refund rest)
+                    txn = await Transaction.filter(id=qr_payment.transaction_id).first()
+                    if txn and txn.energy_consumed_kwh and txn.energy_consumed_kwh > 0:
+                        await QRPaymentService.process_qr_session_billing(qr_payment.transaction_id)
+                    else:
+                        await QRPaymentService.handle_charging_failure(qr_payment.transaction_id)
+                else:
+                    # No transaction — full refund
+                    qr_payment.status = QRPaymentStatusEnum.EXPIRED
+                    qr_payment.failure_reason = "Orphaned payment - no transaction linked"
+                    await qr_payment.save()
+                    await QRPaymentService._full_refund(qr_payment, "Orphaned payment cleanup")
+            except Exception as e:
+                logger.error(f"Failed to process orphaned QR payment {qr_payment.id}: {e}", exc_info=True)
+
+            await asyncio.sleep(0.1)
+
     async def _cleanup_stale_suspended_transactions(self):
         """Auto-stop SUSPENDED transactions orphaned by server restarts.
 
@@ -168,6 +294,16 @@ class BillingRetryService:
                         logger.info(f"💰 Billed stale transaction {transaction.id}: ₹{billing_amount}")
                     else:
                         logger.warning(f"💰 Billing failed for stale transaction {transaction.id}: {message}")
+
+                # Process QR payment billing (refund unused amount or full refund)
+                try:
+                    from services.qr_payment_service import QRPaymentService
+                    if transaction.energy_consumed_kwh is not None and transaction.energy_consumed_kwh > 0:
+                        await QRPaymentService.process_qr_session_billing(transaction.id)
+                    else:
+                        await QRPaymentService.handle_charging_failure(transaction.id)
+                except Exception as qr_err:
+                    logger.error(f"QR billing error for stale suspended transaction {transaction.id}: {qr_err}", exc_info=True)
 
             except Exception as e:
                 logger.error(f"Error cleaning up stale SUSPENDED transaction {transaction.id}: {e}", exc_info=True)

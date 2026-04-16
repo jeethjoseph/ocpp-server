@@ -156,10 +156,12 @@ class DatabaseSeeder:
                 # Admins start with a higher balance for testing
                 initial_balance = Decimal(random.uniform(1000, 2000)).quantize(Decimal('0.01'))
                 
-            wallet = await Wallet.create(
+            wallet, created = await Wallet.get_or_create(
                 user=user,
-                balance=initial_balance
+                defaults={"balance": initial_balance}
             )
+            if not created:
+                print(f"  ⏭️  Wallet already exists for {user.email}")
             
             # Create some top-up transactions (only for regular users to keep it simple)
             if user.role == UserRoleEnum.USER:
@@ -394,7 +396,7 @@ class DatabaseSeeder:
             # Transaction status and timing
             status = random.choices(
                 list(TransactionStatusEnum),
-                weights=[1, 1, 2, 1, 8, 6, 1, 1, 1],  # Bias towards COMPLETED and STOPPED, added weight for BILLING_FAILED
+                weights=[1, 1, 2, 1, 1, 8, 6, 1, 1, 1],  # Bias towards COMPLETED and STOPPED
                 k=1
             )[0]
             

@@ -190,6 +190,7 @@ export interface Charger {
   created_at: string;
   updated_at: string;
   tariff_per_kwh?: number;
+  tariff_gst_percent?: number;
 }
 
 export interface Connector {

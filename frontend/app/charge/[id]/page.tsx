@@ -28,6 +28,7 @@ import {
   useTransactionMeterValues,
 } from "@/lib/queries/transactions";
 import { toast } from "sonner";
+import { isSocketCharger as checkSocketCharger } from "@/lib/utils";
 
 export default function UserChargePage() {
   const params = useParams();
@@ -48,6 +49,8 @@ export default function UserChargePage() {
 
   const charger = chargerData?.charger;
   const station = chargerData?.station;
+  const connectors = chargerData?.connectors;
+  const isSocketCharger = checkSocketCharger(connectors);
   const currentTransactionId = chargerData?.current_transaction?.transaction_id;
   const recentTransactionId = chargerData?.recent_transaction?.transaction_id;
 
@@ -59,12 +62,6 @@ export default function UserChargePage() {
   const { data: meterValuesData } = useTransactionMeterValues(transactionIdToShow || 0);
   const meterValues = meterValuesData?.meter_values || [];
   const latestMeterValue = meterValues[meterValues.length - 1];
-
-  // Debug logging
-  console.log("🔍 Debug - chargerData:", chargerData);
-  console.log("🔍 Debug - currentTransactionId:", currentTransactionId);
-  console.log("🔍 Debug - transaction:", transaction);
-  console.log("🔍 Debug - meterValues:", meterValues);
 
   useEffect(() => {
     if (currentTransactionId) {
@@ -170,12 +167,9 @@ export default function UserChargePage() {
   };
 
   const canStartCharging = () => {
-    return (
-      charger &&
-      charger.latest_status === "Preparing" &&
-      charger.connection_status &&
-      !currentTransactionId
-    );
+    const statusReady = charger?.latest_status === "Preparing" ||
+      (isSocketCharger && charger?.latest_status === "Available");
+    return charger && statusReady && charger.connection_status && !currentTransactionId;
   };
 
   const canStopCharging = () => {
@@ -290,7 +284,8 @@ export default function UserChargePage() {
               <p className="text-sm text-center text-yellow-800 dark:text-yellow-200 font-medium">
                 {!charger.connection_status
                   ? "⚠️ Charger is offline"
-                  : charger.latest_status !== "Preparing"
+                  : charger.latest_status !== "Preparing" &&
+                    !(isSocketCharger && charger.latest_status === "Available")
                   ? `Status: ${charger.latest_status}`
                   : "Charger is not ready"}
               </p>

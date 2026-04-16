@@ -9,6 +9,22 @@ from decimal import Decimal
 
 logger = logging.getLogger(__name__)
 
+
+class RazorpayAlreadyRefundedError(Exception):
+    """Raised when Razorpay indicates a payment is already (fully) refunded."""
+
+    def __init__(self, payment_id: str, original_error: Exception):
+        self.payment_id = payment_id
+        self.original_error = original_error
+        super().__init__(f"Payment {payment_id} is already refunded: {original_error}")
+
+
+def _is_already_refunded_error(err: Exception) -> bool:
+    """Detect Razorpay 'already refunded' / 'fully refunded' responses."""
+    msg = str(err).lower()
+    return any(token in msg for token in ("already refund", "fully refund", "refunded fully"))
+
+
 class RazorpayService:
     """Service for handling Razorpay payment operations"""
 
@@ -204,6 +220,70 @@ class RazorpayService:
             logger.error(f"Failed to fetch order {order_id}: {e}")
             return None
 
+    def create_qr_code(self, name: str) -> Optional[Dict]:
+        """Create a Razorpay QR code for a charger (static, variable amount)"""
+        if not self.is_configured():
+            raise Exception("Razorpay is not configured")
+        try:
+            qr_data = {
+                "type": "upi_qr",
+                "name": f"EV Charging - {name}",
+                "usage": "multiple_use",
+                "fixed_amount": False,
+                "description": f"Pay for EV charging at {name}",
+            }
+            qr_code = self.client.qrcode.create(data=qr_data)
+            logger.info(f"Razorpay QR code created: {qr_code.get('id')} for {name}")
+            return qr_code
+        except Exception as e:
+            logger.error(f"Failed to create Razorpay QR code: {e}", exc_info=True)
+            raise Exception(f"Failed to create QR code: {str(e)}")
+
+    def close_qr_code(self, qr_code_id: str) -> Optional[Dict]:
+        """Close a Razorpay QR code"""
+        if not self.is_configured():
+            raise Exception("Razorpay is not configured")
+        try:
+            result = self.client.qrcode.close(qr_code_id)
+            logger.info(f"Razorpay QR code closed: {qr_code_id}")
+            return result
+        except Exception as e:
+            logger.error(f"Failed to close Razorpay QR code {qr_code_id}: {e}")
+            return None
+
+    def fetch_qr_code(self, qr_code_id: str) -> Optional[Dict]:
+        """Fetch QR code details from Razorpay"""
+        if not self.is_configured():
+            return None
+        try:
+            return self.client.qrcode.fetch(qr_code_id)
+        except Exception as e:
+            logger.error(f"Failed to fetch QR code {qr_code_id}: {e}")
+            return None
+
+    def fetch_qr_payments(self, qr_code_id: str, options: Optional[Dict] = None) -> Optional[Dict]:
+        """Fetch payments for a QR code"""
+        if not self.is_configured():
+            return None
+        try:
+            return self.client.qrcode.fetch_all_payments(qr_code_id, options or {})
+        except Exception as e:
+            logger.error(f"Failed to fetch payments for QR code {qr_code_id}: {e}")
+            return None
+
+    def validate_vpa(self, vpa: str) -> Optional[Dict]:
+        """Validate a UPI VPA and return account holder name."""
+        if not self.is_configured():
+            logger.error("Cannot validate VPA - Razorpay not configured")
+            return None
+        try:
+            result = self.client.payment.validateVpa({"vpa": vpa})
+            logger.info(f"VPA validation for {vpa}: success={result.get('success')}")
+            return result
+        except Exception as e:
+            logger.error(f"Failed to validate VPA {vpa}: {e}")
+            return None
+
     def refund_payment(
         self,
         payment_id: str,
@@ -240,8 +320,30 @@ class RazorpayService:
             return refund
 
         except Exception as e:
+            if _is_already_refunded_error(e):
+                raise RazorpayAlreadyRefundedError(payment_id, e)
             logger.error(f"Failed to create refund for payment {payment_id}: {e}")
+            raise
+
+    def find_refund_for_payment(self, payment_id: str) -> Optional[Dict]:
+        """Fetch existing refund(s) for a payment. Returns the first refund dict or None."""
+        if not self.is_configured():
             return None
+        try:
+            payment = self.client.payment.fetch(payment_id)
+            # SDK may expose `refunds` as list directly or via a subresource call
+            refunds = payment.get("refunds") if isinstance(payment, dict) else None
+            if not refunds:
+                refunds_response = self.client.payment.refunds(payment_id)
+                if isinstance(refunds_response, dict):
+                    refunds = refunds_response.get("items") or []
+                else:
+                    refunds = refunds_response or []
+            if refunds:
+                return refunds[0]
+        except Exception as e:
+            logger.error(f"Failed to fetch refunds for payment {payment_id}: {e}")
+        return None
 
 
 # Singleton instance

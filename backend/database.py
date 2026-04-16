@@ -8,10 +8,11 @@ load_dotenv()
 
 # Detect environment for SSL configuration
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "development")
-IS_PRODUCTION = ENVIRONMENT.lower() in ["production", "prod"]
 
-# SSL configuration: require in production, disable in development
-ssl_config = "require" if IS_PRODUCTION else "disable"
+# SSL configuration: require for cloud/external DBs, disable for local/Docker
+db_host = os.environ.get("DB_HOST", "localhost")
+is_local_db = db_host in ["localhost", "127.0.0.1", "postgres"]
+ssl_config = "disable" if is_local_db else "require"
 
 # Use credential-based config instead of URL string
 TORTOISE_ORM = {
@@ -32,7 +33,6 @@ TORTOISE_ORM = {
         "models": {
             "models": [
                 "models",
-                "admin",  # FastAdmin models
                 "aerich.models"  # Migration tracking
             ],
             "default_connection": "default",

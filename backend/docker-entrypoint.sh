@@ -30,7 +30,7 @@ async def check_db():
             user=os.getenv('DB_USER'),
             password=os.getenv('DB_PASSWORD'),
             database=os.getenv('DB_NAME'),
-            ssl='disable' if os.getenv('ENVIRONMENT', 'development') == 'development' else 'require'
+            ssl='disable'
         )
         await conn.close()
         return True
@@ -58,15 +58,9 @@ echo ""
 echo "Running database migrations..."
 echo "------------------------------------------"
 
-# Check if aerich is initialized (aerich table exists)
-if aerich history 2>/dev/null | grep -q "No migrations"; then
-    echo "No pending migrations."
-elif aerich upgrade 2>&1; then
-    echo "Migrations completed successfully."
-else
-    echo "WARNING: Migration failed or no migrations to run."
-    echo "This might be okay for first-time setup."
-fi
+# Try aerich upgrade — it handles both fresh and existing databases
+aerich upgrade
+echo "Migrations completed successfully."
 
 echo "------------------------------------------"
 echo ""

@@ -52,14 +52,9 @@ Environment="PATH=/root/ocpp_server/.venv/bin:/usr/local/bin:/usr/bin:/bin"
 # Redis Configuration (optional - can use .env file)
 # Environment="REDIS_URL=redis://localhost:6379/0"
 
-# Supabase Configuration (optional - can use .env file)
-# Environment="SUPABASE_URL=https://your-project.supabase.co"
-# Environment="SUPABASE_KEY=your-supabase-anon-key"
-# Environment="SUPABASE_SERVICE_KEY=your-supabase-service-key"
-
 # Clerk Authentication (optional - can use .env file)
 # Environment="CLERK_SECRET_KEY=your-clerk-secret-key"
-# Environment="CLERK_PUBLISHABLE_KEY=your-clerk-publishable-key"
+# Environment="CLERK_WEBHOOK_SECRET=your-clerk-webhook-secret"
 
 # Application Settings (optional)
 # Environment="PORT=8080"

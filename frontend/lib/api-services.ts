@@ -224,11 +224,54 @@ export interface PublicStationsListResponse {
 }
 
 export const publicStationService = {
-  getAll: () => 
+  getAll: () =>
     api.get<PublicStationsListResponse>(`/api/public/stations`),
-  
-  getById: (id: number) => 
+
+  getById: (id: number) =>
     api.get<PublicStationResponse>(`/api/public/stations/${id}`)
+};
+
+// Public station map service (no auth required)
+export const publicStationMapService = {
+  getAll: () =>
+    api.get<PublicStationsListResponse>(`/api/public/stations/map`),
+};
+
+// Public QR Transaction History (no auth required)
+export interface QRTransactionItem {
+  id: number;
+  created_at: string;
+  amount_paid: string;
+  status: string;
+  energy_consumed_kwh: number | null;
+  energy_cost: string | null;
+  gst_amount: string | null;
+  platform_fee: string | null;
+  refund_amount: string | null;
+  charger_name: string | null;
+  duration_minutes: number | null;
+  start_time: string | null;
+  end_time: string | null;
+  failure_reason: string | null;
+}
+
+export interface QRTransactionListResponse {
+  data: QRTransactionItem[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+export const publicQRTransactionService = {
+  getByVpa: (params: { vpa: string; page?: number; limit?: number; status?: string }) => {
+    const searchParams = new URLSearchParams();
+    searchParams.set("vpa", params.vpa);
+    if (params.page) searchParams.set("page", params.page.toString());
+    if (params.limit) searchParams.set("limit", params.limit.toString());
+    if (params.status) searchParams.set("status", params.status);
+    const query = searchParams.toString();
+    return api.get<QRTransactionListResponse>(`/api/public/qr-transactions?${query}`);
+  },
 };
 
 // Log service
@@ -570,4 +613,59 @@ export const chargerErrorService = {
     api.get<ChargerError | null>(
       `/api/admin/chargers/${chargerId}/errors/latest`
     ),
+};
+
+/**
+ * QR Code Service
+ * Handles Razorpay QR codes for appless EV charging
+ */
+export const qrCodeService = {
+  create: (chargerId: number) =>
+    api.post<import("@/types/api").ChargerQRCode>("/api/admin/qr-codes", {
+      charger_id: chargerId,
+    }),
+
+  getAll: (params?: {
+    page?: number;
+    limit?: number;
+    status?: string;
+    search?: string;
+  }) => {
+    const searchParams = new URLSearchParams();
+    if (params?.page) searchParams.set("page", params.page.toString());
+    if (params?.limit) searchParams.set("limit", params.limit.toString());
+    if (params?.status) searchParams.set("status", params.status);
+    if (params?.search) searchParams.set("search", params.search);
+
+    const query = searchParams.toString();
+    return api.get<import("@/types/api").ChargerQRCodeListResponse>(
+      `/api/admin/qr-codes${query ? `?${query}` : ""}`
+    );
+  },
+
+  getById: (id: number) =>
+    api.get<import("@/types/api").ChargerQRCode>(`/api/admin/qr-codes/${id}`),
+
+  getByChargerId: (chargerId: number) =>
+    api.get<import("@/types/api").ChargerQRCode | null>(
+      `/api/admin/qr-codes/charger/${chargerId}`
+    ),
+
+  close: (id: number) =>
+    api.post<{ message: string }>(`/api/admin/qr-codes/${id}/close`, {}),
+
+  getPayments: (
+    id: number,
+    params?: { page?: number; limit?: number; status?: string }
+  ) => {
+    const searchParams = new URLSearchParams();
+    if (params?.page) searchParams.set("page", params.page.toString());
+    if (params?.limit) searchParams.set("limit", params.limit.toString());
+    if (params?.status) searchParams.set("status", params.status);
+
+    const query = searchParams.toString();
+    return api.get<import("@/types/api").QRPaymentListResponse>(
+      `/api/admin/qr-codes/${id}/payments${query ? `?${query}` : ""}`
+    );
+  },
 };

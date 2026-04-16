@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import uuid
 import logging
 
-from models import Charger, ChargingStation, Connector, Transaction, OCPPLog, User, ChargerError
+from models import Charger, ChargingStation, Connector, Transaction, OCPPLog, User, ChargerError, Tariff
 from tortoise.exceptions import IntegrityError
 from auth_middleware import require_admin, require_user_or_admin
 from crud import log_audit_event
@@ -27,6 +27,7 @@ class ChargerCreate(BaseModel):
     serial_number: Optional[str] = None
     external_charger_id: Optional[str] = None
     connectors: List[ConnectorInput]
+    tariff_per_kwh: Optional[float] = None
 
 class ChargerUpdate(BaseModel):
     name: Optional[str] = None
@@ -34,6 +35,7 @@ class ChargerUpdate(BaseModel):
     vendor: Optional[str] = None
     latest_status: Optional[str] = None
     external_charger_id: Optional[str] = None
+    tariff_per_kwh: Optional[float] = None
 
 class LatestErrorInfo(BaseModel):
     """Summary of latest unresolved error for a charger"""
@@ -58,6 +60,7 @@ class ChargerResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     tariff_per_kwh: Optional[float] = None
+    tariff_gst_percent: Optional[float] = None
     latest_error: Optional[LatestErrorInfo] = None
 
     class Config:
@@ -290,7 +293,11 @@ async def create_charger(charger_data: ChargerCreate, admin_user: User = Depends
                 connector_type=connector_input.connector_type,
                 max_power_kw=connector_input.max_power_kw
             )
-        
+
+        # Create charger-specific tariff if provided
+        if charger_data.tariff_per_kwh is not None:
+            await Tariff.create(charger=charger, rate_per_kwh=charger_data.tariff_per_kwh)
+
         await log_audit_event(
             action="charger.created",
             entity_type="charger",
@@ -330,7 +337,8 @@ async def get_charger_details(charger_id: int, user: User = Depends(require_user
 
     # Get applicable tariff for this charger
     from services.wallet_service import WalletService
-    tariff_rate = await WalletService.get_applicable_tariff(charger_id)
+    tariff = await WalletService.get_applicable_tariff(charger_id)
+    tariff_rate = tariff.rate_per_kwh if tariff else None
 
     # Get current active transaction if any
     current_transaction = await Transaction.filter(
@@ -363,6 +371,7 @@ async def get_charger_details(charger_id: int, user: User = Depends(require_user
     charger_response = charger_to_response(charger, connection_status, latest_error)
     charger_dict = charger_response.model_dump()
     charger_dict['tariff_per_kwh'] = float(tariff_rate) if tariff_rate else None
+    charger_dict['tariff_gst_percent'] = float(tariff.gst_percent) if tariff else None
 
     # Build response
     response = ChargerDetailResponse(
@@ -402,6 +411,15 @@ async def update_charger(charger_id: int, update_data: ChargerUpdate, admin_user
 
     # Update only provided fields
     update_dict = update_data.model_dump(exclude_unset=True)
+
+    # Handle tariff separately (not a Charger model field)
+    tariff_per_kwh = update_dict.pop("tariff_per_kwh", None)
+    if tariff_per_kwh is not None:
+        await Tariff.update_or_create(
+            defaults={"rate_per_kwh": tariff_per_kwh},
+            charger_id=charger_id
+        )
+
     for field, value in update_dict.items():
         setattr(charger, field, value)
 
@@ -462,16 +480,21 @@ async def remote_start_charging(charger_id: int, connector_id: int = 1, user: Us
     actual_id_tag = user.rfid_card_id
     logger.info(f"🚀 Remote start requested by user {user.clerk_user_id} (role: {user.role}) using idTag: {actual_id_tag}")
     
-    # FIXME: connector_id is hardcoded to 1 - should dynamically select available connector
-    # or allow user to choose from available connectors for this charger
-    
+    # connector_id=1 covers all single-connector chargers currently in the fleet.
+    # Multi-connector support (user selection of connector) is out of scope for v1.
+
     charger = await Charger.filter(id=charger_id).first()
     if not charger:
         raise HTTPException(status_code=404, detail="Charger not found")
     
     # Check if charger status is suitable for remote start
-    if charger.latest_status != "Preparing":
-        raise HTTPException(status_code=409, detail=f"Cannot start charging. Charger status is {charger.latest_status}, should be Preparing")
+    # Socket chargers may not transition to Preparing (no CP signal), allow Available
+    from services.charger_type_service import is_socket_charger
+    charger_is_socket = await is_socket_charger(charger.charge_point_string_id)
+    allowed_statuses = {"Preparing", "Available"} if charger_is_socket else {"Preparing"}
+    if charger.latest_status not in allowed_statuses:
+        expected = "Preparing or Available" if charger_is_socket else "Preparing"
+        raise HTTPException(status_code=409, detail=f"Cannot start charging. Charger status is {charger.latest_status}, should be {expected}")
     
     # Check if charger is connected (via Redis - works across all workers)
     if not await is_charger_connected(charger.charge_point_string_id):

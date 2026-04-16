@@ -19,7 +19,11 @@ class TestInfrastructure:
     @pytest.mark.asyncio
     async def test_redis_connectivity(self):
         """Test Redis connection and basic operations"""
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+        # Construct from REDIS_HOST/REDIS_PORT (same pattern as redis_manager.py)
+        # so this works inside docker exec where the host is `redis` not `localhost`
+        redis_host = os.getenv("REDIS_HOST", "localhost")
+        redis_port = os.getenv("REDIS_PORT", "6379")
+        redis_url = os.getenv("REDIS_URL") or f"redis://{redis_host}:{redis_port}"
         
         try:
             client = redis.from_url(redis_url, decode_responses=True)
@@ -85,19 +89,22 @@ class TestInfrastructure:
         except Exception as e:
             pytest.skip(f"Database not available: {e}")
     
-    @pytest.mark.asyncio 
+    @pytest.mark.asyncio
     async def test_redis_manager(self):
         """Test Redis manager functionality"""
         from redis_manager import redis_manager
-        
+        from datetime import datetime, timezone
+
         try:
             await redis_manager.connect()
-            
-            # Test basic operations
+
+            # Test basic operations — connected_at/last_seen must be datetime
+            # objects (redis_manager calls .isoformat() on them internally)
             test_charger_id = "test-charger-infra"
+            now = datetime.now(timezone.utc)
             connection_data = {
-                "connected_at": "2025-01-01T00:00:00Z",
-                "last_seen": "2025-01-01T00:00:00Z"
+                "connected_at": now,
+                "last_seen": now,
             }
             
             # Test add

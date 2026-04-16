@@ -6,10 +6,10 @@ import dynamic from "next/dynamic";
 
 import { Button } from "@/components/ui/button";
 import { usePublicStations } from "@/lib/queries/public-stations";
-import type { PublicStationResponse } from "@/lib/api-services";
+import type { StationWithDistance } from "@/components/StationMap";
 
 // Dynamic import for Leaflet to avoid SSR issues
-const Map = dynamic(() => import("./StationMap"), {
+const Map = dynamic(() => import("@/components/StationMap"), {
   ssr: false,
   loading: () => (
     <div className="w-full h-64 bg-gray-100 rounded-lg flex items-center justify-center">
@@ -20,10 +20,6 @@ const Map = dynamic(() => import("./StationMap"), {
     </div>
   ),
 });
-
-interface StationWithDistance extends PublicStationResponse {
-  distance?: number;
-}
 
 export default function StationsPage() {
   const [userLocation, setUserLocation] = useState<{lat: number; lng: number} | null>(null);

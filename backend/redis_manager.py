@@ -96,6 +96,168 @@ class RedisConnectionManager:
             logger.error(f"Failed to get connected chargers: {e}")
             return []
     
+    # QR session cache methods
+    QR_SESSION_PREFIX = "qr_session:"
+
+    async def set_qr_session(self, transaction_id: int, data: Dict, ttl: int = 86400) -> bool:
+        """Cache QR session data for budget checking during MeterValues"""
+        if not self.redis_client:
+            logger.error("Redis client not initialized")
+            return False
+        try:
+            key = f"{self.QR_SESSION_PREFIX}{transaction_id}"
+            await self.redis_client.set(key, json.dumps(data), ex=ttl)
+            logger.info(f"Cached QR session for transaction {transaction_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to cache QR session for transaction {transaction_id}: {e}")
+            return False
+
+    async def get_qr_session(self, transaction_id: int) -> Optional[Dict]:
+        """Get cached QR session data"""
+        if not self.redis_client:
+            return None
+        try:
+            key = f"{self.QR_SESSION_PREFIX}{transaction_id}"
+            data = await self.redis_client.get(key)
+            if data:
+                return json.loads(data)
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get QR session for transaction {transaction_id}: {e}")
+            return None
+
+    async def delete_qr_session(self, transaction_id: int) -> bool:
+        """Delete QR session cache"""
+        if not self.redis_client:
+            return False
+        try:
+            key = f"{self.QR_SESSION_PREFIX}{transaction_id}"
+            await self.redis_client.delete(key)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete QR session for transaction {transaction_id}: {e}")
+            return False
+
+    # Zero-energy watchdog methods
+    ZERO_ENERGY_PREFIX = "zero_energy:"
+
+    async def set_zero_energy_state(self, transaction_id: int, data: Dict, ttl: int = 7200) -> bool:
+        """Cache zero-energy tracking state for a transaction.
+
+        TTL of 2h is well above the longest plausible charging session and
+        bounds any leak from missed cleanup paths."""
+        if not self.redis_client:
+            logger.error("Redis client not initialized")
+            return False
+        try:
+            key = f"{self.ZERO_ENERGY_PREFIX}{transaction_id}"
+            await self.redis_client.set(key, json.dumps(data), ex=ttl)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set zero-energy state for transaction {transaction_id}: {e}")
+            return False
+
+    async def get_zero_energy_state(self, transaction_id: int) -> Optional[Dict]:
+        """Get zero-energy tracking state"""
+        if not self.redis_client:
+            return None
+        try:
+            key = f"{self.ZERO_ENERGY_PREFIX}{transaction_id}"
+            data = await self.redis_client.get(key)
+            if data:
+                return json.loads(data)
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get zero-energy state for transaction {transaction_id}: {e}")
+            return None
+
+    async def delete_zero_energy_state(self, transaction_id: int) -> bool:
+        """Delete zero-energy tracking state"""
+        if not self.redis_client:
+            return False
+        try:
+            key = f"{self.ZERO_ENERGY_PREFIX}{transaction_id}"
+            await self.redis_client.delete(key)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete zero-energy state for transaction {transaction_id}: {e}")
+            return False
+
+    # Socket charger grace period methods
+    SOCKET_GRACE_PREFIX = "socket_grace:"
+
+    async def set_socket_grace_period(
+        self, charge_point_id: str, transaction_ids: list, ttl: int = 300
+    ) -> bool:
+        """Store grace period data for a socket charger reporting Available."""
+        if not self.redis_client:
+            return False
+        try:
+            key = f"{self.SOCKET_GRACE_PREFIX}{charge_point_id}"
+            data = {
+                "transaction_ids": transaction_ids,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+            }
+            await self.redis_client.set(key, json.dumps(data), ex=ttl)
+            logger.info(f"Set socket grace period for {charge_point_id}, txns={transaction_ids}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set socket grace period for {charge_point_id}: {e}")
+            return False
+
+    async def get_socket_grace_period(self, charge_point_id: str) -> Optional[Dict]:
+        """Get active grace period data for a socket charger."""
+        if not self.redis_client:
+            return None
+        try:
+            key = f"{self.SOCKET_GRACE_PREFIX}{charge_point_id}"
+            data = await self.redis_client.get(key)
+            if data:
+                return json.loads(data)
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get socket grace period for {charge_point_id}: {e}")
+            return None
+
+    async def delete_socket_grace_period(self, charge_point_id: str) -> bool:
+        """Clear grace period for a socket charger (e.g. MeterValues arrived)."""
+        if not self.redis_client:
+            return False
+        try:
+            key = f"{self.SOCKET_GRACE_PREFIX}{charge_point_id}"
+            await self.redis_client.delete(key)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete socket grace period for {charge_point_id}: {e}")
+            return False
+
+    # QR transaction verification tokens
+    QR_TXN_TOKEN_PREFIX = "qr_txn_token:"
+
+    async def set_qr_txn_token(self, token: str, vpa: str, ttl: int = 600) -> bool:
+        """Store a verification token for a VPA lookup session."""
+        if not self.redis_client:
+            return False
+        try:
+            key = f"{self.QR_TXN_TOKEN_PREFIX}{token}"
+            await self.redis_client.set(key, vpa, ex=ttl)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set QR txn token: {e}")
+            return False
+
+    async def get_qr_txn_token(self, token: str) -> Optional[str]:
+        """Get the VPA associated with a verification token."""
+        if not self.redis_client:
+            return None
+        try:
+            key = f"{self.QR_TXN_TOKEN_PREFIX}{token}"
+            return await self.redis_client.get(key)
+        except Exception as e:
+            logger.error(f"Failed to get QR txn token: {e}")
+            return None
+
     async def get_charger_connected_at(self, charger_id: str) -> Optional[datetime]:
         """Get connection timestamp for a specific charger"""
         if not self.redis_client:
@@ -113,6 +275,22 @@ class RedisConnectionManager:
         except Exception as e:
             logger.error(f"Failed to get connection data for charger {charger_id}: {e}")
             return None
+
+    async def rate_limit_check(self, key: str, limit: int, window_seconds: int) -> bool:
+        """Redis-backed sliding-window counter. Returns True if request is allowed."""
+        if not self.redis_client:
+            # Fail-open if Redis is down so legitimate traffic is not blocked
+            return True
+        try:
+            redis_key = f"ratelimit:{key}"
+            count = await self.redis_client.incr(redis_key)
+            if count == 1:
+                await self.redis_client.expire(redis_key, window_seconds)
+            return count <= limit
+        except Exception as e:
+            logger.error(f"Rate limit check failed for {key}: {e}")
+            return True
+
 
 # Global instance
 redis_manager = RedisConnectionManager()

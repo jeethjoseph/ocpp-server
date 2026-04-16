@@ -8,7 +8,9 @@ import { Badge } from "@/components/ui/badge";
 import { Zap, Play, Square, Activity, Clock, MapPin, X, CreditCard, Download, Signal, AlertTriangle, QrCode, Printer } from "lucide-react";
 import { QRCodeSVG, QRCodeCanvas } from "qrcode.react";
 import { AdminOnly } from "@/components/RoleWrapper";
+import Link from "next/link";
 import { toast } from "sonner";
+import { isSocketCharger as checkSocketCharger } from "@/lib/utils";
 import ChargerLogs from "@/components/ChargerLogs";
 import ChargerAuditLog from "@/components/ChargerAuditLog";
 import MeterValuesChart from "@/components/MeterValuesChart";
@@ -46,6 +48,7 @@ import {
   useFirmwareHistory,
   useCancelUpdate,
 } from "@/lib/queries/firmware";
+import { useQRCodeByCharger, useCreateQRCode } from "@/lib/queries/qr-codes";
 
 // Transaction data comes exclusively from transaction API
 
@@ -94,6 +97,8 @@ export default function ChargerDetailPage() {
   // Extract data from charger query
   const charger = chargerData?.charger;
   const station = chargerData?.station;
+  const connectors = chargerData?.connectors;
+  const isSocketCharger = checkSocketCharger(connectors);
   const currentTransactionId = chargerData?.current_transaction?.transaction_id;
   const recentTransactionId = chargerData?.recent_transaction?.transaction_id;
 
@@ -235,12 +240,9 @@ export default function ChargerDetailPage() {
   };
 
   const canStartCharging = () => {
-    return (
-      charger &&
-      charger.latest_status === "Preparing" &&
-      charger.connection_status &&
-      !currentTransactionId
-    );
+    const statusReady = charger?.latest_status === "Preparing" ||
+      (isSocketCharger && charger?.latest_status === "Available");
+    return charger && statusReady && charger.connection_status && !currentTransactionId;
   };
 
   const canStopCharging = () => {
@@ -373,6 +375,14 @@ export default function ChargerDetailPage() {
                   </Badge>
                 </div>
               </div>
+              <div className="flex justify-between items-center">
+                <span className="text-sm font-medium">Tariff:</span>
+                <Badge variant="outline">
+                  {charger.tariff_per_kwh != null
+                    ? `₹${charger.tariff_per_kwh}/kWh`
+                    : "Global"}
+                </Badge>
+              </div>
               {/* Latest Error */}
               {charger.latest_error && (
                 <div className="mt-4 p-3 bg-destructive/10 border border-destructive/20 rounded-lg">
@@ -444,8 +454,8 @@ export default function ChargerDetailPage() {
                 <p className="text-sm text-muted-foreground text-center">
                   {!charger.connection_status
                     ? "Charger is disconnected"
-                    : charger.latest_status !== "Preparing" &&
-                      !currentTransactionId
+                    : !currentTransactionId && charger.latest_status !== "Preparing" &&
+                      !(isSocketCharger && charger.latest_status === "Available")
                     ? `Cannot start - status is ${charger.latest_status}`
                     : "No actions available"}
                 </p>
@@ -720,6 +730,9 @@ export default function ChargerDetailPage() {
             </DialogFooter>
           </DialogContent>
         </Dialog>
+
+        {/* Payment QR Code (Razorpay) */}
+        <PaymentQRCard chargerId={chargerId} chargerName={charger.name} />
 
         {/* Current Transaction */}
         {transaction && (
@@ -1023,5 +1036,63 @@ export default function ChargerDetailPage() {
         )}
       </div>
     </AdminOnly>
+  );
+}
+
+function PaymentQRCard({ chargerId }: { chargerId: number; chargerName?: string }) {
+  const { data: qrCode, isLoading } = useQRCodeByCharger(chargerId);
+  const createMutation = useCreateQRCode();
+
+  if (isLoading) return null;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <CreditCard className="h-5 w-5" />
+          Payment QR Code
+        </CardTitle>
+      </CardHeader>
+      <CardContent>
+        {qrCode && qrCode.is_active ? (
+          <div className="flex items-center gap-4">
+            {qrCode.image_url && (
+              <img
+                src={qrCode.image_url}
+                alt="Payment QR"
+                className="w-20 h-20 border rounded"
+              />
+            )}
+            <div className="flex-1 space-y-1">
+              <div className="flex items-center gap-2">
+                <Badge variant="default">Active</Badge>
+                <span className="text-xs text-muted-foreground font-mono">
+                  {qrCode.razorpay_qr_code_id}
+                </span>
+              </div>
+              <p className="text-sm text-muted-foreground">
+                {qrCode.payment_count ?? 0} payments
+              </p>
+            </div>
+            <Link href={`/admin/qr-codes/${qrCode.id}`}>
+              <Button variant="outline" size="sm">View Details</Button>
+            </Link>
+          </div>
+        ) : (
+          <div className="flex items-center justify-between">
+            <p className="text-sm text-muted-foreground">
+              {qrCode ? "Payment QR code is inactive." : "No payment QR code generated yet."} Create one to enable appless charging.
+            </p>
+            <Button
+              size="sm"
+              onClick={() => createMutation.mutate(chargerId)}
+              disabled={createMutation.isPending}
+            >
+              {createMutation.isPending ? "Creating..." : "Generate Payment QR"}
+            </Button>
+          </div>
+        )}
+      </CardContent>
+    </Card>
   );
 }

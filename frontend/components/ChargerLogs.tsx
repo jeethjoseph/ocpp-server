@@ -51,8 +51,8 @@ export default function ChargerLogs({ chargePointId, chargerName }: ChargerLogsP
   const { data: logsResponse, isLoading, error } = useChargerLogs(
     chargePointId,
     {
-      start_date: startDate || undefined,
-      end_date: endDate || undefined,
+      start_date: startDate ? new Date(startDate).toISOString() : undefined,
+      end_date: endDate ? new Date(endDate).toISOString() : undefined,
       limit: limit,
     }
   );

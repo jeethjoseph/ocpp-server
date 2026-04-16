@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # PostgreSQL Database
   postgres:
@@ -58,16 +56,34 @@ services:
     container_name: ocpp-backend-staging
     environment:
       - ENVIRONMENT=staging
+      # Database & Redis
       - DB_HOST=postgres
       - DB_PORT=5432
       - DB_USER=${DB_USER}
       - DB_PASSWORD=${DB_PASSWORD}
       - DB_NAME=${DB_NAME}
       - REDIS_URL=redis://redis:6379
+      # Server
       - HOST=0.0.0.0
       - PORT=8000
       - WORKERS=${WORKERS:-2}
       - LOG_LEVEL=${LOG_LEVEL:-info}
+      # Clerk Authentication
+      - CLERK_SECRET_KEY=${CLERK_SECRET_KEY}
+      - CLERK_WEBHOOK_SECRET=${CLERK_WEBHOOK_SECRET}
+      # Razorpay Payments
+      - RAZORPAY_KEY_ID=${RAZORPAY_KEY_ID:-}
+      - RAZORPAY_KEY_SECRET=${RAZORPAY_KEY_SECRET:-}
+      - RAZORPAY_WEBHOOK_SECRET=${RAZORPAY_WEBHOOK_SECRET:-}
+      # QR Payment Tuning
+      - RAZORPAY_PLATFORM_FEE_PERCENT=${RAZORPAY_PLATFORM_FEE_PERCENT:-2.0}
+      - MINIMUM_REFUND_AMOUNT=${MINIMUM_REFUND_AMOUNT:-1.0}
+      - QR_PAYMENT_PENDING_TIMEOUT=${QR_PAYMENT_PENDING_TIMEOUT:-300}
+      # OCPP & Server Tuning
+      - SUSPEND_TIMEOUT_SECONDS=${SUSPEND_TIMEOUT_SECONDS:-300}
+      - OCPP_TIMEOUT=${OCPP_TIMEOUT:-120}
+      - RETENTION_DAYS=${RETENTION_DAYS:-90}
+      - CLEANUP_INTERVAL_HOURS=${CLEANUP_INTERVAL_HOURS:-24}
       # New Relic (optional for staging)
       - NEW_RELIC_MONITOR_MODE=${NEW_RELIC_MONITOR_MODE:-false}
       - NEW_RELIC_LICENSE_KEY=${NEW_RELIC_LICENSE_KEY:-}
@@ -110,12 +126,14 @@ services:
       target: production
       args:
         - NEXT_PUBLIC_API_URL=https://${DOMAIN_NAME}
-        - NEXT_PUBLIC_SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL}
-        - NEXT_PUBLIC_SUPABASE_ANON_KEY=${NEXT_PUBLIC_SUPABASE_ANON_KEY}
+        - NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY}
+        - NEXT_PUBLIC_APP_URL=https://${DOMAIN_NAME}
         - NEXT_PUBLIC_NEW_RELIC_BROWSER_LICENSE_KEY=${NEXT_PUBLIC_NEW_RELIC_BROWSER_LICENSE_KEY:-}
         - NEXT_PUBLIC_NEW_RELIC_APPLICATION_ID=${NEXT_PUBLIC_NEW_RELIC_APPLICATION_ID:-}
         - NEXT_PUBLIC_NEW_RELIC_ACCOUNT_ID=${NEXT_PUBLIC_NEW_RELIC_ACCOUNT_ID:-}
     container_name: ocpp-frontend-staging
+    environment:
+      - CLERK_SECRET_KEY=${CLERK_SECRET_KEY}
     depends_on:
       - backend
     healthcheck:
