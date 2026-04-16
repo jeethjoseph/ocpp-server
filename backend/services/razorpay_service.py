@@ -9,6 +9,22 @@ from decimal import Decimal
 
 logger = logging.getLogger(__name__)
 
+
+class RazorpayAlreadyRefundedError(Exception):
+    """Raised when Razorpay indicates a payment is already (fully) refunded."""
+
+    def __init__(self, payment_id: str, original_error: Exception):
+        self.payment_id = payment_id
+        self.original_error = original_error
+        super().__init__(f"Payment {payment_id} is already refunded: {original_error}")
+
+
+def _is_already_refunded_error(err: Exception) -> bool:
+    """Detect Razorpay 'already refunded' / 'fully refunded' responses."""
+    msg = str(err).lower()
+    return any(token in msg for token in ("already refund", "fully refund", "refunded fully"))
+
+
 class RazorpayService:
     """Service for handling Razorpay payment operations"""
 
@@ -304,8 +320,30 @@ class RazorpayService:
             return refund
 
         except Exception as e:
+            if _is_already_refunded_error(e):
+                raise RazorpayAlreadyRefundedError(payment_id, e)
             logger.error(f"Failed to create refund for payment {payment_id}: {e}")
             raise
+
+    def find_refund_for_payment(self, payment_id: str) -> Optional[Dict]:
+        """Fetch existing refund(s) for a payment. Returns the first refund dict or None."""
+        if not self.is_configured():
+            return None
+        try:
+            payment = self.client.payment.fetch(payment_id)
+            # SDK may expose `refunds` as list directly or via a subresource call
+            refunds = payment.get("refunds") if isinstance(payment, dict) else None
+            if not refunds:
+                refunds_response = self.client.payment.refunds(payment_id)
+                if isinstance(refunds_response, dict):
+                    refunds = refunds_response.get("items") or []
+                else:
+                    refunds = refunds_response or []
+            if refunds:
+                return refunds[0]
+        except Exception as e:
+            logger.error(f"Failed to fetch refunds for payment {payment_id}: {e}")
+        return None
 
 
 # Singleton instance

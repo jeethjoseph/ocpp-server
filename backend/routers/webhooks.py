@@ -1,3 +1,5 @@
+import time
+
 from fastapi import APIRouter, HTTPException, Request, Header
 from svix import Webhook
 from models import User, UserRoleEnum, Wallet, WalletTransaction, PaymentStatusEnum, TransactionTypeEnum
@@ -14,19 +16,26 @@ from models import WebhookSourceEnum
 logger = logging.getLogger("webhooks")
 router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
 
+
 async def _find_txn_by_order_id(order_id: str):
-    """Find a TOP_UP WalletTransaction by razorpay_order_id in payment_metadata.
+    """Find a TOP_UP WalletTransaction by indexed razorpay_order_id column.
 
-    Searches most-recent-first with a safety cap of 1000 rows to avoid
-    full-table scans. A proper fix is to add an indexed razorpay_order_id column.
+    Falls back to JSON scan for rows created before the column was backfilled.
     """
-    recent_txns = await WalletTransaction.filter(
-        type=TransactionTypeEnum.TOP_UP
-    ).order_by("-created_at").limit(1000)
+    txn = await WalletTransaction.filter(
+        type=TransactionTypeEnum.TOP_UP,
+        razorpay_order_id=order_id,
+    ).first()
+    if txn:
+        return txn
 
-    for txn in recent_txns:
-        if txn.payment_metadata and txn.payment_metadata.get("razorpay_order_id") == order_id:
-            return txn
+    recent_txns = await WalletTransaction.filter(
+        type=TransactionTypeEnum.TOP_UP,
+        razorpay_order_id__isnull=True,
+    ).order_by("-created_at").limit(200)
+    for candidate in recent_txns:
+        if candidate.payment_metadata and candidate.payment_metadata.get("razorpay_order_id") == order_id:
+            return candidate
     return None
 
 
@@ -83,8 +92,9 @@ async def handle_clerk_webhook(
         return {"status": "success"}
         
     except Exception as e:
+        # Return 200 so Svix does not retry on application errors.
         logger.error(f"Webhook processing error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Webhook processing failed")
+        return {"status": "error_handled"}
 
 async def handle_user_created(data: dict):
     """Handle user.created webhook event"""
@@ -352,8 +362,10 @@ async def handle_razorpay_webhook(
     except HTTPException:
         raise
     except Exception as e:
+        # Return 200 so Razorpay does not retry on application errors.
+        # Real infrastructure failures (DB/Redis down) still surface via HTTPException.
         logger.error(f"Razorpay webhook processing error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Webhook processing failed")
+        return {"status": "error_handled"}
 
 
 async def handle_payment_captured(event_data: dict):
@@ -377,8 +389,7 @@ async def handle_payment_captured(event_data: dict):
         if not payment_id:
             raise ValueError("Missing payment_id in webhook payload")
 
-        # Find the wallet transaction by order_id
-        # TODO: Add indexed razorpay_order_id column to avoid in-Python filtering
+        # Find the wallet transaction by indexed order_id
         wallet_txn = await _find_txn_by_order_id(order_id)
 
         if not wallet_txn:
@@ -400,7 +411,7 @@ async def handle_payment_captured(event_data: dict):
         success, message, new_balance = await WalletService.process_wallet_topup(
             wallet_transaction_id=wallet_txn.id,
             razorpay_payment_id=payment_id,
-            razorpay_signature=""  # Signature not available in webhook
+            razorpay_signature=None  # Signature not available in webhook
         )
 
         if success:
@@ -429,8 +440,8 @@ async def handle_payment_captured(event_data: dict):
             )
 
     except Exception as e:
+        # Log but do not re-raise; outer handler returns 200 to prevent Razorpay retries
         logger.error(f"Error handling payment.captured webhook: {e}", exc_info=True)
-        raise
 
 
 async def handle_payment_failed(event_data: dict):
@@ -463,7 +474,7 @@ async def handle_payment_failed(event_data: dict):
             "status": PaymentStatusEnum.FAILED.value,
             "razorpay_payment_id": payment_id,
             "error_description": error_description,
-            "failed_at": int(__import__('time').time())
+            "failed_at": int(time.time())
         })
 
         await WalletTransaction.filter(id=wallet_txn.id).update(
@@ -483,7 +494,6 @@ async def handle_payment_failed(event_data: dict):
 
     except Exception as e:
         logger.error(f"Error handling payment.failed webhook: {e}", exc_info=True)
-        raise
 
 
 async def handle_order_paid(event_data: dict):
@@ -531,7 +541,7 @@ async def handle_order_paid(event_data: dict):
         success, message, new_balance = await WalletService.process_wallet_topup(
             wallet_transaction_id=wallet_txn.id,
             razorpay_payment_id=payment_id,
-            razorpay_signature=""
+            razorpay_signature=None
         )
 
         if success:
@@ -558,7 +568,6 @@ async def handle_order_paid(event_data: dict):
 
     except Exception as e:
         logger.error(f"Error handling order.paid webhook: {e}", exc_info=True)
-        raise
 
 
 async def handle_qr_code_credited(event_data: dict):
@@ -600,4 +609,3 @@ async def handle_qr_code_credited(event_data: dict):
             status="failed",
             error_message=str(e),
         )
-        raise

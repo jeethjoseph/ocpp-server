@@ -47,18 +47,24 @@ CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
 # ============================================
 FROM base AS production
 
-# Copy dependencies from builder
-COPY --from=builder /root/.local /root/.local
-ENV PATH=/root/.local/bin:$PATH
+# Create non-root user early so we can chown copied files
+RUN groupadd --system --gid 1001 app \
+    && useradd --system --uid 1001 --gid app --create-home --shell /sbin/nologin app
 
-# Copy application code
-COPY . .
+# Copy dependencies from builder into the non-root user's home
+COPY --from=builder --chown=app:app /root/.local /home/app/.local
+ENV PATH=/home/app/.local/bin:$PATH
 
-# Create firmware_files directory if not exists
-RUN mkdir -p /app/firmware_files
+# Copy application code with correct ownership
+COPY --chown=app:app . .
+
+# Create firmware_files directory (writable by app user)
+RUN mkdir -p /app/firmware_files && chown -R app:app /app
 
 # Make entrypoint scripts executable
 RUN chmod +x docker-entrypoint.sh start_server.sh 2>/dev/null || true
+
+USER app
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \

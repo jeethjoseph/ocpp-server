@@ -325,7 +325,8 @@ class LoggingWebSocketAdapter(FastAPIWebSocketAdapter):
     def __init__(self, websocket: WebSocket, charge_point_id: str):
         super().__init__(websocket)
         self.charge_point_id = charge_point_id
-        self._at_command_skip_count = 0  # Track consecutive AT commands
+        self._at_command_skip_count = 0  # Count of AT commands seen in the current window
+        self._at_command_window_start: Optional[datetime.datetime] = None  # Start of rolling window
 
     async def recv(self):
         while True:
@@ -348,23 +349,28 @@ class LoggingWebSocketAdapter(FastAPIWebSocketAdapter):
             connection_manager.connected_charge_points[self.charge_point_id]["last_seen"] = datetime.datetime.now(datetime.timezone.utc)
 
             # Filter out AT commands (firmware bug where charger sends raw modem commands)
-            # Common AT commands: AT+CSQ (signal quality), AT+COPS, AT+CREG, etc.
-            # This is a known issue with some charger firmware (e.g., JET_EV1)
+            # Counter uses a rolling 1-hour window to distinguish transient AT leaks
+            # from sustained firmware malfunction.
             msg_stripped = msg.strip()
             if msg_stripped.startswith("AT+") or msg_stripped.startswith("AT ") or msg_stripped.startswith("at+") or msg_stripped.startswith("at "):
+                now = datetime.datetime.now(datetime.timezone.utc)
+                if self._at_command_window_start is None or (now - self._at_command_window_start).total_seconds() > 3600:
+                    self._at_command_window_start = now
+                    self._at_command_skip_count = 0
                 self._at_command_skip_count += 1
 
-                # If we've skipped too many AT commands in a row, this might indicate a serious firmware issue
                 if self._at_command_skip_count > 50:
-                    logger.error(f"[FIRMWARE BUG] {self.charge_point_id} sent {self._at_command_skip_count} consecutive AT commands - possible firmware malfunction. Disconnecting for safety.")
+                    logger.error(
+                        f"[FIRMWARE BUG] {self.charge_point_id} sent {self._at_command_skip_count} AT commands "
+                        f"in the last hour - possible firmware malfunction. Disconnecting for safety."
+                    )
                     raise WebSocketDisconnect(code=1008)
 
                 logger.warning(f"[FIRMWARE BUG] {self.charge_point_id} sent AT modem command over OCPP websocket: '{msg_stripped}' - ignoring (skip count: {self._at_command_skip_count})")
-                # Skip this message and wait for next valid message
                 continue
 
-            # Reset counter on valid message
-            self._at_command_skip_count = 0
+            # Valid message received — keep the window but do not reset the count.
+            # The window itself expires after 1 hour of no AT commands.
 
             # Validate OCPP message format before processing
             correlation_id = None

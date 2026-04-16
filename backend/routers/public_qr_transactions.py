@@ -1,12 +1,11 @@
 """Public endpoint for QR payment users to look up transaction history by UPI ID"""
 import re
-import time
 import logging
-from collections import defaultdict
 from fastapi import APIRouter, HTTPException, Query, Request
 from typing import Optional
 
 from models import QRPayment, QRPaymentStatusEnum
+from redis_manager import redis_manager
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/public/qr-transactions", tags=["Public QR Transactions"])
@@ -14,22 +13,16 @@ router = APIRouter(prefix="/api/public/qr-transactions", tags=["Public QR Transa
 # UPI VPA: alphanumeric start, optional dots/hyphens/underscores, @ followed by bank code (2+ alpha chars)
 VPA_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9.\-_]{0,253}@[a-zA-Z][a-zA-Z0-9]{1,}$")
 
-# Simple in-memory rate limiter: {ip: [timestamp, ...]}
-_rate_limit_store: dict[str, list[float]] = defaultdict(list)
 RATE_LIMIT_MAX = 20  # requests per window
 RATE_LIMIT_WINDOW = 60  # seconds
 
 
-def _check_rate_limit(client_ip: str):
-    """Enforce per-IP rate limiting. Raises 429 if exceeded."""
-    now = time.time()
-    window_start = now - RATE_LIMIT_WINDOW
-    _rate_limit_store[client_ip] = [
-        ts for ts in _rate_limit_store[client_ip] if ts > window_start
-    ]
-    if len(_rate_limit_store[client_ip]) >= RATE_LIMIT_MAX:
+async def _check_rate_limit(client_ip: str):
+    """Enforce per-IP rate limiting via Redis. Raises 429 if exceeded."""
+    key = f"public_qr_transactions:{client_ip}"
+    allowed = await redis_manager.rate_limit_check(key, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW)
+    if not allowed:
         raise HTTPException(status_code=429, detail="Too many requests. Please try again later.")
-    _rate_limit_store[client_ip].append(now)
 
 
 def _validate_vpa_format(vpa: str) -> str:
@@ -50,7 +43,7 @@ async def get_transactions_by_vpa(
 ):
     """Look up QR payment transaction history by VPA."""
     client_ip = request.client.host if request.client else "unknown"
-    _check_rate_limit(client_ip)
+    await _check_rate_limit(client_ip)
 
     vpa = _validate_vpa_format(vpa)
 

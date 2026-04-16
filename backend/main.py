@@ -83,20 +83,21 @@ app = FastAPI(
     description="EV Charging Station Management System with OCPP 1.6 support"
 )
 
-# Allowed CORS origins — single source of truth for CORSMiddleware and OptionsMiddleware
-ALLOWED_ORIGINS = [
-    "http://localhost:3000",           # Local development - Next.js
-    "http://127.0.0.1:3000",           # Local development - Next.js
-    "http://localhost:5173",           # Local development - Vite (mobile app)
-    "http://127.0.0.1:5173",           # Local development - Vite (mobile app)
-    "http://frontend:3000",            # Docker internal network
-    "http://ocpp-frontend:3000",       # Docker container name
-    "https://powerlync.com",            # Production frontend
-    "https://www.powerlync.com",        # Production frontend (www)
-    "https://ocpp-frontend-mu.vercel.app",  # Legacy Vercel frontend
-    "https://lyncpower.com",            # Backend domain (for testing)
-    "https://www.lyncpower.com"         # Backend domain (www)
-]
+# Allowed CORS origins — env-driven, single source of truth for CORSMiddleware and OptionsMiddleware
+_cors_env = os.getenv("CORS_ORIGINS", "").strip()
+if _cors_env:
+    ALLOWED_ORIGINS = [o.strip() for o in _cors_env.split(",") if o.strip()]
+else:
+    # Dev default when CORS_ORIGINS not set
+    ALLOWED_ORIGINS = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://frontend:3000",
+        "http://ocpp-frontend:3000",
+    ]
+logger.info("CORS allowed origins: %s", ALLOWED_ORIGINS)
 
 # Configure CORS - Allow frontend domains
 app.add_middleware(

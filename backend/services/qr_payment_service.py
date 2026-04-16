@@ -7,17 +7,19 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, Tuple, Dict
 
+from tortoise.transactions import in_transaction
+
 from models import (
     User, Wallet, Charger, Transaction, QRPayment, ChargerQRCode,
     QRPaymentStatusEnum, AuthProviderEnum, ChargerStatusEnum,
     TransactionStatusEnum, UserRoleEnum
 )
-from services.razorpay_service import razorpay_service
+from services.razorpay_service import razorpay_service, RazorpayAlreadyRefundedError
 from services.wallet_service import WalletService
 from redis_manager import redis_manager
 from core.connection_manager import connection_manager
 from crud import log_audit_event
-from utils import safe_create_task
+from utils import safe_create_task, mask_vpa, mask_phone, mask_payment_id, mask_email
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +70,7 @@ async def find_or_create_user_from_payment(
             if vpa and not user.upi_vpa:
                 user.upi_vpa = vpa
                 await user.save()
-            logger.info(f"Found existing user by phone: {user.email} (id={user.id})")
+            logger.info(f"Found existing user by phone: {mask_email(user.email)} (id={user.id})")
             return user
 
     # 2. Try VPA lookup (repeat QR customer)
@@ -79,7 +81,7 @@ async def find_or_create_user_from_payment(
             if phone and not user.phone_number:
                 user.phone_number = phone
                 await user.save()
-            logger.info(f"Found existing user by VPA: {user.email} (id={user.id})")
+            logger.info(f"Found existing user by VPA: {mask_email(user.email)} (id={user.id})")
             return user
 
     # 3. Create new UPI_GUEST user
@@ -104,7 +106,7 @@ async def find_or_create_user_from_payment(
             notification_preferences="{}",
         )
         await Wallet.create(user=user, balance=Decimal("0.00"))
-        logger.info(f"Created UPI_GUEST user: {email} (id={user.id})")
+        logger.info(f"Created UPI_GUEST user: {mask_email(email)} (id={user.id})")
         return user
 
     # 4. Fallback to system guest
@@ -138,12 +140,15 @@ class QRPaymentService:
         customer_name = notes.get("customer_name") or payment_entity.get("email")
         qr_code_id = qr_code_entity.get("id") or payment_entity.get("description", "").split("|")[-1].strip()
 
-        logger.info(f"QR payment received: payment_id={payment_id}, amount=₹{amount_paid}, qr_code={qr_code_id}, vpa={vpa}")
+        logger.info(
+            "QR payment received: payment_id=%s amount=₹%s qr_code=%s vpa=%s",
+            mask_payment_id(payment_id), amount_paid, qr_code_id, mask_vpa(vpa),
+        )
 
         # Idempotency check
         existing = await QRPayment.filter(razorpay_payment_id=payment_id).first()
         if existing:
-            logger.info(f"Duplicate webhook for payment {payment_id}, skipping")
+            logger.info(f"Duplicate webhook for payment {mask_payment_id(payment_id)}, skipping")
             return {"status": "duplicate", "qr_payment_id": existing.id}
 
         # Staleness check — if payment is older than the pending timeout,
@@ -154,15 +159,15 @@ class QRPaymentService:
             age_seconds = (datetime.now(timezone.utc) - payment_time).total_seconds()
             if age_seconds > QR_PAYMENT_PENDING_TIMEOUT:
                 logger.warning(
-                    f"Stale QR payment {payment_id}: {age_seconds:.0f}s old "
-                    f"(threshold {QR_PAYMENT_PENDING_TIMEOUT}s), refunding"
+                    "Stale QR payment %s: %.0fs old (threshold %ss), refunding",
+                    mask_payment_id(payment_id), age_seconds, QR_PAYMENT_PENDING_TIMEOUT,
                 )
                 # Still need to look up charger for the record
                 charger_qr = await ChargerQRCode.filter(
                     razorpay_qr_code_id=qr_code_id
                 ).prefetch_related("charger").first()
                 if not charger_qr:
-                    logger.error(f"No ChargerQRCode for stale payment {payment_id}")
+                    logger.error(f"No ChargerQRCode for stale payment {mask_payment_id(payment_id)}")
                     return {"status": "error", "reason": "QR code not found"}
 
                 user = await find_or_create_user_from_payment(contact, vpa, customer_name)
@@ -196,55 +201,73 @@ class QRPaymentService:
         # Find or create user
         user = await find_or_create_user_from_payment(contact, vpa, customer_name)
 
-        # Check for double payment (active transaction or pending QR payment on this charger)
-        active_txn = await Transaction.filter(
-            charger=charger,
-            transaction_status__in=[
-                TransactionStatusEnum.RUNNING,
-                TransactionStatusEnum.STARTED,
-                TransactionStatusEnum.PENDING_START,
-            ]
-        ).first()
-        pending_qr = await QRPayment.filter(
-            charger=charger,
-            status=QRPaymentStatusEnum.PAID,
-            transaction_id__isnull=True,
-        ).first()
-        if active_txn or pending_qr:
-            reason = f"Active transaction {active_txn.id}" if active_txn else f"Pending QR payment {pending_qr.id} already waiting"
-            logger.warning(f"{reason} on charger {charger.id}, refunding new payment")
-            qr_payment = await QRPayment.create(
-                charger=charger,
-                charger_qr_code=charger_qr,
-                user=user,
-                razorpay_payment_id=payment_id,
-                razorpay_qr_code_id=qr_code_id,
-                amount_paid=amount_paid,
-                customer_vpa=vpa,
-                customer_name=customer_name,
-                customer_contact=contact,
-                status=QRPaymentStatusEnum.FAILED,
-                failure_reason="Active transaction exists on charger",
-                metadata=webhook_data,
-            )
-            # Attempt full refund
-            await QRPaymentService._full_refund(qr_payment, "Double payment - active session exists")
-            return {"status": "failed", "reason": "active_transaction", "qr_payment_id": qr_payment.id}
+        # Atomic double-payment guard: serialize concurrent QR webhooks for the
+        # same charger by locking the Charger row. Only one payment can win the
+        # "first slot"; any concurrent payment sees the active txn / pending QR
+        # and is rejected + refunded.
+        rejection_qr_payment_id = None
+        async with in_transaction():
+            locked_charger = await Charger.select_for_update().get(id=charger.id)
 
-        # Create QRPayment record
-        qr_payment = await QRPayment.create(
-            charger=charger,
-            charger_qr_code=charger_qr,
-            user=user,
-            razorpay_payment_id=payment_id,
-            razorpay_qr_code_id=qr_code_id,
-            amount_paid=amount_paid,
-            customer_vpa=vpa,
-            customer_name=customer_name,
-            customer_contact=contact,
-            status=QRPaymentStatusEnum.PAID,
-            metadata=webhook_data,
-        )
+            active_txn = await Transaction.filter(
+                charger=locked_charger,
+                transaction_status__in=[
+                    TransactionStatusEnum.RUNNING,
+                    TransactionStatusEnum.STARTED,
+                    TransactionStatusEnum.PENDING_START,
+                ]
+            ).first()
+            pending_qr = await QRPayment.filter(
+                charger=locked_charger,
+                status=QRPaymentStatusEnum.PAID,
+                transaction_id__isnull=True,
+            ).first()
+
+            if active_txn or pending_qr:
+                reason = (
+                    f"Active transaction {active_txn.id}"
+                    if active_txn
+                    else f"Pending QR payment {pending_qr.id} already waiting"
+                )
+                logger.warning(
+                    "qr_payment_rejected reason=charger_busy charger_id=%s payment_id=%s detail=%s",
+                    locked_charger.id, mask_payment_id(payment_id), reason,
+                )
+                rejected = await QRPayment.create(
+                    charger=locked_charger,
+                    charger_qr_code=charger_qr,
+                    user=user,
+                    razorpay_payment_id=payment_id,
+                    razorpay_qr_code_id=qr_code_id,
+                    amount_paid=amount_paid,
+                    customer_vpa=vpa,
+                    customer_name=customer_name,
+                    customer_contact=contact,
+                    status=QRPaymentStatusEnum.FAILED,
+                    failure_reason="Concurrent payment rejected — charger busy",
+                    metadata=webhook_data,
+                )
+                rejection_qr_payment_id = rejected.id
+            else:
+                qr_payment = await QRPayment.create(
+                    charger=locked_charger,
+                    charger_qr_code=charger_qr,
+                    user=user,
+                    razorpay_payment_id=payment_id,
+                    razorpay_qr_code_id=qr_code_id,
+                    amount_paid=amount_paid,
+                    customer_vpa=vpa,
+                    customer_name=customer_name,
+                    customer_contact=contact,
+                    status=QRPaymentStatusEnum.PAID,
+                    metadata=webhook_data,
+                )
+
+        # Refund rejected payment outside the lock (Razorpay call is slow)
+        if rejection_qr_payment_id is not None:
+            rejected = await QRPayment.get(id=rejection_qr_payment_id)
+            await QRPaymentService._full_refund(rejected, "Concurrent payment rejected — charger busy")
+            return {"status": "failed", "reason": "active_transaction", "qr_payment_id": rejection_qr_payment_id}
 
         # Check if charger is in a suitable state and connected
         # Socket chargers may remain Available (no CP signal for Preparing)
@@ -455,17 +478,19 @@ class QRPaymentService:
             }
             await redis_manager.set_qr_session(transaction_id, session)
 
-        budget_limit = session["budget_limit"]
-        tariff_rate = session["tariff_rate"]
-        gst_percent = session.get("gst_percent", 18.0)
-        start_meter = session["start_meter_kwh"]
+        budget_limit = Decimal(str(session["budget_limit"]))
+        tariff_rate = Decimal(str(session["tariff_rate"]))
+        gst_percent = Decimal(str(session.get("gst_percent", 18.0)))
+        start_meter = Decimal(str(session["start_meter_kwh"]))
 
         if tariff_rate <= 0:
             return
 
-        energy_consumed = reading_kwh - start_meter
-        gst_multiplier = 1 + (gst_percent / 100)
-        cost = energy_consumed * tariff_rate * gst_multiplier
+        energy_consumed = Decimal(str(reading_kwh)) - start_meter
+        gst_multiplier = Decimal("1") + (gst_percent / Decimal("100"))
+        cost = (energy_consumed * tariff_rate * gst_multiplier).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
         remaining = budget_limit - cost
 
         logger.info(
@@ -616,42 +641,73 @@ class QRPaymentService:
 
     @staticmethod
     async def _full_refund(qr_payment: QRPayment, reason: str):
-        """Issue a full refund for a QR payment"""
-        try:
-            # Idempotency: skip if already refunded
-            if qr_payment.razorpay_refund_id:
-                logger.info(f"QR payment {qr_payment.id} already refunded ({qr_payment.razorpay_refund_id}), skipping")
+        """Issue a full refund for a QR payment, guarded by a row lock.
+
+        The entire check-decide-write flow runs inside a single DB transaction
+        with SELECT FOR UPDATE on the QRPayment row. This serializes concurrent
+        callers (webhook retries, watchdogs, billing) so only one refund is ever
+        issued. Razorpay "already refunded" responses are reconciled by
+        fetching the existing refund and persisting its ID.
+        """
+        async with in_transaction():
+            locked = await QRPayment.select_for_update().get(id=qr_payment.id)
+
+            if locked.razorpay_refund_id:
+                logger.info(
+                    "QR payment %s already refunded (%s), skipping",
+                    locked.id, locked.razorpay_refund_id,
+                )
                 return
 
-            platform_fee = (qr_payment.amount_paid * RAZORPAY_PLATFORM_FEE_PERCENT / 100).quantize(
+            platform_fee = (locked.amount_paid * RAZORPAY_PLATFORM_FEE_PERCENT / 100).quantize(
                 Decimal('0.01'), rounding=ROUND_HALF_UP
             )
-            refund_amount = qr_payment.amount_paid - platform_fee
+            refund_amount = locked.amount_paid - platform_fee
 
             if refund_amount < MINIMUM_REFUND_AMOUNT:
                 logger.info(f"Refund amount ₹{refund_amount} below minimum, skipping")
                 return
 
-            qr_payment.platform_fee = platform_fee
-            qr_payment.refund_amount = refund_amount
+            locked.platform_fee = platform_fee
+            locked.refund_amount = refund_amount
+
             try:
                 refund_result = razorpay_service.refund_payment(
-                    qr_payment.razorpay_payment_id,
+                    locked.razorpay_payment_id,
                     amount=refund_amount,
-                    notes={"reason": reason, "qr_payment_id": str(qr_payment.id)}
+                    notes={"reason": reason, "qr_payment_id": str(locked.id)},
                 )
-                qr_payment.razorpay_refund_id = refund_result.get("id")
-                if qr_payment.status not in (QRPaymentStatusEnum.EXPIRED,):
-                    qr_payment.status = QRPaymentStatusEnum.REFUNDED
-                await qr_payment.save()
-                logger.info(f"Full refund ₹{refund_amount} issued for QR payment {qr_payment.id}: {reason}")
+                locked.razorpay_refund_id = refund_result.get("id")
+                if locked.status != QRPaymentStatusEnum.EXPIRED:
+                    locked.status = QRPaymentStatusEnum.REFUNDED
+                await locked.save()
+                logger.info(
+                    "Full refund ₹%s issued for QR payment %s: %s",
+                    refund_amount, locked.id, reason,
+                )
+            except RazorpayAlreadyRefundedError as e:
+                existing = razorpay_service.find_refund_for_payment(locked.razorpay_payment_id)
+                if existing and existing.get("id"):
+                    locked.razorpay_refund_id = existing["id"]
+                    if locked.status != QRPaymentStatusEnum.EXPIRED:
+                        locked.status = QRPaymentStatusEnum.REFUNDED
+                    await locked.save()
+                    logger.warning(
+                        "refund_reconciled=true qr_payment=%s existing_refund=%s reason=%s",
+                        locked.id, existing["id"], reason,
+                    )
+                else:
+                    locked.status = QRPaymentStatusEnum.REFUND_FAILED
+                    locked.failure_reason = f"Razorpay reports already refunded but no refund record found: {e}"
+                    await locked.save()
+                    logger.error(
+                        "Could not reconcile already-refunded payment %s: no refund record found",
+                        locked.razorpay_payment_id,
+                    )
             except Exception as e:
-                logger.error(f"Full refund error for QR payment {qr_payment.id}: {e}", exc_info=True)
-                qr_payment.status = QRPaymentStatusEnum.REFUND_FAILED
-                qr_payment.failure_reason = str(e)
-                await qr_payment.save()
-        except Exception as e:
-            logger.error(f"Full refund calculation error for QR payment {qr_payment.id}: {e}", exc_info=True)
-            qr_payment.status = QRPaymentStatusEnum.REFUND_FAILED
-            qr_payment.failure_reason = str(e)
-            await qr_payment.save()
+                logger.error(
+                    "Full refund error for QR payment %s: %s", locked.id, e, exc_info=True,
+                )
+                locked.status = QRPaymentStatusEnum.REFUND_FAILED
+                locked.failure_reason = str(e)
+                await locked.save()

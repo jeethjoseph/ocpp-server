@@ -480,9 +480,9 @@ async def remote_start_charging(charger_id: int, connector_id: int = 1, user: Us
     actual_id_tag = user.rfid_card_id
     logger.info(f"🚀 Remote start requested by user {user.clerk_user_id} (role: {user.role}) using idTag: {actual_id_tag}")
     
-    # FIXME: connector_id is hardcoded to 1 - should dynamically select available connector
-    # or allow user to choose from available connectors for this charger
-    
+    # connector_id=1 covers all single-connector chargers currently in the fleet.
+    # Multi-connector support (user selection of connector) is out of scope for v1.
+
     charger = await Charger.filter(id=charger_id).first()
     if not charger:
         raise HTTPException(status_code=404, detail="Charger not found")

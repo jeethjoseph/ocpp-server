@@ -276,5 +276,21 @@ class RedisConnectionManager:
             logger.error(f"Failed to get connection data for charger {charger_id}: {e}")
             return None
 
+    async def rate_limit_check(self, key: str, limit: int, window_seconds: int) -> bool:
+        """Redis-backed sliding-window counter. Returns True if request is allowed."""
+        if not self.redis_client:
+            # Fail-open if Redis is down so legitimate traffic is not blocked
+            return True
+        try:
+            redis_key = f"ratelimit:{key}"
+            count = await self.redis_client.incr(redis_key)
+            if count == 1:
+                await self.redis_client.expire(redis_key, window_seconds)
+            return count <= limit
+        except Exception as e:
+            logger.error(f"Rate limit check failed for {key}: {e}")
+            return True
+
+
 # Global instance
 redis_manager = RedisConnectionManager()

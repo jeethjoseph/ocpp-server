@@ -173,8 +173,9 @@ class WalletTransaction(Model):
     description = fields.TextField(null=True)
     charging_transaction = fields.ForeignKeyField("models.Transaction", related_name="wallet_transactions", null=True)
     payment_metadata = fields.JSONField(null=True)
+    razorpay_order_id = fields.CharField(max_length=64, null=True, index=True)
     created_at = fields.DatetimeField(auto_now_add=True)
-    
+
     class Meta:
         table = "wallet_transaction"
 
@@ -469,7 +470,7 @@ class QRPayment(Model):
     razorpay_payment_id = fields.CharField(max_length=255, unique=True, index=True)
     razorpay_qr_code_id = fields.CharField(max_length=255, index=True)
     amount_paid = fields.DecimalField(max_digits=10, decimal_places=2)
-    customer_vpa = fields.CharField(max_length=255, null=True)
+    customer_vpa = fields.CharField(max_length=255, null=True, index=True)
     customer_name = fields.CharField(max_length=255, null=True)
     customer_contact = fields.CharField(max_length=255, null=True)
     energy_cost = fields.DecimalField(max_digits=10, decimal_places=2, null=True)   # Pre-GST energy charge
@@ -485,6 +486,7 @@ class QRPayment(Model):
 
     class Meta:
         table = "qr_payment"
+        indexes = [("charger_id", "status", "transaction_id")]
 
 # Pydantic models for API serialization
 User_Pydantic = pydantic_model_creator(User, name="User")

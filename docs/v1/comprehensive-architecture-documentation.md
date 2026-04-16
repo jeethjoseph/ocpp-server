@@ -1384,6 +1384,15 @@ npx cap open android  # Open in Android Studio
 ### Overview
 The QR-based appless charging feature enables customers to charge their EV by scanning a Razorpay UPI QR code at the charger and paying any amount via their UPI app (Google Pay, PhonePe, etc.) — **without needing to download an app or create an account**. The system automatically starts charging, enforces a budget limit, and refunds any unused balance after the session.
 
+### Payment Safety Guarantees
+
+- **Atomic refund idempotency** — `QRPaymentService._full_refund` wraps its check-decide-write flow in `async with in_transaction()` and uses `QRPayment.select_for_update().get(id=...)` so concurrent callers (webhook retries, watchdog, billing) serialize on the row. Exactly one refund is issued.
+- **Concurrent-payment rejection** — `handle_qr_payment` wraps the active-transaction + pending-QR check in a transaction with `Charger.select_for_update().get(id=charger.id)`. If the charger is busy, the new payment is created with `FAILED` status and auto-refunded outside the lock; the charger holder is unaffected.
+- **Razorpay "already refunded" reconciliation** — When Razorpay returns a fully-refunded error, `razorpay_service` raises `RazorpayAlreadyRefundedError`. `_full_refund` catches it, calls `find_refund_for_payment()`, persists the pre-existing refund ID, and logs `refund_reconciled=true`. The database row ends consistent with Razorpay's state.
+- **Indexed order-id lookup** — `WalletTransaction.razorpay_order_id` is a dedicated indexed column (migration 14). Webhook handlers use a direct indexed lookup instead of scanning the 1000 most recent rows (old JSON fallback retained for pre-migration rows only).
+- **Webhook retries avoided** — All Razorpay webhook handlers return HTTP 200 on application errors (logged) so Razorpay does not retry. Only infrastructure failures (DB/Redis) surface as 5xx.
+- **PII masked in logs** — `mask_vpa()`, `mask_phone()`, `mask_payment_id()`, `mask_email()` helpers in `utils.py` are applied in all QR payment log statements. Logs forwarded to New Relic contain only masked identifiers.
+
 ### Payment & Charging Flow
 
 ```
@@ -2198,16 +2207,24 @@ curl https://server.com/api/firmware/latest
 #### Backend Authentication (`backend/auth_middleware.py`)
 **Purpose**: JWT validation and role-based access control
 
-```python
-# Implementation: backend/auth_middleware.py
-class ClerkJWTBearer(HTTPBearer):
-```
+**JWT verification** uses `jwt.PyJWKClient` from PyJWT. A module-level client caches Clerk's JWKS (1-hour TTL) and auto-refreshes on unknown `kid`. The `verify_token()` function:
+1. Fetches the signing key for the token's `kid` via `PyJWKClient.get_signing_key_from_jwt(token)`
+2. Calls `jwt.decode(token, key, algorithms=["RS256"], issuer=CLERK_ISSUER)` — RS256 signature and issuer are validated
+3. Looks up the user role from the local DB (not JWT claims) to enforce current role
+
+**Environment variables:**
+- `CLERK_SECRET_KEY` — Clerk secret (required)
+- `CLERK_JWKS_URL` — JWKS endpoint (prod: `https://clerk.voltlync.com/.well-known/jwks.json`)
+- `CLERK_ISSUER` — Expected `iss` claim (prod: `https://clerk.voltlync.com`)
+- `CORS_ORIGINS` — comma-separated allowlist (prod: `https://app.voltlync.com`)
+
+If `CLERK_JWKS_URL` is unset, the module logs a warning and derives a dev-tenant URL from the secret key for development convenience only.
 
 **Features**:
-- **JWT Validation**: Clerk-signed token verification
-- **Role Extraction**: User role determination from Clerk metadata
+- **JWT Validation**: RS256 signature check against Clerk JWKS + issuer verification
+- **Role Extraction**: Role sourced from DB (not JWT), allowing admin revocation without token rotation
 - **Request Context**: User information injection for route handlers
-- **Error Handling**: Comprehensive authentication error responses
+- **Error Handling**: Distinct 401 responses for expired, invalid-signature, and invalid-issuer tokens
 
 **Protected Route Patterns**:
 - `/api/admin/*`: Requires ADMIN role

@@ -61,7 +61,7 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
 ### Backend Core (`/backend/`)
 - **`main.py`** - FastAPI app with OCPP WebSocket endpoint `/ocpp/{charge_point_id}` and all OCPP message handlers. **QR integration**: StartTransaction links QR payments, MeterValues checks budget, StopTransaction triggers billing/refund. **Transaction resume**: BootNotification resets timeout for already-SUSPENDED transactions (from disconnect handler) or suspends still-active ones. **Socket charger support**: Grace period on Available status instead of immediate failure. **StopTransaction sanitization**: `route_message()` override cleans non-standard reason values
 - **`models.py`** - Complete database schema with OCPP enums, User, Charger, Transaction, Wallet, **ChargerQRCode, QRPayment** models
-- **`auth_middleware.py`** - Clerk JWT authentication with role-based access control (ADMIN/USER)
+- **`auth_middleware.py`** - Clerk JWT authentication with **RS256 signature verification via `PyJWKClient`** (JWKS URL is env-driven: `CLERK_JWKS_URL` + `CLERK_ISSUER`). Issuer is strictly validated; signature is verified against Clerk's rotating public keys. Role-based access control (ADMIN/USER).
 - **`redis_manager.py`** - Real-time connection state management for chargers + **QR session budget caching** (`set_qr_session`, `get_qr_session`, `delete_qr_session`) + **Socket charger grace period** (`set_socket_grace_period`, `get_socket_grace_period`, `delete_socket_grace_period`)
 - **`core/connection_manager.py`** - Centralized charger connection management with tombstone mechanism, heartbeat monitoring (120s timeout), ghost session detection, OCPP command dispatch (RemoteStart/Stop, ChangeAvailability, UpdateFirmware, Reset), **disconnect callback hook** (`register_on_disconnect`) for transaction suspension
 - **`tortoise_config.py`** - Database configuration with SSL for production
@@ -892,7 +892,11 @@ cd backend
 # IMPORTANT: Always activate the virtual environment first
 source .venv/bin/activate
 pip install -r requirements.txt
-# Set environment variables: DATABASE_URL, REDIS_URL, CLERK_* credentials
+# Set environment variables: DATABASE_URL, REDIS_URL, CLERK_*, CORS_ORIGINS
+# Required Clerk vars for JWT verification: CLERK_SECRET_KEY, CLERK_JWKS_URL, CLERK_ISSUER
+# Prod: CLERK_JWKS_URL=https://clerk.voltlync.com/.well-known/jwks.json
+# Staging: use your Clerk dev-tenant JWKS URL
+# CORS: set CORS_ORIGINS=https://app.voltlync.com (prod) / https://staging.voltlync.com (staging)
 python main.py  # Starts on port 8000 with OCPP WebSocket endpoint
 ```
 

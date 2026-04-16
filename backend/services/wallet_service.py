@@ -1,5 +1,6 @@
 # Wallet service for handling billing and wallet transactions
 import asyncio
+import time
 from utils import safe_create_task
 from crud import log_audit_event
 from decimal import Decimal, ROUND_HALF_UP
@@ -286,7 +287,7 @@ class WalletService:
     async def process_wallet_topup(
         wallet_transaction_id: int,
         razorpay_payment_id: str,
-        razorpay_signature: str
+        razorpay_signature: Optional[str] = None,
     ) -> Tuple[bool, str, Optional[Decimal]]:
         """
         Process wallet top-up after payment verification
@@ -294,7 +295,8 @@ class WalletService:
         Args:
             wallet_transaction_id: ID of the pending wallet transaction
             razorpay_payment_id: Payment ID from Razorpay
-            razorpay_signature: Signature from Razorpay
+            razorpay_signature: Signature from client callback;
+                None when called from webhook (webhook signature is verified upstream)
 
         Returns:
             (success: bool, message: str, new_balance: Optional[Decimal])
@@ -347,7 +349,7 @@ class WalletService:
                     "status": PaymentStatusEnum.COMPLETED.value,
                     "razorpay_payment_id": razorpay_payment_id,
                     "razorpay_signature": razorpay_signature,
-                    "completed_at": int(__import__('time').time()),
+                    "completed_at": int(time.time()),
                     "previous_balance": float(current_balance),
                     "new_balance": float(new_balance)
                 })

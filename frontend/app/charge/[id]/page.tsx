@@ -63,12 +63,6 @@ export default function UserChargePage() {
   const meterValues = meterValuesData?.meter_values || [];
   const latestMeterValue = meterValues[meterValues.length - 1];
 
-  // Debug logging
-  console.log("🔍 Debug - chargerData:", chargerData);
-  console.log("🔍 Debug - currentTransactionId:", currentTransactionId);
-  console.log("🔍 Debug - transaction:", transaction);
-  console.log("🔍 Debug - meterValues:", meterValues);
-
   useEffect(() => {
     if (currentTransactionId) {
       setLastTransactionId(currentTransactionId);
