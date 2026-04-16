@@ -52,6 +52,13 @@ async def _resolve_platform_fee(qr_payment: QRPayment) -> Decimal:
     estimated = (qr_payment.amount_paid * RAZORPAY_PLATFORM_FEE_PERCENT / 100).quantize(
         Decimal('0.01'), rounding=ROUND_HALF_UP
     )
+    # Estimate breakdown: Razorpay charges 18% GST on their commission
+    gst_on_fee = (estimated * Decimal('18') / Decimal('118')).quantize(
+        Decimal('0.01'), rounding=ROUND_HALF_UP
+    )
+    qr_payment.platform_fee = estimated
+    qr_payment.razorpay_commission = estimated - gst_on_fee
+    qr_payment.razorpay_gst = gst_on_fee
     qr_payment.fee_source = "estimated"
     return estimated
 
@@ -695,13 +702,14 @@ class QRPaymentService:
                 return
 
             platform_fee = await _resolve_platform_fee(locked)
+            locked.platform_fee = platform_fee
             refund_amount = locked.amount_paid - platform_fee
 
             if refund_amount < MINIMUM_REFUND_AMOUNT:
+                await locked.save()  # Persist fee data even if refund is skipped
                 logger.info(f"Refund amount ₹{refund_amount} below minimum, skipping")
                 return
 
-            locked.platform_fee = platform_fee
             locked.refund_amount = refund_amount
 
             try:

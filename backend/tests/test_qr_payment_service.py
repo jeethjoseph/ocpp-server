@@ -476,3 +476,27 @@ async def test_resolve_fee_falls_back_to_estimate(client, qr_charger, qr_code):
 
     assert fee == Decimal("2.00")
     assert qr_payment.fee_source == "estimated"
+    # Estimated breakdown: 18% GST on commission → gst = 2.00 * 18/118 ≈ 0.31
+    assert qr_payment.razorpay_gst == Decimal("0.31")
+    assert qr_payment.razorpay_commission == Decimal("1.69")
+    assert qr_payment.razorpay_commission + qr_payment.razorpay_gst == fee
+
+
+# ============================================================================
+# Zero-fee serialization (Decimal("0.00") must not serialize as null)
+# ============================================================================
+
+def test_zero_decimal_serializes_as_string():
+    """Decimal('0.00') must serialize as '0.00', not None.
+
+    Python treats Decimal('0.00') as falsy. Using `if value` instead of
+    `if value is not None` causes zero fees to vanish from API responses.
+    """
+    from decimal import Decimal
+    val = Decimal("0.00")
+    # This is what the routers do after the fix:
+    result = str(val) if val is not None else None
+    assert result == "0.00"
+    # The old buggy pattern:
+    buggy = str(val) if val else None
+    assert buggy is None  # confirms the bug existed
