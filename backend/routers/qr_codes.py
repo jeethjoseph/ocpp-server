@@ -5,8 +5,13 @@ from typing import Optional
 import logging
 
 from auth_middleware import require_admin
-from models import Charger, ChargerQRCode, QRPayment, QRPaymentStatusEnum
-from services.razorpay_service import razorpay_service
+from models import (
+    Charger, ChargerQRCode, QRPayment, QRPaymentStatusEnum,
+    Franchisee, FranchiseeStatusEnum,
+)
+from services.razorpay_service import (
+    razorpay_service, build_qr_payee_name, build_qr_description,
+)
 from tortoise.functions import Count, Sum
 
 logger = logging.getLogger(__name__)
@@ -17,14 +22,84 @@ class CreateQRCodeRequest(BaseModel):
     charger_id: int
 
 
+async def _resolve_qr_owner(charger: Charger) -> tuple[Optional[Franchisee], Optional[str]]:
+    """Decide which Razorpay account owns a QR created for this charger.
+
+    Returns (franchisee, account_id_for_header). When the charger's station
+    is linked to an ACTIVE franchisee with a Razorpay linked account, the
+    QR is scoped to that account via X-Razorpay-Account. Otherwise the QR
+    falls back to being owned by the platform (account_id=None).
+
+    This is what gets the franchisee's registered business name rendered
+    on the QR image (RBI Route payer-payee transparency).
+    """
+    await charger.fetch_related("station__franchisee")
+    station = charger.station
+    if not station or not station.franchisee:
+        return None, None
+    franchisee = station.franchisee
+    if (
+        franchisee.status == FranchiseeStatusEnum.ACTIVE
+        and franchisee.razorpay_account_id
+    ):
+        return franchisee, franchisee.razorpay_account_id
+    # Franchisee exists but Razorpay onboarding isn't complete — fall back
+    # to platform ownership. Admin can regenerate later.
+    return franchisee, None
+
+
+async def _create_qr_for_charger(charger: Charger) -> dict:
+    """Create a QR code for a charger, auto-scoping to the franchisee's
+    linked account when possible. Returns the Razorpay response merged
+    with our internal ChargerQRCode fields."""
+    franchisee, account_id = await _resolve_qr_owner(charger)
+    business_name = franchisee.business_name if franchisee else None
+    charger_name = charger.name or charger.charge_point_string_id
+
+    result = razorpay_service.create_qr_code(
+        payee_name=build_qr_payee_name(business_name, charger_name),
+        description=build_qr_description(business_name, charger_name),
+        account_id=account_id,
+    )
+
+    qr_code = await ChargerQRCode.create(
+        charger=charger,
+        razorpay_qr_code_id=result["id"],
+        image_url=result.get("image_url", ""),
+        short_url=result.get("short_url"),
+        is_active=True,
+        owner_razorpay_account_id=account_id,
+    )
+    return {
+        "id": qr_code.id,
+        "charger_id": charger.id,
+        "charger_name": charger.name,
+        "charge_point_string_id": charger.charge_point_string_id,
+        "razorpay_qr_code_id": qr_code.razorpay_qr_code_id,
+        "image_url": qr_code.image_url,
+        "short_url": qr_code.short_url,
+        "is_active": qr_code.is_active,
+        "owner": "franchisee" if account_id else "platform",
+        "owner_razorpay_account_id": account_id,
+        "franchisee_name": business_name,
+        "created_at": qr_code.created_at.isoformat(),
+    }
+
+
 @router.post("")
 async def create_qr_code(request: CreateQRCodeRequest, admin_user=Depends(require_admin())):
-    """Create a Razorpay QR code for a charger"""
+    """Create a Razorpay QR code for a charger.
+
+    When the charger's station belongs to an ACTIVE franchisee with a
+    Razorpay linked account, the QR is scoped to that account so the
+    rendered QR image displays the franchisee's business name (RBI
+    Route payer-payee transparency). Otherwise falls back to a
+    platform-owned QR.
+    """
     charger = await Charger.filter(id=request.charger_id).first()
     if not charger:
         raise HTTPException(status_code=404, detail="Charger not found")
 
-    # Check if QR already exists
     existing = await ChargerQRCode.filter(charger=charger, is_active=True).first()
     if existing:
         raise HTTPException(status_code=400, detail="Active QR code already exists for this charger")
@@ -33,32 +108,44 @@ async def create_qr_code(request: CreateQRCodeRequest, admin_user=Depends(requir
         raise HTTPException(status_code=503, detail="Razorpay not configured")
 
     try:
-        result = razorpay_service.create_qr_code(
-            name=charger.name or charger.charge_point_string_id,
-        )
-
-        qr_code = await ChargerQRCode.create(
-            charger=charger,
-            razorpay_qr_code_id=result["id"],
-            image_url=result.get("image_url", ""),
-            short_url=result.get("short_url"),
-            is_active=True,
-        )
-
-        return {
-            "id": qr_code.id,
-            "charger_id": charger.id,
-            "charger_name": charger.name,
-            "charge_point_string_id": charger.charge_point_string_id,
-            "razorpay_qr_code_id": qr_code.razorpay_qr_code_id,
-            "image_url": qr_code.image_url,
-            "short_url": qr_code.short_url,
-            "is_active": qr_code.is_active,
-            "created_at": qr_code.created_at.isoformat(),
-        }
-
+        return await _create_qr_for_charger(charger)
     except Exception as e:
         logger.error(f"Failed to create QR code: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{qr_id}/regenerate")
+async def regenerate_qr_code(qr_id: int, admin_user=Depends(require_admin())):
+    """Close the existing QR and create a new one under today's ownership.
+
+    Used to upgrade a platform-owned QR to a franchisee-owned one after
+    the franchisee completes Razorpay onboarding, or after any change
+    that should refresh the rendered payee label on the QR image.
+    """
+    qr = await ChargerQRCode.filter(id=qr_id).prefetch_related("charger").first()
+    if not qr:
+        raise HTTPException(status_code=404, detail="QR code not found")
+
+    if not razorpay_service.is_configured():
+        raise HTTPException(status_code=503, detail="Razorpay not configured")
+
+    # Close the existing QR first (best-effort: Razorpay side may already
+    # be closed; proceed to create the replacement regardless).
+    if qr.is_active:
+        try:
+            razorpay_service.close_qr_code(
+                qr.razorpay_qr_code_id,
+                account_id=qr.owner_razorpay_account_id,
+            )
+        except Exception as e:
+            logger.warning("Razorpay close failed during regenerate (continuing): %s", e)
+        qr.is_active = False
+        await qr.save()
+
+    try:
+        return await _create_qr_for_charger(qr.charger)
+    except Exception as e:
+        logger.error(f"Failed to regenerate QR code: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -184,7 +271,10 @@ async def close_qr_code(qr_id: int, admin_user=Depends(require_admin())):
         raise HTTPException(status_code=400, detail="QR code already inactive")
 
     try:
-        razorpay_service.close_qr_code(qr.razorpay_qr_code_id)
+        razorpay_service.close_qr_code(
+            qr.razorpay_qr_code_id,
+            account_id=qr.owner_razorpay_account_id,
+        )
     except Exception as e:
         logger.warning(f"Failed to close QR on Razorpay (marking inactive anyway): {e}")
 

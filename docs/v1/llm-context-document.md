@@ -78,9 +78,13 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
   - Public: `/api/firmware/latest` for non-OCPP charge points
 - **`public_stations.py`** - Public unauthenticated station/charger discovery (`/api/public/stations/*`) for user-facing pages
 - **`public_qr_transactions.py`** - Public QR transaction history lookup by UPI VPA (`/api/public/qr-transactions`) — no auth, paginated, minimal data exposure
-- **`qr_codes.py`** - **NEW**: Admin QR code CRUD for appless charging (`/api/admin/qr-codes/*`)
-  - Create/list/close QR codes linked to chargers
+- **`qr_codes.py`** - Admin QR code CRUD for appless charging (`/api/admin/qr-codes/*`)
+  - Create/list/close/regenerate QR codes linked to chargers
   - Payment history and revenue stats per QR code
+  - On create, auto-scopes the QR to the franchisee's Razorpay linked account (via `X-Razorpay-Account`) when the station's franchisee is ACTIVE — that makes Razorpay render the franchisee's business name on the rendered QR image. Falls back to platform-owned when no franchisee or the franchisee's Razorpay account isn't ACTIVE yet. Ownership is persisted on `ChargerQRCode.owner_razorpay_account_id` so later close/fetch calls scope correctly.
+- **`franchisee_portal.py`** - Franchisee-facing portal API (`/api/franchisee/*`)
+  - Dashboard, stations, chargers, transactions, settlements, profile, QR codes
+  - `/qr-codes` endpoints support full CRUD on the franchisee's own chargers' QRs (list with `can_create_direct` / `payee_display_name`, create, regenerate, close). Regenerate is the retroactive compliance path: once Razorpay KYC completes, the franchisee clicks it to upgrade each platform-owned QR into a franchisee-owned one. All mutations audit-log with `actor_type=franchisee`.
 - **`webhooks.py`** - Clerk webhook processing for user lifecycle (`/webhooks/clerk`) + Razorpay webhook handler (`/webhooks/razorpay`)
   - Routes `qr_code.credited` events to `QRPaymentService.handle_qr_payment()`
 - **`wallet_payments.py`** - Razorpay payment integration for wallet recharge (`/api/wallet/*`)
@@ -127,7 +131,8 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
 - **`razorpay_service.py`** - Razorpay payment gateway integration
   - Order creation and payment verification
   - Webhook signature verification (HMAC SHA256)
-  - **QR code creation**: `create_qr_code()`, `close_qr_code()`
+  - **QR code creation**: `create_qr_code(payee_name, description, account_id=None)`, `close_qr_code(id, account_id=None)`, `fetch_qr_code(id, account_id=None)`. `account_id` is passed as the `X-Razorpay-Account` header so the QR is owned by that linked account and Razorpay renders that account's registered business name on the returned image — the RBI payer-payee transparency path for Route.
+  - **Helpers**: `build_qr_payee_name(business_name, charger_name)` composes the `name` metadata (50-char cap; falls back to "VoltLync" when no franchisee). `build_qr_description(...)` composes the rendered descriptor line.
   - **Refunds**: `refund_payment()` for partial/full refunds
   - Test/Live mode support
 - **`monitoring_service.py`** - Sentry + New Relic integration
@@ -140,11 +145,47 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
   - Download URL generation for OCPP UpdateFirmware
   - File naming: `{version}_{original_filename}`
   - Static serving via `/firmware/{filename}` endpoint
+  - Volume is a Docker named volume (`backend_firmware_{env}`). Production
+    image has no `USER` directive — `docker-entrypoint.sh` starts as root,
+    `chown`s `/app/firmware_files` to `app:app`, then `exec gosu app` to
+    drop privileges. Heals pre-existing volumes whose root directory was
+    seeded under a different user (the bug that broke staging firmware
+    uploads). See `backend/Dockerfile` + `backend/docker-entrypoint.sh`.
 - **`data_retention_service.py`** - **Background data cleanup service**
   - Automated cleanup of old signal quality data (90 days retention)
   - OCPP log cleanup (90 days retention)
   - Runs every 24 hours
   - Configurable retention period and cleanup interval
+- **`clerk_invitation_service.py`** - **Clerk sign-up invitation helper**
+  - Used by the franchisee onboarding flow: when admin creates a
+    franchisee, we fire a Clerk invitation seeded with
+    `public_metadata.role = "FRANCHISEE"` so the new user lands in the
+    portal on first login with no manual role editing.
+  - `send_invitation(email, role, redirect_path)` creates + emails
+    the invite via `clerk_backend_api`. Idempotent: "already
+    invited/registered" errors are swallowed.
+  - `revoke_pending_invitation(email)` used by the resend endpoint.
+  - `push_role_to_clerk(clerk_user_id, role)` called from the Clerk
+    `user.created` webhook to self-heal role drift when a user signs
+    up without using the invitation link.
+  - Needs `CLERK_SECRET_KEY` and `FRONTEND_URL` env vars.
+- **`franchisee_onboarding_service.py`** - **Razorpay Route KYC flow**
+  - `create_linked_account(franchisee_id)` creates a Razorpay linked
+    account, transitions status to `KYC_SUBMITTED`, and persists any
+    `hosted_onboarding_url` / `onboarding.url` returned by Razorpay into
+    `Franchisee.razorpay_onboarding_url` so the franchisee UI can
+    render a "Complete KYC on Razorpay" button.
+  - `handle_account_webhook(event_type, data)` advances the status
+    machine on Razorpay lifecycle events
+    (under_review → activated / needs_clarification / suspended /
+    rejected).
+  - `refresh_kyc_status(franchisee_id)` polls Razorpay for current
+    account status.
+  - End-to-end UX: admin clicks "Start Razorpay onboarding" on
+    `/admin/franchisees/[id]`, backend creates the linked account and
+    stores the hosted URL; franchisee sees "Complete KYC on Razorpay"
+    on `/franchisee/profile` which opens Razorpay's hosted form; their
+    webhook activates the account.
 
 ### Frontend Core (`/frontend/`)
 - **`app/page.tsx`** - Role-based dashboard (different for ADMIN vs USER)

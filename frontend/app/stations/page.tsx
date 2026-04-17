@@ -131,6 +131,11 @@ export default function StationsPage() {
                     <div className="flex justify-between items-start">
                       <div className="flex-1">
                         <h3 className="font-medium text-gray-900">{station.name}</h3>
+                        {station.franchisee_name && (
+                          <p className="text-xs text-gray-500">
+                            Operator: <span className="font-medium">{station.franchisee_name}</span>
+                          </p>
+                        )}
                         <p className="text-sm text-gray-600 mb-2">{station.address}</p>
                         
                         <div className="flex items-center space-x-4 text-sm">

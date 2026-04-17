@@ -696,7 +696,7 @@ async def get_charger_by_string_id(
 
     try:
         # Look up charger by charge_point_string_id
-        charger = await Charger.filter(charge_point_string_id=charge_point_id).prefetch_related('station', 'connectors').first()
+        charger = await Charger.filter(charge_point_string_id=charge_point_id).prefetch_related('station__franchisee', 'connectors').first()
 
         if not charger:
             raise HTTPException(status_code=404, detail="Charger not found")
@@ -751,6 +751,10 @@ async def get_charger_by_string_id(
                 "id": charger.station.id,
                 "name": charger.station.name,
                 "address": charger.station.address,
+                "franchisee_name": (
+                    charger.station.franchisee.business_name
+                    if charger.station.franchisee else None
+                ),
             },
             "connectors": [
                 {

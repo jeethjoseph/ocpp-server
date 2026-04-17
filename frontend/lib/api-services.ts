@@ -16,6 +16,13 @@ import {
   SignalQualityListResponse,
   ChargerError,
   ChargerErrorListResponse,
+  Franchisee,
+  FranchiseeCreate,
+  FranchiseeUpdate,
+  FranchiseeListResponse,
+  CommissionUpdate,
+  CommissionAuditEntry,
+  FranchiseeStation,
 } from "@/types/api";
 
 export const stationService = {
@@ -216,6 +223,7 @@ export interface PublicStationResponse {
     total_count: number;
   }>;
   price_per_kwh: number | null;
+  franchisee_name: string | null;
 }
 
 export interface PublicStationsListResponse {
@@ -252,6 +260,8 @@ export interface QRTransactionItem {
   fee_source: string | null;
   refund_amount: string | null;
   charger_name: string | null;
+  station_name: string | null;
+  franchisee_name: string | null;
   duration_minutes: number | null;
   start_time: string | null;
   end_time: string | null;
@@ -672,3 +682,160 @@ export const qrCodeService = {
     );
   },
 };
+
+// ─── Franchisee Service ────────────────────────────────────────────
+
+export const franchiseeService = {
+  getAll: (params?: {
+    page?: number;
+    limit?: number;
+    status?: string;
+    search?: string;
+  }) => {
+    const searchParams = new URLSearchParams();
+    if (params?.page) searchParams.set("page", params.page.toString());
+    if (params?.limit) searchParams.set("limit", params.limit.toString());
+    if (params?.status) searchParams.set("status", params.status);
+    if (params?.search) searchParams.set("search", params.search);
+
+    const query = searchParams.toString();
+    return api.get<FranchiseeListResponse>(
+      `/api/admin/franchisees${query ? `?${query}` : ""}`
+    );
+  },
+
+  getById: (id: number) => api.get<Franchisee>(`/api/admin/franchisees/${id}`),
+
+  create: (data: FranchiseeCreate) =>
+    api.post<Franchisee>("/api/admin/franchisees", data),
+
+  update: (id: number, data: FranchiseeUpdate) =>
+    api.put<Franchisee>(`/api/admin/franchisees/${id}`, data),
+
+  updateCommission: (id: number, data: CommissionUpdate) =>
+    api.put<{ message: string }>(`/api/admin/franchisees/${id}/commission`, data),
+
+  updateTDS: (id: number, data: { tds_rate_percent: number; notes?: string }) =>
+    api.put<{ message: string }>(`/api/admin/franchisees/${id}/tds`, data),
+
+  getCommissionHistory: (id: number) =>
+    api.get<CommissionAuditEntry[]>(
+      `/api/admin/franchisees/${id}/commission-history`
+    ),
+
+  getStations: (id: number) =>
+    api.get<FranchiseeStation[]>(`/api/admin/franchisees/${id}/stations`),
+
+  assignStations: (id: number, stationIds: number[]) =>
+    api.post<{ message: string }>(`/api/admin/franchisees/${id}/stations`, {
+      station_ids: stationIds,
+    }),
+
+  unassignStation: (franchiseeId: number, stationId: number) =>
+    api.delete<{ message: string }>(
+      `/api/admin/franchisees/${franchiseeId}/stations/${stationId}`
+    ),
+
+  updateStatus: (id: number, status: string, reason?: string) => {
+    const searchParams = new URLSearchParams({ status });
+    if (reason) searchParams.set("reason", reason);
+    return api.put<{ message: string }>(
+      `/api/admin/franchisees/${id}/status?${searchParams.toString()}`
+    );
+  },
+
+  resendInvitation: (id: number) =>
+    api.post<{ message: string; email: string }>(
+      `/api/admin/franchisees/${id}/resend-invitation`,
+      {}
+    ),
+
+  onboardRazorpay: (id: number) =>
+    api.post<{
+      message?: string;
+      account_id?: string;
+      status?: string;
+      razorpay_onboarding_url?: string | null;
+    }>(`/api/admin/franchisees/${id}/onboard-razorpay`, {}),
+};
+
+// ─── Franchisee Portal Service ─────────────────────────────────────
+
+export const franchiseePortalService = {
+  getDashboard: () => api.get<any>("/api/franchisee/dashboard"),
+
+  getStations: () => api.get<any[]>("/api/franchisee/stations"),
+
+  getStation: (id: number) => api.get<any>(`/api/franchisee/stations/${id}`),
+
+  getCharger: (id: number) => api.get<any>(`/api/franchisee/chargers/${id}`),
+
+  remoteStop: (chargerId: number) =>
+    api.post<any>(`/api/franchisee/chargers/${chargerId}/remote-stop`),
+
+  resetCharger: (chargerId: number) =>
+    api.post<any>(`/api/franchisee/chargers/${chargerId}/reset`),
+
+  changeAvailability: (chargerId: number, available: boolean) =>
+    api.post<any>(
+      `/api/franchisee/chargers/${chargerId}/change-availability?available=${available}`
+    ),
+
+  getTransactions: (params?: { page?: number; limit?: number; status?: string }) => {
+    const searchParams = new URLSearchParams();
+    if (params?.page) searchParams.set("page", params.page.toString());
+    if (params?.limit) searchParams.set("limit", params.limit.toString());
+    if (params?.status) searchParams.set("status", params.status);
+    const query = searchParams.toString();
+    return api.get<any>(`/api/franchisee/transactions${query ? `?${query}` : ""}`);
+  },
+
+  getTransaction: (id: number) =>
+    api.get<any>(`/api/franchisee/transactions/${id}`),
+
+  getSettlements: (params?: { page?: number; limit?: number }) => {
+    const searchParams = new URLSearchParams();
+    if (params?.page) searchParams.set("page", params.page.toString());
+    if (params?.limit) searchParams.set("limit", params.limit.toString());
+    const query = searchParams.toString();
+    return api.get<any>(`/api/franchisee/settlements${query ? `?${query}` : ""}`);
+  },
+
+  getProfile: () => api.get<any>("/api/franchisee/profile"),
+
+  getQRCodes: () =>
+    api.get<{
+      data: PortalQRCode[];
+      can_create_direct: boolean;
+      razorpay_account_status: string | null;
+      franchisee_status: string;
+    }>("/api/franchisee/qr-codes"),
+
+  createQRCode: (charger_id: number) =>
+    api.post<PortalQRCode>("/api/franchisee/qr-codes", { charger_id }),
+
+  regenerateQRCode: (qr_id: number) =>
+    api.post<PortalQRCode>(
+      `/api/franchisee/qr-codes/${qr_id}/regenerate`,
+      {}
+    ),
+
+  closeQRCode: (qr_id: number) =>
+    api.post<{ message: string; id: number }>(
+      `/api/franchisee/qr-codes/${qr_id}/close`,
+      {}
+    ),
+};
+
+export interface PortalQRCode {
+  id: number;
+  charger_id: number;
+  charger_name: string | null;
+  razorpay_qr_code_id: string;
+  image_url: string;
+  short_url: string | null;
+  is_active: boolean;
+  owner: "franchisee" | "platform";
+  payee_display_name: string;
+  created_at: string;
+}

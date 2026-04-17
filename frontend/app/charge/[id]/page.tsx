@@ -233,6 +233,11 @@ export default function UserChargePage() {
                 <span className="text-sm truncate">{station.name}</span>
               </div>
             )}
+            {station?.franchisee_name && (
+              <div className="text-xs text-muted-foreground truncate mt-0.5">
+                Operator: <span className="font-medium">{station.franchisee_name}</span>
+              </div>
+            )}
           </div>
         </div>
 
@@ -402,6 +407,11 @@ export default function UserChargePage() {
                 <Receipt className="h-5 w-5" />
                 Billing Summary
               </CardTitle>
+              {station?.franchisee_name && (
+                <p className="text-xs text-muted-foreground pt-1">
+                  Paid to <span className="font-medium">{station.franchisee_name}</span>
+                </p>
+              )}
             </CardHeader>
             <CardContent>
               {transactionData?.wallet_transactions && transactionData.wallet_transactions.length > 0 ? (

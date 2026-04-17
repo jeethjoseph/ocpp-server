@@ -42,6 +42,7 @@ markdown-it-py==3.0.0
 MarkupSafe==3.0.2
 mdurl==0.1.2
 newrelic==10.6.0
+num2words==0.5.14
 ocpp==2.0.0
 packaging==25.0
 pluggy==1.6.0
@@ -62,6 +63,7 @@ pytz==2025.2
 PyYAML==6.0.2
 razorpay==2.0.0
 redis==6.2.0
+reportlab==4.4.10
 referencing==0.36.2
 requests==2.32.4
 rich==14.1.0

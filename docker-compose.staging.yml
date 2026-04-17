@@ -56,6 +56,9 @@ services:
     container_name: ocpp-backend-staging
     environment:
       - ENVIRONMENT=staging
+      - CORS_ORIGINS=${CORS_ORIGINS:-}
+      - CLERK_JWKS_URL=${CLERK_JWKS_URL:-}
+      - CLERK_ISSUER=${CLERK_ISSUER:-}
       # Database & Redis
       - DB_HOST=postgres
       - DB_PORT=5432
@@ -71,6 +74,7 @@ services:
       # Clerk Authentication
       - CLERK_SECRET_KEY=${CLERK_SECRET_KEY}
       - CLERK_WEBHOOK_SECRET=${CLERK_WEBHOOK_SECRET}
+      - FRONTEND_URL=${FRONTEND_URL:-https://${DOMAIN_NAME}}
       # Razorpay Payments
       - RAZORPAY_KEY_ID=${RAZORPAY_KEY_ID:-}
       - RAZORPAY_KEY_SECRET=${RAZORPAY_KEY_SECRET:-}

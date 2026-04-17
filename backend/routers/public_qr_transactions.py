@@ -47,7 +47,9 @@ async def get_transactions_by_vpa(
 
     vpa = _validate_vpa_format(vpa)
 
-    query = QRPayment.filter(customer_vpa=vpa).prefetch_related("charger", "transaction")
+    query = QRPayment.filter(customer_vpa=vpa).prefetch_related(
+        "charger__station__franchisee", "transaction",
+    )
 
     if status:
         try:
@@ -63,6 +65,8 @@ async def get_transactions_by_vpa(
     for p in payments:
         txn = p.transaction if p.transaction_id else None
         charger = p.charger
+        station = charger.station if charger else None
+        franchisee = station.franchisee if station else None
 
         duration_minutes = None
         if txn and txn.start_time and txn.end_time:
@@ -83,6 +87,8 @@ async def get_transactions_by_vpa(
             "fee_source": p.fee_source,
             "refund_amount": str(p.refund_amount) if p.refund_amount else None,
             "charger_name": charger.name if charger else None,
+            "station_name": station.name if station else None,
+            "franchisee_name": franchisee.business_name if franchisee else None,
             "duration_minutes": duration_minutes,
             "start_time": txn.start_time.isoformat() if txn and txn.start_time else None,
             "end_time": txn.end_time.isoformat() if txn and txn.end_time else None,

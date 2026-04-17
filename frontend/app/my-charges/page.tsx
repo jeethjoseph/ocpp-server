@@ -160,7 +160,15 @@ function TransactionCard({ txn }: { txn: QRTransactionItem }) {
           {txn.charger_name && (
             <div className="flex items-center gap-2 text-sm text-muted-foreground truncate">
               <Zap className="h-3.5 w-3.5 flex-shrink-0" />
-              <span className="truncate">{txn.charger_name}</span>
+              <span className="truncate">
+                {txn.charger_name}
+                {txn.station_name ? ` · ${txn.station_name}` : ""}
+              </span>
+            </div>
+          )}
+          {txn.franchisee_name && (
+            <div className="text-xs text-muted-foreground truncate pl-5">
+              Operator: <span className="font-medium">{txn.franchisee_name}</span>
             </div>
           )}
         </div>

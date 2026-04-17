@@ -542,6 +542,18 @@ def file_exists(file_path: str) -> bool:
 - Unique version enforcement
 - Soft deletion (keeps physical files after database soft delete)
 
+**Volume ownership (production image)**:
+- The `firmware_files/` directory is mounted as a Docker named volume
+  (`backend_firmware_prod`, `backend_firmware_staging`) so uploads survive
+  container recreation.
+- Named volumes are seeded once at first mount; later image rebuilds do
+  not re-apply ownership. To guarantee the app user (`uid 1001`) can
+  write to the volume regardless of when it was created, the production
+  image ships without a `USER` directive — `docker-entrypoint.sh` starts
+  as root, `chown`s `/app/firmware_files` to `app:app`, then re-execs
+  itself under `app` via `gosu`. The rest of the container lifecycle
+  (migrations, uvicorn, healthcheck's CMD target) runs unprivileged.
+
 **Static File Configuration** (`main.py`):
 ```python
 FIRMWARE_DIR = os.path.join(os.path.dirname(__file__), "firmware_files")
@@ -2247,6 +2259,77 @@ export default clerkMiddleware((auth, req) => {
 - **Role-Based Redirects**: Admin vs User dashboard routing
 - **Session Management**: Automatic token refresh handling
 - **Public Route Handling**: Sign-in/sign-up accessibility
+
+#### Admin-Onboarded Users: Invitation + Role Sync
+
+Franchisee users are created by admins in the DB first, then invited into
+Clerk rather than asked to self-sign-up. The flow:
+
+1. `POST /api/admin/franchisees` creates the `Franchisee` + `User(role=FRANCHISEE)` rows inside one transaction.
+2. `services/clerk_invitation_service.send_invitation()` calls Clerk's
+   `invitations.create` with `public_metadata={"role": "FRANCHISEE"}` and
+   `redirect_url = FRONTEND_URL + /franchisee`. Clerk emails the magic
+   link.
+3. User clicks link → Clerk creates the auth account, copying the
+   invitation's `public_metadata` onto the user.
+4. Clerk fires `user.created` webhook → `routers/webhooks.py` matches the
+   existing DB User by email, attaches `clerk_user_id`. If the Clerk
+   `public_metadata.role` drifts from the DB role (user signed up
+   without the invitation link, metadata was stripped, etc.) the
+   handler calls `clerk_invitation_service.push_role_to_clerk()` to
+   re-sync — important because the frontend middleware routes on the
+   Clerk session claim, not the DB.
+5. Admin can resend the invitation via
+   `POST /api/admin/franchisees/{id}/resend-invitation`, which revokes
+   any pending invitation first so the newest email wins.
+
+Authority: **DB `User.role` is the source of truth.** Clerk
+`public_metadata.role` is a mirror, kept consistent by the invitation at
+creation time and the webhook self-heal at first login.
+
+Env vars required for this flow: `CLERK_SECRET_KEY`, `CLERK_WEBHOOK_SECRET`, `FRONTEND_URL`.
+
+#### Payer-Payee Transparency on QR Codes (RBI Route Compliance)
+
+The Razorpay QR code a customer scans at a charger is a PNG that Razorpay
+generates server-side. The **big bold label on that image is the owning
+merchant's legal business name as registered during KYC** — it is *not*
+something we pass via the `name` field in the API payload. RBI's
+Payment Aggregator mandate requires the customer to see the actual payee
+(the franchisee / station operator) at the point of payment, which for
+us means that label must read the franchisee's business name — not
+"VOLTLYNC PRIVATE LIMITED".
+
+The mechanism: the Razorpay QR create API accepts an
+`X-Razorpay-Account` header. When present, Razorpay treats the QR as
+owned by that linked (Route) account and renders the linked account's
+business name on the image. Our flow therefore:
+
+1. When a QR is being created for a charger whose station belongs to a
+   franchisee whose Razorpay linked account is `ACTIVE`, the backend
+   passes `X-Razorpay-Account: <razorpay_account_id>` on the create
+   call (`services/razorpay_service.create_qr_code(..., account_id=...)`).
+2. Ownership is persisted in `ChargerQRCode.owner_razorpay_account_id`
+   so later close/fetch calls use the same header (otherwise Razorpay
+   returns "account not found").
+3. Franchisees can self-serve via the `/franchisee/qr-codes` portal:
+   create, regenerate, and close their own chargers' QRs. Regenerate
+   is the retroactive compliance path — once a franchisee's Razorpay
+   KYC completes, they click Regenerate and the QR's big label
+   switches from VoltLync to their business name.
+4. For chargers at stations with no franchisee (platform-owned) or
+   whose franchisee hasn't completed Razorpay KYC yet, the QR remains
+   platform-owned and renders VoltLync — correct behavior since
+   VoltLync is legally the merchant of record in those cases.
+
+Complementary transparency surfaces (all read-only, franchisee name
+sourced from the `Charger → Station → Franchisee` FK chain):
+
+- `/api/public/stations` and `/api/public/stations/map` include `franchisee_name` on each station.
+- `/api/public/qr-transactions` returns `franchisee_name` and `station_name` alongside `charger_name` for transaction history.
+- `/api/users/charger/{id}` surfaces `station.franchisee_name`.
+- The `/my-charges`, `/stations`, `/charge/[id]` and `StationMap` popup all render an "Operator:" line when populated.
+- The GST invoice PDF has always included the franchisee's business name as the supplier (no change needed there).
 
 ### Role-Based Access Control (RBAC)
 

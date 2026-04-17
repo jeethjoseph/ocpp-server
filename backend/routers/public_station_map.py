@@ -51,6 +51,7 @@ class MapStationResponse(BaseModel):
     connector_types: List[str]
     connector_details: List[ConnectorInfo]
     price_per_kwh: Optional[float]
+    franchisee_name: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -83,6 +84,7 @@ async def list_map_stations(request: Request):
             connector_types=s.connector_types,
             connector_details=s.connector_details,
             price_per_kwh=s.price_per_kwh,
+            franchisee_name=s.franchisee_name,
         )
         for s in full_stations
     ]

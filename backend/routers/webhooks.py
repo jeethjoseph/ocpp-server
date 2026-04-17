@@ -151,6 +151,25 @@ async def handle_user_created(data: dict):
                     f"existing DB user (ID={existing_user.id}) has a different Clerk account. "
                     f"User record NOT updated. Manually resolve this conflict."
                 )
+                return
+
+            # Self-heal role drift: the frontend middleware routes on Clerk
+            # public_metadata.role, so if our authoritative DB role
+            # disagrees with what Clerk holds (e.g. a franchisee signed up
+            # without an invitation, or an invitation's metadata got
+            # stripped), push the DB role back to Clerk. USER is the
+            # default and safe to skip to avoid needless API calls.
+            db_role = existing_user.role.value if hasattr(existing_user.role, "value") else str(existing_user.role)
+            clerk_role = public_metadata.get("role")
+            if db_role != "USER" and db_role != clerk_role:
+                from services.clerk_invitation_service import push_role_to_clerk
+                try:
+                    await push_role_to_clerk(clerk_user_id, db_role)
+                except Exception:
+                    logger.exception(
+                        "Role sync to Clerk failed for %s — will retry on next login.",
+                        primary_email,
+                    )
             return
         
         # Generate unique RFID/ID tag for OCPP
@@ -353,6 +372,14 @@ async def handle_razorpay_webhook(
         # Handle QR code credited event (appless charging payment)
         elif event_type == "qr_code.credited":
             await handle_qr_code_credited(event_data)
+
+        # Razorpay Route: account lifecycle
+        elif event_type.startswith("account."):
+            await handle_account_event(event_type, event_data)
+
+        # Razorpay Route: transfer lifecycle
+        elif event_type.startswith("transfer."):
+            await handle_transfer_event(event_type, event_data)
 
         else:
             logger.info(f"Unhandled Razorpay webhook event: {event_type}")
@@ -620,6 +647,70 @@ async def handle_qr_code_credited(event_data: dict):
             source=WebhookSourceEnum.RAZORPAY,
             event_type="qr_code.credited",
             event_id=event_data.get("payment", {}).get("entity", {}).get("id"),
+            payload=event_data,
+            status="failed",
+            error_message=str(e),
+        )
+
+
+async def handle_account_event(event_type: str, event_data: dict):
+    """Handle Razorpay Route account lifecycle webhooks."""
+    try:
+        account_data = event_data.get("account", {}).get("entity", {})
+        if not account_data:
+            logger.warning("No account entity in %s webhook", event_type)
+            return
+
+        from services.franchisee_onboarding_service import FranchiseeOnboardingService
+        await FranchiseeOnboardingService.handle_account_webhook(
+            event_type, account_data
+        )
+
+        await log_webhook_event(
+            source=WebhookSourceEnum.RAZORPAY,
+            event_type=event_type,
+            event_id=account_data.get("id"),
+            payload=event_data,
+            status="processed",
+        )
+    except Exception as e:
+        logger.error("Error handling %s webhook: %s", event_type, e, exc_info=True)
+        await log_webhook_event(
+            source=WebhookSourceEnum.RAZORPAY,
+            event_type=event_type,
+            event_id=event_data.get("account", {}).get("entity", {}).get("id"),
+            payload=event_data,
+            status="failed",
+            error_message=str(e),
+        )
+
+
+async def handle_transfer_event(event_type: str, event_data: dict):
+    """Handle Razorpay Route transfer lifecycle webhooks."""
+    try:
+        transfer_data = event_data.get("transfer", {}).get("entity", {})
+        if not transfer_data:
+            logger.warning("No transfer entity in %s webhook", event_type)
+            return
+
+        from services.franchisee_settlement_service import FranchiseeSettlementService
+        await FranchiseeSettlementService.handle_transfer_webhook(
+            event_type, transfer_data
+        )
+
+        await log_webhook_event(
+            source=WebhookSourceEnum.RAZORPAY,
+            event_type=event_type,
+            event_id=transfer_data.get("id"),
+            payload=event_data,
+            status="processed",
+        )
+    except Exception as e:
+        logger.error("Error handling %s webhook: %s", event_type, e, exc_info=True)
+        await log_webhook_event(
+            source=WebhookSourceEnum.RAZORPAY,
+            event_type=event_type,
+            event_id=event_data.get("transfer", {}).get("entity", {}).get("id"),
             payload=event_data,
             status="failed",
             error_message=str(e),

@@ -587,6 +587,26 @@ class ChargePoint(OcppChargePoint):
         except Exception as qr_err:
             logger.warning(f"QR payment handling error (non-fatal): {qr_err}")
 
+        # Franchisee settlement
+        try:
+            from services.franchisee_settlement_service import FranchiseeSettlementService
+            safe_create_task(
+                FranchiseeSettlementService.process_settlement(transaction.id),
+                name=f"settlement-txn-{transaction.id}",
+            )
+        except Exception as settle_err:
+            logger.error("Settlement trigger error for txn %s: %s", transaction.id, settle_err)
+
+        # GST invoice generation
+        try:
+            from services.invoice_service import InvoiceService
+            safe_create_task(
+                InvoiceService.generate_invoice(transaction.id),
+                name=f"invoice-txn-{transaction.id}",
+            )
+        except Exception as inv_err:
+            logger.error("Invoice trigger error for txn %s: %s", transaction.id, inv_err)
+
     @on('Heartbeat')
     async def on_heartbeat(self, **kwargs):
         # Record heartbeat metric (lightweight, don't trace entire transaction)
@@ -886,6 +906,26 @@ class ChargePoint(OcppChargePoint):
                 await QRPaymentService.process_qr_session_billing(transaction_id)
             except Exception as qr_err:
                 logger.error(f"QR billing error for transaction {transaction_id}: {qr_err}", exc_info=True)
+
+            # Franchisee settlement
+            try:
+                from services.franchisee_settlement_service import FranchiseeSettlementService
+                safe_create_task(
+                    FranchiseeSettlementService.process_settlement(transaction_id),
+                    name=f"settlement-txn-{transaction_id}",
+                )
+            except Exception as settle_err:
+                logger.error("Settlement trigger error for txn %s: %s", transaction_id, settle_err)
+
+            # GST invoice generation
+            try:
+                from services.invoice_service import InvoiceService
+                safe_create_task(
+                    InvoiceService.generate_invoice(transaction_id),
+                    name=f"invoice-txn-{transaction_id}",
+                )
+            except Exception as inv_err:
+                logger.error("Invoice trigger error for txn %s: %s", transaction_id, inv_err)
 
             return call_result.StopTransaction(
                 id_tag_info={"status": "Accepted"}
@@ -1484,6 +1524,11 @@ app.include_router(firmware.public_router)
 from routers import qr_codes, public_qr_transactions
 app.include_router(qr_codes.router)
 app.include_router(public_qr_transactions.router)
+
+from routers import franchisees, franchisee_portal, invoices
+app.include_router(franchisees.router)
+app.include_router(franchisee_portal.router)
+app.include_router(invoices.router)
 
 # OCPP WebSocket endpoint (connection management + message handling)
 from routers import ocpp_ws

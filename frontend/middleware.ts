@@ -5,6 +5,7 @@ import { NextResponse } from 'next/server'
 const isProtectedRoute = createRouteMatcher([
   '/',
   '/admin(.*)',
+  '/franchisee(.*)',
   '/stations(.*)',
   '/charge(.*)',
   '/scanner(.*)',
@@ -40,7 +41,7 @@ async function assignDefaultRole(userId: string) {
 
 function handleRoleBasedRouting(req: any, role: string) {
   const { pathname } = req.nextUrl;
-  
+
   // Admin routes - only admins can access
   if (pathname.startsWith('/admin')) {
     if (role !== 'ADMIN') {
@@ -48,15 +49,28 @@ function handleRoleBasedRouting(req: any, role: string) {
     }
     return NextResponse.next();
   }
-  
+
+  // Franchisee routes - only franchisees can access
+  if (pathname.startsWith('/franchisee')) {
+    if (role !== 'FRANCHISEE') {
+      return NextResponse.redirect(new URL('/', req.url));
+    }
+    return NextResponse.next();
+  }
+
   // Redirect admin users from root to admin dashboard
   if (pathname === '/' && role === 'ADMIN') {
     return NextResponse.redirect(new URL('/admin', req.url));
   }
-  
+
+  // Redirect franchisee users from root to franchisee dashboard
+  if (pathname === '/' && role === 'FRANCHISEE') {
+    return NextResponse.redirect(new URL('/franchisee', req.url));
+  }
+
   // Regular users can access root directly - no redirect needed
   // Root page now has proper RBAC to show user content
-  
+
   return NextResponse.next();
 }
 

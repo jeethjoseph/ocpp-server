@@ -4,6 +4,10 @@ export interface Station {
   latitude: number;
   longitude: number;
   address: string;
+  franchisee_id?: number | null;
+  state?: string | null;
+  state_code?: string | null;
+  pincode?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -13,6 +17,10 @@ export interface StationCreate {
   latitude: number;
   longitude: number;
   address: string;
+  franchisee_id?: number;
+  state?: string;
+  state_code?: string;
+  pincode?: string;
 }
 
 export interface StationUpdate {
@@ -499,4 +507,93 @@ export interface QRPaymentListResponse {
   total: number;
   page: number;
   limit: number;
+}
+
+// ─── Franchisee Types ──────────────────────────────────────────────
+
+export interface Franchisee {
+  id: number;
+  business_name: string;
+  business_type?: string | null;
+  contact_name: string;
+  contact_email: string;
+  contact_phone: string;
+  address?: string | null;
+  pan_number?: string | null;
+  gstin?: string | null;
+  state?: string | null;
+  state_code?: string | null;
+  commission_percent: number;
+  tds_rate_percent: number;
+  status: string;
+  status_reason?: string | null;
+  razorpay_account_id?: string | null;
+  razorpay_account_status?: string | null;
+  razorpay_onboarding_url?: string | null;
+  station_count: number;
+  activated_at?: string | null;
+  created_at: string;
+  updated_at: string;
+  notes?: string | null;
+}
+
+export interface FranchiseeCreate {
+  business_name: string;
+  contact_name: string;
+  contact_email: string;
+  contact_phone: string;
+  commission_percent?: number;
+  tds_rate_percent?: number;
+  notes?: string;
+}
+
+export interface FranchiseeUpdate {
+  business_name?: string;
+  contact_name?: string;
+  contact_phone?: string;
+  address?: string;
+  business_type?: string;
+  pan_number?: string;
+  gstin?: string;
+  tan_number?: string;
+  state?: string;
+  state_code?: string;
+  notes?: string;
+}
+
+export interface FranchiseeListResponse {
+  data: Franchisee[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+export interface CommissionUpdate {
+  new_percent: number;
+  reason: string;
+  effective_from: string;
+  notes?: string;
+}
+
+export interface CommissionAuditEntry {
+  id: number;
+  previous_percent?: number | null;
+  new_percent: number;
+  reason: string;
+  effective_from: string;
+  notes?: string | null;
+  changed_by_email?: string | null;
+  created_at: string;
+}
+
+export interface FranchiseeStation {
+  id: number;
+  name: string;
+  address?: string;
+  latitude?: number;
+  longitude?: number;
+  state?: string;
+  state_code?: string;
+  pincode?: string;
+  charger_count: number;
 }

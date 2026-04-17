@@ -16,12 +16,20 @@ class StationCreate(BaseModel):
     latitude: float
     longitude: float
     address: str
+    franchisee_id: Optional[int] = None
+    state: Optional[str] = None
+    state_code: Optional[str] = None
+    pincode: Optional[str] = None
 
 class StationUpdate(BaseModel):
     name: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     address: Optional[str] = None
+    franchisee_id: Optional[int] = None
+    state: Optional[str] = None
+    state_code: Optional[str] = None
+    pincode: Optional[str] = None
 
 class StationResponse(BaseModel):
     id: int
@@ -29,9 +37,13 @@ class StationResponse(BaseModel):
     latitude: float
     longitude: float
     address: str
+    franchisee_id: Optional[int] = None
+    state: Optional[str] = None
+    state_code: Optional[str] = None
+    pincode: Optional[str] = None
     created_at: datetime
     updated_at: datetime
-    
+
     class Config:
         from_attributes = True
 
@@ -104,12 +116,21 @@ async def create_station(station_data: StationCreate, admin_user: User = Depends
     """Create a new charging station"""
     
     try:
-        station = await ChargingStation.create(
-            name=station_data.name,
-            latitude=station_data.latitude,
-            longitude=station_data.longitude,
-            address=station_data.address
-        )
+        create_kwargs = {
+            "name": station_data.name,
+            "latitude": station_data.latitude,
+            "longitude": station_data.longitude,
+            "address": station_data.address,
+        }
+        if station_data.franchisee_id is not None:
+            create_kwargs["franchisee_id"] = station_data.franchisee_id
+        if station_data.state is not None:
+            create_kwargs["state"] = station_data.state
+        if station_data.state_code is not None:
+            create_kwargs["state_code"] = station_data.state_code
+        if station_data.pincode is not None:
+            create_kwargs["pincode"] = station_data.pincode
+        station = await ChargingStation.create(**create_kwargs)
         
         await log_audit_event(
             action="station.created",

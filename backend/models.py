@@ -1,5 +1,6 @@
 # Tortoise ORM Models
 import enum
+from datetime import date
 from tortoise.models import Model
 from tortoise import fields
 from tortoise.contrib.pydantic import pydantic_model_creator
@@ -75,6 +76,7 @@ class OCPPErrorCodeEnum(str, enum.Enum):
 class UserRoleEnum(str, enum.Enum):
     ADMIN = "ADMIN"
     USER = "USER"  # EV drivers
+    FRANCHISEE = "FRANCHISEE"  # Franchisee portal access
 
 class AuthProviderEnum(str, enum.Enum):
     EMAIL = "EMAIL"
@@ -94,6 +96,43 @@ class QRPaymentStatusEnum(str, enum.Enum):
 class WebhookSourceEnum(str, enum.Enum):
     CLERK = "CLERK"
     RAZORPAY = "RAZORPAY"
+
+# Franchisee enums
+class FranchiseeStatusEnum(str, enum.Enum):
+    DRAFT = "DRAFT"
+    KYC_SUBMITTED = "KYC_SUBMITTED"
+    KYC_UNDER_REVIEW = "KYC_UNDER_REVIEW"
+    KYC_NEEDS_CLARIFICATION = "KYC_NEEDS_CLARIFICATION"
+    ACTIVE = "ACTIVE"
+    SUSPENDED = "SUSPENDED"
+    DEACTIVATED = "DEACTIVATED"
+
+class FranchiseeBusinessTypeEnum(str, enum.Enum):
+    INDIVIDUAL = "INDIVIDUAL"
+    PROPRIETORSHIP = "PROPRIETORSHIP"
+    PARTNERSHIP = "PARTNERSHIP"
+    PRIVATE_LIMITED = "PRIVATE_LIMITED"
+    LLP = "LLP"
+
+class SettlementStatusEnum(str, enum.Enum):
+    PENDING = "PENDING"
+    TRANSFER_INITIATED = "TRANSFER_INITIATED"
+    TRANSFER_PROCESSED = "TRANSFER_PROCESSED"
+    SETTLED = "SETTLED"
+    FAILED = "FAILED"
+    REVERSED = "REVERSED"
+    ON_HOLD = "ON_HOLD"
+
+class CommissionChangeReasonEnum(str, enum.Enum):
+    INITIAL_SETUP = "INITIAL_SETUP"
+    CONTRACT_RENEWAL = "CONTRACT_RENEWAL"
+    PERFORMANCE_ADJUSTMENT = "PERFORMANCE_ADJUSTMENT"
+    PROMOTION = "PROMOTION"
+    ADMIN_OVERRIDE = "ADMIN_OVERRIDE"
+
+class GSTInvoiceStatusEnum(str, enum.Enum):
+    ISSUED = "ISSUED"
+    CANCELLED = "CANCELLED"
 
 
 # Models
@@ -224,10 +263,20 @@ class ChargingStation(Model):
     latitude = fields.FloatField(null=True)
     longitude = fields.FloatField(null=True)
     address = fields.TextField(null=True)
-    
+
+    # Franchisee ownership (NULL = VoltLync-owned)
+    franchisee = fields.ForeignKeyField(
+        "models.Franchisee", related_name="stations", null=True, on_delete=fields.SET_NULL
+    )
+
+    # Location details for GST place-of-supply
+    state = fields.CharField(max_length=100, null=True)
+    state_code = fields.CharField(max_length=5, null=True)
+    pincode = fields.CharField(max_length=10, null=True)
+
     # Relationships
     chargers: fields.ReverseRelation["Charger"]
-    
+
     class Meta:
         table = "charging_station"
 
@@ -275,6 +324,7 @@ class Tariff(Model):
     charger = fields.ForeignKeyField("models.Charger", related_name="tariffs", null=True)
     rate_per_kwh = fields.DecimalField(max_digits=5, decimal_places=2)
     gst_percent = fields.DecimalField(max_digits=5, decimal_places=2, default=18.00)
+    hsn_sac_code = fields.CharField(max_length=10, null=True)
     is_global = fields.BooleanField(default=False)
 
     class Meta:
@@ -452,6 +502,11 @@ class ChargerQRCode(Model):
     image_url = fields.CharField(max_length=500)
     short_url = fields.CharField(max_length=500, null=True)
     is_active = fields.BooleanField(default=True)
+    # Razorpay linked-account id this QR was created under. Null means the
+    # QR is owned by the platform (VoltLync's merchant account). Stored at
+    # creation time so later close/fetch calls can scope via the same
+    # X-Razorpay-Account header even if the station is later reassigned.
+    owner_razorpay_account_id = fields.CharField(max_length=50, null=True)
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)
 
@@ -490,6 +545,319 @@ class QRPayment(Model):
     class Meta:
         table = "qr_payment"
         indexes = [("charger_id", "status", "transaction_id")]
+
+# Franchisee Models
+
+class Franchisee(Model):
+    id = fields.IntField(pk=True)
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    # Identity (minimal at creation, rest filled during KYC)
+    business_name = fields.CharField(max_length=255)
+    business_type = fields.CharEnumField(
+        FranchiseeBusinessTypeEnum, null=True
+    )
+    contact_name = fields.CharField(max_length=255)
+    contact_email = fields.CharField(max_length=255, unique=True)
+    contact_phone = fields.CharField(max_length=20)
+    address = fields.TextField(null=True)
+
+    # Tax/Legal (populated during KYC or by admin)
+    pan_number = fields.CharField(max_length=10, unique=True, null=True)
+    gstin = fields.CharField(max_length=15, unique=True, null=True)
+    tan_number = fields.CharField(max_length=10, null=True)
+
+    # Location (for GST place-of-supply on invoices)
+    state = fields.CharField(max_length=100, null=True)
+    state_code = fields.CharField(max_length=5, null=True)
+
+    # Bank details (reference copy; Razorpay holds canonical)
+    bank_account_name = fields.CharField(max_length=255, null=True)
+    bank_account_number = fields.CharField(max_length=30, null=True)
+    bank_ifsc_code = fields.CharField(max_length=11, null=True)
+
+    # Razorpay Route integration
+    razorpay_account_id = fields.CharField(
+        max_length=50, unique=True, null=True
+    )
+    razorpay_account_status = fields.CharField(max_length=50, null=True)
+    razorpay_onboarding_url = fields.CharField(max_length=500, null=True)
+    kyc_submitted_at = fields.DatetimeField(null=True)
+    kyc_verified_at = fields.DatetimeField(null=True)
+
+    # Commission (VoltLync's platform cut, default 20%)
+    commission_percent = fields.DecimalField(
+        max_digits=5, decimal_places=2, default=20.00
+    )
+    commission_effective_from = fields.DateField(default=date.today)
+
+    # TDS (configurable per franchisee, default 10%)
+    tds_rate_percent = fields.DecimalField(
+        max_digits=5, decimal_places=2, default=10.00
+    )
+    tds_pan_verified = fields.BooleanField(default=False)
+
+    # Status
+    status = fields.CharEnumField(
+        FranchiseeStatusEnum, default=FranchiseeStatusEnum.DRAFT
+    )
+    status_reason = fields.TextField(null=True)
+    activated_at = fields.DatetimeField(null=True)
+    deactivated_at = fields.DatetimeField(null=True)
+
+    # Admin
+    onboarded_by = fields.ForeignKeyField(
+        "models.User", related_name="onboarded_franchisees", null=True
+    )
+    notes = fields.TextField(null=True)
+
+    # User account for portal access (1:1)
+    user = fields.OneToOneField(
+        "models.User", related_name="franchisee_profile", null=True
+    )
+
+    # Relationships
+    stations: fields.ReverseRelation["ChargingStation"]
+    ledger_entries: fields.ReverseRelation["CommissionLedgerEntry"]
+    commission_audit_logs: fields.ReverseRelation["CommissionAuditLog"]
+
+    class Meta:
+        table = "franchisee"
+
+
+class CommissionLedgerEntry(Model):
+    id = fields.IntField(pk=True)
+    created_at = fields.DatetimeField(auto_now_add=True)
+
+    # Links
+    transaction = fields.OneToOneField(
+        "models.Transaction", related_name="settlement"
+    )
+    franchisee = fields.ForeignKeyField(
+        "models.Franchisee", related_name="ledger_entries"
+    )
+    qr_payment = fields.ForeignKeyField(
+        "models.QRPayment", related_name="settlement", null=True
+    )
+    wallet_transaction = fields.ForeignKeyField(
+        "models.WalletTransaction", related_name="settlement", null=True
+    )
+
+    # Gross
+    gross_amount = fields.DecimalField(max_digits=10, decimal_places=2)
+    payment_method = fields.CharField(max_length=20)  # WALLET | QR_UPI
+    razorpay_payment_id = fields.CharField(max_length=255, null=True)
+
+    # Deductions
+    refund_amount = fields.DecimalField(
+        max_digits=10, decimal_places=2, default=0.00
+    )
+    pg_fee_amount = fields.DecimalField(
+        max_digits=10, decimal_places=2, default=0.00
+    )
+    net_amount = fields.DecimalField(max_digits=10, decimal_places=2)
+
+    # GST
+    gst_collected = fields.DecimalField(max_digits=10, decimal_places=2)
+    net_excl_gst = fields.DecimalField(max_digits=10, decimal_places=2)
+
+    # Commission split (calculated on net_excl_gst)
+    commission_percent = fields.DecimalField(max_digits=5, decimal_places=2)
+    platform_commission = fields.DecimalField(max_digits=10, decimal_places=2)
+    tds_rate_percent = fields.DecimalField(
+        max_digits=5, decimal_places=2, default=0.00
+    )
+    tds_amount = fields.DecimalField(
+        max_digits=10, decimal_places=2, default=0.00
+    )
+    transfer_fee = fields.DecimalField(
+        max_digits=10, decimal_places=2, default=0.00
+    )
+
+    # Franchisee payout
+    franchisee_payout = fields.DecimalField(max_digits=10, decimal_places=2)
+
+    # Energy data (denormalized for reporting)
+    energy_consumed_kwh = fields.FloatField()
+    tariff_rate_per_kwh = fields.DecimalField(max_digits=5, decimal_places=2)
+
+    # Transfer tracking
+    settlement_status = fields.CharEnumField(
+        SettlementStatusEnum, default=SettlementStatusEnum.PENDING
+    )
+    razorpay_transfer_id = fields.CharField(
+        max_length=255, unique=True, null=True
+    )
+    transfer_initiated_at = fields.DatetimeField(null=True)
+    transfer_processed_at = fields.DatetimeField(null=True)
+    settled_at = fields.DatetimeField(null=True)
+    failure_reason = fields.TextField(null=True)
+    retry_count = fields.IntField(default=0)
+
+    # Idempotency
+    idempotency_key = fields.CharField(max_length=255, unique=True)
+
+    class Meta:
+        table = "commission_ledger_entry"
+
+
+class CommissionAuditLog(Model):
+    id = fields.IntField(pk=True)
+    created_at = fields.DatetimeField(auto_now_add=True)
+    franchisee = fields.ForeignKeyField(
+        "models.Franchisee", related_name="commission_audit_logs"
+    )
+    previous_percent = fields.DecimalField(
+        max_digits=5, decimal_places=2, null=True
+    )
+    new_percent = fields.DecimalField(max_digits=5, decimal_places=2)
+    reason = fields.CharEnumField(CommissionChangeReasonEnum)
+    effective_from = fields.DateField()
+    changed_by = fields.ForeignKeyField(
+        "models.User", related_name="commission_changes"
+    )
+    notes = fields.TextField(null=True)
+
+    class Meta:
+        table = "commission_audit_log"
+
+
+# GST Invoice Models
+
+class GSTInvoiceCounter(Model):
+    """Sequential invoice numbering per (franchisee, series, FY).
+    franchisee=NULL means VoltLync is the supplier."""
+    id = fields.IntField(pk=True)
+    franchisee = fields.ForeignKeyField(
+        "models.Franchisee", related_name="invoice_counters", null=True
+    )
+    series = fields.CharField(max_length=10)  # WALLET, QR
+    financial_year = fields.CharField(max_length=10)  # e.g. 2026-27
+    last_number = fields.IntField(default=0)
+
+    class Meta:
+        table = "gst_invoice_counter"
+        unique_together = [("franchisee", "series", "financial_year")]
+
+
+class GSTInvoice(Model):
+    """Per-session customer-facing GST tax invoice."""
+    id = fields.IntField(pk=True)
+    created_at = fields.DatetimeField(auto_now_add=True)
+
+    # Identity
+    invoice_number = fields.CharField(max_length=50, unique=True)
+    status = fields.CharEnumField(
+        GSTInvoiceStatusEnum, default=GSTInvoiceStatusEnum.ISSUED
+    )
+    invoice_date = fields.DatetimeField(auto_now_add=True)
+
+    # Links
+    transaction = fields.OneToOneField(
+        "models.Transaction", related_name="gst_invoice"
+    )
+    franchisee = fields.ForeignKeyField(
+        "models.Franchisee", related_name="gst_invoices", null=True
+    )
+    user = fields.ForeignKeyField(
+        "models.User", related_name="gst_invoices", null=True
+    )
+
+    # Supplier snapshot (franchisee or VoltLync)
+    supplier_name = fields.CharField(max_length=255)
+    supplier_gstin = fields.CharField(max_length=20, null=True)
+    supplier_address = fields.TextField(null=True)
+    supplier_state = fields.CharField(max_length=100, null=True)
+    supplier_state_code = fields.CharField(max_length=5, null=True)
+
+    # Customer snapshot
+    customer_name = fields.CharField(max_length=255, null=True)
+    customer_identifier = fields.CharField(max_length=255, null=True)  # UPI ID, email, phone
+    customer_address = fields.TextField(null=True)
+
+    # Station/Charger snapshot
+    station_name = fields.CharField(max_length=255, null=True)
+    station_location = fields.CharField(max_length=500, null=True)
+    charger_id_str = fields.CharField(max_length=255, null=True)
+    connector_type = fields.CharField(max_length=50, null=True)
+
+    # Charging details
+    energy_consumed_kwh = fields.FloatField()
+    tariff_rate_incl_tax = fields.DecimalField(max_digits=10, decimal_places=2)
+    charged_on = fields.DatetimeField(null=True)
+    duration_seconds = fields.IntField(null=True)
+    hsn_sac_code = fields.CharField(max_length=10, default="998749")
+
+    # Line items (pre-tax)
+    energy_taxable_value = fields.DecimalField(max_digits=10, decimal_places=2)
+    gateway_charges = fields.DecimalField(
+        max_digits=10, decimal_places=2, default=0
+    )
+    gateway_hsn_code = fields.CharField(max_length=10, default="997158")
+    total_taxable_value = fields.DecimalField(max_digits=10, decimal_places=2)
+
+    # Tax breakdown
+    is_inter_state = fields.BooleanField(default=False)
+    cgst_rate = fields.DecimalField(max_digits=5, decimal_places=2, null=True)
+    cgst_amount = fields.DecimalField(max_digits=10, decimal_places=2, null=True)
+    sgst_rate = fields.DecimalField(max_digits=5, decimal_places=2, null=True)
+    sgst_amount = fields.DecimalField(max_digits=10, decimal_places=2, null=True)
+    igst_rate = fields.DecimalField(max_digits=5, decimal_places=2, null=True)
+    igst_amount = fields.DecimalField(max_digits=10, decimal_places=2, null=True)
+
+    # Totals
+    total_tax = fields.DecimalField(max_digits=10, decimal_places=2)
+    total_amount = fields.DecimalField(max_digits=10, decimal_places=2)
+    amount_in_words = fields.CharField(max_length=500, null=True)
+
+    # Payment info (for QR sessions)
+    payment_method = fields.CharField(max_length=20, null=True)  # UPI, WALLET
+    transaction_amount = fields.DecimalField(
+        max_digits=10, decimal_places=2, null=True
+    )  # What customer paid (QR prepayment)
+    refund_amount = fields.DecimalField(
+        max_digits=10, decimal_places=2, null=True
+    )
+
+    # PDF
+    pdf_url = fields.CharField(max_length=500, null=True)
+
+    # Audit
+    cancelled_at = fields.DatetimeField(null=True)
+    cancellation_reason = fields.TextField(null=True)
+
+    class Meta:
+        table = "gst_invoice"
+
+
+class GSTCreditNote(Model):
+    """Credit note against a GST invoice (for refunds/corrections)."""
+    id = fields.IntField(pk=True)
+    created_at = fields.DatetimeField(auto_now_add=True)
+
+    credit_note_number = fields.CharField(max_length=50, unique=True)
+    original_invoice = fields.ForeignKeyField(
+        "models.GSTInvoice", related_name="credit_notes"
+    )
+    franchisee = fields.ForeignKeyField(
+        "models.Franchisee", related_name="credit_notes", null=True
+    )
+
+    reason = fields.CharField(max_length=255)
+    credit_amount = fields.DecimalField(max_digits=10, decimal_places=2)
+
+    # Tax mirror
+    cgst_amount = fields.DecimalField(max_digits=10, decimal_places=2, null=True)
+    sgst_amount = fields.DecimalField(max_digits=10, decimal_places=2, null=True)
+    igst_amount = fields.DecimalField(max_digits=10, decimal_places=2, null=True)
+
+    issue_date = fields.DatetimeField(auto_now_add=True)
+    pdf_url = fields.CharField(max_length=500, null=True)
+
+    class Meta:
+        table = "gst_credit_note"
+
 
 # Pydantic models for API serialization
 User_Pydantic = pydantic_model_creator(User, name="User")

@@ -11,11 +11,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Install system dependencies required for asyncpg and other packages
+# Install system dependencies required for asyncpg and other packages.
+# gosu is used by the production entrypoint to drop privileges from root to the
+# app user after fixing ownership on mounted volumes.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libpq-dev \
     curl \
+    gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # ============================================
@@ -64,7 +67,11 @@ RUN mkdir -p /app/firmware_files && chown -R app:app /app
 # Make entrypoint scripts executable
 RUN chmod +x docker-entrypoint.sh start_server.sh 2>/dev/null || true
 
-USER app
+# NOTE: no USER directive here. docker-entrypoint.sh starts as root, fixes
+# ownership on /app/firmware_files (heals pre-existing volumes whose root
+# directory was created under a different user), then re-execs itself under the
+# app user via gosu. The rest of the script — migrations, uvicorn — runs
+# unprivileged.
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \

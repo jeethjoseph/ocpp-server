@@ -195,6 +195,11 @@ export default function StationMap({ stations, userLocation, onStationSelect, on
             <Popup>
               <div className="min-w-[200px]">
                 <div className="font-medium text-gray-900 mb-1">{station.name}</div>
+                {station.franchisee_name && (
+                  <div className="text-xs text-gray-500 mb-1">
+                    Operator: <span className="font-medium">{station.franchisee_name}</span>
+                  </div>
+                )}
                 <div className="text-sm text-gray-600 mb-2">{station.address}</div>
                 
                 <div className="flex justify-center mb-3">

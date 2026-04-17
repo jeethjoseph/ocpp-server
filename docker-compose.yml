@@ -55,6 +55,9 @@ services:
       - REDIS_URL=redis://redis:6379
       - NEW_RELIC_MONITOR_MODE=false
       - SENTRY_ENABLED=false
+      # Used by Clerk invitation service to build the redirect URL that
+      # Clerk's magic-link email points to after sign-up completes.
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3000}
     volumes:
       - ./backend:/app
       - backend_firmware:/app/firmware_files

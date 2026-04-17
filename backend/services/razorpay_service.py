@@ -44,6 +44,33 @@ def _is_already_refunded_error(err: Exception) -> bool:
     return any(token in msg for token in ("already refund", "fully refund", "refunded fully"))
 
 
+# Razorpay caps the QR `name` field at ~50 chars; truncate business + charger
+# so the whole string fits even when the business name is long.
+_QR_NAME_MAX = 50
+_QR_BUSINESS_MAX = 30
+_QR_CHARGER_MAX = 17
+
+
+def build_qr_payee_name(business_name: Optional[str], charger_name: str) -> str:
+    """Compose the Razorpay QR ``name`` metadata field.
+
+    Format: ``"{business_name} - {charger_name}"``. When no franchisee is
+    linked, falls back to ``"VoltLync"`` as the business_name. The result
+    is truncated to fit Razorpay's 50-char cap on the QR name.
+    """
+    business = (business_name or "VoltLync").strip()[:_QR_BUSINESS_MAX]
+    charger = (charger_name or "").strip()[:_QR_CHARGER_MAX]
+    combined = f"{business} - {charger}" if charger else business
+    return combined[:_QR_NAME_MAX]
+
+
+def build_qr_description(business_name: Optional[str], charger_name: str) -> str:
+    """Compose the rendered descriptor line on the Razorpay QR image."""
+    business = (business_name or "VoltLync").strip()
+    charger = (charger_name or "").strip()
+    return f"{business} - Pay for EV charging at {charger}" if charger else f"{business} - Pay for EV charging"
+
+
 class RazorpayService:
     """Service for handling Razorpay payment operations"""
 
@@ -250,43 +277,82 @@ class RazorpayService:
             logger.error(f"Failed to fetch order {order_id}: {e}")
             return None
 
-    def create_qr_code(self, name: str) -> Optional[Dict]:
-        """Create a Razorpay QR code for a charger (static, variable amount)"""
+    def create_qr_code(
+        self,
+        payee_name: str,
+        description: str,
+        account_id: Optional[str] = None,
+    ) -> Optional[Dict]:
+        """Create a Razorpay QR code for a charger (static, variable amount).
+
+        Args:
+            payee_name: metadata label stored on the QR object in Razorpay's
+                dashboard. Does not rewrite the rendered big-label on the
+                returned image — that comes from the owning merchant's KYC.
+            description: shorter descriptor rendered on the returned QR image.
+            account_id: when provided, scopes the QR to a linked account via
+                the ``X-Razorpay-Account`` header. The rendered image will
+                then show the linked account's registered business name
+                instead of the platform's. Required for RBI Route
+                payer-payee transparency when the charger belongs to a
+                franchisee whose linked account is ACTIVE.
+        """
         if not self.is_configured():
             raise Exception("Razorpay is not configured")
         try:
             qr_data = {
                 "type": "upi_qr",
-                "name": f"EV Charging - {name}",
+                "name": payee_name,
                 "usage": "multiple_use",
                 "fixed_amount": False,
-                "description": f"Pay for EV charging at {name}",
+                "description": description,
             }
-            qr_code = self.client.qrcode.create(data=qr_data)
-            logger.info(f"Razorpay QR code created: {qr_code.get('id')} for {name}")
+            options = {}
+            if account_id:
+                options["headers"] = {"X-Razorpay-Account": account_id}
+            qr_code = self.client.qrcode.create(data=qr_data, **options)
+            logger.info(
+                "Razorpay QR code created: %s payee=%s account=%s",
+                qr_code.get("id"), payee_name, account_id or "platform",
+            )
             return qr_code
         except Exception as e:
             logger.error(f"Failed to create Razorpay QR code: {e}", exc_info=True)
             raise Exception(f"Failed to create QR code: {str(e)}")
 
-    def close_qr_code(self, qr_code_id: str) -> Optional[Dict]:
-        """Close a Razorpay QR code"""
+    def close_qr_code(
+        self, qr_code_id: str, account_id: Optional[str] = None
+    ) -> Optional[Dict]:
+        """Close a Razorpay QR code. Pass ``account_id`` if the QR was
+        created under a linked account so the close call is authorised
+        against the same context."""
         if not self.is_configured():
             raise Exception("Razorpay is not configured")
         try:
-            result = self.client.qrcode.close(qr_code_id)
-            logger.info(f"Razorpay QR code closed: {qr_code_id}")
+            options = {}
+            if account_id:
+                options["headers"] = {"X-Razorpay-Account": account_id}
+            result = self.client.qrcode.close(qr_code_id, **options)
+            logger.info(
+                "Razorpay QR code closed: %s account=%s",
+                qr_code_id, account_id or "platform",
+            )
             return result
         except Exception as e:
             logger.error(f"Failed to close Razorpay QR code {qr_code_id}: {e}")
             return None
 
-    def fetch_qr_code(self, qr_code_id: str) -> Optional[Dict]:
-        """Fetch QR code details from Razorpay"""
+    def fetch_qr_code(
+        self, qr_code_id: str, account_id: Optional[str] = None
+    ) -> Optional[Dict]:
+        """Fetch QR code details from Razorpay."""
         if not self.is_configured():
             return None
         try:
-            return self.client.qrcode.fetch(qr_code_id)
+            options = {}
+            if account_id:
+                options["headers"] = {"X-Razorpay-Account": account_id}
+            return self.client.qrcode.fetch(qr_code_id, **options)
         except Exception as e:
             logger.error(f"Failed to fetch QR code {qr_code_id}: {e}")
             return None
@@ -374,6 +440,99 @@ class RazorpayService:
         except Exception as e:
             logger.error(f"Failed to fetch refunds for payment {payment_id}: {e}")
         return None
+
+
+    # ─── Razorpay Route (Linked Accounts & Transfers) ──────────────
+
+    def is_route_enabled(self) -> bool:
+        return self.is_configured() and os.getenv(
+            "RAZORPAY_ROUTE_ENABLED", "false"
+        ).lower() in ("true", "1", "yes")
+
+    def create_linked_account(self, payload: Dict) -> Dict:
+        """Create a Razorpay Route linked account (POST /v2/accounts)."""
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        try:
+            result = self.client.account.create(data=payload)
+            logger.info("Linked account created: %s", result.get("id"))
+            return result
+        except Exception as e:
+            logger.error("Failed to create linked account: %s", e)
+            raise
+
+    def fetch_linked_account(self, account_id: str) -> Dict:
+        """Fetch linked account details (GET /v2/accounts/{id})."""
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        try:
+            return self.client.account.fetch(account_id)
+        except Exception as e:
+            logger.error("Failed to fetch account %s: %s", account_id, e)
+            raise
+
+    def create_transfer(
+        self,
+        account_id: str,
+        amount_paise: int,
+        notes: Optional[Dict] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Dict:
+        """Create a Route transfer to a linked account."""
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        try:
+            data = {
+                "account": account_id,
+                "amount": amount_paise,
+                "currency": "INR",
+            }
+            if notes:
+                data["notes"] = notes
+
+            headers = {}
+            if idempotency_key:
+                headers["X-Transfer-Idempotency"] = idempotency_key
+
+            result = self.client.transfer.create(data=data)
+            logger.info(
+                "Transfer created: %s -> %s (%d paise)",
+                result.get("id"), account_id, amount_paise,
+            )
+            return result
+        except Exception as e:
+            logger.error(
+                "Transfer failed to %s (%d paise): %s",
+                account_id, amount_paise, e,
+            )
+            raise
+
+    def fetch_transfer(self, transfer_id: str) -> Dict:
+        """Fetch transfer status."""
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        try:
+            return self.client.transfer.fetch(transfer_id)
+        except Exception as e:
+            logger.error("Failed to fetch transfer %s: %s", transfer_id, e)
+            raise
+
+    def reverse_transfer(
+        self, transfer_id: str, amount_paise: Optional[int] = None
+    ) -> Dict:
+        """Reverse a transfer (full or partial)."""
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        try:
+            data = {}
+            if amount_paise is not None:
+                data["amount"] = amount_paise
+            result = self.client.transfer.reverse(transfer_id, data=data)
+            logger.info("Transfer %s reversed", transfer_id)
+            return result
+        except Exception as e:
+            logger.error("Failed to reverse transfer %s: %s", transfer_id, e)
+            raise
 
 
 # Singleton instance

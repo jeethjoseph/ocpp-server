@@ -39,6 +39,10 @@ class PublicStationResponse(BaseModel):
     connector_details: List[ConnectorInfo]
     chargers: List[StationChargerInfo] = Field(default_factory=list)
     price_per_kwh: Optional[float]
+    # Operator / franchisee business name for payer-payee transparency
+    # (RBI Payment Aggregator mandate). None means the platform operates
+    # this station directly.
+    franchisee_name: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -64,7 +68,7 @@ async def _fetch_stations_with_availability(
     qs = station_filter if station_filter is not None else ChargingStation.all()
     stations = await qs.prefetch_related(
         Prefetch('chargers', queryset=Charger.all().prefetch_related('connectors', 'tariffs'))
-    )
+    ).select_related('franchisee')
 
     connected_charger_ids = set(await redis_manager.get_all_connected_chargers())
     current_time = datetime.now(timezone.utc)
@@ -101,6 +105,7 @@ async def _fetch_stations_with_availability(
             connector_details=sorted(connector_details, key=lambda x: x.connector_type),
             chargers=charger_info_list,
             price_per_kwh=price_per_kwh,
+            franchisee_name=station.franchisee.business_name if station.franchisee else None,
         ))
 
     return station_responses
