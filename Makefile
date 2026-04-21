@@ -261,7 +261,10 @@ prod-deploy: prod-pull prod-rebuild
 
 # Restart all services without rebuilding
 prod-restart:
-	$(PROD_COMPOSE) restart
+	# `up -d` re-reads --env-file and recreates containers whose config
+	# changed (plain `docker compose restart` does NOT re-read env vars —
+	# it just bounces the process inside the existing container).
+	$(PROD_COMPOSE) up -d
 
 # Rebuild a single service (usage: make prod-rebuild-service SERVICE=backend)
 prod-rebuild-service:
@@ -418,7 +421,10 @@ staging-deploy: staging-pull staging-rebuild
 
 # Restart all services without rebuilding
 staging-restart:
-	$(STAGING_COMPOSE) restart
+	# `up -d` re-reads --env-file and recreates containers whose config
+	# changed (plain `docker compose restart` does NOT re-read env vars —
+	# it just bounces the process inside the existing container).
+	$(STAGING_COMPOSE) up -d
 
 # Rebuild a single service (usage: make staging-rebuild-service SERVICE=backend)
 staging-rebuild-service:
