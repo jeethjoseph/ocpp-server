@@ -105,6 +105,7 @@ export interface ChargerDetail {
     id: number;
     name: string;
     address: string;
+    franchisee_name?: string | null;
   };
   connectors: Connector[];
   transactions?: Array<{

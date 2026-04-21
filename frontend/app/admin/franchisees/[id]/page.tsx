@@ -3,7 +3,6 @@
 import { useParams, useRouter } from "next/navigation";
 import { useState } from "react";
 import {
-  Building2,
   MapPin,
   Percent,
   ArrowLeft,
@@ -12,7 +11,6 @@ import {
   CreditCard,
   Pencil,
 } from "lucide-react";
-import Link from "next/link";
 
 import { AdminOnly } from "@/components/RoleWrapper";
 import { Button } from "@/components/ui/button";
@@ -20,7 +18,6 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
-import { Separator } from "@/components/ui/separator";
 import {
   Table,
   TableBody,
