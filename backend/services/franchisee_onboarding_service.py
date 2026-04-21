@@ -117,9 +117,14 @@ class FranchiseeOnboardingService:
             # `address` on comma / newline when the admin provided a
             # multi-part string; otherwise fall back to `city` so
             # street2 is never empty.
+            # Razorpay's category/subcategory enum does not have a
+            # dedicated EV-charging code. `services/service_stations`
+            # maps to the MCC globally used for fuel/EV stations and is
+            # the closest accepted pair. If Razorpay ever adds a
+            # dedicated EV code we should switch.
             "profile": {
-                "category": "utilities",
-                "subcategory": "electric_vehicle_charging",
+                "category": "services",
+                "subcategory": "service_stations",
                 "addresses": {
                     "registered": {
                         **_split_street(franchisee.address, franchisee.city),
