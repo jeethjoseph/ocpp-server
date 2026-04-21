@@ -133,6 +133,7 @@ class BillingRetryService:
                     qr_payment.razorpay_payment_id,
                     amount=refund_amount,
                     notes={"qr_payment_id": str(qr_payment.id), "reason": "Retry: " + (qr_payment.failure_reason or "unknown")},
+                    idempotency_key=f"qr_payment_{qr_payment.id}",
                 )
                 qr_payment.razorpay_refund_id = refund_result.get("id")
                 qr_payment.status = QRPaymentStatusEnum.REFUNDED

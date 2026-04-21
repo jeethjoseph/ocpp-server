@@ -75,6 +75,7 @@ class FranchiseeResponse(BaseModel):
     address: Optional[str] = None
     pan_number: Optional[str] = None
     gstin: Optional[str] = None
+    tan_number: Optional[str] = None
     state: Optional[str] = None
     state_code: Optional[str] = None
     commission_percent: Decimal
@@ -133,6 +134,7 @@ async def _franchisee_to_response(f: Franchisee) -> dict:
         "address": f.address,
         "pan_number": f.pan_number,
         "gstin": f.gstin,
+        "tan_number": f.tan_number,
         "state": f.state,
         "state_code": f.state_code,
         "commission_percent": f.commission_percent,

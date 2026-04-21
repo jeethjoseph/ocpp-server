@@ -2294,33 +2294,40 @@ Env vars required for this flow: `CLERK_SECRET_KEY`, `CLERK_WEBHOOK_SECRET`, `FR
 The Razorpay QR code a customer scans at a charger is a PNG that Razorpay
 generates server-side. The **big bold label on that image is the owning
 merchant's legal business name as registered during KYC** — it is *not*
-something we pass via the `name` field in the API payload. RBI's
-Payment Aggregator mandate requires the customer to see the actual payee
-(the franchisee / station operator) at the point of payment, which for
-us means that label must read the franchisee's business name — not
-"VOLTLYNC PRIVATE LIMITED".
+something we pass via the `name` field in the API payload.
 
-The mechanism: the Razorpay QR create API accepts an
-`X-Razorpay-Account` header. When present, Razorpay treats the QR as
-owned by that linked (Route) account and renders the linked account's
-business name on the image. Our flow therefore:
+Current model: **all QRs are platform-owned**. Every UPI payment lands
+in VoltLync's nodal balance first; the franchisee's share is disbursed
+via a Razorpay Route transfer after the charging session settles. This
+keeps fund flow auditable from a single point and lets refunds execute
+from the platform nodal without needing to claw money back from a
+franchisee. The QR image therefore displays "VOLTLYNC PRIVATE LIMITED";
+the franchisee's business name is included in the QR *description*
+(shown under the big label on Razorpay's rendered image and in the
+customer's UPI app transaction history) but not as the payee.
 
-1. When a QR is being created for a charger whose station belongs to a
-   franchisee whose Razorpay linked account is `ACTIVE`, the backend
-   passes `X-Razorpay-Account: <razorpay_account_id>` on the create
-   call (`services/razorpay_service.create_qr_code(..., account_id=...)`).
-2. Ownership is persisted in `ChargerQRCode.owner_razorpay_account_id`
-   so later close/fetch calls use the same header (otherwise Razorpay
-   returns "account not found").
-3. Franchisees can self-serve via the `/franchisee/qr-codes` portal:
-   create, regenerate, and close their own chargers' QRs. Regenerate
-   is the retroactive compliance path — once a franchisee's Razorpay
-   KYC completes, they click Regenerate and the QR's big label
-   switches from VoltLync to their business name.
-4. For chargers at stations with no franchisee (platform-owned) or
-   whose franchisee hasn't completed Razorpay KYC yet, the QR remains
-   platform-owned and renders VoltLync — correct behavior since
-   VoltLync is legally the merchant of record in those cases.
+Implementation notes:
+
+1. `services/razorpay_service.create_qr_code` still accepts an
+   `account_id` parameter (forwarded as `X-Razorpay-Account`) for
+   backward-compatible close/fetch on legacy QRs, but new QRs are
+   always created with `account_id=None` (see
+   `routers/qr_codes._create_qr_for_charger` and
+   `routers/franchisee_portal._create_franchisee_qr`).
+2. `ChargerQRCode.owner_razorpay_account_id` remains on the model for
+   legacy rows; on new rows it is always NULL.
+3. Franchisees can still create/regenerate/close their chargers' QRs
+   via `/franchisee/qr-codes`, but the `can_create_direct` flag now
+   always returns False since franchisee-scoping is disabled
+   platform-wide.
+4. Route transfer lifecycle: settlement service creates a
+   `CommissionLedgerEntry` after QR billing + refund complete, then
+   calls `create_transfer` with `X-Transfer-Idempotency` set to the
+   ledger entry's stable idempotency key. The franchisee's Route
+   account status (`transfers_enabled`, `funds_on_hold`) gates every
+   transfer attempt; when gated, the entry is marked `ON_HOLD` and
+   retried automatically when a subsequent `account.funds_unhold` /
+   `account.activated` webhook flips the gate off.
 
 Complementary transparency surfaces (all read-only, franchisee name
 sourced from the `Charger → Station → Franchisee` FK chain):

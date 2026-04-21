@@ -435,13 +435,12 @@ class CreatePortalQRCodeRequest(BaseModel):
 
 
 def _franchisee_can_own_qrs(franchisee: Franchisee) -> bool:
-    """A franchisee can receive QR payments directly only once their
-    Razorpay linked account is ACTIVE. Until then any QR we issue on
-    their behalf renders VoltLync as the payee."""
-    return (
-        franchisee.status == FranchiseeStatusEnum.ACTIVE
-        and bool(franchisee.razorpay_account_id)
-    )
+    """Deprecated — all QRs are platform-owned. Retained so legacy
+    response fields (``can_create_direct``) keep a stable shape for the
+    frontend. Always False now that QRs no longer scope to the
+    franchisee's linked account; the platform transfers the franchisee's
+    share post-settlement via Route instead."""
+    return False
 
 
 def _qr_owner_kind(account_id: Optional[str]) -> str:
@@ -487,17 +486,19 @@ async def _ensure_charger_belongs_to_franchisee(
 async def _create_franchisee_qr(
     charger: Charger, franchisee: Franchisee
 ) -> ChargerQRCode:
-    """Call Razorpay to create a new QR for this charger, scoped to the
-    franchisee's linked account when eligible. Returns the saved row."""
-    can_scope = _franchisee_can_own_qrs(franchisee)
-    account_id = franchisee.razorpay_account_id if can_scope else None
+    """Create a platform-owned QR for one of this franchisee's chargers.
+
+    The QR is never scoped to the franchisee's linked account — all
+    payments flow to the platform first, and the franchisee's share is
+    disbursed via a Route transfer after the session settles.
+    """
     business_name = franchisee.business_name
     charger_name = charger.name or charger.charge_point_string_id
 
     result = razorpay_service.create_qr_code(
         payee_name=build_qr_payee_name(business_name, charger_name),
         description=build_qr_description(business_name, charger_name),
-        account_id=account_id,
+        account_id=None,
     )
     qr = await ChargerQRCode.create(
         charger=charger,
@@ -505,7 +506,7 @@ async def _create_franchisee_qr(
         image_url=result.get("image_url", ""),
         short_url=result.get("short_url"),
         is_active=True,
-        owner_razorpay_account_id=account_id,
+        owner_razorpay_account_id=None,
     )
     await qr.fetch_related("charger")
     return qr

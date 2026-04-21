@@ -381,6 +381,14 @@ async def handle_razorpay_webhook(
         elif event_type.startswith("transfer."):
             await handle_transfer_event(event_type, event_data)
 
+        # Razorpay Route: settlement lifecycle (money landing in linked account bank)
+        elif event_type.startswith("settlement."):
+            await handle_settlement_event(event_type, event_data)
+
+        # Refund lifecycle (customer refund has left Razorpay)
+        elif event_type.startswith("refund."):
+            await handle_refund_event(event_type, event_data)
+
         else:
             logger.info(f"Unhandled Razorpay webhook event: {event_type}")
 
@@ -715,3 +723,115 @@ async def handle_transfer_event(event_type: str, event_data: dict):
             status="failed",
             error_message=str(e),
         )
+
+
+async def handle_settlement_event(event_type: str, event_data: dict):
+    """Handle Razorpay Route settlement webhooks (money landed in the
+    linked account's bank). Used to close out ledger entries and record
+    actual transfer fees."""
+    try:
+        settlement_data = event_data.get("settlement", {}).get("entity", {})
+        if not settlement_data:
+            logger.warning("No settlement entity in %s webhook", event_type)
+            return
+
+        from services.franchisee_settlement_service import FranchiseeSettlementService
+        await FranchiseeSettlementService.handle_settlement_webhook(
+            event_type, settlement_data
+        )
+
+        await log_webhook_event(
+            source=WebhookSourceEnum.RAZORPAY,
+            event_type=event_type,
+            event_id=settlement_data.get("id"),
+            payload=event_data,
+            status="processed",
+        )
+    except Exception as e:
+        logger.error("Error handling %s webhook: %s", event_type, e, exc_info=True)
+        await log_webhook_event(
+            source=WebhookSourceEnum.RAZORPAY,
+            event_type=event_type,
+            event_id=event_data.get("settlement", {}).get("entity", {}).get("id"),
+            payload=event_data,
+            status="failed",
+            error_message=str(e),
+        )
+
+
+async def handle_refund_event(event_type: str, event_data: dict):
+    """Handle Razorpay refund lifecycle webhooks (refund.processed /
+    refund.failed). Stamps the corresponding QRPayment row so we know
+    the customer refund has actually left Razorpay."""
+    try:
+        from models import QRPayment
+
+        refund = event_data.get("refund", {}).get("entity", {})
+        if not refund:
+            logger.warning("No refund entity in %s webhook", event_type)
+            return
+
+        refund_id = refund.get("id")
+        if not refund_id:
+            return
+
+        qr_payment = await QRPayment.filter(razorpay_refund_id=refund_id).first()
+        if not qr_payment:
+            # Refund might be on a non-QR payment (e.g. wallet top-up),
+            # which we don't track a per-row lifecycle for today.
+            logger.info(
+                "No QRPayment for refund %s (%s) — skipping",
+                refund_id, event_type,
+            )
+            await log_webhook_event(
+                source=WebhookSourceEnum.RAZORPAY,
+                event_type=event_type,
+                event_id=refund_id,
+                payload=event_data,
+                status="processed",
+            )
+            return
+
+        if event_type == "refund.processed":
+            qr_payment.refund_processed_at = time_now_utc()
+            qr_payment.refund_failure_reason = None
+            await qr_payment.save()
+            logger.info(
+                "Refund processed for QR payment %s (refund=%s)",
+                qr_payment.id, refund_id,
+            )
+        elif event_type == "refund.failed":
+            reason = (
+                refund.get("error", {}).get("description")
+                or refund.get("status_reason")
+                or "unknown"
+            )
+            qr_payment.refund_failure_reason = str(reason)[:500]
+            await qr_payment.save()
+            logger.error(
+                "Refund failed for QR payment %s (refund=%s): %s",
+                qr_payment.id, refund_id, reason,
+            )
+
+        await log_webhook_event(
+            source=WebhookSourceEnum.RAZORPAY,
+            event_type=event_type,
+            event_id=refund_id,
+            payload=event_data,
+            status="processed",
+        )
+    except Exception as e:
+        logger.error("Error handling %s webhook: %s", event_type, e, exc_info=True)
+        await log_webhook_event(
+            source=WebhookSourceEnum.RAZORPAY,
+            event_type=event_type,
+            event_id=event_data.get("refund", {}).get("entity", {}).get("id"),
+            payload=event_data,
+            status="failed",
+            error_message=str(e),
+        )
+
+
+def time_now_utc():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc)

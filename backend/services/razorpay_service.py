@@ -384,7 +384,8 @@ class RazorpayService:
         self,
         payment_id: str,
         amount: Optional[Decimal] = None,
-        notes: Optional[Dict] = None
+        notes: Optional[Dict] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Optional[Dict]:
         """
         Create a refund for a payment
@@ -393,6 +394,9 @@ class RazorpayService:
             payment_id: Razorpay payment ID
             amount: Amount to refund in rupees (None for full refund)
             notes: Additional metadata
+            idempotency_key: Stable key for safe retries. Sent as
+                ``X-Refund-Idempotency`` header. Same key + same body replays
+                the original refund; same key + different body returns 400.
 
         Returns:
             Refund details or None if failed
@@ -411,8 +415,15 @@ class RazorpayService:
             if notes:
                 refund_data["notes"] = notes
 
-            refund = self.client.payment.refund(payment_id, refund_data)
-            logger.info(f"Refund created: {refund['id']} for payment {payment_id}")
+            options = {}
+            if idempotency_key:
+                options["headers"] = {"X-Refund-Idempotency": idempotency_key}
+
+            refund = self.client.payment.refund(payment_id, refund_data, **options)
+            logger.info(
+                "Refund created: %s for payment %s idempotency_key=%s",
+                refund.get("id"), payment_id, idempotency_key or "none",
+            )
             return refund
 
         except Exception as e:
@@ -478,7 +489,12 @@ class RazorpayService:
         notes: Optional[Dict] = None,
         idempotency_key: Optional[str] = None,
     ) -> Dict:
-        """Create a Route transfer to a linked account."""
+        """Create a Route transfer to a linked account.
+
+        When ``idempotency_key`` is set, Razorpay deduplicates retries via the
+        ``X-Transfer-Idempotency`` header: same key + same body returns the
+        original response; same key + different body returns 400.
+        """
         if not self.is_configured():
             raise Exception("Razorpay not configured")
         try:
@@ -490,14 +506,15 @@ class RazorpayService:
             if notes:
                 data["notes"] = notes
 
-            headers = {}
+            options = {}
             if idempotency_key:
-                headers["X-Transfer-Idempotency"] = idempotency_key
+                options["headers"] = {"X-Transfer-Idempotency": idempotency_key}
 
-            result = self.client.transfer.create(data=data)
+            result = self.client.transfer.create(data=data, **options)
             logger.info(
-                "Transfer created: %s -> %s (%d paise)",
+                "Transfer created: %s -> %s (%d paise) idempotency_key=%s",
                 result.get("id"), account_id, amount_paise,
+                idempotency_key or "none",
             )
             return result
         except Exception as e:

@@ -18,11 +18,26 @@ logger = logging.getLogger("ocpp-server")
 
 class FranchiseeOnboardingService:
 
+    # Razorpay `business_type` values (lowercased, snake_case). Our enum uses
+    # UPPERCASE; this maps between the two.
+    _BUSINESS_TYPE_MAP = {
+        "INDIVIDUAL": "individual",
+        "PROPRIETORSHIP": "proprietorship",
+        "PARTNERSHIP": "partnership",
+        "PRIVATE_LIMITED": "private_limited",
+        "LLP": "llp",
+    }
+
     @staticmethod
     async def create_linked_account(franchisee_id: int) -> Dict:
-        """Create a minimal Razorpay Route linked account for the
-        franchisee. The franchisee then completes KYC via Razorpay's
-        hosted onboarding URL."""
+        """Create a Razorpay Route linked account for the franchisee.
+
+        Razorpay's default Route flow emails the franchisee a KYC invite
+        link automatically once the account is created; we don't host a
+        KYC form ourselves. The create response may or may not include a
+        ``hosted_onboarding_url`` depending on Partner dashboard config —
+        treat its absence as expected, not an error.
+        """
         from services.razorpay_service import razorpay_service
 
         franchisee = await Franchisee.filter(id=franchisee_id).first()
@@ -39,11 +54,35 @@ class FranchiseeOnboardingService:
         if not razorpay_service.is_route_enabled():
             raise RuntimeError("Razorpay Route is not enabled")
 
+        if not franchisee.business_type:
+            raise RuntimeError(
+                "business_type must be set on the franchisee before Razorpay "
+                "onboarding (update via PUT /api/admin/franchisees/{id})."
+            )
+
+        business_type = FranchiseeOnboardingService._BUSINESS_TYPE_MAP.get(
+            franchisee.business_type.value
+            if hasattr(franchisee.business_type, "value")
+            else str(franchisee.business_type)
+        )
+        if not business_type:
+            raise RuntimeError(
+                f"Unsupported business_type {franchisee.business_type}"
+            )
+
         payload = {
             "email": franchisee.contact_email,
             "phone": franchisee.contact_phone,
             "type": "route",
+            "reference_id": f"franchisee_{franchisee.id}",
             "legal_business_name": franchisee.business_name,
+            "customer_facing_business_name": franchisee.business_name,
+            "business_type": business_type,
+            "contact_name": franchisee.contact_name,
+            "profile": {
+                "category": "utilities",
+                "subcategory": "electric_vehicle_charging",
+            },
             "notes": {
                 "voltlync_franchisee_id": str(franchisee.id),
             },
@@ -52,11 +91,9 @@ class FranchiseeOnboardingService:
         result = razorpay_service.create_linked_account(payload)
 
         account_id = result.get("id")
-        # Razorpay's hosted onboarding URL is returned under slightly
-        # different keys depending on whether the merchant has Hosted
-        # Onboarding enabled on their Partner dashboard. Check known
-        # variants and fall back to None — if unavailable, Razorpay emails
-        # the account holder a link directly.
+        # Hosted onboarding URL is best-effort: Razorpay returns it only
+        # when the Partner dashboard has Hosted Onboarding enabled. When
+        # absent, Razorpay emails the franchisee a KYC invite directly.
         onboarding_url = (
             result.get("hosted_onboarding_url")
             or result.get("onboarding_url")
@@ -108,12 +145,22 @@ class FranchiseeOnboardingService:
             "razorpay_account_status": account_data.get("status"),
         }
 
-        if event_type == "account.activated":
+        if event_type in ("account.activated", "account.instantly_activated"):
             update_fields["status"] = FranchiseeStatusEnum.ACTIVE
             update_fields["kyc_verified_at"] = datetime.utcnow()
+            update_fields["transfers_enabled"] = True
             if not franchisee.activated_at:
                 update_fields["activated_at"] = datetime.utcnow()
-            logger.info("Franchisee %s KYC approved", franchisee.id)
+            logger.info("Franchisee %s KYC approved (%s)", franchisee.id, event_type)
+
+        elif event_type == "account.activated_kyc_pending":
+            # Account can accept payments but cannot yet receive transfers.
+            update_fields["status"] = FranchiseeStatusEnum.KYC_UNDER_REVIEW
+            update_fields["transfers_enabled"] = False
+            logger.info(
+                "Franchisee %s activated with KYC pending — transfers disabled",
+                franchisee.id,
+            )
 
         elif event_type == "account.under_review":
             update_fields["status"] = FranchiseeStatusEnum.KYC_UNDER_REVIEW
@@ -130,15 +177,22 @@ class FranchiseeOnboardingService:
                 "Franchisee %s KYC needs clarification", franchisee.id
             )
 
-        elif event_type == "account.suspended":
-            update_fields["status"] = FranchiseeStatusEnum.SUSPENDED
-            update_fields["status_reason"] = account_data.get("reason", "Suspended by Razorpay")
-            logger.warning("Franchisee %s suspended", franchisee.id)
-
         elif event_type == "account.rejected":
             update_fields["status"] = FranchiseeStatusEnum.DRAFT
+            update_fields["transfers_enabled"] = False
             update_fields["status_reason"] = account_data.get("reason", "KYC rejected")
             logger.warning("Franchisee %s KYC rejected", franchisee.id)
+
+        elif event_type == "account.updated":
+            # Generic catch-all. Razorpay fires this for any account-entity
+            # change (bank details, contact info, status updates that aren't
+            # covered by a specific lifecycle event). We already refresh
+            # razorpay_account_status from the payload above — nothing else
+            # to do unless we decide to sync bank details into our table.
+            logger.info(
+                "Franchisee %s account updated (status=%s)",
+                franchisee.id, account_data.get("status"),
+            )
 
         else:
             logger.info(

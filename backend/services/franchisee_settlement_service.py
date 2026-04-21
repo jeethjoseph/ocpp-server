@@ -31,9 +31,6 @@ from models import (
 logger = logging.getLogger("ocpp-server")
 
 TWO_DP = Decimal("0.01")
-TRANSFER_FEE_PCT = Decimal(
-    os.getenv("RAZORPAY_TRANSFER_FEE_PERCENT", "0.25")
-)
 MIN_TRANSFER_AMOUNT = Decimal(
     os.getenv("MINIMUM_TRANSFER_AMOUNT", "1.00")
 )
@@ -65,7 +62,13 @@ class FranchiseeSettlementService:
         commission_pct: Decimal,
         tds_pct: Decimal,
     ) -> Dict[str, Decimal]:
-        """Pure calculation -- no side effects."""
+        """Pure calculation -- no side effects.
+
+        ``transfer_fee`` is populated after-the-fact from the
+        ``settlement.processed`` webhook (the actual fee Razorpay charges
+        for the Route transfer). It is NOT deducted from
+        ``franchisee_payout`` at calc time.
+        """
         net_amount = (gross_amount - refund_amount - pg_fee_amount).quantize(
             TWO_DP, ROUND_HALF_UP
         )
@@ -78,13 +81,9 @@ class FranchiseeSettlementService:
         tds_amount = (
             net_excl_gst * tds_pct / Decimal("100")
         ).quantize(TWO_DP, ROUND_HALF_UP)
-        pre_transfer = net_excl_gst - platform_commission - tds_amount
-        transfer_fee = (
-            pre_transfer * TRANSFER_FEE_PCT / Decimal("100")
+        franchisee_payout = (
+            net_excl_gst - platform_commission - tds_amount
         ).quantize(TWO_DP, ROUND_HALF_UP)
-        franchisee_payout = (pre_transfer - transfer_fee).quantize(
-            TWO_DP, ROUND_HALF_UP
-        )
 
         return {
             "net_amount": net_amount,
@@ -92,7 +91,7 @@ class FranchiseeSettlementService:
             "net_excl_gst": net_excl_gst,
             "platform_commission": platform_commission,
             "tds_amount": tds_amount,
-            "transfer_fee": transfer_fee,
+            "transfer_fee": Decimal("0.00"),  # filled post-settlement
             "franchisee_payout": franchisee_payout,
         }
 
@@ -230,7 +229,14 @@ class FranchiseeSettlementService:
     async def initiate_transfer(
         entry: CommissionLedgerEntry,
     ) -> bool:
-        """Attempt Razorpay Route transfer. Returns True on success."""
+        """Attempt Razorpay Route transfer. Returns True on success.
+
+        Skips (and marks ON_HOLD) when the franchisee has
+        ``funds_on_hold=True`` or ``transfers_enabled=False`` — both flags
+        are driven by ``account.*`` webhooks. A later
+        ``account.funds_unhold`` / ``account.activated`` will trigger a
+        retry via ``retry_failed_transfers``.
+        """
         from services.razorpay_service import razorpay_service
 
         if not razorpay_service.is_route_enabled():
@@ -241,6 +247,20 @@ class FranchiseeSettlementService:
 
         franchisee = await Franchisee.filter(id=entry.franchisee_id).first()
         if not franchisee or not franchisee.razorpay_account_id:
+            return False
+
+        if franchisee.funds_on_hold or not franchisee.transfers_enabled:
+            await CommissionLedgerEntry.filter(id=entry.id).update(
+                settlement_status=SettlementStatusEnum.ON_HOLD,
+                failure_reason=(
+                    "funds_on_hold" if franchisee.funds_on_hold
+                    else "transfers_disabled"
+                ),
+            )
+            logger.info(
+                "Transfer for entry %s held: funds_on_hold=%s transfers_enabled=%s",
+                entry.id, franchisee.funds_on_hold, franchisee.transfers_enabled,
+            )
             return False
 
         amount_paise = int(entry.franchisee_payout * 100)
@@ -285,7 +305,13 @@ class FranchiseeSettlementService:
     async def handle_transfer_webhook(
         event_type: str, transfer_data: dict
     ):
-        """Handle transfer.processed, transfer.failed, etc."""
+        """Handle transfer.processed / transfer.failed.
+
+        Razorpay does not emit ``transfer.settled`` (that's
+        ``settlement.processed``, see ``handle_settlement_webhook``) or
+        ``transfer.reversed`` (reversals are surfaced via the transfer
+        entity's ``amount_reversed`` / ``status`` fields).
+        """
         transfer_id = transfer_data.get("id")
         if not transfer_id:
             return
@@ -304,13 +330,6 @@ class FranchiseeSettlementService:
             )
             logger.info("Transfer processed: %s", transfer_id)
 
-        elif event_type == "transfer.settled":
-            await CommissionLedgerEntry.filter(id=entry.id).update(
-                settlement_status=SettlementStatusEnum.SETTLED,
-                settled_at=datetime.utcnow(),
-            )
-            logger.info("Transfer settled: %s", transfer_id)
-
         elif event_type == "transfer.failed":
             reason = transfer_data.get("error", {}).get(
                 "description", "Unknown"
@@ -321,17 +340,78 @@ class FranchiseeSettlementService:
             )
             logger.error("Transfer failed: %s - %s", transfer_id, reason)
 
-        elif event_type == "transfer.reversed":
-            await CommissionLedgerEntry.filter(id=entry.id).update(
-                settlement_status=SettlementStatusEnum.REVERSED,
+    @staticmethod
+    async def handle_settlement_webhook(
+        event_type: str, settlement_data: dict
+    ):
+        """Handle settlement.processed for linked-account settlements.
+
+        A single settlement can cover multiple transfers. We advance every
+        ledger entry whose ``razorpay_transfer_id`` is listed in the
+        settlement entity, and capture the per-transfer fee (Razorpay's
+        actual transfer charge) when provided.
+        """
+        if event_type != "settlement.processed":
+            return
+
+        transfer_ids = []
+        # Known Razorpay shapes: a list of transfer ids, or a list of
+        # {id, fees, tax} dicts. Handle both defensively.
+        raw_transfers = settlement_data.get("transfers") or []
+        for t in raw_transfers:
+            if isinstance(t, str):
+                transfer_ids.append(t)
+            elif isinstance(t, dict) and t.get("id"):
+                transfer_ids.append(t["id"])
+
+        if not transfer_ids:
+            logger.info(
+                "settlement.processed with no transfers listed: %s",
+                settlement_data.get("id"),
             )
-            logger.info("Transfer reversed: %s", transfer_id)
+            return
+
+        # Build a map transfer_id -> (fees_rupees, tax_rupees) when available
+        fee_by_transfer: Dict[str, Decimal] = {}
+        for t in raw_transfers:
+            if isinstance(t, dict) and t.get("id"):
+                fee_paise = t.get("fees")
+                tax_paise = t.get("tax") or 0
+                if fee_paise is not None:
+                    total = Decimal(str(fee_paise)) + Decimal(str(tax_paise))
+                    fee_by_transfer[t["id"]] = (total / Decimal("100")).quantize(
+                        TWO_DP, ROUND_HALF_UP
+                    )
+
+        entries = await CommissionLedgerEntry.filter(
+            razorpay_transfer_id__in=transfer_ids
+        ).all()
+        now = datetime.utcnow()
+        for entry in entries:
+            updates = {
+                "settlement_status": SettlementStatusEnum.SETTLED,
+                "settled_at": now,
+            }
+            fee = fee_by_transfer.get(entry.razorpay_transfer_id)
+            if fee is not None:
+                updates["transfer_fee"] = fee
+            await CommissionLedgerEntry.filter(id=entry.id).update(**updates)
+            logger.info(
+                "Settlement processed: entry=%s transfer=%s fee=%s",
+                entry.id, entry.razorpay_transfer_id, fee or "n/a",
+            )
 
     @staticmethod
     async def retry_failed_transfers(franchisee_id: Optional[int] = None):
-        """Retry FAILED entries that haven't exceeded max retries."""
+        """Retry FAILED and ON_HOLD entries that haven't exceeded max
+        retries. ON_HOLD entries are picked up after a subsequent
+        ``account.funds_unhold`` / ``account.activated`` webhook flips
+        the gating flags back on."""
         query = CommissionLedgerEntry.filter(
-            settlement_status=SettlementStatusEnum.FAILED,
+            settlement_status__in=[
+                SettlementStatusEnum.FAILED,
+                SettlementStatusEnum.ON_HOLD,
+            ],
             retry_count__lt=MAX_TRANSFER_RETRIES,
         )
         if franchisee_id:

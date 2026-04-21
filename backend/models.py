@@ -535,7 +535,9 @@ class QRPayment(Model):
     razorpay_gst = fields.DecimalField(max_digits=10, decimal_places=2, null=True)         # GST on Razorpay commission (tax), rupees
     fee_source = fields.CharField(max_length=20, null=True)                                 # 'webhook', 'api', or 'estimated'
     refund_amount = fields.DecimalField(max_digits=10, decimal_places=2, null=True)
-    razorpay_refund_id = fields.CharField(max_length=255, null=True)
+    razorpay_refund_id = fields.CharField(max_length=255, null=True, index=True)
+    refund_processed_at = fields.DatetimeField(null=True)
+    refund_failure_reason = fields.TextField(null=True)
     status = fields.CharEnumField(QRPaymentStatusEnum)
     failure_reason = fields.TextField(null=True)
     metadata = fields.JSONField(null=True)
@@ -585,6 +587,9 @@ class Franchisee(Model):
     razorpay_onboarding_url = fields.CharField(max_length=500, null=True)
     kyc_submitted_at = fields.DatetimeField(null=True)
     kyc_verified_at = fields.DatetimeField(null=True)
+    # Route transfer gates (driven by account.* webhooks)
+    transfers_enabled = fields.BooleanField(default=True)
+    funds_on_hold = fields.BooleanField(default=False)
 
     # Commission (VoltLync's platform cut, default 20%)
     commission_percent = fields.DecimalField(

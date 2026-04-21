@@ -81,7 +81,7 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
 - **`qr_codes.py`** - Admin QR code CRUD for appless charging (`/api/admin/qr-codes/*`)
   - Create/list/close/regenerate QR codes linked to chargers
   - Payment history and revenue stats per QR code
-  - On create, auto-scopes the QR to the franchisee's Razorpay linked account (via `X-Razorpay-Account`) when the station's franchisee is ACTIVE — that makes Razorpay render the franchisee's business name on the rendered QR image. Falls back to platform-owned when no franchisee or the franchisee's Razorpay account isn't ACTIVE yet. Ownership is persisted on `ChargerQRCode.owner_razorpay_account_id` so later close/fetch calls scope correctly.
+  - All QRs are platform-owned: payments land in VoltLync's nodal balance, never scoped to a franchisee's linked account. The franchisee's share is disbursed via a Route transfer *after* the session settles (see `franchisee_settlement_service`). Legacy rows with `ChargerQRCode.owner_razorpay_account_id IS NOT NULL` must be regenerated via the close-and-recreate endpoint before new payments flow correctly.
 - **`franchisee_portal.py`** - Franchisee-facing portal API (`/api/franchisee/*`)
   - Dashboard, stations, chargers, transactions, settlements, profile, QR codes
   - `/qr-codes` endpoints support full CRUD on the franchisee's own chargers' QRs (list with `can_create_direct` / `payee_display_name`, create, regenerate, close). Regenerate is the retroactive compliance path: once Razorpay KYC completes, the franchisee clicks it to upgrade each platform-owned QR into a franchisee-owned one. All mutations audit-log with `actor_type=franchisee`.
@@ -131,9 +131,11 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
 - **`razorpay_service.py`** - Razorpay payment gateway integration
   - Order creation and payment verification
   - Webhook signature verification (HMAC SHA256)
-  - **QR code creation**: `create_qr_code(payee_name, description, account_id=None)`, `close_qr_code(id, account_id=None)`, `fetch_qr_code(id, account_id=None)`. `account_id` is passed as the `X-Razorpay-Account` header so the QR is owned by that linked account and Razorpay renders that account's registered business name on the returned image — the RBI payer-payee transparency path for Route.
+  - **QR code creation**: `create_qr_code(payee_name, description, account_id=None)`, `close_qr_code(id, account_id=None)`, `fetch_qr_code(id, account_id=None)`. `account_id` is still accepted for backward-compatible close/fetch on legacy franchisee-scoped QRs but NEW QRs are always created with `account_id=None` (platform-owned); the franchisee's share is transferred post-settlement via Route.
   - **Helpers**: `build_qr_payee_name(business_name, charger_name)` composes the `name` metadata (50-char cap; falls back to "VoltLync" when no franchisee). `build_qr_description(...)` composes the rendered descriptor line.
-  - **Refunds**: `refund_payment()` for partial/full refunds
+  - **Refunds**: `refund_payment(payment_id, amount, notes, idempotency_key)` — `idempotency_key` is sent as `X-Refund-Idempotency` so retries dedupe server-side. Callers use `f"qr_payment_{id}"` as the stable key.
+  - **Route transfers**: `create_transfer(account_id, amount_paise, notes, idempotency_key)` — `idempotency_key` is sent as `X-Transfer-Idempotency`. Retries with the same key are deduped by Razorpay (replays original response); same key + different body → 400.
+  - **Linked accounts**: `create_linked_account(payload)` — caller builds the payload including `reference_id=f"franchisee_{id}"`, `business_type`, `profile.category/subcategory`, `contact_name`. Razorpay emails the franchisee a KYC invite directly; no hosted onboarding URL is relied on.
   - Test/Live mode support
 - **`monitoring_service.py`** - Sentry + New Relic integration
   - `@trace_transaction` decorator for OCPP message tracing
@@ -171,21 +173,35 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
   - Needs `CLERK_SECRET_KEY` and `FRONTEND_URL` env vars.
 - **`franchisee_onboarding_service.py`** - **Razorpay Route KYC flow**
   - `create_linked_account(franchisee_id)` creates a Razorpay linked
-    account, transitions status to `KYC_SUBMITTED`, and persists any
-    `hosted_onboarding_url` / `onboarding.url` returned by Razorpay into
-    `Franchisee.razorpay_onboarding_url` so the franchisee UI can
-    render a "Complete KYC on Razorpay" button.
-  - `handle_account_webhook(event_type, data)` advances the status
-    machine on Razorpay lifecycle events
-    (under_review → activated / needs_clarification / suspended /
-    rejected).
+    account with full payload: `reference_id=f"franchisee_{id}"`,
+    `legal_business_name`, `customer_facing_business_name`,
+    `business_type` (mapped via `_BUSINESS_TYPE_MAP` from our
+    `FranchiseeBusinessTypeEnum`), `contact_name`, `profile.category/
+    subcategory` (utilities / electric_vehicle_charging). Fails fast
+    with a `RuntimeError` if `business_type` is not yet set on the
+    franchisee — admin must fill it via the Business Details edit
+    dialog before calling onboarding. Persists any optional
+    `hosted_onboarding_url` from the response (best-effort; Razorpay
+    emails the franchisee directly regardless).
+  - `handle_account_webhook(event_type, data)` advances the franchisee
+    status machine on Razorpay account events. Subscribed events
+    handled: `account.activated`, `account.instantly_activated`,
+    `account.activated_kyc_pending`, `account.under_review`,
+    `account.needs_clarification`, `account.rejected`,
+    `account.updated` (generic catch-all). **Not subscribed /
+    not emitted by Razorpay**: `account.suspended`,
+    `account.funds_onhold`, `account.funds_unhold` — the
+    corresponding `Franchisee.transfers_enabled` /
+    `funds_on_hold` / `SUSPENDED` status fields exist but are
+    only ever toggled by admin action or rejected-account webhook,
+    not by a dedicated Razorpay webhook.
   - `refresh_kyc_status(franchisee_id)` polls Razorpay for current
-    account status.
-  - End-to-end UX: admin clicks "Start Razorpay onboarding" on
-    `/admin/franchisees/[id]`, backend creates the linked account and
-    stores the hosted URL; franchisee sees "Complete KYC on Razorpay"
-    on `/franchisee/profile` which opens Razorpay's hosted form; their
-    webhook activates the account.
+    account status when webhooks aren't trusted.
+  - End-to-end UX: admin fills business details (business_type, PAN,
+    GSTIN, etc.) via the Edit dialog on `/admin/franchisees/[id]`,
+    clicks "Start Razorpay onboarding"; backend creates the linked
+    account; Razorpay emails the franchisee a KYC invite directly;
+    webhook handlers advance status as Razorpay progresses the KYC.
 
 ### Frontend Core (`/frontend/`)
 - **`app/page.tsx`** - Role-based dashboard (different for ADMIN vs USER)

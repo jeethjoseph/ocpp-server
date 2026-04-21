@@ -10,6 +10,7 @@ import {
   Unlink,
   Mail,
   CreditCard,
+  Pencil,
 } from "lucide-react";
 import Link from "next/link";
 
@@ -43,7 +44,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
-import { CommissionUpdate } from "@/types/api";
+import { CommissionUpdate, FranchiseeUpdate } from "@/types/api";
 import {
   useFranchisee,
   useFranchiseeStations,
@@ -78,8 +79,10 @@ export default function FranchiseeDetailPage() {
 
   const [showCommissionDialog, setShowCommissionDialog] = useState(false);
   const [showAssignDialog, setShowAssignDialog] = useState(false);
+  const [showBusinessDialog, setShowBusinessDialog] = useState(false);
   const [selectedStationId, setSelectedStationId] = useState<string>("");
 
+  const updateFranchisee = useUpdateFranchisee(id);
   const updateCommission = useUpdateCommission(id);
   const assignStations = useAssignStations(id);
   const unassignStation = useUnassignStation(id);
@@ -119,6 +122,23 @@ export default function FranchiseeDetailPage() {
     };
     updateCommission.mutate(payload, {
       onSuccess: () => setShowCommissionDialog(false),
+    });
+  };
+
+  const handleBusinessUpdate = (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const formData = new FormData(e.currentTarget);
+    // Only send fields the admin actually filled in. Empty strings map to
+    // undefined so the PUT endpoint's exclude_unset=True check leaves
+    // existing values alone.
+    const raw: Record<string, string> = {};
+    formData.forEach((v, k) => {
+      const val = String(v).trim();
+      if (val) raw[k] = val;
+    });
+    const payload: FranchiseeUpdate = raw;
+    updateFranchisee.mutate(payload, {
+      onSuccess: () => setShowBusinessDialog(false),
     });
   };
 
@@ -216,8 +236,15 @@ export default function FranchiseeDetailPage() {
 
         {/* Details */}
         <Card>
-          <CardHeader>
+          <CardHeader className="flex flex-row items-center justify-between">
             <CardTitle>Business Details</CardTitle>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setShowBusinessDialog(true)}
+            >
+              <Pencil className="w-4 h-4 mr-1" /> Edit
+            </Button>
           </CardHeader>
           <CardContent className="grid grid-cols-2 gap-4 text-sm">
             <div>
@@ -426,6 +453,147 @@ export default function FranchiseeDetailPage() {
                 </Button>
                 <Button type="submit" disabled={updateCommission.isPending}>
                   {updateCommission.isPending ? "Updating..." : "Update"}
+                </Button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
+
+        {/* Business Details Edit Dialog */}
+        <Dialog open={showBusinessDialog} onOpenChange={setShowBusinessDialog}>
+          <DialogContent className="max-w-xl">
+            <DialogHeader>
+              <DialogTitle>Edit Business Details</DialogTitle>
+            </DialogHeader>
+            <form
+              onSubmit={handleBusinessUpdate}
+              className="grid grid-cols-2 gap-4"
+            >
+              <div className="space-y-2 col-span-2">
+                <Label htmlFor="business_name">Business Name</Label>
+                <Input
+                  id="business_name"
+                  name="business_name"
+                  defaultValue={franchisee.business_name}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="business_type">
+                  Business Type
+                  <span className="text-xs text-muted-foreground ml-1">
+                    (required for Razorpay onboarding)
+                  </span>
+                </Label>
+                <Select
+                  name="business_type"
+                  defaultValue={franchisee.business_type || undefined}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder="Select type" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="INDIVIDUAL">Individual</SelectItem>
+                    <SelectItem value="PROPRIETORSHIP">
+                      Proprietorship
+                    </SelectItem>
+                    <SelectItem value="PARTNERSHIP">Partnership</SelectItem>
+                    <SelectItem value="PRIVATE_LIMITED">
+                      Private Limited
+                    </SelectItem>
+                    <SelectItem value="LLP">LLP</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="contact_name">Contact Name</Label>
+                <Input
+                  id="contact_name"
+                  name="contact_name"
+                  defaultValue={franchisee.contact_name}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="contact_phone">Contact Phone</Label>
+                <Input
+                  id="contact_phone"
+                  name="contact_phone"
+                  defaultValue={franchisee.contact_phone}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="pan_number">PAN</Label>
+                <Input
+                  id="pan_number"
+                  name="pan_number"
+                  defaultValue={franchisee.pan_number || ""}
+                  placeholder="ABCDE1234F"
+                  maxLength={10}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="gstin">GSTIN</Label>
+                <Input
+                  id="gstin"
+                  name="gstin"
+                  defaultValue={franchisee.gstin || ""}
+                  placeholder="29ABCDE1234F1Z5"
+                  maxLength={15}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="tan_number">TAN</Label>
+                <Input
+                  id="tan_number"
+                  name="tan_number"
+                  defaultValue={franchisee.tan_number || ""}
+                  maxLength={10}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="state">State</Label>
+                <Input
+                  id="state"
+                  name="state"
+                  defaultValue={franchisee.state || ""}
+                  placeholder="Karnataka"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="state_code">State Code</Label>
+                <Input
+                  id="state_code"
+                  name="state_code"
+                  defaultValue={franchisee.state_code || ""}
+                  placeholder="KA"
+                  maxLength={5}
+                />
+              </div>
+              <div className="space-y-2 col-span-2">
+                <Label htmlFor="address">Address</Label>
+                <Input
+                  id="address"
+                  name="address"
+                  defaultValue={franchisee.address || ""}
+                />
+              </div>
+              <div className="space-y-2 col-span-2">
+                <Label htmlFor="notes">Notes</Label>
+                <Input
+                  id="notes"
+                  name="notes"
+                  defaultValue={franchisee.notes || ""}
+                />
+              </div>
+              <DialogFooter className="col-span-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setShowBusinessDialog(false)}
+                >
+                  Cancel
+                </Button>
+                <Button type="submit" disabled={updateFranchisee.isPending}>
+                  {updateFranchisee.isPending ? "Saving..." : "Save"}
                 </Button>
               </DialogFooter>
             </form>

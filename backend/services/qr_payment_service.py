@@ -635,7 +635,8 @@ class QRPaymentService:
                 refund_result = razorpay_service.refund_payment(
                     qr_payment.razorpay_payment_id,
                     amount=refund,
-                    notes={"transaction_id": str(transaction_id), "reason": "Unused charging credit refund"}
+                    notes={"transaction_id": str(transaction_id), "reason": "Unused charging credit refund"},
+                    idempotency_key=f"qr_payment_{qr_payment.id}",
                 )
                 qr_payment.razorpay_refund_id = refund_result.get("id")
                 qr_payment.status = QRPaymentStatusEnum.REFUNDED
@@ -717,6 +718,7 @@ class QRPaymentService:
                     locked.razorpay_payment_id,
                     amount=refund_amount,
                     notes={"reason": reason, "qr_payment_id": str(locked.id)},
+                    idempotency_key=f"qr_payment_{locked.id}",
                 )
                 locked.razorpay_refund_id = refund_result.get("id")
                 if locked.status != QRPaymentStatusEnum.EXPIRED:

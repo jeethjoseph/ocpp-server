@@ -521,6 +521,7 @@ export interface Franchisee {
   address?: string | null;
   pan_number?: string | null;
   gstin?: string | null;
+  tan_number?: string | null;
   state?: string | null;
   state_code?: string | null;
   commission_percent: number;

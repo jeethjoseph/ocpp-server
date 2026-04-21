@@ -22,44 +22,35 @@ class CreateQRCodeRequest(BaseModel):
     charger_id: int
 
 
-async def _resolve_qr_owner(charger: Charger) -> tuple[Optional[Franchisee], Optional[str]]:
-    """Decide which Razorpay account owns a QR created for this charger.
+async def _resolve_qr_franchisee(charger: Charger) -> Optional[Franchisee]:
+    """Return the franchisee (if any) that owns this charger's station.
 
-    Returns (franchisee, account_id_for_header). When the charger's station
-    is linked to an ACTIVE franchisee with a Razorpay linked account, the
-    QR is scoped to that account via X-Razorpay-Account. Otherwise the QR
-    falls back to being owned by the platform (account_id=None).
-
-    This is what gets the franchisee's registered business name rendered
-    on the QR image (RBI Route payer-payee transparency).
+    The franchisee's business name is embedded in the QR description for
+    auditability, but the QR itself is always created on the platform's
+    Razorpay account so that payments land in the platform nodal balance
+    first. The platform then transfers the franchisee's share via
+    Razorpay Route after the session settles — see
+    FranchiseeSettlementService.
     """
     await charger.fetch_related("station__franchisee")
     station = charger.station
     if not station or not station.franchisee:
-        return None, None
-    franchisee = station.franchisee
-    if (
-        franchisee.status == FranchiseeStatusEnum.ACTIVE
-        and franchisee.razorpay_account_id
-    ):
-        return franchisee, franchisee.razorpay_account_id
-    # Franchisee exists but Razorpay onboarding isn't complete — fall back
-    # to platform ownership. Admin can regenerate later.
-    return franchisee, None
+        return None
+    return station.franchisee
 
 
 async def _create_qr_for_charger(charger: Charger) -> dict:
-    """Create a QR code for a charger, auto-scoping to the franchisee's
-    linked account when possible. Returns the Razorpay response merged
-    with our internal ChargerQRCode fields."""
-    franchisee, account_id = await _resolve_qr_owner(charger)
+    """Create a platform-owned QR code for a charger. Franchisee (if any)
+    is referenced only for descriptive labeling; the QR itself is NOT
+    scoped to the franchisee's linked account."""
+    franchisee = await _resolve_qr_franchisee(charger)
     business_name = franchisee.business_name if franchisee else None
     charger_name = charger.name or charger.charge_point_string_id
 
     result = razorpay_service.create_qr_code(
         payee_name=build_qr_payee_name(business_name, charger_name),
         description=build_qr_description(business_name, charger_name),
-        account_id=account_id,
+        account_id=None,
     )
 
     qr_code = await ChargerQRCode.create(
@@ -68,7 +59,7 @@ async def _create_qr_for_charger(charger: Charger) -> dict:
         image_url=result.get("image_url", ""),
         short_url=result.get("short_url"),
         is_active=True,
-        owner_razorpay_account_id=account_id,
+        owner_razorpay_account_id=None,
     )
     return {
         "id": qr_code.id,
@@ -79,8 +70,8 @@ async def _create_qr_for_charger(charger: Charger) -> dict:
         "image_url": qr_code.image_url,
         "short_url": qr_code.short_url,
         "is_active": qr_code.is_active,
-        "owner": "franchisee" if account_id else "platform",
-        "owner_razorpay_account_id": account_id,
+        "owner": "platform",
+        "owner_razorpay_account_id": None,
         "franchisee_name": business_name,
         "created_at": qr_code.created_at.isoformat(),
     }
@@ -88,13 +79,14 @@ async def _create_qr_for_charger(charger: Charger) -> dict:
 
 @router.post("")
 async def create_qr_code(request: CreateQRCodeRequest, admin_user=Depends(require_admin())):
-    """Create a Razorpay QR code for a charger.
+    """Create a platform-owned Razorpay QR code for a charger.
 
-    When the charger's station belongs to an ACTIVE franchisee with a
-    Razorpay linked account, the QR is scoped to that account so the
-    rendered QR image displays the franchisee's business name (RBI
-    Route payer-payee transparency). Otherwise falls back to a
-    platform-owned QR.
+    All QR payments land in the platform's nodal balance regardless of
+    station ownership; the franchisee's share is disbursed via a Route
+    transfer after the session settles. When the charger's station is
+    owned by a franchisee, the franchisee's name is included in the QR
+    description field but the QR image always displays the platform's
+    registered merchant name.
     """
     charger = await Charger.filter(id=request.charger_id).first()
     if not charger:
@@ -116,11 +108,11 @@ async def create_qr_code(request: CreateQRCodeRequest, admin_user=Depends(requir
 
 @router.post("/{qr_id}/regenerate")
 async def regenerate_qr_code(qr_id: int, admin_user=Depends(require_admin())):
-    """Close the existing QR and create a new one under today's ownership.
+    """Close the existing QR and create a fresh platform-owned replacement.
 
-    Used to upgrade a platform-owned QR to a franchisee-owned one after
-    the franchisee completes Razorpay onboarding, or after any change
-    that should refresh the rendered payee label on the QR image.
+    Used to migrate any legacy franchisee-scoped QRs (owner_razorpay_
+    account_id IS NOT NULL) to the new platform-owned model, or to refresh
+    the descriptor after a franchisee name change.
     """
     qr = await ChargerQRCode.filter(id=qr_id).prefetch_related("charger").first()
     if not qr:
