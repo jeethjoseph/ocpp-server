@@ -92,13 +92,15 @@ class FranchiseeOnboardingService:
             "customer_facing_business_name": franchisee.business_name,
             "business_type": business_type,
             "contact_name": franchisee.contact_name,
+            # Razorpay Route treats empty strings on optional fields as
+            # "required not provided" — omit keys we don't have a real
+            # value for (e.g. street2) rather than sending "".
             "profile": {
                 "category": "utilities",
                 "subcategory": "electric_vehicle_charging",
                 "addresses": {
                     "registered": {
                         "street1": franchisee.address[:100],
-                        "street2": "",
                         "city": franchisee.city,
                         "state": (franchisee.state or "").upper(),
                         "postal_code": franchisee.pincode,
