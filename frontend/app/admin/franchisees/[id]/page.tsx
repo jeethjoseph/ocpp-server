@@ -261,8 +261,16 @@ export default function FranchiseeDetailPage() {
               {franchisee.gstin || "Not set"}
             </div>
             <div>
+              <span className="text-muted-foreground">City:</span>{" "}
+              {franchisee.city || "Not set"}
+            </div>
+            <div>
               <span className="text-muted-foreground">State:</span>{" "}
               {franchisee.state || "Not set"}
+            </div>
+            <div>
+              <span className="text-muted-foreground">Pincode:</span>{" "}
+              {franchisee.pincode || "Not set"}
             </div>
             <div>
               <span className="text-muted-foreground">Razorpay Account:</span>{" "}
@@ -547,6 +555,15 @@ export default function FranchiseeDetailPage() {
                 />
               </div>
               <div className="space-y-2">
+                <Label htmlFor="city">City</Label>
+                <Input
+                  id="city"
+                  name="city"
+                  defaultValue={franchisee.city || ""}
+                  placeholder="Bengaluru"
+                />
+              </div>
+              <div className="space-y-2">
                 <Label htmlFor="state">State</Label>
                 <Input
                   id="state"
@@ -563,6 +580,16 @@ export default function FranchiseeDetailPage() {
                   defaultValue={franchisee.state_code || ""}
                   placeholder="KA"
                   maxLength={5}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="pincode">Pincode</Label>
+                <Input
+                  id="pincode"
+                  name="pincode"
+                  defaultValue={franchisee.pincode || ""}
+                  placeholder="560034"
+                  maxLength={10}
                 />
               </div>
               <div className="space-y-2 col-span-2">

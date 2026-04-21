@@ -570,9 +570,12 @@ class Franchisee(Model):
     gstin = fields.CharField(max_length=15, unique=True, null=True)
     tan_number = fields.CharField(max_length=10, null=True)
 
-    # Location (for GST place-of-supply on invoices)
+    # Location (for GST place-of-supply on invoices + Razorpay Route
+    # `profile.addresses.registered` payload)
+    city = fields.CharField(max_length=100, null=True)
     state = fields.CharField(max_length=100, null=True)
     state_code = fields.CharField(max_length=5, null=True)
+    pincode = fields.CharField(max_length=10, null=True)
 
     # Bank details (reference copy; Razorpay holds canonical)
     bank_account_name = fields.CharField(max_length=255, null=True)

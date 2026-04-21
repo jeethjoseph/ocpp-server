@@ -44,8 +44,10 @@ class FranchiseeUpdate(BaseModel):
     pan_number: Optional[str] = None
     gstin: Optional[str] = None
     tan_number: Optional[str] = None
+    city: Optional[str] = None
     state: Optional[str] = None
     state_code: Optional[str] = None
+    pincode: Optional[str] = None
     notes: Optional[str] = None
 
 
@@ -76,8 +78,10 @@ class FranchiseeResponse(BaseModel):
     pan_number: Optional[str] = None
     gstin: Optional[str] = None
     tan_number: Optional[str] = None
+    city: Optional[str] = None
     state: Optional[str] = None
     state_code: Optional[str] = None
+    pincode: Optional[str] = None
     commission_percent: Decimal
     tds_rate_percent: Decimal
     status: str
@@ -135,8 +139,10 @@ async def _franchisee_to_response(f: Franchisee) -> dict:
         "pan_number": f.pan_number,
         "gstin": f.gstin,
         "tan_number": f.tan_number,
+        "city": f.city,
         "state": f.state,
         "state_code": f.state_code,
+        "pincode": f.pincode,
         "commission_percent": f.commission_percent,
         "tds_rate_percent": f.tds_rate_percent,
         "status": f.status.value if hasattr(f.status, "value") else str(f.status),
@@ -748,6 +754,11 @@ async def onboard_to_razorpay(
 ):
     """Create a Razorpay Route linked account for the franchisee."""
     from services.franchisee_onboarding_service import FranchiseeOnboardingService
+    from razorpay.errors import (
+        BadRequestError as RazorpayBadRequestError,
+        ServerError as RazorpayServerError,
+        GatewayError as RazorpayGatewayError,
+    )
 
     try:
         result = await FranchiseeOnboardingService.create_linked_account(
@@ -757,6 +768,13 @@ async def onboard_to_razorpay(
         raise HTTPException(status_code=400, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except (RazorpayBadRequestError, RazorpayServerError, RazorpayGatewayError) as e:
+        # Razorpay rejected the payload — surface the exact message so the
+        # admin UI shows it as a readable 400 instead of Internal Server Error.
+        logger.exception(
+            "Razorpay rejected onboarding for franchisee %s", franchisee_id
+        )
+        raise HTTPException(status_code=400, detail=f"Razorpay: {e}")
 
     await log_audit_event(
         actor_type="admin",

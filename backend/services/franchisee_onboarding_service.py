@@ -70,6 +70,19 @@ class FranchiseeOnboardingService:
                 f"Unsupported business_type {franchisee.business_type}"
             )
 
+        # Razorpay Route requires profile.addresses.registered with all
+        # subfields populated. Fail early with a clear message so the
+        # admin knows which field to fill in the edit dialog.
+        missing = [
+            f for f in ("address", "city", "state", "pincode")
+            if not getattr(franchisee, f)
+        ]
+        if missing:
+            raise RuntimeError(
+                "Franchisee is missing required address fields for Razorpay: "
+                + ", ".join(missing)
+            )
+
         payload = {
             "email": franchisee.contact_email,
             "phone": franchisee.contact_phone,
@@ -82,6 +95,16 @@ class FranchiseeOnboardingService:
             "profile": {
                 "category": "utilities",
                 "subcategory": "electric_vehicle_charging",
+                "addresses": {
+                    "registered": {
+                        "street1": franchisee.address[:100],
+                        "street2": "",
+                        "city": franchisee.city,
+                        "state": (franchisee.state or "").upper(),
+                        "postal_code": franchisee.pincode,
+                        "country": "IN",
+                    }
+                },
             },
             "notes": {
                 "voltlync_franchisee_id": str(franchisee.id),

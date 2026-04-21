@@ -523,8 +523,10 @@ export interface Franchisee {
   pan_number?: string | null;
   gstin?: string | null;
   tan_number?: string | null;
+  city?: string | null;
   state?: string | null;
   state_code?: string | null;
+  pincode?: string | null;
   commission_percent: number;
   tds_rate_percent: number;
   status: string;
@@ -558,8 +560,10 @@ export interface FranchiseeUpdate {
   pan_number?: string;
   gstin?: string;
   tan_number?: string;
+  city?: string;
   state?: string;
   state_code?: string;
+  pincode?: string;
   notes?: string;
 }
 
