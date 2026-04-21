@@ -24,7 +24,7 @@ SCRIPTS_DIR=$(BACKEND_DIR)/scripts
 .PHONY: help db-reset db-reset-cloud db-first-time db-drop-user db-create-user db-drop db-create migrate seed setup-dev truncate-tables
 .PHONY: docker-dev docker-dev-detach docker-staging docker-staging-detach docker-prod docker-prod-detach docker-down docker-down-staging docker-down-prod docker-logs docker-logs-backend docker-logs-frontend docker-build docker-build-staging docker-build-prod docker-clean docker-migrate docker-staging-cert docker-prod-cert docker-cert-renew
 .PHONY: prod-push prod-pull prod-up prod-down prod-deploy prod-rebuild prod-rebuild-service prod-rebuild-clean prod-nuke prod-restart prod-logs prod-logs-backend prod-logs-frontend prod-logs-nginx prod-ps prod-cert prod-migrate prod-backup-db prod-cache-clear prod-health prod-stats prod-shell prod-bash prod-db-reset prod-seed
-.PHONY: staging-push staging-pull staging-up staging-down staging-deploy staging-rebuild staging-rebuild-service staging-rebuild-clean staging-nuke staging-restart staging-logs staging-logs-backend staging-logs-frontend staging-logs-nginx staging-ps staging-cert staging-migrate staging-backup-db staging-cache-clear staging-health staging-stats staging-shell staging-bash staging-db-reset staging-seed
+.PHONY: staging-push staging-pull staging-up staging-down staging-deploy staging-rebuild staging-rebuild-service staging-rebuild-clean staging-nuke staging-restart staging-logs staging-logs-backend staging-logs-frontend staging-logs-nginx staging-ps staging-cert staging-migrate staging-backup-db staging-cache-clear staging-health staging-stats staging-shell staging-bash staging-ssm staging-db-reset staging-seed
 
 help:
 	@echo "OCPP Server - Available Commands"
@@ -463,6 +463,10 @@ staging-shell:
 # Open bash on staging backend container
 staging-bash:
 	$(STAGING_COMPOSE) exec backend bash
+
+# SSH into the staging EC2 instance via AWS SSM (no inbound SSH required)
+staging-ssm:
+	aws ssm start-session --target i-00fd9fb3c2b48932a --profile voltlync
 
 # Show staging container status
 staging-ps:

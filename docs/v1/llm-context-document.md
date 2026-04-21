@@ -202,6 +202,44 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
     clicks "Start Razorpay onboarding"; backend creates the linked
     account; Razorpay emails the franchisee a KYC invite directly;
     webhook handlers advance status as Razorpay progresses the KYC.
+- **`franchisee_settlement_service.py`** - **Post-session franchisee payout**
+  - `process_settlement(transaction_id)` runs from `transaction_finalizer`
+    right after `process_qr_session_billing` returns (refund already
+    issued). Creates a `CommissionLedgerEntry` with `idempotency_key=
+    f"txn_{id}"` capturing the gross → net → franchisee_payout split.
+    Immediately calls `initiate_transfer` if the franchisee is ACTIVE
+    with a linked account and payout ≥ `MINIMUM_TRANSFER_AMOUNT` (₹1).
+  - `calculate_settlement(...)` is the pure math: `net_excl_gst =
+    gross - refund - pg_fee - gst_collected`; `platform_commission`
+    and `tds_amount` come off that; `franchisee_payout` is what
+    remains. `transfer_fee` is NOT deducted at calc time — it's
+    populated after the fact from the `settlement.processed` webhook
+    (Razorpay's actual per-transfer fee).
+  - `initiate_transfer(entry)` calls
+    `razorpay_service.create_transfer` with a stable idempotency key
+    (the ledger entry's `idempotency_key`) so retries are safe.
+    Skips + marks `ON_HOLD` when `franchisee.transfers_enabled=False`
+    or `funds_on_hold=True` (admin-driven gates today — see the
+    onboarding service notes).
+  - `handle_transfer_webhook(event_type, transfer_data)` handles only
+    `transfer.processed` and `transfer.failed`. Razorpay does not
+    emit `transfer.reversed` (reversals are reflected in the transfer
+    entity's `amount_reversed` / `status` fields) or `transfer.settled`
+    (that's `settlement.processed`).
+  - `handle_settlement_webhook(event_type, settlement_data)` processes
+    `settlement.processed` — when money lands in the franchisee's
+    bank. Walks the settlement entity's `transfers` list (accepts
+    either `[id, id, ...]` or `[{id, fees, tax}, ...]`), flips each
+    matching `CommissionLedgerEntry` to `SETTLED`, stamps `settled_at`,
+    and captures the per-transfer `transfer_fee` when available.
+  - `retry_failed_transfers(franchisee_id=None)` background-job entry
+    point. Picks up entries in both `FAILED` and `ON_HOLD` states
+    (below `MAX_TRANSFER_RETRIES`) and re-runs `initiate_transfer`.
+    Triggered from the franchisee admin "Retry failed settlements"
+    endpoint.
+  - Config: `MINIMUM_TRANSFER_AMOUNT=1.00`, `MAX_TRANSFER_RETRIES=3`.
+    `RAZORPAY_TRANSFER_FEE_PERCENT` is **removed** — was double-charging
+    the franchisee on top of Razorpay's own fee.
 
 ### Frontend Core (`/frontend/`)
 - **`app/page.tsx`** - Role-based dashboard (different for ADMIN vs USER)

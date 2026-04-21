@@ -178,8 +178,15 @@ function InfoRow({ label, value }: { label: string; value: string }) {
  *   otherwise tell the user to check the email Razorpay sent them.
  * - DRAFT → admin hasn't kicked off onboarding yet.
  */
-function KYCAction({ profile }: { profile: any }) {
-  const status: string = profile?.status;
+interface KYCProfile {
+  status?: string;
+  razorpay_onboarding_url?: string | null;
+  razorpay_account_id?: string | null;
+  contact_email?: string;
+}
+
+function KYCAction({ profile }: { profile: KYCProfile | null | undefined }) {
+  const status: string = profile?.status ?? "";
   const url: string | null | undefined = profile?.razorpay_onboarding_url;
 
   if (status === "ACTIVE") {
@@ -217,7 +224,7 @@ function KYCAction({ profile }: { profile: any }) {
           </a>
         </Button>
         <p className="text-xs text-muted-foreground">
-          Opens Razorpay's hosted onboarding. Finish all steps there; your
+          Opens Razorpay&apos;s hosted onboarding. Finish all steps there; your
           status here updates automatically once Razorpay confirms.
         </p>
       </div>

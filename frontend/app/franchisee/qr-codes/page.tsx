@@ -47,6 +47,18 @@ interface StationCharger {
   charge_point_string_id: string;
 }
 
+interface PortalChargerLite {
+  id: number;
+  name?: string | null;
+  charge_point_string_id: string;
+}
+
+interface PortalStationLite {
+  id: number;
+  name?: string | null;
+  chargers?: PortalChargerLite[];
+}
+
 function QRCodesContent() {
   const { data: qrPayload, isLoading, error } = usePortalQRCodes();
   const { data: stations } = usePortalStations();
@@ -70,7 +82,7 @@ function QRCodesContent() {
       qrCodes.filter((q) => q.is_active).map((q) => q.charger_id)
     );
     const flat: StationCharger[] = [];
-    for (const s of stations as any[]) {
+    for (const s of stations as unknown as PortalStationLite[]) {
       const chargers = s.chargers || [];
       for (const c of chargers) {
         if (chargerIdsWithActiveQR.has(c.id)) continue;
@@ -209,7 +221,7 @@ function QRCodesContent() {
                 <p className="text-amber-800 dark:text-amber-200 mt-1">
                   Until your KYC is complete, QR codes you create will display
                   <span className="font-semibold"> VoltLync</span> as the payee
-                  on the customer's UPI app. Once your Razorpay account is
+                  on the customer&apos;s UPI app. Once your Razorpay account is
                   activated, come back here and click{" "}
                   <span className="font-semibold">Regenerate</span> on each QR
                   to switch the payee label to your business name (RBI
@@ -234,7 +246,7 @@ function QRCodesContent() {
               <QrCode className="h-12 w-12 mx-auto mb-4 opacity-50" />
               <p>No QR codes yet.</p>
               <p className="text-xs mt-1">
-                Click "Create QR" above to generate one for a charger.
+                Click &quot;Create QR&quot; above to generate one for a charger.
               </p>
             </div>
           </CardContent>

@@ -33,6 +33,16 @@ function SettlementStatusBadge({ status }: { status: string }) {
   );
 }
 
+interface SettlementEntry {
+  id: number;
+  created_at: string;
+  payment_method?: string | null;
+  gross_amount: string | number;
+  franchisee_payout: string | number;
+  commission_percent: string | number;
+  settlement_status: string;
+}
+
 function SettlementsContent() {
   const [currentPage, setCurrentPage] = useState(1);
   const limit = 20;
@@ -96,7 +106,7 @@ function SettlementsContent() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {data.data.map((entry: any) => (
+                {(data.data as SettlementEntry[]).map((entry) => (
                   <TableRow key={entry.id}>
                     <TableCell className="text-sm">
                       {new Date(entry.created_at).toLocaleDateString()}

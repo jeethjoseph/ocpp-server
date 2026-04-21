@@ -761,6 +761,11 @@ export const franchiseeService = {
 
 // ─── Franchisee Portal Service ─────────────────────────────────────
 
+// Franchisee portal endpoints return loosely-typed payloads that flow
+// straight into admin-style UIs reading ad-hoc fields. Defining strict
+// response schemas for all of these is a follow-up; for now, allow
+// `any` in this section only.
+/* eslint-disable @typescript-eslint/no-explicit-any */
 export const franchiseePortalService = {
   getDashboard: () => api.get<any>("/api/franchisee/dashboard"),
 
@@ -826,6 +831,7 @@ export const franchiseePortalService = {
       {}
     ),
 };
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
 export interface PortalQRCode {
   id: number;
