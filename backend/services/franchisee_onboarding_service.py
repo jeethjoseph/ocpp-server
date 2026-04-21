@@ -16,6 +16,25 @@ from models import (
 logger = logging.getLogger("ocpp-server")
 
 
+def _split_street(address: str, fallback: str) -> Dict[str, str]:
+    """Split a freeform address into Razorpay Route's street1 + street2.
+
+    Razorpay requires both to be non-empty. If ``address`` contains a
+    comma or newline, use the parts either side. Otherwise use the full
+    address as street1 and ``fallback`` (the city) as street2 so
+    Razorpay's validator accepts the payload. Both values are truncated
+    to 100 chars per Razorpay's documented limit.
+    """
+    raw = (address or "").replace("\n", ",")
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if len(parts) >= 2:
+        return {"street1": parts[0][:100], "street2": ", ".join(parts[1:])[:100]}
+    return {
+        "street1": (parts[0] if parts else address or "")[:100],
+        "street2": (fallback or "NA")[:100],
+    }
+
+
 class FranchiseeOnboardingService:
 
     # Razorpay `business_type` values (lowercased, snake_case). Our enum uses
@@ -92,15 +111,18 @@ class FranchiseeOnboardingService:
             "customer_facing_business_name": franchisee.business_name,
             "business_type": business_type,
             "contact_name": franchisee.contact_name,
-            # Razorpay Route treats empty strings on optional fields as
-            # "required not provided" — omit keys we don't have a real
-            # value for (e.g. street2) rather than sending "".
+            # Razorpay Route requires BOTH street1 and street2 to be
+            # non-empty even though the docs mark street2 optional (live
+            # API validation drift, 2026-04). Split the freeform
+            # `address` on comma / newline when the admin provided a
+            # multi-part string; otherwise fall back to `city` so
+            # street2 is never empty.
             "profile": {
                 "category": "utilities",
                 "subcategory": "electric_vehicle_charging",
                 "addresses": {
                     "registered": {
-                        "street1": franchisee.address[:100],
+                        **_split_street(franchisee.address, franchisee.city),
                         "city": franchisee.city,
                         "state": (franchisee.state or "").upper(),
                         "postal_code": franchisee.pincode,
