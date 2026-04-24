@@ -197,11 +197,28 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
     not by a dedicated Razorpay webhook.
   - `refresh_kyc_status(franchisee_id)` polls Razorpay for current
     account status when webhooks aren't trusted.
-  - End-to-end UX: admin fills business details (business_type, PAN,
-    GSTIN, etc.) via the Edit dialog on `/admin/franchisees/[id]`,
-    clicks "Start Razorpay onboarding"; backend creates the linked
-    account; Razorpay emails the franchisee a KYC invite directly;
-    webhook handlers advance status as Razorpay progresses the KYC.
+  - **Post-create KYC submission chain** (API-driven, bypasses the
+    Razorpay dashboard's broken KYC Form): `ensure_product_config`
+    POSTs `/v2/accounts/{id}/products` and persists the returned
+    `product_id` on `Franchisee.razorpay_product_id`; `submit_bank_details`
+    PATCHes the product config with `settlements` from the franchisee's
+    bank fields; `add_stakeholder` POSTs to `/stakeholders` and mirrors
+    the result into `FranchiseeStakeholder`. The top-level
+    `submit_kyc(franchisee_id)` orchestrates ensure_product_config +
+    submit_bank_details + fetch, returning `{activation_status,
+    requirements[], stakeholder_count}`. `reconcile_razorpay` back-fills
+    product_id + stakeholder rows for accounts pushed to Razorpay outside
+    this flow (e.g. via one-off scripts). Razorpay's dashboard KYC Form
+    omits stakeholder entry for `business_type=not_yet_registered`
+    (proprietorship), so the API path is the only way to get past
+    `activation_status: created` for those accounts.
+  - End-to-end UX: admin fills Business Details (business_type, address,
+    city, state, pincode, bank) + adds at least one Stakeholder on
+    `/admin/franchisees/[id]`, clicks "Start Razorpay onboarding" (creates
+    linked account), then "Submit for KYC" (submits product config +
+    bank). Razorpay's review team then advances the account through
+    `under_review` → `activated`; our `handle_account_webhook` catches
+    the transitions.
 - **`franchisee_settlement_service.py`** - **Post-session franchisee payout**
   - `process_settlement(transaction_id)` runs from `transaction_finalizer`
     right after `process_qr_session_billing` returns (refund already

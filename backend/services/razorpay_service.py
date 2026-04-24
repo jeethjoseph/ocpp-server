@@ -482,6 +482,84 @@ class RazorpayService:
             logger.error("Failed to fetch account %s: %s", account_id, e)
             raise
 
+    # ─── Route product configuration + stakeholders (KYC submission) ───
+
+    def request_product_configuration(
+        self, account_id: str, data: Dict
+    ) -> Dict:
+        """POST /v2/accounts/{id}/products — create a product config.
+        Minimal body is ``{product_name, tnc_accepted, ip?}``; other config
+        (settlements, payment_methods, refund, etc.) is PATCH-only."""
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        try:
+            return self.client.product.requestProductConfiguration(
+                account_id, data
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to request product config for %s: %s", account_id, e
+            )
+            raise
+
+    def edit_product_configuration(
+        self, account_id: str, product_id: str, data: Dict
+    ) -> Dict:
+        """PATCH /v2/accounts/{id}/products/{product_id} — update bank,
+        payment_methods, refund, notifications, checkout, etc."""
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        try:
+            return self.client.product.edit(account_id, product_id, data)
+        except Exception as e:
+            logger.error(
+                "Failed to edit product %s for %s: %s",
+                product_id, account_id, e,
+            )
+            raise
+
+    def fetch_product_configuration(
+        self, account_id: str, product_id: str
+    ) -> Dict:
+        """GET /v2/accounts/{id}/products/{product_id} — read
+        ``activation_status`` and outstanding ``requirements[]``."""
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        try:
+            return self.client.product.fetch(account_id, product_id)
+        except Exception as e:
+            logger.error(
+                "Failed to fetch product %s for %s: %s",
+                product_id, account_id, e,
+            )
+            raise
+
+    def create_stakeholder(self, account_id: str, data: Dict) -> Dict:
+        """POST /v2/accounts/{id}/stakeholders — add a
+        director/proprietor. Razorpay requires at least one stakeholder
+        to clear the ``name`` requirement on product config."""
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        try:
+            return self.client.stakeholder.create(account_id, data)
+        except Exception as e:
+            logger.error(
+                "Failed to create stakeholder on %s: %s", account_id, e
+            )
+            raise
+
+    def list_stakeholders(self, account_id: str) -> Dict:
+        """GET /v2/accounts/{id}/stakeholders — list all."""
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        try:
+            return self.client.stakeholder.all(account_id)
+        except Exception as e:
+            logger.error(
+                "Failed to list stakeholders on %s: %s", account_id, e
+            )
+            raise
+
     def create_transfer(
         self,
         account_id: str,

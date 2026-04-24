@@ -13,6 +13,7 @@ from tortoise.transactions import in_transaction
 
 from models import (
     Franchisee, FranchiseeStatusEnum, FranchiseeBusinessTypeEnum,
+    FranchiseeStakeholder,
     CommissionAuditLog, CommissionChangeReasonEnum, CommissionLedgerEntry,
     SettlementStatusEnum,
     ChargingStation, User, UserRoleEnum,
@@ -48,6 +49,9 @@ class FranchiseeUpdate(BaseModel):
     state: Optional[str] = None
     state_code: Optional[str] = None
     pincode: Optional[str] = None
+    bank_account_name: Optional[str] = None
+    bank_account_number: Optional[str] = None
+    bank_ifsc_code: Optional[str] = None
     notes: Optional[str] = None
 
 
@@ -82,13 +86,20 @@ class FranchiseeResponse(BaseModel):
     state: Optional[str] = None
     state_code: Optional[str] = None
     pincode: Optional[str] = None
+    bank_account_name: Optional[str] = None
+    bank_account_number: Optional[str] = None
+    bank_ifsc_code: Optional[str] = None
     commission_percent: Decimal
     tds_rate_percent: Decimal
     status: str
     status_reason: Optional[str] = None
     razorpay_account_id: Optional[str] = None
     razorpay_account_status: Optional[str] = None
+    razorpay_product_id: Optional[str] = None
     razorpay_onboarding_url: Optional[str] = None
+    bank_account_name: Optional[str] = None
+    bank_account_number: Optional[str] = None
+    bank_ifsc_code: Optional[str] = None
     station_count: int = 0
     activated_at: Optional[datetime] = None
     created_at: datetime
@@ -149,7 +160,11 @@ async def _franchisee_to_response(f: Franchisee) -> dict:
         "status_reason": f.status_reason,
         "razorpay_account_id": f.razorpay_account_id,
         "razorpay_account_status": f.razorpay_account_status,
+        "razorpay_product_id": f.razorpay_product_id,
         "razorpay_onboarding_url": f.razorpay_onboarding_url,
+        "bank_account_name": f.bank_account_name,
+        "bank_account_number": f.bank_account_number,
+        "bank_ifsc_code": f.bank_ifsc_code,
         "station_count": station_count,
         "activated_at": f.activated_at,
         "created_at": f.created_at,
@@ -802,3 +817,174 @@ async def get_kyc_status(
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# ─── Stakeholders + KYC submission ──────────────────────────────────
+
+class StakeholderCreate(BaseModel):
+    name: str
+    email: EmailStr
+    phone_primary: Optional[str] = None
+    relationship_director: bool = True
+    relationship_executive: bool = True
+    pan_number: Optional[str] = None
+
+
+class StakeholderResponse(BaseModel):
+    id: int
+    razorpay_stakeholder_id: Optional[str] = None
+    name: str
+    email: str
+    phone_primary: Optional[str] = None
+    relationship_director: bool
+    relationship_executive: bool
+    pan_number: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ReconcileRequest(BaseModel):
+    razorpay_product_id: Optional[str] = None
+    razorpay_stakeholder_ids: Optional[List[str]] = None
+
+
+def _stakeholder_to_response(s: FranchiseeStakeholder) -> dict:
+    return {
+        "id": s.id,
+        "razorpay_stakeholder_id": s.razorpay_stakeholder_id,
+        "name": s.name,
+        "email": s.email,
+        "phone_primary": s.phone_primary,
+        "relationship_director": s.relationship_director,
+        "relationship_executive": s.relationship_executive,
+        "pan_number": s.pan_number,
+        "created_at": s.created_at,
+    }
+
+
+@router.get("/{franchisee_id}/stakeholders", response_model=List[StakeholderResponse])
+async def list_stakeholders(
+    franchisee_id: int,
+    _admin: User = Depends(require_admin()),
+):
+    """List stakeholders registered for a franchisee."""
+    franchisee = await Franchisee.filter(id=franchisee_id).first()
+    if not franchisee:
+        raise HTTPException(status_code=404, detail="Franchisee not found")
+    rows = await FranchiseeStakeholder.filter(
+        franchisee_id=franchisee_id
+    ).order_by("id")
+    return [_stakeholder_to_response(s) for s in rows]
+
+
+@router.post("/{franchisee_id}/stakeholders", response_model=StakeholderResponse)
+async def create_stakeholder(
+    franchisee_id: int,
+    body: StakeholderCreate,
+    admin: User = Depends(require_admin()),
+):
+    """Create a stakeholder on Razorpay + persist locally."""
+    from services.franchisee_onboarding_service import FranchiseeOnboardingService
+
+    try:
+        row = await FranchiseeOnboardingService.add_stakeholder(
+            franchisee_id, body.model_dump(exclude_none=True)
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except (RazorpayBadRequestError, RazorpayServerError, RazorpayGatewayError) as e:
+        logger.exception(
+            "Razorpay rejected stakeholder create for franchisee %s", franchisee_id
+        )
+        raise HTTPException(status_code=400, detail=f"Razorpay: {e}")
+
+    await log_audit_event(
+        actor_type="admin",
+        actor=admin,
+        action="franchisee.stakeholder_created",
+        entity_type="franchisee",
+        entity_id=str(franchisee_id),
+        changes={
+            "stakeholder_id": row.id,
+            "razorpay_stakeholder_id": row.razorpay_stakeholder_id,
+        },
+    )
+    return _stakeholder_to_response(row)
+
+
+@router.post("/{franchisee_id}/submit-kyc")
+async def submit_kyc(
+    franchisee_id: int,
+    admin: User = Depends(require_admin()),
+):
+    """Ensure product config + submit bank settlements. Returns the
+    resulting ``activation_status`` and outstanding ``requirements``
+    from Razorpay so the admin UI can show what (if anything) Razorpay
+    is waiting on next."""
+    from services.franchisee_onboarding_service import FranchiseeOnboardingService
+
+    try:
+        result = await FranchiseeOnboardingService.submit_kyc(franchisee_id)
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except (RazorpayBadRequestError, RazorpayServerError, RazorpayGatewayError) as e:
+        logger.exception(
+            "Razorpay rejected KYC submit for franchisee %s", franchisee_id
+        )
+        raise HTTPException(status_code=400, detail=f"Razorpay: {e}")
+
+    await log_audit_event(
+        actor_type="admin",
+        actor=admin,
+        action="franchisee.kyc_submitted",
+        entity_type="franchisee",
+        entity_id=str(franchisee_id),
+        changes={
+            "product_id": result.get("product_id"),
+            "activation_status": result.get("activation_status"),
+            "requirements_count": len(result.get("requirements") or []),
+        },
+    )
+    return result
+
+
+@router.post("/{franchisee_id}/reconcile-razorpay")
+async def reconcile_razorpay(
+    franchisee_id: int,
+    body: ReconcileRequest,
+    admin: User = Depends(require_admin()),
+):
+    """One-off reconciliation for accounts pushed to Razorpay outside
+    our normal flow (staging account ``acc_Sg73UwyOU3jziR`` is the
+    motivating example). Stores ``razorpay_product_id`` on the
+    franchisee and mirrors existing stakeholders into our local table
+    without re-creating them on Razorpay.
+    """
+    from services.franchisee_onboarding_service import FranchiseeOnboardingService
+
+    try:
+        result = await FranchiseeOnboardingService.reconcile_razorpay(
+            franchisee_id,
+            razorpay_product_id=body.razorpay_product_id,
+            razorpay_stakeholder_ids=body.razorpay_stakeholder_ids,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    await log_audit_event(
+        actor_type="admin",
+        actor=admin,
+        action="franchisee.razorpay_reconciled",
+        entity_type="franchisee",
+        entity_id=str(franchisee_id),
+        changes=result,
+    )
+    return result

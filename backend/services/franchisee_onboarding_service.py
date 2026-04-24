@@ -10,6 +10,7 @@ from typing import Dict, Optional
 
 from models import (
     Franchisee,
+    FranchiseeStakeholder,
     FranchiseeStatusEnum,
 )
 
@@ -277,3 +278,243 @@ class FranchiseeOnboardingService:
         )
 
         return account
+
+    # ─── Post-create KYC submission chain ──────────────────────────────
+    # After ``create_linked_account`` returns an ``acc_xxx`` in status
+    # ``created``, the account still needs (1) a product config, (2) bank
+    # settlement details, and (3) at least one stakeholder before Razorpay
+    # will accept the account into their review queue. The methods below
+    # drive that chain without requiring the admin to touch Razorpay's
+    # dashboard.
+
+    @staticmethod
+    async def ensure_product_config(franchisee_id: int) -> str:
+        """Return the franchisee's Route product_id, creating the product
+        config on Razorpay if one doesn't exist yet. Idempotent: safe to
+        call multiple times."""
+        from services.razorpay_service import razorpay_service
+
+        franchisee = await Franchisee.filter(id=franchisee_id).first()
+        if not franchisee:
+            raise ValueError(f"Franchisee {franchisee_id} not found")
+        if not franchisee.razorpay_account_id:
+            raise RuntimeError(
+                "Franchisee has no Razorpay account. Run onboarding first."
+            )
+        if franchisee.razorpay_product_id:
+            return franchisee.razorpay_product_id
+
+        result = razorpay_service.request_product_configuration(
+            franchisee.razorpay_account_id,
+            {"product_name": "route", "tnc_accepted": True},
+        )
+        product_id = result.get("id")
+        if not product_id:
+            raise RuntimeError(
+                "Razorpay product creation returned no id: %s" % result
+            )
+        await Franchisee.filter(id=franchisee_id).update(
+            razorpay_product_id=product_id,
+        )
+        logger.info(
+            "Product config created for franchisee %s: %s",
+            franchisee_id, product_id,
+        )
+        return product_id
+
+    @staticmethod
+    async def submit_bank_details(franchisee_id: int) -> Dict:
+        """PATCH the product config with the franchisee's bank account.
+        Requires bank fields to be populated on the Franchisee record."""
+        from services.razorpay_service import razorpay_service
+
+        franchisee = await Franchisee.filter(id=franchisee_id).first()
+        if not franchisee:
+            raise ValueError(f"Franchisee {franchisee_id} not found")
+        if not franchisee.razorpay_product_id:
+            raise RuntimeError(
+                "No product config. Call ensure_product_config first."
+            )
+
+        missing = [
+            f for f in ("bank_ifsc_code", "bank_account_number", "bank_account_name")
+            if not getattr(franchisee, f)
+        ]
+        if missing:
+            raise RuntimeError(
+                "Franchisee is missing bank fields: " + ", ".join(missing)
+            )
+
+        result = razorpay_service.edit_product_configuration(
+            franchisee.razorpay_account_id,
+            franchisee.razorpay_product_id,
+            {
+                "settlements": {
+                    "account_number": franchisee.bank_account_number,
+                    "ifsc_code": franchisee.bank_ifsc_code,
+                    "beneficiary_name": franchisee.bank_account_name,
+                }
+            },
+        )
+        logger.info(
+            "Bank details submitted for franchisee %s: activation_status=%s",
+            franchisee_id, result.get("activation_status"),
+        )
+        return result
+
+    @staticmethod
+    async def add_stakeholder(
+        franchisee_id: int, payload: Dict
+    ) -> FranchiseeStakeholder:
+        """Create a stakeholder on Razorpay + persist locally.
+
+        ``payload`` must contain at least ``name`` and ``email``. Optional:
+        ``phone_primary``, ``relationship_director`` (default True),
+        ``relationship_executive`` (default True), ``pan_number``.
+        """
+        from services.razorpay_service import razorpay_service
+
+        franchisee = await Franchisee.filter(id=franchisee_id).first()
+        if not franchisee:
+            raise ValueError(f"Franchisee {franchisee_id} not found")
+        if not franchisee.razorpay_account_id:
+            raise RuntimeError(
+                "Franchisee has no Razorpay account. Run onboarding first."
+            )
+
+        name = (payload.get("name") or "").strip()
+        email = (payload.get("email") or "").strip()
+        if not name or not email:
+            raise RuntimeError("Stakeholder name and email are required")
+
+        director = payload.get("relationship_director", True)
+        executive = payload.get("relationship_executive", True)
+        phone = payload.get("phone_primary")
+
+        rzp_payload: Dict = {
+            "name": name,
+            "email": email,
+            "relationship": {"director": director, "executive": executive},
+        }
+        if phone:
+            rzp_payload["phone"] = {"primary": phone}
+
+        result = razorpay_service.create_stakeholder(
+            franchisee.razorpay_account_id, rzp_payload
+        )
+        stakeholder_id = result.get("id")
+
+        row = await FranchiseeStakeholder.create(
+            franchisee=franchisee,
+            razorpay_stakeholder_id=stakeholder_id,
+            name=name,
+            email=email,
+            phone_primary=phone,
+            relationship_director=director,
+            relationship_executive=executive,
+            pan_number=payload.get("pan_number"),
+        )
+        logger.info(
+            "Stakeholder created for franchisee %s: %s",
+            franchisee_id, stakeholder_id,
+        )
+        return row
+
+    @staticmethod
+    async def submit_kyc(franchisee_id: int) -> Dict:
+        """Orchestrate: ensure product config → submit bank → re-fetch.
+        Returns a summary dict with ``activation_status`` and
+        ``requirements`` for the admin UI toast.
+        """
+        from services.razorpay_service import razorpay_service
+
+        franchisee = await Franchisee.filter(id=franchisee_id).first()
+        if not franchisee:
+            raise ValueError(f"Franchisee {franchisee_id} not found")
+        if not franchisee.razorpay_account_id:
+            raise RuntimeError(
+                "Franchisee has no Razorpay account. Run onboarding first."
+            )
+
+        stakeholder_count = await FranchiseeStakeholder.filter(
+            franchisee_id=franchisee_id
+        ).count()
+        if stakeholder_count == 0:
+            raise RuntimeError(
+                "Razorpay requires at least one stakeholder before KYC "
+                "submission. Add a stakeholder first."
+            )
+
+        product_id = await FranchiseeOnboardingService.ensure_product_config(
+            franchisee_id
+        )
+        await FranchiseeOnboardingService.submit_bank_details(franchisee_id)
+        final = razorpay_service.fetch_product_configuration(
+            franchisee.razorpay_account_id, product_id
+        )
+
+        return {
+            "product_id": product_id,
+            "activation_status": final.get("activation_status"),
+            "requirements": final.get("requirements") or [],
+            "stakeholder_count": stakeholder_count,
+        }
+
+    @staticmethod
+    async def reconcile_razorpay(
+        franchisee_id: int,
+        razorpay_product_id: Optional[str] = None,
+        razorpay_stakeholder_ids: Optional[list] = None,
+    ) -> Dict:
+        """Back-reconcile an account that was pushed to Razorpay outside
+        the normal flow (e.g. via a one-off script or the Razorpay
+        dashboard). Stores product_id + creates stakeholder rows that
+        point at existing Razorpay stakeholders without re-creating them.
+        """
+        franchisee = await Franchisee.filter(id=franchisee_id).first()
+        if not franchisee:
+            raise ValueError(f"Franchisee {franchisee_id} not found")
+
+        updates: Dict = {}
+        if razorpay_product_id and not franchisee.razorpay_product_id:
+            updates["razorpay_product_id"] = razorpay_product_id
+        if updates:
+            await Franchisee.filter(id=franchisee_id).update(**updates)
+
+        created = 0
+        for sid in razorpay_stakeholder_ids or []:
+            existing = await FranchiseeStakeholder.filter(
+                razorpay_stakeholder_id=sid
+            ).first()
+            if existing:
+                continue
+            # Fetch details from Razorpay so we can populate the local row
+            # faithfully. Cheap GET; skip on failure.
+            from services.razorpay_service import razorpay_service
+            try:
+                remote = razorpay_service.client.stakeholder.fetch(
+                    franchisee.razorpay_account_id, sid
+                )
+            except Exception as e:
+                logger.warning(
+                    "reconcile: could not fetch stakeholder %s: %s", sid, e
+                )
+                continue
+            rel = remote.get("relationship") or {}
+            phone = (remote.get("phone") or {}).get("primary")
+            await FranchiseeStakeholder.create(
+                franchisee=franchisee,
+                razorpay_stakeholder_id=sid,
+                name=remote.get("name") or "Unknown",
+                email=remote.get("email") or "",
+                phone_primary=phone,
+                relationship_director=rel.get("director", True),
+                relationship_executive=rel.get("executive", True),
+            )
+            created += 1
+
+        return {
+            "franchisee_id": franchisee_id,
+            "razorpay_product_id": franchisee.razorpay_product_id or razorpay_product_id,
+            "stakeholders_reconciled": created,
+        }

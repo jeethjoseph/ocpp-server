@@ -1,6 +1,11 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { franchiseeService } from "@/lib/api-services";
-import { FranchiseeCreate, FranchiseeUpdate, CommissionUpdate } from "@/types/api";
+import {
+  FranchiseeCreate,
+  FranchiseeUpdate,
+  CommissionUpdate,
+  StakeholderCreate,
+} from "@/types/api";
 import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
 
@@ -15,6 +20,8 @@ export const franchiseeKeys = {
     [...franchiseeKeys.detail(id), "stations"] as const,
   commissionHistory: (id: number) =>
     [...franchiseeKeys.detail(id), "commission-history"] as const,
+  stakeholders: (id: number) =>
+    [...franchiseeKeys.detail(id), "stakeholders"] as const,
 };
 
 export function useFranchisees(
@@ -188,6 +195,57 @@ export function useOnboardRazorpay() {
     onError: (err) => {
       const msg = err instanceof Error ? err.message : String(err);
       toast.error(`Razorpay onboarding failed: ${msg}`);
+    },
+  });
+}
+
+export function useFranchiseeStakeholders(id: number) {
+  const { isAuthReady } = useAuth();
+  return useQuery({
+    queryKey: franchiseeKeys.stakeholders(id),
+    queryFn: () => franchiseeService.listStakeholders(id),
+    enabled: isAuthReady && !!id,
+  });
+}
+
+export function useCreateStakeholder(id: number) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (body: StakeholderCreate) =>
+      franchiseeService.createStakeholder(id, body),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: franchiseeKeys.stakeholders(id) });
+      toast.success("Stakeholder added.");
+    },
+    onError: (err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error(`Could not add stakeholder: ${msg}`);
+    },
+  });
+}
+
+export function useSubmitKYC() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => franchiseeService.submitKYC(id),
+    onSuccess: (res, id) => {
+      queryClient.invalidateQueries({ queryKey: franchiseeKeys.detail(id) });
+      const reqs = res.requirements?.length ?? 0;
+      if (reqs === 0) {
+        toast.success(
+          `KYC submitted to Razorpay (status: ${res.activation_status}).`
+        );
+      } else {
+        toast.warning(
+          `KYC submitted. Razorpay still needs ${reqs} item(s): ${res.requirements
+            .map((r) => r.field_reference)
+            .join(", ")}`
+        );
+      }
+    },
+    onError: (err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error(`KYC submit failed: ${msg}`);
     },
   });
 }

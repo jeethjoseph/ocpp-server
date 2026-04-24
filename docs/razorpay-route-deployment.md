@@ -132,14 +132,17 @@ Then print fresh QR stickers and coordinate station visits to swap. This is a fi
 4. Click **Start Razorpay onboarding**. Backend hits `POST /api/admin/franchisees/<id>/onboard-razorpay`.
    - Expected: HTTP 200 with `id: "acc_..."` in the response and the account status reads `created`.
    - If HTTP 400 with "business_type must be set..." — step 2 was skipped.
-5. Razorpay emails the franchisee a KYC invite. Verify with the franchisee that the email arrived; if not, contact the Razorpay partner manager — your account may need "auto-KYC-email" enabled.
-6. Franchisee completes KYC on Razorpay's hosted flow. Our webhook handlers advance `Franchisee.status` through:
+5. Fill **bank account details** (Beneficiary Name, IFSC, Account Number) in the same Business Details edit dialog. These are required for Step 7.
+6. In the **Stakeholders** card, click **Add Stakeholder** and register the proprietor/director (Name + Email are required; Phone and PAN optional). Razorpay needs at least one stakeholder before KYC can be submitted.
+7. Click **Submit for KYC**. Backend hits `POST /api/admin/franchisees/<id>/submit-kyc` — creates a product config, submits bank settlements, and returns the current `activation_status` + `requirements[]`. Account moves from `created` → `needs_clarification` / `under_review`.
+   - Razorpay does NOT auto-email franchisees for this flow on your current partner setup. Once the account status becomes `activated`, toggle **Dashboard Access** on in the Razorpay partner dashboard (manual step — no API) if the franchisee needs dashboard login.
+8. Razorpay's human review then advances the account. Our webhook handlers advance `Franchisee.status` through:
    - `account.activated_kyc_pending` → `KYC_UNDER_REVIEW`, `transfers_enabled=false`
    - `account.under_review` → `KYC_UNDER_REVIEW`
    - `account.needs_clarification` → `KYC_NEEDS_CLARIFICATION` (admin prompts franchisee to fix)
    - `account.activated` / `account.instantly_activated` → `ACTIVE`, `transfers_enabled=true`
    - `account.rejected` → back to `DRAFT`, `transfers_enabled=false`
-7. Once `status=ACTIVE`, the franchisee can receive Route transfers.
+9. Once `status=ACTIVE`, the franchisee can receive Route transfers.
 
 ---
 

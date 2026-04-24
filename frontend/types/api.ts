@@ -533,7 +533,11 @@ export interface Franchisee {
   status_reason?: string | null;
   razorpay_account_id?: string | null;
   razorpay_account_status?: string | null;
+  razorpay_product_id?: string | null;
   razorpay_onboarding_url?: string | null;
+  bank_account_name?: string | null;
+  bank_account_number?: string | null;
+  bank_ifsc_code?: string | null;
   station_count: number;
   activated_at?: string | null;
   created_at: string;
@@ -564,7 +568,43 @@ export interface FranchiseeUpdate {
   state?: string;
   state_code?: string;
   pincode?: string;
+  bank_account_name?: string;
+  bank_account_number?: string;
+  bank_ifsc_code?: string;
   notes?: string;
+}
+
+export interface FranchiseeStakeholder {
+  id: number;
+  razorpay_stakeholder_id: string | null;
+  name: string;
+  email: string;
+  phone_primary?: string | null;
+  relationship_director: boolean;
+  relationship_executive: boolean;
+  pan_number?: string | null;
+  created_at: string;
+}
+
+export interface StakeholderCreate {
+  name: string;
+  email: string;
+  phone_primary?: string;
+  relationship_director?: boolean;
+  relationship_executive?: boolean;
+  pan_number?: string;
+}
+
+export interface SubmitKYCResponse {
+  product_id: string;
+  activation_status: string;
+  requirements: Array<{
+    field_reference: string;
+    status: string;
+    reason_code: string;
+    resolution_url?: string;
+  }>;
+  stakeholder_count: number;
 }
 
 export interface FranchiseeListResponse {

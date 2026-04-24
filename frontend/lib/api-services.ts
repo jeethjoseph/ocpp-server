@@ -20,6 +20,9 @@ import {
   FranchiseeCreate,
   FranchiseeUpdate,
   FranchiseeListResponse,
+  FranchiseeStakeholder,
+  StakeholderCreate,
+  SubmitKYCResponse,
   CommissionUpdate,
   CommissionAuditEntry,
   FranchiseeStation,
@@ -757,6 +760,23 @@ export const franchiseeService = {
       status?: string;
       razorpay_onboarding_url?: string | null;
     }>(`/api/admin/franchisees/${id}/onboard-razorpay`, {}),
+
+  listStakeholders: (id: number) =>
+    api.get<FranchiseeStakeholder[]>(
+      `/api/admin/franchisees/${id}/stakeholders`
+    ),
+
+  createStakeholder: (id: number, body: StakeholderCreate) =>
+    api.post<FranchiseeStakeholder>(
+      `/api/admin/franchisees/${id}/stakeholders`,
+      body
+    ),
+
+  submitKYC: (id: number) =>
+    api.post<SubmitKYCResponse>(
+      `/api/admin/franchisees/${id}/submit-kyc`,
+      {}
+    ),
 };
 
 // ─── Franchisee Portal Service ─────────────────────────────────────

@@ -10,6 +10,9 @@ import {
   Mail,
   CreditCard,
   Pencil,
+  UserPlus,
+  Send,
+  Users,
 } from "lucide-react";
 
 import { AdminOnly } from "@/components/RoleWrapper";
@@ -41,7 +44,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
-import { CommissionUpdate, FranchiseeUpdate } from "@/types/api";
+import { CommissionUpdate, FranchiseeUpdate, StakeholderCreate } from "@/types/api";
 import {
   useFranchisee,
   useFranchiseeStations,
@@ -52,6 +55,9 @@ import {
   useUnassignStation,
   useResendInvitation,
   useOnboardRazorpay,
+  useFranchiseeStakeholders,
+  useCreateStakeholder,
+  useSubmitKYC,
 } from "@/lib/queries/franchisees";
 import { useStations } from "@/lib/queries/stations";
 
@@ -77,10 +83,14 @@ export default function FranchiseeDetailPage() {
   const [showCommissionDialog, setShowCommissionDialog] = useState(false);
   const [showAssignDialog, setShowAssignDialog] = useState(false);
   const [showBusinessDialog, setShowBusinessDialog] = useState(false);
+  const [showStakeholderDialog, setShowStakeholderDialog] = useState(false);
   const [selectedStationId, setSelectedStationId] = useState<string>("");
 
   const updateFranchisee = useUpdateFranchisee(id);
   const updateCommission = useUpdateCommission(id);
+  const { data: stakeholders } = useFranchiseeStakeholders(id);
+  const createStakeholder = useCreateStakeholder(id);
+  const submitKYC = useSubmitKYC();
   const assignStations = useAssignStations(id);
   const unassignStation = useUnassignStation(id);
   const resendInvitation = useResendInvitation();
@@ -139,6 +149,23 @@ export default function FranchiseeDetailPage() {
     });
   };
 
+  const handleStakeholderCreate = (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const formData = new FormData(e.currentTarget);
+    const payload: StakeholderCreate = {
+      name: String(formData.get("name") || "").trim(),
+      email: String(formData.get("email") || "").trim(),
+      phone_primary: String(formData.get("phone_primary") || "").trim() || undefined,
+      relationship_director: formData.get("relationship_director") === "on",
+      relationship_executive: formData.get("relationship_executive") === "on",
+      pan_number: String(formData.get("pan_number") || "").trim() || undefined,
+    };
+    if (!payload.name || !payload.email) return;
+    createStakeholder.mutate(payload, {
+      onSuccess: () => setShowStakeholderDialog(false),
+    });
+  };
+
   const handleAssignStation = () => {
     if (!selectedStationId) return;
     assignStations.mutate([Number(selectedStationId)], {
@@ -183,6 +210,30 @@ export default function FranchiseeDetailPage() {
             >
               <CreditCard className="w-4 h-4 mr-2" />
               {onboardRazorpay.isPending ? "Starting…" : "Start Razorpay onboarding"}
+            </Button>
+          )}
+          {franchisee.razorpay_account_id && franchisee.status !== "ACTIVE" && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => submitKYC.mutate(id)}
+              disabled={
+                submitKYC.isPending ||
+                !(stakeholders && stakeholders.length > 0) ||
+                !franchisee.bank_account_number ||
+                !franchisee.bank_ifsc_code ||
+                !franchisee.bank_account_name
+              }
+              title={
+                !(stakeholders && stakeholders.length > 0)
+                  ? "Add at least one stakeholder first"
+                  : !franchisee.bank_account_number || !franchisee.bank_ifsc_code || !franchisee.bank_account_name
+                  ? "Fill bank details first"
+                  : "Submit product config + bank details to Razorpay for KYC review"
+              }
+            >
+              <Send className="w-4 h-4 mr-2" />
+              {submitKYC.isPending ? "Submitting…" : "Submit for KYC"}
             </Button>
           )}
           <Badge
@@ -276,11 +327,85 @@ export default function FranchiseeDetailPage() {
               <span className="text-muted-foreground">Razorpay Account:</span>{" "}
               {franchisee.razorpay_account_id || "Not linked"}
             </div>
+            <div>
+              <span className="text-muted-foreground">Razorpay Product:</span>{" "}
+              {franchisee.razorpay_product_id || "Not submitted"}
+            </div>
+            <div>
+              <span className="text-muted-foreground">Bank Beneficiary:</span>{" "}
+              {franchisee.bank_account_name || "Not set"}
+            </div>
+            <div>
+              <span className="text-muted-foreground">Bank IFSC:</span>{" "}
+              {franchisee.bank_ifsc_code || "Not set"}
+            </div>
+            <div>
+              <span className="text-muted-foreground">Bank Account:</span>{" "}
+              {franchisee.bank_account_number
+                ? `••••${franchisee.bank_account_number.slice(-4)}`
+                : "Not set"}
+            </div>
             {franchisee.notes && (
               <div className="col-span-2">
                 <span className="text-muted-foreground">Notes:</span>{" "}
                 {franchisee.notes}
               </div>
+            )}
+          </CardContent>
+        </Card>
+
+        {/* Stakeholders */}
+        <Card>
+          <CardHeader className="flex flex-row items-center justify-between">
+            <CardTitle className="flex items-center gap-2">
+              <Users className="w-4 h-4" /> Stakeholders
+            </CardTitle>
+            <Button size="sm" onClick={() => setShowStakeholderDialog(true)}>
+              <UserPlus className="w-4 h-4 mr-1" /> Add Stakeholder
+            </Button>
+          </CardHeader>
+          <CardContent>
+            {!stakeholders || stakeholders.length === 0 ? (
+              <p className="text-muted-foreground text-center py-4 text-sm">
+                No stakeholders yet. Razorpay requires at least one stakeholder
+                before KYC can be submitted.
+              </p>
+            ) : (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Name</TableHead>
+                    <TableHead>Email</TableHead>
+                    <TableHead>Phone</TableHead>
+                    <TableHead>Razorpay ID</TableHead>
+                    <TableHead>Roles</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {stakeholders.map((s) => (
+                    <TableRow key={s.id}>
+                      <TableCell className="font-medium">{s.name}</TableCell>
+                      <TableCell className="text-sm text-muted-foreground">
+                        {s.email}
+                      </TableCell>
+                      <TableCell className="text-sm text-muted-foreground">
+                        {s.phone_primary || "-"}
+                      </TableCell>
+                      <TableCell className="text-xs font-mono text-muted-foreground">
+                        {s.razorpay_stakeholder_id || "—"}
+                      </TableCell>
+                      <TableCell className="space-x-1">
+                        {s.relationship_director && (
+                          <Badge variant="secondary" className="text-xs">director</Badge>
+                        )}
+                        {s.relationship_executive && (
+                          <Badge variant="secondary" className="text-xs">executive</Badge>
+                        )}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
             )}
           </CardContent>
         </Card>
@@ -600,6 +725,37 @@ export default function FranchiseeDetailPage() {
                   defaultValue={franchisee.address || ""}
                 />
               </div>
+              <div className="col-span-2 border-t pt-4 mt-2">
+                <h4 className="text-sm font-medium mb-2">Bank Account (for Razorpay settlements)</h4>
+              </div>
+              <div className="space-y-2 col-span-2">
+                <Label htmlFor="bank_account_name">Account Holder Name</Label>
+                <Input
+                  id="bank_account_name"
+                  name="bank_account_name"
+                  defaultValue={franchisee.bank_account_name || ""}
+                  placeholder="Must match cancelled cheque"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="bank_ifsc_code">IFSC Code</Label>
+                <Input
+                  id="bank_ifsc_code"
+                  name="bank_ifsc_code"
+                  defaultValue={franchisee.bank_ifsc_code || ""}
+                  placeholder="SBIN0010570"
+                  maxLength={11}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="bank_account_number">Account Number</Label>
+                <Input
+                  id="bank_account_number"
+                  name="bank_account_number"
+                  defaultValue={franchisee.bank_account_number || ""}
+                  placeholder="Current account"
+                />
+              </div>
               <div className="space-y-2 col-span-2">
                 <Label htmlFor="notes">Notes</Label>
                 <Input
@@ -618,6 +774,58 @@ export default function FranchiseeDetailPage() {
                 </Button>
                 <Button type="submit" disabled={updateFranchisee.isPending}>
                   {updateFranchisee.isPending ? "Saving..." : "Save"}
+                </Button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
+
+        {/* Add Stakeholder Dialog */}
+        <Dialog
+          open={showStakeholderDialog}
+          onOpenChange={setShowStakeholderDialog}
+        >
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Add Stakeholder</DialogTitle>
+            </DialogHeader>
+            <form onSubmit={handleStakeholderCreate} className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="sh_name">Full Name</Label>
+                <Input id="sh_name" name="name" required />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="sh_email">Email</Label>
+                <Input id="sh_email" name="email" type="email" required />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="sh_phone">Primary Phone (optional)</Label>
+                <Input id="sh_phone" name="phone_primary" placeholder="10-digit number" />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="sh_pan">PAN (optional)</Label>
+                <Input id="sh_pan" name="pan_number" placeholder="ABCDE1234F" maxLength={10} />
+              </div>
+              <div className="flex items-center gap-4">
+                <label className="flex items-center gap-2 text-sm">
+                  <input type="checkbox" name="relationship_director" defaultChecked />
+                  Director
+                </label>
+                <label className="flex items-center gap-2 text-sm">
+                  <input type="checkbox" name="relationship_executive" defaultChecked />
+                  Executive
+                </label>
+              </div>
+              <DialogFooter>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setShowStakeholderDialog(false)}
+                >
+                  Cancel
+                </Button>
+                <Button type="submit" disabled={createStakeholder.isPending}>
+                  {createStakeholder.isPending ? "Adding…" : "Add"}
                 </Button>
               </DialogFooter>
             </form>

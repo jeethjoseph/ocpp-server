@@ -587,6 +587,9 @@ class Franchisee(Model):
         max_length=50, unique=True, null=True
     )
     razorpay_account_status = fields.CharField(max_length=50, null=True)
+    # Product configuration id returned by POST /v2/accounts/{id}/products.
+    # Persisted so subsequent PATCH/GET on the product don't need a lookup.
+    razorpay_product_id = fields.CharField(max_length=50, null=True)
     razorpay_onboarding_url = fields.CharField(max_length=500, null=True)
     kyc_submitted_at = fields.DatetimeField(null=True)
     kyc_verified_at = fields.DatetimeField(null=True)
@@ -629,9 +632,42 @@ class Franchisee(Model):
     stations: fields.ReverseRelation["ChargingStation"]
     ledger_entries: fields.ReverseRelation["CommissionLedgerEntry"]
     commission_audit_logs: fields.ReverseRelation["CommissionAuditLog"]
+    stakeholders: fields.ReverseRelation["FranchiseeStakeholder"]
 
     class Meta:
         table = "franchisee"
+
+
+class FranchiseeStakeholder(Model):
+    """Stakeholder (director / proprietor / beneficial owner) linked to a
+    franchisee's Razorpay Route account. Razorpay requires at least one
+    stakeholder to complete KYC submission for any non-individual
+    business_type (proprietorship maps to `not_yet_registered`, which
+    also requires one). One franchisee can have many stakeholders (e.g.
+    multiple directors for a private limited company).
+    """
+
+    id = fields.IntField(pk=True)
+    franchisee = fields.ForeignKeyField(
+        "models.Franchisee", related_name="stakeholders",
+        on_delete=fields.CASCADE,
+    )
+    # Razorpay id (sth_XXX). Null until POST /v2/accounts/{a}/stakeholders
+    # succeeds — a row exists briefly in draft state before the API call.
+    razorpay_stakeholder_id = fields.CharField(
+        max_length=50, unique=True, null=True
+    )
+    name = fields.CharField(max_length=255)
+    email = fields.CharField(max_length=255)
+    phone_primary = fields.CharField(max_length=20, null=True)
+    relationship_director = fields.BooleanField(default=True)
+    relationship_executive = fields.BooleanField(default=True)
+    pan_number = fields.CharField(max_length=10, null=True)
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = "franchisee_stakeholder"
 
 
 class CommissionLedgerEntry(Model):
