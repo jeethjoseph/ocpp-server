@@ -849,6 +849,62 @@ async def delete_razorpay_account(
     return result
 
 
+class RazorpayApiLogResponse(BaseModel):
+    id: int
+    created_at: datetime
+    method: str
+    endpoint: str
+    request_body: Optional[dict] = None
+    response_status: Optional[int] = None
+    response_body: Optional[dict] = None
+    success: bool
+    error_message: Optional[str] = None
+    razorpay_account_id: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+@router.get(
+    "/{franchisee_id}/razorpay-api-logs",
+    response_model=List[RazorpayApiLogResponse],
+)
+async def list_razorpay_api_logs(
+    franchisee_id: int,
+    limit: int = Query(50, ge=1, le=200),
+    _admin: User = Depends(require_admin()),
+):
+    """Return the most recent outbound Razorpay API audit-log rows for
+    this franchisee, newest first. Sensitive fields in the request /
+    response bodies are already masked at write time by
+    ``RazorpayService._mask_sensitive`` — admins see the redacted form."""
+    from models import RazorpayApiLog
+
+    franchisee = await Franchisee.filter(id=franchisee_id).first()
+    if not franchisee:
+        raise HTTPException(status_code=404, detail="Franchisee not found")
+
+    rows = await RazorpayApiLog.filter(
+        franchisee_id=franchisee_id
+    ).order_by("-created_at").limit(limit)
+
+    return [
+        {
+            "id": r.id,
+            "created_at": r.created_at,
+            "method": r.method,
+            "endpoint": r.endpoint,
+            "request_body": r.request_body,
+            "response_status": r.response_status,
+            "response_body": r.response_body,
+            "success": r.success,
+            "error_message": r.error_message,
+            "razorpay_account_id": r.razorpay_account_id,
+        }
+        for r in rows
+    ]
+
+
 @router.get("/{franchisee_id}/kyc-status")
 async def get_kyc_status(
     franchisee_id: int,

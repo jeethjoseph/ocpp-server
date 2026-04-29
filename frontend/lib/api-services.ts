@@ -23,6 +23,7 @@ import {
   FranchiseeStakeholder,
   StakeholderCreate,
   StakeholderUpdate,
+  RazorpayApiLog,
   SubmitKYCResponse,
   CommissionUpdate,
   CommissionAuditEntry,
@@ -796,6 +797,11 @@ export const franchiseeService = {
       razorpay_account_id?: string;
       stakeholders_removed?: number;
     }>(`/api/admin/franchisees/${id}/razorpay-account`),
+
+  listRazorpayApiLogs: (id: number, limit = 50) =>
+    api.get<RazorpayApiLog[]>(
+      `/api/admin/franchisees/${id}/razorpay-api-logs?limit=${limit}`
+    ),
 };
 
 // ─── Franchisee Portal Service ─────────────────────────────────────

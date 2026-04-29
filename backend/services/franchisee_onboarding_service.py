@@ -137,11 +137,17 @@ class FranchiseeOnboardingService:
                 + ", ".join(missing)
             )
 
+        # `reference_id` is unique-per-merchant on Razorpay's side, and
+        # the constraint persists even after `account.delete()` (which
+        # only soft-suspends). Append a UTC epoch suffix so re-onboarding
+        # after a delete doesn't 400 with "This code is already in use".
+        # The franchisee_id is still recoverable from `notes` below.
+        ref_suffix = int(datetime.utcnow().timestamp())
         payload = {
             "email": franchisee.contact_email,
             "phone": franchisee.contact_phone,
             "type": "route",
-            "reference_id": f"franchisee_{franchisee.id}",
+            "reference_id": f"franchisee_{franchisee.id}_{ref_suffix}",
             "legal_business_name": franchisee.business_name,
             "customer_facing_business_name": franchisee.business_name,
             "business_type": business_type,

@@ -17,6 +17,8 @@ export const franchiseeKeys = {
     [...franchiseeKeys.lists(), params] as const,
   details: () => [...franchiseeKeys.all, "detail"] as const,
   detail: (id: number) => [...franchiseeKeys.details(), id] as const,
+  apiLogs: (id: number) =>
+    [...franchiseeKeys.detail(id), "razorpay-api-logs"] as const,
   stations: (id: number) =>
     [...franchiseeKeys.detail(id), "stations"] as const,
   commissionHistory: (id: number) =>
@@ -189,11 +191,16 @@ export function useOnboardRazorpay() {
     onSuccess: (_, id) => {
       queryClient.invalidateQueries({ queryKey: franchiseeKeys.detail(id) });
       queryClient.invalidateQueries({ queryKey: franchiseeKeys.lists() });
+      queryClient.invalidateQueries({ queryKey: franchiseeKeys.apiLogs(id) });
       toast.success(
         "Razorpay onboarding started. The franchisee will receive an email to complete KYC."
       );
     },
-    onError: (err) => {
+    onError: (err, id) => {
+      // Even on error, refresh the audit log so admins can see what
+      // was sent + Razorpay's response in the new "Razorpay API Audit
+      // Log" card on the franchisee detail page.
+      queryClient.invalidateQueries({ queryKey: franchiseeKeys.apiLogs(id) });
       const msg = err instanceof Error ? err.message : String(err);
       toast.error(`Razorpay onboarding failed: ${msg}`);
     },
@@ -253,6 +260,7 @@ export function useDeleteRazorpayAccount(id: number) {
     onSuccess: (res) => {
       queryClient.invalidateQueries({ queryKey: franchiseeKeys.detail(id) });
       queryClient.invalidateQueries({ queryKey: franchiseeKeys.stakeholders(id) });
+      queryClient.invalidateQueries({ queryKey: franchiseeKeys.apiLogs(id) });
       if (res.status === "already_clear") {
         toast.success("Razorpay account already cleared locally.");
       } else {
@@ -270,12 +278,23 @@ export function useDeleteRazorpayAccount(id: number) {
   });
 }
 
+export function useRazorpayApiLogs(id: number, limit = 50) {
+  const { isAuthReady } = useAuth();
+  return useQuery({
+    queryKey: franchiseeKeys.apiLogs(id),
+    queryFn: () => franchiseeService.listRazorpayApiLogs(id, limit),
+    enabled: isAuthReady && !!id,
+    refetchInterval: 10000, // poll every 10s — useful while onboarding is in flight
+  });
+}
+
 export function useSubmitKYC() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (id: number) => franchiseeService.submitKYC(id),
     onSuccess: (res, id) => {
       queryClient.invalidateQueries({ queryKey: franchiseeKeys.detail(id) });
+      queryClient.invalidateQueries({ queryKey: franchiseeKeys.apiLogs(id) });
       const reqs = res.requirements?.length ?? 0;
       if (reqs === 0) {
         toast.success(

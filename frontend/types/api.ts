@@ -622,6 +622,19 @@ export interface StakeholderUpdate {
   residential?: StakeholderResidential;
 }
 
+export interface RazorpayApiLog {
+  id: number;
+  created_at: string;
+  method: string;
+  endpoint: string;
+  request_body?: Record<string, unknown> | null;
+  response_status?: number | null;
+  response_body?: Record<string, unknown> | null;
+  success: boolean;
+  error_message?: string | null;
+  razorpay_account_id?: string | null;
+}
+
 export interface SubmitKYCResponse {
   product_id: string;
   activation_status: string;

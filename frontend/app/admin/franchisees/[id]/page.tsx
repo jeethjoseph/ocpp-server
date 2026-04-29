@@ -1,7 +1,7 @@
 "use client";
 
 import { useParams, useRouter } from "next/navigation";
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import {
   MapPin,
   Percent,
@@ -67,6 +67,7 @@ import {
   useUpdateStakeholder,
   useSubmitKYC,
   useDeleteRazorpayAccount,
+  useRazorpayApiLogs,
 } from "@/lib/queries/franchisees";
 import { useStations } from "@/lib/queries/stations";
 
@@ -106,6 +107,8 @@ export default function FranchiseeDetailPage() {
   const createStakeholder = useCreateStakeholder(id);
   const updateStakeholder = useUpdateStakeholder(id);
   const deleteRazorpayAccount = useDeleteRazorpayAccount(id);
+  const { data: apiLogs } = useRazorpayApiLogs(id);
+  const [expandedLogId, setExpandedLogId] = useState<number | null>(null);
   const submitKYC = useSubmitKYC();
   const assignStations = useAssignStations(id);
   const unassignStation = useUnassignStation(id);
@@ -525,6 +528,117 @@ export default function FranchiseeDetailPage() {
                       </TableCell>
                     </TableRow>
                   ))}
+                </TableBody>
+              </Table>
+            )}
+          </CardContent>
+        </Card>
+
+        {/* Razorpay API Audit Log */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <CreditCard className="w-4 h-4" /> Razorpay API Audit Log
+              <span className="text-xs font-normal text-muted-foreground ml-2">
+                Outbound onboarding-chain calls. PII masked.
+              </span>
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            {!apiLogs || apiLogs.length === 0 ? (
+              <p className="text-muted-foreground text-center py-4 text-sm">
+                No Razorpay API calls have been made for this franchisee yet.
+              </p>
+            ) : (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="w-40">When</TableHead>
+                    <TableHead className="w-20">Method</TableHead>
+                    <TableHead>Endpoint</TableHead>
+                    <TableHead className="w-20">Status</TableHead>
+                    <TableHead>Error</TableHead>
+                    <TableHead className="w-12"></TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {apiLogs.map((log) => {
+                    const expanded = expandedLogId === log.id;
+                    return (
+                      <Fragment key={log.id}>
+                        <TableRow
+                          className="cursor-pointer hover:bg-gray-50"
+                          onClick={() =>
+                            setExpandedLogId(expanded ? null : log.id)
+                          }
+                        >
+                          <TableCell className="text-xs text-muted-foreground">
+                            {new Date(log.created_at).toLocaleString()}
+                          </TableCell>
+                          <TableCell className="text-xs font-mono">
+                            {log.method}
+                          </TableCell>
+                          <TableCell className="text-xs font-mono">
+                            {log.endpoint}
+                          </TableCell>
+                          <TableCell>
+                            <Badge
+                              variant="secondary"
+                              className={
+                                log.success
+                                  ? "bg-green-100 text-green-800 text-xs"
+                                  : "bg-red-100 text-red-800 text-xs"
+                              }
+                            >
+                              {log.response_status ?? (log.success ? "OK" : "ERR")}
+                            </Badge>
+                          </TableCell>
+                          <TableCell className="text-xs text-red-700 max-w-md truncate">
+                            {log.error_message || ""}
+                          </TableCell>
+                          <TableCell className="text-xs text-muted-foreground">
+                            {expanded ? "▼" : "▶"}
+                          </TableCell>
+                        </TableRow>
+                        {expanded && (
+                          <TableRow>
+                            <TableCell colSpan={6} className="bg-gray-50">
+                              <div className="grid grid-cols-2 gap-4 text-xs">
+                                <div>
+                                  <p className="font-medium mb-1">
+                                    Request body
+                                  </p>
+                                  <pre className="bg-white border rounded p-2 overflow-x-auto whitespace-pre-wrap break-all max-h-96">
+                                    {log.request_body
+                                      ? JSON.stringify(
+                                          log.request_body,
+                                          null,
+                                          2
+                                        )
+                                      : "(none)"}
+                                  </pre>
+                                </div>
+                                <div>
+                                  <p className="font-medium mb-1">
+                                    Response body
+                                  </p>
+                                  <pre className="bg-white border rounded p-2 overflow-x-auto whitespace-pre-wrap break-all max-h-96">
+                                    {log.response_body
+                                      ? JSON.stringify(
+                                          log.response_body,
+                                          null,
+                                          2
+                                        )
+                                      : "(none)"}
+                                  </pre>
+                                </div>
+                              </div>
+                            </TableCell>
+                          </TableRow>
+                        )}
+                      </Fragment>
+                    );
+                  })}
                 </TableBody>
               </Table>
             )}
