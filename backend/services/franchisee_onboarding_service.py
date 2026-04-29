@@ -187,7 +187,9 @@ class FranchiseeOnboardingService:
             },
         }
 
-        result = razorpay_service.create_linked_account(payload)
+        result = await razorpay_service.create_linked_account(
+            payload, franchisee_id=franchisee_id
+        )
 
         # Razorpay sometimes silently downgrades the requested
         # ``business_type`` to ``not_yet_registered`` when its
@@ -391,9 +393,10 @@ class FranchiseeOnboardingService:
         if franchisee.razorpay_product_id:
             return franchisee.razorpay_product_id
 
-        result = razorpay_service.request_product_configuration(
+        result = await razorpay_service.request_product_configuration(
             franchisee.razorpay_account_id,
             {"product_name": "route", "tnc_accepted": True},
+            franchisee_id=franchisee_id,
         )
         product_id = result.get("id")
         if not product_id:
@@ -445,13 +448,14 @@ class FranchiseeOnboardingService:
         if franchisee.bank_account_type:
             settlements["account_type"] = franchisee.bank_account_type
 
-        result = razorpay_service.edit_product_configuration(
+        result = await razorpay_service.edit_product_configuration(
             franchisee.razorpay_account_id,
             franchisee.razorpay_product_id,
             {
                 "settlements": settlements,
                 "tnc_accepted": True,
             },
+            franchisee_id=franchisee_id,
         )
         logger.info(
             "Bank details submitted for franchisee %s: activation_status=%s",
@@ -522,8 +526,9 @@ class FranchiseeOnboardingService:
                 }
             }
 
-        result = razorpay_service.create_stakeholder(
-            franchisee.razorpay_account_id, rzp_payload
+        result = await razorpay_service.create_stakeholder(
+            franchisee.razorpay_account_id, rzp_payload,
+            franchisee_id=franchisee_id,
         )
         stakeholder_id = result.get("id")
 
@@ -641,10 +646,11 @@ class FranchiseeOnboardingService:
             }
 
         if rzp_payload:
-            razorpay_service.update_stakeholder(
+            await razorpay_service.update_stakeholder(
                 franchisee.razorpay_account_id,
                 row.razorpay_stakeholder_id,
                 rzp_payload,
+                franchisee_id=franchisee_id,
             )
 
         # Persist locally — only fields the caller actually provided.
@@ -774,4 +780,100 @@ class FranchiseeOnboardingService:
             "franchisee_id": franchisee_id,
             "razorpay_product_id": franchisee.razorpay_product_id or razorpay_product_id,
             "stakeholders_reconciled": created,
+        }
+
+    @staticmethod
+    async def delete_linked_account(franchisee_id: int) -> Dict:
+        """Hard-delete the franchisee's Razorpay linked account and clear
+        local Razorpay state.
+
+        Safety:
+        - Refuses if any ``CommissionLedgerEntry`` exists for the
+          franchisee. There is intentionally NO ``force`` flag — bypassing
+          this check on a franchisee with existing settlements would
+          corrupt the audit trail with no way to reverse the funds-flow.
+          Resolve settlements manually first if a delete is genuinely
+          needed.
+        - Idempotent on re-entry: returns ``{"status": "already_clear"}``
+          when the franchisee has no ``razorpay_account_id``.
+        - Tolerant of Razorpay 404s on the DELETE call (account already
+          gone upstream): proceeds with local cleanup.
+
+        Ordering: Razorpay DELETE first → local cleanup in @atomic. If the
+        local TX fails after the upstream delete, the audit log row for
+        the DELETE is still written so admins can recover by re-running
+        the delete (which then hits the 404-tolerant path) and the local
+        cleanup retries cleanly.
+        """
+        from services.razorpay_service import razorpay_service
+        from models import (
+            CommissionLedgerEntry,
+            FranchiseeStakeholder as _FStakeholder,
+        )
+        from tortoise.transactions import in_transaction
+
+        franchisee = await Franchisee.filter(id=franchisee_id).first()
+        if not franchisee:
+            raise ValueError(f"Franchisee {franchisee_id} not found")
+
+        if not franchisee.razorpay_account_id:
+            return {"status": "already_clear", "franchisee_id": franchisee_id}
+
+        ledger_count = await CommissionLedgerEntry.filter(
+            franchisee_id=franchisee_id
+        ).count()
+        if ledger_count > 0:
+            raise RuntimeError(
+                f"Cannot delete Razorpay account: franchisee has "
+                f"{ledger_count} commission_ledger_entry row(s). Resolve "
+                f"settlements first."
+            )
+
+        former_account_id = franchisee.razorpay_account_id
+
+        # Razorpay DELETE first. Tolerate 404 / "not found" — admin may
+        # be re-running after a partial failure, or the account could
+        # have been deleted out-of-band (Razorpay dashboard).
+        try:
+            await razorpay_service.delete_linked_account(
+                former_account_id, franchisee_id=franchisee_id
+            )
+        except Exception as e:
+            msg = str(e).lower()
+            if "not found" in msg or "404" in msg or "does not exist" in msg:
+                logger.info(
+                    "Razorpay account %s already gone (404) — proceeding "
+                    "with local cleanup.",
+                    former_account_id,
+                )
+            else:
+                raise
+
+        async with in_transaction():
+            stakeholders_removed = await _FStakeholder.filter(
+                franchisee_id=franchisee_id
+            ).delete()
+            await Franchisee.filter(id=franchisee_id).update(
+                razorpay_account_id=None,
+                razorpay_account_status=None,
+                razorpay_product_id=None,
+                razorpay_onboarding_url=None,
+                kyc_verifications=None,
+                kyc_submitted_at=None,
+                kyc_verified_at=None,
+                activated_at=None,
+                status_reason=None,
+                status=FranchiseeStatusEnum.DRAFT,
+            )
+
+        logger.info(
+            "Deleted Razorpay account %s for franchisee %s; %s "
+            "stakeholder(s) removed locally.",
+            former_account_id, franchisee_id, stakeholders_removed,
+        )
+        return {
+            "status": "deleted",
+            "franchisee_id": franchisee_id,
+            "razorpay_account_id": former_account_id,
+            "stakeholders_removed": stakeholders_removed,
         }

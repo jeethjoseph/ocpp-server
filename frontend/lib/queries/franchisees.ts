@@ -246,6 +246,30 @@ export function useUpdateStakeholder(id: number) {
   });
 }
 
+export function useDeleteRazorpayAccount(id: number) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => franchiseeService.deleteRazorpayAccount(id),
+    onSuccess: (res) => {
+      queryClient.invalidateQueries({ queryKey: franchiseeKeys.detail(id) });
+      queryClient.invalidateQueries({ queryKey: franchiseeKeys.stakeholders(id) });
+      if (res.status === "already_clear") {
+        toast.success("Razorpay account already cleared locally.");
+      } else {
+        toast.success(
+          `Razorpay account deleted. ${
+            res.stakeholders_removed ?? 0
+          } stakeholder(s) removed.`
+        );
+      }
+    },
+    onError: (err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error(`Could not delete Razorpay account: ${msg}`);
+    },
+  });
+}
+
 export function useSubmitKYC() {
   const queryClient = useQueryClient();
   return useMutation({

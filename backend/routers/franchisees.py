@@ -808,6 +808,47 @@ async def onboard_to_razorpay(
     return result
 
 
+@router.delete("/{franchisee_id}/razorpay-account")
+async def delete_razorpay_account(
+    franchisee_id: int,
+    admin: User = Depends(require_admin()),
+):
+    """Hard-delete the franchisee's Razorpay linked account and clear
+    local Razorpay state. Refuses if any commission ledger entries
+    exist for the franchisee. Idempotent on re-entry."""
+    from services.franchisee_onboarding_service import FranchiseeOnboardingService
+    from razorpay.errors import (
+        BadRequestError as RazorpayBadRequestError,
+        ServerError as RazorpayServerError,
+        GatewayError as RazorpayGatewayError,
+    )
+
+    try:
+        result = await FranchiseeOnboardingService.delete_linked_account(
+            franchisee_id
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except (RazorpayBadRequestError, RazorpayServerError, RazorpayGatewayError) as e:
+        logger.exception(
+            "Razorpay rejected account delete for franchisee %s",
+            franchisee_id,
+        )
+        raise HTTPException(status_code=502, detail=f"Razorpay: {e}")
+
+    await log_audit_event(
+        actor_type="admin",
+        actor=admin,
+        action="franchisee.razorpay_account_deleted",
+        entity_type="franchisee",
+        entity_id=str(franchisee_id),
+        changes=result,
+    )
+    return result
+
+
 @router.get("/{franchisee_id}/kyc-status")
 async def get_kyc_status(
     franchisee_id: int,

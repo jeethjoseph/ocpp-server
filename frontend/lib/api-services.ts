@@ -788,6 +788,14 @@ export const franchiseeService = {
       `/api/admin/franchisees/${id}/submit-kyc`,
       {}
     ),
+
+  deleteRazorpayAccount: (id: number) =>
+    api.delete<{
+      status: string;
+      franchisee_id: number;
+      razorpay_account_id?: string;
+      stakeholders_removed?: number;
+    }>(`/api/admin/franchisees/${id}/razorpay-account`),
 };
 
 // ─── Franchisee Portal Service ─────────────────────────────────────

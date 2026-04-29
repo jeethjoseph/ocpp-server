@@ -244,6 +244,32 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
     bank). Razorpay's review team then advances the account through
     `under_review` → `activated`; our `handle_account_webhook` catches
     the transitions.
+  - **Outbound API audit log (`razorpay_api_log` table)**: every mutating
+    onboarding-chain SDK call (account / stakeholder / product create /
+    edit / delete) flows through `RazorpayService._audit_call`, which
+    captures request + response body + status + error message into the
+    `razorpay_api_log` table. PII (`pan`, `account_number`, `ifsc_code`,
+    `aadhaar`, `gst`, `gstin`, `tan`, `card_number`) is masked to
+    `***LAST4` via `_mask_sensitive` before persistence. Read-only
+    fetches and high-frequency calls (transfers, refunds, payments, QR)
+    are intentionally NOT logged. Audit-write failures are swallowed so
+    SDK call behaviour is preserved. Counterpart of the inbound
+    `webhook_event` table — together they give end-to-end traceability
+    for any Razorpay-side dispute. Joinable to `franchisee` via
+    `franchisee_id` FK with `ON DELETE SET NULL` (logs survive franchisee
+    deletion).
+  - **Hard-delete a Razorpay linked account**: admins can permanently
+    delete a stuck/misconfigured Razorpay account via the destructive
+    "Delete Razorpay" button on `/admin/franchisees/[id]`. The
+    confirmation dialog requires typing the exact `acc_*` ID. Backend
+    refuses if any `CommissionLedgerEntry` exists for the franchisee
+    (no force flag — fund-flow integrity). Idempotent on already-cleared
+    state and tolerant of Razorpay 404s (account already gone upstream).
+    Endpoint: `DELETE /api/admin/franchisees/{id}/razorpay-account`,
+    orchestrated by `FranchiseeOnboardingService.delete_linked_account`.
+    Razorpay DELETE first, then local cleanup inside `@in_transaction()`:
+    deletes `franchisee_stakeholder` rows, clears all `razorpay_*` /
+    `kyc_*` / `activated_at` fields, resets `status` to `DRAFT`.
 - **`franchisee_settlement_service.py`** - **Post-session franchisee payout**
   - `process_settlement(transaction_id)` runs from `transaction_finalizer`
     right after `process_qr_session_billing` returns (refund already

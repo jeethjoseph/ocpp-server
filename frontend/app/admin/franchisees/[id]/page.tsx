@@ -12,6 +12,7 @@ import {
   Pencil,
   UserPlus,
   Send,
+  Trash2,
   Users,
 } from "lucide-react";
 
@@ -65,6 +66,7 @@ import {
   useCreateStakeholder,
   useUpdateStakeholder,
   useSubmitKYC,
+  useDeleteRazorpayAccount,
 } from "@/lib/queries/franchisees";
 import { useStations } from "@/lib/queries/stations";
 
@@ -95,12 +97,15 @@ export default function FranchiseeDetailPage() {
   const [editingStakeholder, setEditingStakeholder] =
     useState<FranchiseeStakeholder | null>(null);
   const [selectedStationId, setSelectedStationId] = useState<string>("");
+  const [showDeleteRazorpayDialog, setShowDeleteRazorpayDialog] = useState(false);
+  const [deleteRazorpayConfirmInput, setDeleteRazorpayConfirmInput] = useState("");
 
   const updateFranchisee = useUpdateFranchisee(id);
   const updateCommission = useUpdateCommission(id);
   const { data: stakeholders } = useFranchiseeStakeholders(id);
   const createStakeholder = useCreateStakeholder(id);
   const updateStakeholder = useUpdateStakeholder(id);
+  const deleteRazorpayAccount = useDeleteRazorpayAccount(id);
   const submitKYC = useSubmitKYC();
   const assignStations = useAssignStations(id);
   const unassignStation = useUnassignStation(id);
@@ -291,6 +296,20 @@ export default function FranchiseeDetailPage() {
             >
               <Send className="w-4 h-4 mr-2" />
               {submitKYC.isPending ? "Submitting…" : "Submit for KYC"}
+            </Button>
+          )}
+          {franchisee.razorpay_account_id && (
+            <Button
+              variant="destructive"
+              size="sm"
+              onClick={() => {
+                setDeleteRazorpayConfirmInput("");
+                setShowDeleteRazorpayDialog(true);
+              }}
+              title="Permanently delete the Razorpay linked account and clear local Razorpay state. Refused if commission ledger entries exist."
+            >
+              <Trash2 className="w-4 h-4 mr-2" />
+              Delete Razorpay
             </Button>
           )}
           <Badge
@@ -1094,6 +1113,91 @@ export default function FranchiseeDetailPage() {
                 disabled={!selectedStationId || assignStations.isPending}
               >
                 {assignStations.isPending ? "Assigning..." : "Assign"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        {/* Delete Razorpay Account Dialog (typed-confirm) */}
+        <Dialog
+          open={showDeleteRazorpayDialog}
+          onOpenChange={(open) => {
+            setShowDeleteRazorpayDialog(open);
+            if (!open) setDeleteRazorpayConfirmInput("");
+          }}
+        >
+          <DialogContent className="max-w-lg">
+            <DialogHeader>
+              <DialogTitle className="text-red-700">
+                Delete Razorpay Linked Account
+              </DialogTitle>
+            </DialogHeader>
+            <div className="space-y-4 text-sm">
+              <p className="text-red-600 font-medium">
+                This is permanent and cannot be undone.
+              </p>
+              <p className="text-muted-foreground">
+                The Razorpay account will be deleted on Razorpay&apos;s side
+                (irreversible) and the following local fields will be cleared:
+              </p>
+              <ul className="list-disc list-inside text-muted-foreground space-y-0.5">
+                <li>Razorpay account ID, product ID, onboarding URL</li>
+                <li>KYC submission and verification timestamps</li>
+                <li>Razorpay-side verification statuses</li>
+                <li>All local stakeholder rows for this franchisee</li>
+                <li>Status reset to DRAFT</li>
+              </ul>
+              <div className="rounded-md bg-gray-50 px-3 py-2 font-mono text-xs">
+                {franchisee.razorpay_account_id}
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="rzp_delete_confirm">
+                  Type the account ID exactly to enable Delete:
+                </Label>
+                <Input
+                  id="rzp_delete_confirm"
+                  value={deleteRazorpayConfirmInput}
+                  onChange={(e) =>
+                    setDeleteRazorpayConfirmInput(e.target.value)
+                  }
+                  placeholder={franchisee.razorpay_account_id || ""}
+                  autoComplete="off"
+                />
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Refuses if any commission ledger entries exist for this
+                franchisee.
+              </p>
+            </div>
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => {
+                  setShowDeleteRazorpayDialog(false);
+                  setDeleteRazorpayConfirmInput("");
+                }}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                disabled={
+                  deleteRazorpayAccount.isPending ||
+                  deleteRazorpayConfirmInput !==
+                    (franchisee.razorpay_account_id || "")
+                }
+                onClick={() =>
+                  deleteRazorpayAccount.mutate(undefined, {
+                    onSuccess: () => {
+                      setShowDeleteRazorpayDialog(false);
+                      setDeleteRazorpayConfirmInput("");
+                    },
+                  })
+                }
+              >
+                <Trash2 className="w-4 h-4 mr-2" />
+                {deleteRazorpayAccount.isPending ? "Deleting…" : "Delete"}
               </Button>
             </DialogFooter>
           </DialogContent>

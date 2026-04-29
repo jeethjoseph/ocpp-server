@@ -495,6 +495,40 @@ class WebhookEvent(Model):
     class Meta:
         table = "webhook_event"
 
+
+class RazorpayApiLog(Model):
+    """Outbound audit trail for mutating Razorpay onboarding-chain calls.
+
+    Counterpart of ``WebhookEvent`` (which logs inbound). Captures the
+    request body we sent + the response/error we got back, with sensitive
+    fields (PAN, account_number, IFSC, etc.) masked via
+    ``RazorpayService._mask_sensitive``. Read-only fetches and high-volume
+    calls (transfers / refunds / payments / QR) are intentionally NOT
+    logged here — only the onboarding-chain endpoints.
+    """
+
+    id = fields.IntField(pk=True)
+    created_at = fields.DatetimeField(auto_now_add=True, index=True)
+    method = fields.CharField(max_length=10)            # POST | PATCH | DELETE
+    endpoint = fields.CharField(max_length=255)         # e.g. "POST /v2/accounts"
+    request_body = fields.JSONField(null=True)          # masked
+    response_status = fields.IntField(null=True)        # HTTP status; NULL on transport error
+    response_body = fields.JSONField(null=True)         # masked
+    success = fields.BooleanField()
+    error_message = fields.TextField(null=True)
+    # FK with SET NULL so logs survive franchisee deletion but stay joinable.
+    franchisee = fields.ForeignKeyField(
+        "models.Franchisee",
+        related_name="razorpay_api_logs",
+        null=True,
+        on_delete=fields.SET_NULL,
+    )
+    razorpay_account_id = fields.CharField(max_length=50, null=True, index=True)
+
+    class Meta:
+        table = "razorpay_api_log"
+
+
 class ChargerQRCode(Model):
     id = fields.IntField(pk=True)
     charger = fields.ForeignKeyField("models.Charger", related_name="qr_codes")

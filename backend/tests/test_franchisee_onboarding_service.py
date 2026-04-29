@@ -88,13 +88,13 @@ async def test_create_linked_account_payload_keeps_type_route_and_mirrors_addres
 
     captured = {}
 
-    def capture_create(payload):
+    def capture_create(payload, **kwargs):
         captured["payload"] = payload
         return {"id": "acc_test", "status": "created", "business_type": "individual"}
 
     rzp = MagicMock()
     rzp.is_route_enabled.return_value = True
-    rzp.create_linked_account.side_effect = capture_create
+    rzp.create_linked_account = AsyncMock(side_effect=capture_create)
 
     with patch(
         "services.razorpay_service.razorpay_service", rzp
@@ -140,10 +140,10 @@ async def test_create_linked_account_warns_on_business_type_mismatch(ocpp_caplog
 
     rzp = MagicMock()
     rzp.is_route_enabled.return_value = True
-    rzp.create_linked_account.return_value = {
+    rzp.create_linked_account = AsyncMock(return_value={
         "id": "acc_x", "status": "created",
         "business_type": "not_yet_registered",  # <-- mismatch
-    }
+    })
 
     with patch(
         "services.razorpay_service.razorpay_service", rzp
@@ -172,9 +172,9 @@ async def test_submit_bank_details_includes_tnc_and_optional_account_type():
     franchisee.bank_account_type = "savings"
 
     rzp = MagicMock()
-    rzp.edit_product_configuration.return_value = {
+    rzp.edit_product_configuration = AsyncMock(return_value={
         "activation_status": "under_review"
-    }
+    })
 
     with patch("services.razorpay_service.razorpay_service", rzp), patch(
         "models.Franchisee.filter"
@@ -200,7 +200,7 @@ async def test_submit_bank_details_omits_account_type_when_unset():
     franchisee.bank_account_type = None
 
     rzp = MagicMock()
-    rzp.edit_product_configuration.return_value = {}
+    rzp.edit_product_configuration = AsyncMock(return_value={})
 
     with patch("services.razorpay_service.razorpay_service", rzp), patch(
         "models.Franchisee.filter"
@@ -342,3 +342,203 @@ async def test_initiate_transfer_holds_within_24h_of_activation():
     assert captured["settlement_status"] == SettlementStatusEnum.ON_HOLD
     assert captured["failure_reason"] == "cooling_period"
     rzp.create_transfer.assert_not_called()
+
+
+# ─── Audit log writes from the wrappers ─────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_create_linked_account_writes_audit_log_on_success():
+    """Successful SDK call must produce one RazorpayApiLog row with
+    success=True, the masked request body, and the response body."""
+    from services.razorpay_service import RazorpayService
+
+    svc = RazorpayService.__new__(RazorpayService)
+    svc.client = MagicMock()
+    svc.client.account.create.return_value = {"id": "acc_test"}
+
+    captured_log = {}
+
+    async def fake_create(**kw):
+        captured_log.update(kw)
+        return MagicMock()
+
+    fake_log_cls = MagicMock()
+    fake_log_cls.create = AsyncMock(side_effect=fake_create)
+
+    with patch.dict("sys.modules", {}), patch(
+        "models.RazorpayApiLog", fake_log_cls, create=True
+    ):
+        result = await svc.create_linked_account(
+            {"legal_info": {"pan": "BFIPJ6239L"}}, franchisee_id=42
+        )
+
+    assert result == {"id": "acc_test"}
+    fake_log_cls.create.assert_awaited_once()
+    assert captured_log["method"] == "POST"
+    assert captured_log["endpoint"] == "/v2/accounts"
+    assert captured_log["success"] is True
+    assert captured_log["franchisee_id"] == 42
+    # PAN must be masked.
+    assert captured_log["request_body"]["legal_info"]["pan"] == "***239L"
+
+
+@pytest.mark.asyncio
+async def test_create_linked_account_writes_audit_log_on_failure():
+    """SDK exception still writes a row (success=False) and re-raises."""
+    import razorpay
+    from services.razorpay_service import RazorpayService
+
+    svc = RazorpayService.__new__(RazorpayService)
+    svc.client = MagicMock()
+    svc.client.account.create.side_effect = razorpay.errors.BadRequestError(
+        "invalid pan"
+    )
+
+    captured_log = {}
+    fake_log_cls = MagicMock()
+
+    async def fake_create(**kw):
+        captured_log.update(kw)
+        return MagicMock()
+
+    fake_log_cls.create = AsyncMock(side_effect=fake_create)
+
+    with patch("models.RazorpayApiLog", fake_log_cls, create=True):
+        with pytest.raises(razorpay.errors.BadRequestError):
+            await svc.create_linked_account({"legal_info": {"pan": "X"}})
+
+    fake_log_cls.create.assert_awaited_once()
+    assert captured_log["success"] is False
+    assert captured_log["response_status"] == 400
+    assert "invalid pan" in (captured_log["error_message"] or "")
+
+
+@pytest.mark.asyncio
+async def test_audit_call_swallows_audit_write_failure():
+    """If RazorpayApiLog.create itself raises, the SDK return value
+    must still propagate (audit-log failure does not break the SDK call)."""
+    from services.razorpay_service import RazorpayService
+
+    svc = RazorpayService.__new__(RazorpayService)
+    svc.client = MagicMock()
+    svc.client.account.create.return_value = {"id": "acc_ok"}
+
+    fake_log_cls = MagicMock()
+    fake_log_cls.create = AsyncMock(side_effect=RuntimeError("db down"))
+
+    with patch("models.RazorpayApiLog", fake_log_cls, create=True):
+        result = await svc.create_linked_account({"x": "y"})
+
+    assert result == {"id": "acc_ok"}
+
+
+# ─── delete_linked_account orchestration ────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_delete_linked_account_returns_already_clear_when_no_account():
+    franchisee = MagicMock()
+    franchisee.razorpay_account_id = None
+
+    with patch("models.Franchisee.filter") as mock_filter:
+        mock_filter.return_value.first = AsyncMock(return_value=franchisee)
+        result = await FranchiseeOnboardingService.delete_linked_account(7)
+
+    assert result["status"] == "already_clear"
+
+
+@pytest.mark.asyncio
+async def test_delete_linked_account_refuses_when_settlements_exist():
+    franchisee = MagicMock()
+    franchisee.razorpay_account_id = "acc_x"
+
+    with patch("models.Franchisee.filter") as mock_franchisee_filter, patch(
+        "models.CommissionLedgerEntry.filter"
+    ) as mock_entry_filter:
+        mock_franchisee_filter.return_value.first = AsyncMock(
+            return_value=franchisee
+        )
+        mock_entry_filter.return_value.count = AsyncMock(return_value=3)
+
+        with pytest.raises(RuntimeError, match="commission_ledger_entry"):
+            await FranchiseeOnboardingService.delete_linked_account(7)
+
+
+@pytest.mark.asyncio
+async def test_delete_linked_account_clears_local_state_on_success():
+    franchisee = MagicMock()
+    franchisee.razorpay_account_id = "acc_x"
+
+    rzp = MagicMock()
+    rzp.delete_linked_account = AsyncMock(return_value={"deleted": True})
+
+    captured_updates = {}
+    stakeholders_deleted = AsyncMock(return_value=2)
+
+    with patch(
+        "services.razorpay_service.razorpay_service", rzp
+    ), patch("models.Franchisee.filter") as mock_franchisee_filter, patch(
+        "models.CommissionLedgerEntry.filter"
+    ) as mock_entry_filter, patch(
+        "models.FranchiseeStakeholder.filter"
+    ) as mock_stakeholder_filter, patch(
+        "tortoise.transactions.in_transaction"
+    ) as mock_txn:
+        mock_franchisee_filter.return_value.first = AsyncMock(
+            return_value=franchisee
+        )
+        mock_franchisee_filter.return_value.update = AsyncMock(
+            side_effect=lambda **kw: captured_updates.update(kw) or None
+        )
+        mock_entry_filter.return_value.count = AsyncMock(return_value=0)
+        mock_stakeholder_filter.return_value.delete = stakeholders_deleted
+        mock_txn.return_value.__aenter__ = AsyncMock(return_value=None)
+        mock_txn.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        result = await FranchiseeOnboardingService.delete_linked_account(7)
+
+    rzp.delete_linked_account.assert_awaited_once_with(
+        "acc_x", franchisee_id=7
+    )
+    assert result["status"] == "deleted"
+    assert result["razorpay_account_id"] == "acc_x"
+    assert result["stakeholders_removed"] == 2
+    # Local fields cleared.
+    assert captured_updates["razorpay_account_id"] is None
+    assert captured_updates["razorpay_product_id"] is None
+    assert captured_updates["kyc_verifications"] is None
+    assert captured_updates["activated_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_delete_linked_account_tolerates_razorpay_404():
+    """If Razorpay says 'not found' (account already gone upstream),
+    proceed with local cleanup instead of erroring."""
+    franchisee = MagicMock()
+    franchisee.razorpay_account_id = "acc_x"
+
+    rzp = MagicMock()
+    rzp.delete_linked_account = AsyncMock(
+        side_effect=Exception("The account does not exist")
+    )
+
+    with patch(
+        "services.razorpay_service.razorpay_service", rzp
+    ), patch("models.Franchisee.filter") as mock_franchisee_filter, patch(
+        "models.CommissionLedgerEntry.filter"
+    ) as mock_entry_filter, patch(
+        "models.FranchiseeStakeholder.filter"
+    ) as mock_stakeholder_filter, patch(
+        "tortoise.transactions.in_transaction"
+    ) as mock_txn:
+        mock_franchisee_filter.return_value.first = AsyncMock(
+            return_value=franchisee
+        )
+        mock_franchisee_filter.return_value.update = AsyncMock(return_value=None)
+        mock_entry_filter.return_value.count = AsyncMock(return_value=0)
+        mock_stakeholder_filter.return_value.delete = AsyncMock(return_value=0)
+        mock_txn.return_value.__aenter__ = AsyncMock(return_value=None)
+        mock_txn.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        result = await FranchiseeOnboardingService.delete_linked_account(7)
+
+    assert result["status"] == "deleted"

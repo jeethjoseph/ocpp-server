@@ -2361,6 +2361,39 @@ Implementation notes:
      (JSONB) so admins can see per-dimension KYC progress beyond the
      top-level `activation_status`.
 
+6. **Outbound API audit log (migration-24 era)**:
+   `services/razorpay_service._audit_call` is an async helper that wraps
+   every mutating onboarding-chain SDK call (`account.create`,
+   `account.edit`, `account.delete`, `stakeholder.create`,
+   `stakeholder.edit`, `product.requestProductConfiguration`,
+   `product.edit`) and writes one row to the `razorpay_api_log` table
+   capturing method, endpoint, request body, response status,
+   response body, success flag, and error message. PII keys
+   (`pan`, `account_number`, `ifsc_code`, `aadhaar`, `gst`, `gstin`,
+   `tan`, `card_number`, `card_id`) are masked to `***LAST4` via the
+   `_mask_sensitive` recursive helper. Audit-write failures are
+   swallowed so the SDK call result is preserved. Read-only fetches and
+   high-volume calls (transfers, refunds, payments, QR ops) are
+   intentionally NOT logged — they have idempotency keys as their audit
+   anchor. The table mirrors `webhook_event` (inbound), giving symmetric
+   end-to-end traceability for any Razorpay-side dispute. FK to
+   `franchisee` uses `ON DELETE SET NULL` so logs survive franchisee
+   deletion while staying joinable.
+
+7. **Hard-delete linked account flow (admin self-serve)**:
+   `DELETE /api/admin/franchisees/{id}/razorpay-account`, orchestrated
+   by `FranchiseeOnboardingService.delete_linked_account`. Order: call
+   Razorpay `DELETE /v2/accounts/{id}` first (audit-logged), then in a
+   `tortoise.transactions.in_transaction()` block delete
+   `franchisee_stakeholder` rows and clear all `razorpay_*` / `kyc_*` /
+   `activated_at` / `status_reason` fields on the franchisee with
+   `status` reset to `DRAFT`. Safety: refuses if any
+   `CommissionLedgerEntry` rows exist for the franchisee (no force
+   flag). Idempotent on already-cleared local state. Tolerates Razorpay
+   404 / "not found" errors so admins can re-run after a partial
+   failure. Frontend confirmation dialog requires typing the exact
+   `acc_*` ID before the destructive button is enabled.
+
 Complementary transparency surfaces (all read-only, franchisee name
 sourced from the `Charger → Station → Franchisee` FK chain):
 

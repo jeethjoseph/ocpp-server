@@ -44,6 +44,41 @@ def _is_already_refunded_error(err: Exception) -> bool:
     return any(token in msg for token in ("already refund", "fully refund", "refunded fully"))
 
 
+# Sensitive field names that get masked before being persisted to
+# `razorpay_api_log`. Keys are matched case-insensitively against the
+# JSON payload's keys (top-level and nested). Email/phone are NOT in
+# this set — they're already stored cleartext on the franchisee row.
+_SENSITIVE_KEYS = {
+    "pan", "account_number", "ifsc_code", "ifsc",
+    "aadhaar", "aadhar", "gst", "gstin", "tan",
+    "card_number", "card_id",
+}
+
+
+def _mask_sensitive(value):
+    """Recursively mask known sensitive fields in a JSON-serialisable
+    structure. Returns a NEW structure — never mutates input.
+
+    Masking rule: for any dict key in ``_SENSITIVE_KEYS`` (case-insensitive),
+    replace the value with ``f"***{last4}"`` (preserving last-4 chars for
+    diagnostic value) when the stringified value is at least 4 chars long,
+    or with ``"***"`` for shorter values. Recurses into nested dicts and
+    lists; leaves other scalars untouched.
+    """
+    if isinstance(value, dict):
+        masked = {}
+        for k, v in value.items():
+            if isinstance(k, str) and k.lower() in _SENSITIVE_KEYS and v is not None:
+                sval = str(v)
+                masked[k] = f"***{sval[-4:]}" if len(sval) >= 4 else "***"
+            else:
+                masked[k] = _mask_sensitive(v)
+        return masked
+    if isinstance(value, list):
+        return [_mask_sensitive(v) for v in value]
+    return value
+
+
 # Razorpay caps the QR `name` field at ~50 chars; truncate business + charger
 # so the whole string fits even when the business name is long.
 _QR_NAME_MAX = 50
@@ -460,17 +495,92 @@ class RazorpayService:
             "RAZORPAY_ROUTE_ENABLED", "false"
         ).lower() in ("true", "1", "yes")
 
-    def create_linked_account(self, payload: Dict) -> Dict:
+    async def _audit_call(
+        self,
+        *,
+        method: str,
+        endpoint: str,
+        request_body: Optional[Dict],
+        sdk_call,
+        franchisee_id: Optional[int] = None,
+        account_id: Optional[str] = None,
+    ) -> Dict:
+        """Run a sync Razorpay SDK call and persist a single
+        ``RazorpayApiLog`` row capturing request + response (PII masked).
+
+        - SDK exceptions are re-raised AFTER the log row is written.
+        - Audit-write failures are SWALLOWED so SDK behaviour is
+          preserved (logged at ERROR level for ops visibility).
+        - Used by the onboarding-chain wrappers only; transfers /
+          refunds / payments / QR ops are intentionally NOT audited.
+        """
+        masked_request = _mask_sensitive(request_body) if request_body else None
+        response_body = None
+        response_status: Optional[int] = None
+        error_message: Optional[str] = None
+        success = False
+        sdk_exc: Optional[BaseException] = None
+        try:
+            response_body = sdk_call()
+            success = True
+        except razorpay.errors.BadRequestError as e:
+            response_status = 400
+            error_message = str(e)
+            sdk_exc = e
+        except razorpay.errors.GatewayError as e:
+            response_status = 502
+            error_message = str(e)
+            sdk_exc = e
+        except Exception as e:
+            error_message = str(e)
+            sdk_exc = e
+
+        # Always attempt to write the audit row, regardless of SDK outcome.
+        try:
+            from models import RazorpayApiLog
+            await RazorpayApiLog.create(
+                method=method,
+                endpoint=endpoint,
+                request_body=masked_request,
+                response_status=response_status,
+                response_body=(
+                    _mask_sensitive(response_body)
+                    if isinstance(response_body, (dict, list))
+                    else None
+                ),
+                success=success,
+                error_message=error_message,
+                franchisee_id=franchisee_id,
+                razorpay_account_id=account_id,
+            )
+        except Exception as audit_err:
+            logger.error(
+                "Failed to write razorpay_api_log row for %s %s: %s — "
+                "audit write swallowed; SDK call %s.",
+                method, endpoint, audit_err,
+                "succeeded" if success else "failed",
+            )
+
+        if sdk_exc is not None:
+            raise sdk_exc
+        return response_body
+
+    async def create_linked_account(
+        self, payload: Dict, franchisee_id: Optional[int] = None
+    ) -> Dict:
         """Create a Razorpay Route linked account (POST /v2/accounts)."""
         if not self.is_configured():
             raise Exception("Razorpay not configured")
-        try:
-            result = self.client.account.create(data=payload)
-            logger.info("Linked account created: %s", result.get("id"))
-            return result
-        except Exception as e:
-            logger.error("Failed to create linked account: %s", e)
-            raise
+        result = await self._audit_call(
+            method="POST",
+            endpoint="/v2/accounts",
+            request_body=payload,
+            sdk_call=lambda: self.client.account.create(data=payload),
+            franchisee_id=franchisee_id,
+            account_id=None,
+        )
+        logger.info("Linked account created: %s", result.get("id"))
+        return result
 
     def fetch_linked_account(self, account_id: str) -> Dict:
         """Fetch linked account details (GET /v2/accounts/{id})."""
@@ -482,55 +592,95 @@ class RazorpayService:
             logger.error("Failed to fetch account %s: %s", account_id, e)
             raise
 
-    def update_linked_account(self, account_id: str, data: Dict) -> Dict:
+    async def update_linked_account(
+        self,
+        account_id: str,
+        data: Dict,
+        franchisee_id: Optional[int] = None,
+    ) -> Dict:
         """PATCH /v2/accounts/{id} — amend account fields post-create.
         Some fields (notably ``business_type``) are locked by Razorpay
         once set; the SDK surfaces those as BadRequestError."""
         if not self.is_configured():
             raise Exception("Razorpay not configured")
-        try:
-            result = self.client.account.edit(account_id, data)
-            logger.info("Linked account updated: %s", account_id)
-            return result
-        except Exception as e:
-            logger.error("Failed to update account %s: %s", account_id, e)
-            raise
+        result = await self._audit_call(
+            method="PATCH",
+            endpoint=f"/v2/accounts/{account_id}",
+            request_body=data,
+            sdk_call=lambda: self.client.account.edit(account_id, data),
+            franchisee_id=franchisee_id,
+            account_id=account_id,
+        )
+        logger.info("Linked account updated: %s", account_id)
+        return result
+
+    async def delete_linked_account(
+        self, account_id: str, franchisee_id: Optional[int] = None
+    ) -> Dict:
+        """DELETE /v2/accounts/{id} — hard-delete a linked account.
+
+        Irreversible on Razorpay's side. Used by the admin
+        "Delete Razorpay Account" flow when the account is stuck or
+        misconfigured and we'd rather start over.
+        """
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        result = await self._audit_call(
+            method="DELETE",
+            endpoint=f"/v2/accounts/{account_id}",
+            request_body=None,
+            sdk_call=lambda: self.client.account.delete(account_id),
+            franchisee_id=franchisee_id,
+            account_id=account_id,
+        )
+        logger.info("Linked account deleted: %s", account_id)
+        return result if isinstance(result, dict) else {"deleted": True}
 
     # ─── Route product configuration + stakeholders (KYC submission) ───
 
-    def request_product_configuration(
-        self, account_id: str, data: Dict
+    async def request_product_configuration(
+        self,
+        account_id: str,
+        data: Dict,
+        franchisee_id: Optional[int] = None,
     ) -> Dict:
         """POST /v2/accounts/{id}/products — create a product config.
         Minimal body is ``{product_name, tnc_accepted, ip?}``; other config
         (settlements, payment_methods, refund, etc.) is PATCH-only."""
         if not self.is_configured():
             raise Exception("Razorpay not configured")
-        try:
-            return self.client.product.requestProductConfiguration(
+        return await self._audit_call(
+            method="POST",
+            endpoint=f"/v2/accounts/{account_id}/products",
+            request_body=data,
+            sdk_call=lambda: self.client.product.requestProductConfiguration(
                 account_id, data
-            )
-        except Exception as e:
-            logger.error(
-                "Failed to request product config for %s: %s", account_id, e
-            )
-            raise
+            ),
+            franchisee_id=franchisee_id,
+            account_id=account_id,
+        )
 
-    def edit_product_configuration(
-        self, account_id: str, product_id: str, data: Dict
+    async def edit_product_configuration(
+        self,
+        account_id: str,
+        product_id: str,
+        data: Dict,
+        franchisee_id: Optional[int] = None,
     ) -> Dict:
         """PATCH /v2/accounts/{id}/products/{product_id} — update bank,
         payment_methods, refund, notifications, checkout, etc."""
         if not self.is_configured():
             raise Exception("Razorpay not configured")
-        try:
-            return self.client.product.edit(account_id, product_id, data)
-        except Exception as e:
-            logger.error(
-                "Failed to edit product %s for %s: %s",
-                product_id, account_id, e,
-            )
-            raise
+        return await self._audit_call(
+            method="PATCH",
+            endpoint=f"/v2/accounts/{account_id}/products/{product_id}",
+            request_body=data,
+            sdk_call=lambda: self.client.product.edit(
+                account_id, product_id, data
+            ),
+            franchisee_id=franchisee_id,
+            account_id=account_id,
+        )
 
     def fetch_product_configuration(
         self, account_id: str, product_id: str
@@ -548,19 +698,25 @@ class RazorpayService:
             )
             raise
 
-    def create_stakeholder(self, account_id: str, data: Dict) -> Dict:
+    async def create_stakeholder(
+        self,
+        account_id: str,
+        data: Dict,
+        franchisee_id: Optional[int] = None,
+    ) -> Dict:
         """POST /v2/accounts/{id}/stakeholders — add a
         director/proprietor. Razorpay requires at least one stakeholder
         to clear the ``name`` requirement on product config."""
         if not self.is_configured():
             raise Exception("Razorpay not configured")
-        try:
-            return self.client.stakeholder.create(account_id, data)
-        except Exception as e:
-            logger.error(
-                "Failed to create stakeholder on %s: %s", account_id, e
-            )
-            raise
+        return await self._audit_call(
+            method="POST",
+            endpoint=f"/v2/accounts/{account_id}/stakeholders",
+            request_body=data,
+            sdk_call=lambda: self.client.stakeholder.create(account_id, data),
+            franchisee_id=franchisee_id,
+            account_id=account_id,
+        )
 
     def list_stakeholders(self, account_id: str) -> Dict:
         """GET /v2/accounts/{id}/stakeholders — list all."""
@@ -587,28 +743,32 @@ class RazorpayService:
             )
             raise
 
-    def update_stakeholder(
-        self, account_id: str, stakeholder_id: str, data: Dict
+    async def update_stakeholder(
+        self,
+        account_id: str,
+        stakeholder_id: str,
+        data: Dict,
+        franchisee_id: Optional[int] = None,
     ) -> Dict:
         """PATCH /v2/accounts/{id}/stakeholders/{sid} — amend stakeholder
         fields. Used to add ``kyc.pan`` / ``addresses.residential`` to a
         stakeholder created earlier without them."""
         if not self.is_configured():
             raise Exception("Razorpay not configured")
-        try:
-            result = self.client.stakeholder.edit(
+        result = await self._audit_call(
+            method="PATCH",
+            endpoint=f"/v2/accounts/{account_id}/stakeholders/{stakeholder_id}",
+            request_body=data,
+            sdk_call=lambda: self.client.stakeholder.edit(
                 account_id, stakeholder_id, data
-            )
-            logger.info(
-                "Stakeholder updated: %s on %s", stakeholder_id, account_id
-            )
-            return result
-        except Exception as e:
-            logger.error(
-                "Failed to update stakeholder %s on %s: %s",
-                stakeholder_id, account_id, e,
-            )
-            raise
+            ),
+            franchisee_id=franchisee_id,
+            account_id=account_id,
+        )
+        logger.info(
+            "Stakeholder updated: %s on %s", stakeholder_id, account_id
+        )
+        return result
 
     def create_transfer(
         self,
