@@ -162,15 +162,20 @@ async def test_create_linked_account_warns_on_business_type_mismatch(ocpp_caplog
 # ─── submit_bank_details payload shape ──────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_submit_bank_details_includes_tnc_and_optional_account_type():
-    """PATCH must always include `tnc_accepted: true`; `account_type` is
-    only sent when the franchisee row has bank_account_type set."""
+async def test_submit_bank_details_includes_tnc_and_excludes_account_type():
+    """PATCH must always include `tnc_accepted: true`. `account_type`
+    must NEVER be sent — Razorpay 400s with "account_type is/are not
+    required and should not be sent" (verified 2026-04-29 via the
+    audit log). The franchisee.bank_account_type column stays locally
+    for invoicing / reconciliation but is omitted from the Razorpay
+    payload regardless of whether it's set."""
     franchisee = MagicMock()
     franchisee.razorpay_account_id = "acc_x"
     franchisee.razorpay_product_id = "acc_prd_x"
     franchisee.bank_account_number = "12345"
     franchisee.bank_ifsc_code = "SBIN0001"
     franchisee.bank_account_name = "Jane Doe"
+    # Even when bank_account_type IS populated locally, we must not send it.
     franchisee.bank_account_type = "savings"
 
     rzp = MagicMock()
@@ -187,12 +192,17 @@ async def test_submit_bank_details_includes_tnc_and_optional_account_type():
     args, _kwargs = rzp.edit_product_configuration.call_args
     body = args[2]
     assert body["tnc_accepted"] is True
-    assert body["settlements"]["account_type"] == "savings"
     assert body["settlements"]["account_number"] == "12345"
+    assert body["settlements"]["ifsc_code"] == "SBIN0001"
+    assert body["settlements"]["beneficiary_name"] == "Jane Doe"
+    # Razorpay rejects account_type — it must never appear.
+    assert "account_type" not in body["settlements"]
 
 
 @pytest.mark.asyncio
-async def test_submit_bank_details_omits_account_type_when_unset():
+async def test_submit_bank_details_omits_account_type_when_unset_too():
+    """Sanity: with bank_account_type=None, account_type still must not
+    appear in the payload (same as when it's set)."""
     franchisee = MagicMock()
     franchisee.razorpay_account_id = "acc_x"
     franchisee.razorpay_product_id = "acc_prd_x"

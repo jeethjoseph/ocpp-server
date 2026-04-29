@@ -2349,9 +2349,14 @@ Implementation notes:
      individual), corporate types get `(True, True)`. Stakeholder
      payload includes `kyc.pan` and optional `addresses.residential`.
    - `submit_bank_details` PATCH includes `tnc_accepted: true` (per
-     Razorpay's `update-product-config` doc) plus optional
-     `account_type` (`savings`/`current`) when the franchisee row has
-     `bank_account_type` populated.
+     Razorpay's `update-product-config` doc) and the three documented
+     settlement fields (`account_number`, `ifsc_code`,
+     `beneficiary_name`) only. **`account_type` is NOT sent** —
+     Razorpay rejects it with "account_type is/are not required and
+     should not be sent" despite being on bank-account schemas
+     elsewhere (verified 2026-04-29 via the audit log on a fresh
+     onboarding). The `Franchisee.bank_account_type` column stays for
+     invoicing / reconciliation use.
    - `update_stakeholder` (PUT
      `/api/admin/franchisees/{id}/stakeholders/{sid}`) PATCHes an
      existing Razorpay stakeholder so admins can backfill PAN /

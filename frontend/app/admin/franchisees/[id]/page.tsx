@@ -469,15 +469,25 @@ export default function FranchiseeDetailPage() {
             <CardTitle className="flex items-center gap-2">
               <Users className="w-4 h-4" /> Stakeholders
             </CardTitle>
-            <Button size="sm" onClick={openStakeholderCreate}>
+            <Button
+              size="sm"
+              onClick={openStakeholderCreate}
+              disabled={!franchisee.razorpay_account_id}
+              title={
+                !franchisee.razorpay_account_id
+                  ? "Start Razorpay onboarding first — stakeholders attach to the linked account"
+                  : "Add a director / proprietor / signatory"
+              }
+            >
               <UserPlus className="w-4 h-4 mr-1" /> Add Stakeholder
             </Button>
           </CardHeader>
           <CardContent>
             {!stakeholders || stakeholders.length === 0 ? (
               <p className="text-muted-foreground text-center py-4 text-sm">
-                No stakeholders yet. Razorpay requires at least one stakeholder
-                before KYC can be submitted.
+                {!franchisee.razorpay_account_id
+                  ? "Start Razorpay onboarding first — stakeholders attach to the linked account, so the account_id has to exist before this button works."
+                  : "No stakeholders yet. Razorpay requires at least one stakeholder before KYC can be submitted."}
               </p>
             ) : (
               <Table>

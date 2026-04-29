@@ -201,10 +201,15 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
     Razorpay dashboard's broken KYC Form): `ensure_product_config`
     POSTs `/v2/accounts/{id}/products` and persists the returned
     `product_id` on `Franchisee.razorpay_product_id`; `submit_bank_details`
-    PATCHes the product config with `settlements` (incl. optional
-    `account_type` from `Franchisee.bank_account_type`) plus
-    `tnc_accepted: true` (re-sent on every PATCH per Razorpay's
-    update-product-config doc); `add_stakeholder` POSTs to
+    PATCHes the product config with `settlements`
+    (`account_number` / `ifsc_code` / `beneficiary_name` only —
+    Razorpay rejects `account_type` with "account_type is/are not
+    required and should not be sent", verified 2026-04-29 via the
+    audit log) plus `tnc_accepted: true` (re-sent on every PATCH per
+    Razorpay's update-product-config doc). The
+    `Franchisee.bank_account_type` column is kept locally for
+    invoicing / reconciliation but is NOT sent to Razorpay.
+    `add_stakeholder` POSTs to
     `/stakeholders` with `kyc.pan` + optional `addresses.residential`
     and mirrors the result into `FranchiseeStakeholder`. The top-level
     `submit_kyc(franchisee_id)` orchestrates ensure_product_config +

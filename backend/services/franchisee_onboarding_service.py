@@ -439,18 +439,21 @@ class FranchiseeOnboardingService:
                 "Franchisee is missing bank fields: " + ", ".join(missing)
             )
 
-        # account_type is optional in Razorpay's update-product-config
-        # spec; send only when the franchisee row has it populated. The
-        # update endpoint also accepts ``tnc_accepted`` and re-sending it
-        # is documented as safe — including it ensures the consent stays
-        # current even after a PATCH.
+        # Razorpay's `update-product-config` spec accepts only
+        # `account_number`, `ifsc_code`, `beneficiary_name` under
+        # `settlements`. The Tier 1+2 PR sent `account_type` too (based
+        # on a since-retracted reading of the docs); Razorpay 400'd with
+        # "account_type is/are not required and should not be sent"
+        # (verified 2026-04-29 via the audit log on Ancy Thomas's PATCH).
+        # Keep `franchisee.bank_account_type` locally — it's still
+        # useful for invoicing / reconciliation — but don't send it.
+        # The update endpoint also accepts `tnc_accepted` and re-sending
+        # it is documented as safe.
         settlements = {
             "account_number": franchisee.bank_account_number,
             "ifsc_code": franchisee.bank_ifsc_code,
             "beneficiary_name": franchisee.bank_account_name,
         }
-        if franchisee.bank_account_type:
-            settlements["account_type"] = franchisee.bank_account_type
 
         result = await razorpay_service.edit_product_configuration(
             franchisee.razorpay_account_id,
