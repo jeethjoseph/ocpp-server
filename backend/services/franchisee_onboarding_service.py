@@ -137,17 +137,20 @@ class FranchiseeOnboardingService:
                 + ", ".join(missing)
             )
 
-        # `reference_id` is unique-per-merchant on Razorpay's side, and
-        # the constraint persists even after `account.delete()` (which
-        # only soft-suspends). Append a UTC epoch suffix so re-onboarding
-        # after a delete doesn't 400 with "This code is already in use".
-        # The franchisee_id is still recoverable from `notes` below.
+        # `reference_id` is unique-per-merchant on Razorpay's side, the
+        # constraint persists even after `account.delete()` (which only
+        # soft-suspends), AND Razorpay caps it at **20 chars** (verified
+        # 2026-04-29 via the audit log: longer values 400 with "The code
+        # may not be greater than 20 characters."). Use the short
+        # `f_{id}_{epoch}` form so franchisee + retry are both decodable
+        # while staying under the cap. The full franchisee_id is also
+        # in `notes.voltlync_franchisee_id` below for recovery.
         ref_suffix = int(datetime.utcnow().timestamp())
         payload = {
             "email": franchisee.contact_email,
             "phone": franchisee.contact_phone,
             "type": "route",
-            "reference_id": f"franchisee_{franchisee.id}_{ref_suffix}",
+            "reference_id": f"f_{franchisee.id}_{ref_suffix}",
             "legal_business_name": franchisee.business_name,
             "customer_facing_business_name": franchisee.business_name,
             "business_type": business_type,

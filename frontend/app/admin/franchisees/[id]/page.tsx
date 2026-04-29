@@ -567,7 +567,7 @@ export default function FranchiseeDetailPage() {
                     return (
                       <Fragment key={log.id}>
                         <TableRow
-                          className="cursor-pointer hover:bg-gray-50"
+                          className="cursor-pointer hover:bg-muted/50"
                           onClick={() =>
                             setExpandedLogId(expanded ? null : log.id)
                           }
@@ -602,13 +602,13 @@ export default function FranchiseeDetailPage() {
                         </TableRow>
                         {expanded && (
                           <TableRow>
-                            <TableCell colSpan={6} className="bg-gray-50">
+                            <TableCell colSpan={6} className="bg-muted/40">
                               <div className="grid grid-cols-2 gap-4 text-xs">
                                 <div>
-                                  <p className="font-medium mb-1">
+                                  <p className="font-medium mb-1 text-foreground">
                                     Request body
                                   </p>
-                                  <pre className="bg-white border rounded p-2 overflow-x-auto whitespace-pre-wrap break-all max-h-96">
+                                  <pre className="bg-background text-foreground border rounded p-2 overflow-x-auto whitespace-pre-wrap break-all max-h-96 font-mono">
                                     {log.request_body
                                       ? JSON.stringify(
                                           log.request_body,
@@ -619,10 +619,10 @@ export default function FranchiseeDetailPage() {
                                   </pre>
                                 </div>
                                 <div>
-                                  <p className="font-medium mb-1">
+                                  <p className="font-medium mb-1 text-foreground">
                                     Response body
                                   </p>
-                                  <pre className="bg-white border rounded p-2 overflow-x-auto whitespace-pre-wrap break-all max-h-96">
+                                  <pre className="bg-background text-foreground border rounded p-2 overflow-x-auto whitespace-pre-wrap break-all max-h-96 font-mono">
                                     {log.response_body
                                       ? JSON.stringify(
                                           log.response_body,
