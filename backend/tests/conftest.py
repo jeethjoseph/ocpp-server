@@ -21,12 +21,13 @@ from models import (
 )
 from auth_middleware import get_current_user_with_db
 
-# Test database configuration
-# Reads TEST_DATABASE_URL env var so tests can run via `docker exec ocpp-backend pytest ...`
-# (where postgres is reachable as host `postgres`) and also via local venv if needed.
+# Test database configuration.
+# Default targets the postgres container's hostname (`postgres`) since the
+# expected runner is `docker exec ocpp-backend pytest ...` per CLAUDE.md.
+# Override TEST_DATABASE_URL when running outside the container.
 TEST_DB_URL = os.environ.get(
     "TEST_DATABASE_URL",
-    "postgres://test_user:test_pass@localhost:5432/test_ocpp_db",
+    "postgres://test_user:test_pass@postgres:5432/test_ocpp_db",
 )
 
 @pytest.fixture(scope="module")
@@ -53,7 +54,22 @@ async def client() -> AsyncGenerator[AsyncClient, None]:
         mock_redis.remove_connected_charger = AsyncMock(return_value=True)
         mock_redis.get_charger_connected_at = AsyncMock(return_value=None)
         
-        # Initialize test database
+        # Initialize test database.
+        # Tortoise.init() internally calls close_all(discard=True) on any
+        # existing connections. When a prior test exits inside an @atomic()
+        # block (or its sync TestClient counterpart leaks into our loop),
+        # the current connection is a TransactionWrapper that doesn't have
+        # `_template`, and base_postgres.client.close() crashes with
+        # AttributeError: 'TransactionWrapper' object has no attribute
+        # '_template'. Bypass Tortoise's broken close path by purging the
+        # connection storage directly before Tortoise.init runs its own
+        # close_all (which would now find an empty registry).
+        from tortoise import connections as _conn
+        try:
+            _conn._clear_storage()
+        except Exception:
+            pass
+        Tortoise._inited = False
         config = {
             "connections": {"default": TEST_DB_URL},
             "apps": {

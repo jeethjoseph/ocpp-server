@@ -52,6 +52,7 @@ class FranchiseeUpdate(BaseModel):
     bank_account_name: Optional[str] = None
     bank_account_number: Optional[str] = None
     bank_ifsc_code: Optional[str] = None
+    bank_account_type: Optional[str] = None  # 'savings' | 'current'
     notes: Optional[str] = None
 
 
@@ -89,6 +90,7 @@ class FranchiseeResponse(BaseModel):
     bank_account_name: Optional[str] = None
     bank_account_number: Optional[str] = None
     bank_ifsc_code: Optional[str] = None
+    bank_account_type: Optional[str] = None
     commission_percent: Decimal
     tds_rate_percent: Decimal
     status: str
@@ -97,6 +99,7 @@ class FranchiseeResponse(BaseModel):
     razorpay_account_status: Optional[str] = None
     razorpay_product_id: Optional[str] = None
     razorpay_onboarding_url: Optional[str] = None
+    kyc_verifications: Optional[dict] = None
     bank_account_name: Optional[str] = None
     bank_account_number: Optional[str] = None
     bank_ifsc_code: Optional[str] = None
@@ -162,9 +165,11 @@ async def _franchisee_to_response(f: Franchisee) -> dict:
         "razorpay_account_status": f.razorpay_account_status,
         "razorpay_product_id": f.razorpay_product_id,
         "razorpay_onboarding_url": f.razorpay_onboarding_url,
+        "kyc_verifications": f.kyc_verifications,
         "bank_account_name": f.bank_account_name,
         "bank_account_number": f.bank_account_number,
         "bank_ifsc_code": f.bank_ifsc_code,
+        "bank_account_type": f.bank_account_type,
         "station_count": station_count,
         "activated_at": f.activated_at,
         "created_at": f.created_at,
@@ -821,13 +826,37 @@ async def get_kyc_status(
 
 # ─── Stakeholders + KYC submission ──────────────────────────────────
 
+class StakeholderResidential(BaseModel):
+    street: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    postal_code: Optional[str] = None
+    country: Optional[str] = None  # ISO-2; defaults to "IN" downstream
+
+
 class StakeholderCreate(BaseModel):
     name: str
     email: EmailStr
     phone_primary: Optional[str] = None
-    relationship_director: bool = True
-    relationship_executive: bool = True
+    # Defaults intentionally None so the onboarding service can derive
+    # business-type-aware defaults via _relationship_defaults; an explicit
+    # bool from the caller still wins.
+    relationship_director: Optional[bool] = None
+    relationship_executive: Optional[bool] = None
     pan_number: Optional[str] = None
+    residential: Optional[StakeholderResidential] = None
+
+
+class StakeholderUpdate(BaseModel):
+    """Partial update on a stakeholder. All fields optional. None values
+    are dropped before being sent to Razorpay or persisted locally."""
+    name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    phone_primary: Optional[str] = None
+    relationship_director: Optional[bool] = None
+    relationship_executive: Optional[bool] = None
+    pan_number: Optional[str] = None
+    residential: Optional[StakeholderResidential] = None
 
 
 class StakeholderResponse(BaseModel):
@@ -839,6 +868,11 @@ class StakeholderResponse(BaseModel):
     relationship_director: bool
     relationship_executive: bool
     pan_number: Optional[str] = None
+    residential_street: Optional[str] = None
+    residential_city: Optional[str] = None
+    residential_state: Optional[str] = None
+    residential_postal_code: Optional[str] = None
+    residential_country: Optional[str] = None
     created_at: datetime
 
     class Config:
@@ -860,6 +894,11 @@ def _stakeholder_to_response(s: FranchiseeStakeholder) -> dict:
         "relationship_director": s.relationship_director,
         "relationship_executive": s.relationship_executive,
         "pan_number": s.pan_number,
+        "residential_street": s.residential_street,
+        "residential_city": s.residential_city,
+        "residential_state": s.residential_state,
+        "residential_postal_code": s.residential_postal_code,
+        "residential_country": s.residential_country,
         "created_at": s.created_at,
     }
 
@@ -911,6 +950,50 @@ async def create_stakeholder(
         changes={
             "stakeholder_id": row.id,
             "razorpay_stakeholder_id": row.razorpay_stakeholder_id,
+        },
+    )
+    return _stakeholder_to_response(row)
+
+
+@router.put(
+    "/{franchisee_id}/stakeholders/{stakeholder_id}",
+    response_model=StakeholderResponse,
+)
+async def update_stakeholder(
+    franchisee_id: int,
+    stakeholder_id: int,
+    body: StakeholderUpdate,
+    admin: User = Depends(require_admin()),
+):
+    """PATCH a stakeholder on Razorpay + persist locally. Only fields the
+    caller actually provides are updated; None values are dropped."""
+    from services.franchisee_onboarding_service import FranchiseeOnboardingService
+
+    payload = body.model_dump(exclude_none=True)
+    try:
+        row = await FranchiseeOnboardingService.update_stakeholder(
+            franchisee_id, stakeholder_id, payload
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except (RazorpayBadRequestError, RazorpayServerError, RazorpayGatewayError) as e:
+        logger.exception(
+            "Razorpay rejected stakeholder update for franchisee %s",
+            franchisee_id,
+        )
+        raise HTTPException(status_code=400, detail=f"Razorpay: {e}")
+
+    await log_audit_event(
+        actor_type="admin",
+        actor=admin,
+        action="franchisee.stakeholder_updated",
+        entity_type="franchisee",
+        entity_id=str(franchisee_id),
+        changes={
+            "stakeholder_id": stakeholder_id,
+            "fields": list(payload.keys()),
         },
     )
     return _stakeholder_to_response(row)

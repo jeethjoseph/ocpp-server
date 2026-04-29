@@ -9,7 +9,7 @@ After each charging session completes billing, this service:
 
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, Dict
 
@@ -262,6 +262,22 @@ class FranchiseeSettlementService:
                 entry.id, franchisee.funds_on_hold, franchisee.transfers_enabled,
             )
             return False
+
+        # Razorpay enforces a 24-hour cooling period after a linked account
+        # is activated before transfers can be initiated. Park as ON_HOLD
+        # so retry_failed_transfers picks it up after the window closes.
+        if franchisee.activated_at:
+            cooling_until = franchisee.activated_at + timedelta(hours=24)
+            if datetime.utcnow() < cooling_until.replace(tzinfo=None):
+                await CommissionLedgerEntry.filter(id=entry.id).update(
+                    settlement_status=SettlementStatusEnum.ON_HOLD,
+                    failure_reason="cooling_period",
+                )
+                logger.info(
+                    "Transfer for entry %s held: 24h cooling period until %s",
+                    entry.id, cooling_until,
+                )
+                return False
 
         amount_paise = int(entry.franchisee_payout * 100)
         if amount_paise < 100:  # Razorpay minimum Rs.1

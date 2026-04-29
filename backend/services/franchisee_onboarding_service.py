@@ -36,6 +36,40 @@ def _split_street(address: str, fallback: str) -> Dict[str, str]:
     }
 
 
+# For INDIVIDUAL / PROPRIETORSHIP there is no "director" of the business —
+# the proprietor is just the executive (signatory). For PARTNERSHIP / LLP /
+# PRIVATE_LIMITED the stakeholder typically holds both relationships. The
+# defaults below keep the wire payload semantically correct; callers can
+# still override via explicit args.
+_RELATIONSHIP_DEFAULTS = {
+    "INDIVIDUAL": (False, True),
+    "PROPRIETORSHIP": (False, True),
+    "PARTNERSHIP": (True, True),
+    "PRIVATE_LIMITED": (True, True),
+    "LLP": (True, True),
+}
+
+
+def _relationship_defaults(business_type) -> tuple[bool, bool]:
+    """Return ``(director, executive)`` defaults for a business_type.
+
+    Falls back to ``(True, True)`` with a warning for unmapped enum
+    members so a future addition to ``FranchiseeBusinessTypeEnum``
+    doesn't crash silently.
+    """
+    key = business_type.value if hasattr(business_type, "value") else str(
+        business_type
+    )
+    defaults = _RELATIONSHIP_DEFAULTS.get(key)
+    if defaults is None:
+        logger.warning(
+            "_relationship_defaults: unmapped business_type %r — "
+            "defaulting to (True, True)", key,
+        )
+        return (True, True)
+    return defaults
+
+
 class FranchiseeOnboardingService:
 
     # Razorpay `business_type` values (lowercased, snake_case). Our enum uses
@@ -127,13 +161,25 @@ class FranchiseeOnboardingService:
                 "category": "services",
                 "subcategory": "service_stations",
                 "addresses": {
+                    # Razorpay's `addresses` accepts both `registered` and
+                    # `operational`. Mirroring the registered address as
+                    # operational gives the review queue both touchpoints
+                    # at once; updating operational separately later via
+                    # account.edit is cheap if it ever diverges.
                     "registered": {
                         **_split_street(franchisee.address, franchisee.city),
                         "city": franchisee.city,
                         "state": (franchisee.state or "").upper(),
                         "postal_code": franchisee.pincode,
                         "country": "IN",
-                    }
+                    },
+                    "operational": {
+                        **_split_street(franchisee.address, franchisee.city),
+                        "city": franchisee.city,
+                        "state": (franchisee.state or "").upper(),
+                        "postal_code": franchisee.pincode,
+                        "country": "IN",
+                    },
                 },
             },
             "notes": {
@@ -142,6 +188,20 @@ class FranchiseeOnboardingService:
         }
 
         result = razorpay_service.create_linked_account(payload)
+
+        # Razorpay sometimes silently downgrades the requested
+        # ``business_type`` to ``not_yet_registered`` when its
+        # internal classifier disagrees (we observed this on
+        # acc_Sg73UwyOU3jziR). Surface the mismatch so the admin can
+        # contact support before the account stalls in review.
+        echoed = result.get("business_type")
+        if echoed and echoed != business_type:
+            logger.warning(
+                "Razorpay echoed business_type=%r for franchisee %s "
+                "(we sent %r) — review may stall; contact support if "
+                "this is unexpected.",
+                echoed, franchisee_id, business_type,
+            )
 
         account_id = result.get("id")
         # Hosted onboarding URL is best-effort: Razorpay returns it only
@@ -198,6 +258,19 @@ class FranchiseeOnboardingService:
             "razorpay_account_status": account_data.get("status"),
         }
 
+        # Persist Razorpay's verification subtree when present. Razorpay
+        # ships fields like ``bank_details_verification_status``,
+        # ``poi_verification_status``, ``poa_verification_status`` (and
+        # may add more) on under_review / needs_clarification / activated
+        # webhook payloads. Storing the raw subtree as JSONB is forward-
+        # compatible — admin UI can render whatever keys are present.
+        verification = (
+            account_data.get("verification")
+            or account_data.get("verification_statuses")
+        )
+        if verification:
+            update_fields["kyc_verifications"] = verification
+
         if event_type in ("account.activated", "account.instantly_activated"):
             update_fields["status"] = FranchiseeStatusEnum.ACTIVE
             update_fields["kyc_verified_at"] = datetime.utcnow()
@@ -221,13 +294,27 @@ class FranchiseeOnboardingService:
 
         elif event_type == "account.needs_clarification":
             update_fields["status"] = FranchiseeStatusEnum.KYC_NEEDS_CLARIFICATION
-            reason = account_data.get("reason") or account_data.get(
-                "requirements", {}
-            ).get("reason", "")
-            if reason:
-                update_fields["status_reason"] = str(reason)[:500]
+            # `requirements` is a list of {field_reference, resolution_url,
+            # reason_code, status} dicts (NOT a dict). Concatenate the
+            # human-readable parts so admins can see what to fix without
+            # opening the JSONB column.
+            reason_parts = []
+            requirements = account_data.get("requirements") or []
+            if isinstance(requirements, list):
+                for r in requirements:
+                    if not isinstance(r, dict):
+                        continue
+                    field_ref = r.get("field_reference") or "?"
+                    code = r.get("reason_code") or r.get("reason") or "?"
+                    reason_parts.append(f"{field_ref}: {code}")
+            top_reason = account_data.get("reason")
+            if top_reason:
+                reason_parts.insert(0, str(top_reason))
+            if reason_parts:
+                update_fields["status_reason"] = "; ".join(reason_parts)[:500]
             logger.info(
-                "Franchisee %s KYC needs clarification", franchisee.id
+                "Franchisee %s KYC needs clarification: %s",
+                franchisee.id, update_fields.get("status_reason", "(no reason)"),
             )
 
         elif event_type == "account.rejected":
@@ -345,15 +432,25 @@ class FranchiseeOnboardingService:
                 "Franchisee is missing bank fields: " + ", ".join(missing)
             )
 
+        # account_type is optional in Razorpay's update-product-config
+        # spec; send only when the franchisee row has it populated. The
+        # update endpoint also accepts ``tnc_accepted`` and re-sending it
+        # is documented as safe — including it ensures the consent stays
+        # current even after a PATCH.
+        settlements = {
+            "account_number": franchisee.bank_account_number,
+            "ifsc_code": franchisee.bank_ifsc_code,
+            "beneficiary_name": franchisee.bank_account_name,
+        }
+        if franchisee.bank_account_type:
+            settlements["account_type"] = franchisee.bank_account_type
+
         result = razorpay_service.edit_product_configuration(
             franchisee.razorpay_account_id,
             franchisee.razorpay_product_id,
             {
-                "settlements": {
-                    "account_number": franchisee.bank_account_number,
-                    "ifsc_code": franchisee.bank_ifsc_code,
-                    "beneficiary_name": franchisee.bank_account_name,
-                }
+                "settlements": settlements,
+                "tnc_accepted": True,
             },
         )
         logger.info(
@@ -369,8 +466,11 @@ class FranchiseeOnboardingService:
         """Create a stakeholder on Razorpay + persist locally.
 
         ``payload`` must contain at least ``name`` and ``email``. Optional:
-        ``phone_primary``, ``relationship_director`` (default True),
-        ``relationship_executive`` (default True), ``pan_number``.
+        ``phone_primary``, ``relationship_director`` /
+        ``relationship_executive`` (defaults derived from the franchisee's
+        ``business_type`` via ``_relationship_defaults`` — caller-provided
+        values still win), ``pan_number``, ``residential`` (dict with
+        ``street`` / ``city`` / ``state`` / ``postal_code`` / ``country``).
         """
         from services.razorpay_service import razorpay_service
 
@@ -387,9 +487,14 @@ class FranchiseeOnboardingService:
         if not name or not email:
             raise RuntimeError("Stakeholder name and email are required")
 
-        director = payload.get("relationship_director", True)
-        executive = payload.get("relationship_executive", True)
+        default_director, default_executive = _relationship_defaults(
+            franchisee.business_type
+        )
+        director = payload.get("relationship_director", default_director)
+        executive = payload.get("relationship_executive", default_executive)
         phone = payload.get("phone_primary")
+        pan = payload.get("pan_number")
+        residential = payload.get("residential") or {}
 
         rzp_payload: Dict = {
             "name": name,
@@ -398,27 +503,179 @@ class FranchiseeOnboardingService:
         }
         if phone:
             rzp_payload["phone"] = {"primary": phone}
+        if pan:
+            rzp_payload["kyc"] = {"pan": pan}
+        if residential.get("street"):
+            rzp_payload["addresses"] = {
+                "residential": {
+                    "street": residential["street"],
+                    "city": residential.get("city") or franchisee.city or "",
+                    "state": (
+                        residential.get("state") or franchisee.state or ""
+                    ).upper(),
+                    "postal_code": (
+                        residential.get("postal_code")
+                        or franchisee.pincode
+                        or ""
+                    ),
+                    "country": residential.get("country") or "IN",
+                }
+            }
 
         result = razorpay_service.create_stakeholder(
             franchisee.razorpay_account_id, rzp_payload
         )
         stakeholder_id = result.get("id")
 
-        row = await FranchiseeStakeholder.create(
-            franchisee=franchisee,
-            razorpay_stakeholder_id=stakeholder_id,
-            name=name,
-            email=email,
-            phone_primary=phone,
-            relationship_director=director,
-            relationship_executive=executive,
-            pan_number=payload.get("pan_number"),
-        )
+        try:
+            row = await FranchiseeStakeholder.create(
+                franchisee=franchisee,
+                razorpay_stakeholder_id=stakeholder_id,
+                name=name,
+                email=email,
+                phone_primary=phone,
+                relationship_director=director,
+                relationship_executive=executive,
+                pan_number=pan,
+                residential_street=residential.get("street"),
+                residential_city=residential.get("city"),
+                residential_state=residential.get("state"),
+                residential_postal_code=residential.get("postal_code"),
+                residential_country=residential.get("country") or "IN",
+            )
+        except Exception as e:
+            # Razorpay create succeeded but local persistence failed —
+            # don't silently duplicate-create on retry. Surface the
+            # mismatch so the admin can reconcile via reconcile_razorpay.
+            logger.error(
+                "Stakeholder %s created on Razorpay for franchisee %s but "
+                "local insert failed: %s — reconcile via "
+                "POST /api/admin/franchisees/{id}/reconcile-razorpay",
+                stakeholder_id, franchisee_id, e,
+            )
+            raise
         logger.info(
             "Stakeholder created for franchisee %s: %s",
             franchisee_id, stakeholder_id,
         )
         return row
+
+    @staticmethod
+    async def update_stakeholder(
+        franchisee_id: int, stakeholder_id: int, payload: Dict
+    ) -> FranchiseeStakeholder:
+        """PATCH a stakeholder on Razorpay + persist locally.
+
+        ``payload`` keys (all optional, only provided fields are sent /
+        persisted): ``name``, ``email``, ``phone_primary``, ``pan_number``,
+        ``relationship_director``, ``relationship_executive``,
+        ``residential`` (dict with street / city / state / postal_code /
+        country).
+        """
+        from services.razorpay_service import razorpay_service
+
+        franchisee = await Franchisee.filter(id=franchisee_id).first()
+        if not franchisee:
+            raise ValueError(f"Franchisee {franchisee_id} not found")
+
+        row = await FranchiseeStakeholder.filter(
+            id=stakeholder_id, franchisee_id=franchisee_id
+        ).first()
+        if not row:
+            raise ValueError(
+                f"Stakeholder {stakeholder_id} not found for franchisee "
+                f"{franchisee_id}"
+            )
+        if not row.razorpay_stakeholder_id:
+            raise RuntimeError(
+                "Stakeholder has no razorpay_stakeholder_id (not yet "
+                "synced to Razorpay) — recreate via add_stakeholder."
+            )
+
+        # Build the Razorpay PATCH body — only include keys actually
+        # provided (PATCH semantics; None must not overwrite existing
+        # Razorpay-side values).
+        rzp_payload: Dict = {}
+        if payload.get("name"):
+            rzp_payload["name"] = payload["name"].strip()
+        if payload.get("email"):
+            rzp_payload["email"] = payload["email"].strip()
+        if payload.get("phone_primary"):
+            rzp_payload["phone"] = {"primary": payload["phone_primary"]}
+        if payload.get("pan_number"):
+            rzp_payload["kyc"] = {"pan": payload["pan_number"]}
+        relationship_keys = (
+            "relationship_director", "relationship_executive",
+        )
+        if any(k in payload for k in relationship_keys):
+            rzp_payload["relationship"] = {
+                "director": payload.get(
+                    "relationship_director", row.relationship_director
+                ),
+                "executive": payload.get(
+                    "relationship_executive", row.relationship_executive
+                ),
+            }
+        residential = payload.get("residential") or {}
+        if residential.get("street"):
+            rzp_payload["addresses"] = {
+                "residential": {
+                    "street": residential["street"],
+                    "city": residential.get("city") or row.residential_city
+                            or franchisee.city or "",
+                    "state": (
+                        residential.get("state")
+                        or row.residential_state
+                        or franchisee.state or ""
+                    ).upper(),
+                    "postal_code": (
+                        residential.get("postal_code")
+                        or row.residential_postal_code
+                        or franchisee.pincode or ""
+                    ),
+                    "country": (
+                        residential.get("country")
+                        or row.residential_country or "IN"
+                    ),
+                }
+            }
+
+        if rzp_payload:
+            razorpay_service.update_stakeholder(
+                franchisee.razorpay_account_id,
+                row.razorpay_stakeholder_id,
+                rzp_payload,
+            )
+
+        # Persist locally — only fields the caller actually provided.
+        local_updates: Dict = {}
+        for key in (
+            "name", "email", "phone_primary", "pan_number",
+            "relationship_director", "relationship_executive",
+        ):
+            if key in payload and payload[key] is not None:
+                local_updates[key] = payload[key]
+        if residential:
+            for k, col in (
+                ("street", "residential_street"),
+                ("city", "residential_city"),
+                ("state", "residential_state"),
+                ("postal_code", "residential_postal_code"),
+                ("country", "residential_country"),
+            ):
+                if residential.get(k):
+                    local_updates[col] = residential[k]
+
+        if local_updates:
+            await FranchiseeStakeholder.filter(id=stakeholder_id).update(
+                **local_updates
+            )
+
+        logger.info(
+            "Stakeholder %s updated for franchisee %s: keys=%s",
+            stakeholder_id, franchisee_id, list(local_updates.keys()),
+        )
+        return await FranchiseeStakeholder.filter(id=stakeholder_id).first()
 
     @staticmethod
     async def submit_kyc(franchisee_id: int) -> Dict:
@@ -492,7 +749,7 @@ class FranchiseeOnboardingService:
             # faithfully. Cheap GET; skip on failure.
             from services.razorpay_service import razorpay_service
             try:
-                remote = razorpay_service.client.stakeholder.fetch(
+                remote = razorpay_service.fetch_stakeholder(
                     franchisee.razorpay_account_id, sid
                 )
             except Exception as e:

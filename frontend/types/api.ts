@@ -538,6 +538,8 @@ export interface Franchisee {
   bank_account_name?: string | null;
   bank_account_number?: string | null;
   bank_ifsc_code?: string | null;
+  bank_account_type?: string | null;
+  kyc_verifications?: Record<string, unknown> | null;
   station_count: number;
   activated_at?: string | null;
   created_at: string;
@@ -571,7 +573,16 @@ export interface FranchiseeUpdate {
   bank_account_name?: string;
   bank_account_number?: string;
   bank_ifsc_code?: string;
+  bank_account_type?: string;
   notes?: string;
+}
+
+export interface StakeholderResidential {
+  street?: string;
+  city?: string;
+  state?: string;
+  postal_code?: string;
+  country?: string;
 }
 
 export interface FranchiseeStakeholder {
@@ -583,6 +594,11 @@ export interface FranchiseeStakeholder {
   relationship_director: boolean;
   relationship_executive: boolean;
   pan_number?: string | null;
+  residential_street?: string | null;
+  residential_city?: string | null;
+  residential_state?: string | null;
+  residential_postal_code?: string | null;
+  residential_country?: string | null;
   created_at: string;
 }
 
@@ -593,6 +609,17 @@ export interface StakeholderCreate {
   relationship_director?: boolean;
   relationship_executive?: boolean;
   pan_number?: string;
+  residential?: StakeholderResidential;
+}
+
+export interface StakeholderUpdate {
+  name?: string;
+  email?: string;
+  phone_primary?: string;
+  relationship_director?: boolean;
+  relationship_executive?: boolean;
+  pan_number?: string;
+  residential?: StakeholderResidential;
 }
 
 export interface SubmitKYCResponse {

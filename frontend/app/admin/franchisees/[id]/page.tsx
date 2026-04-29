@@ -44,7 +44,13 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
-import { CommissionUpdate, FranchiseeUpdate, StakeholderCreate } from "@/types/api";
+import {
+  CommissionUpdate,
+  FranchiseeUpdate,
+  FranchiseeStakeholder,
+  StakeholderCreate,
+  StakeholderUpdate,
+} from "@/types/api";
 import {
   useFranchisee,
   useFranchiseeStations,
@@ -57,6 +63,7 @@ import {
   useOnboardRazorpay,
   useFranchiseeStakeholders,
   useCreateStakeholder,
+  useUpdateStakeholder,
   useSubmitKYC,
 } from "@/lib/queries/franchisees";
 import { useStations } from "@/lib/queries/stations";
@@ -84,12 +91,16 @@ export default function FranchiseeDetailPage() {
   const [showAssignDialog, setShowAssignDialog] = useState(false);
   const [showBusinessDialog, setShowBusinessDialog] = useState(false);
   const [showStakeholderDialog, setShowStakeholderDialog] = useState(false);
+  // null = create mode; otherwise prefilled edit mode for the row
+  const [editingStakeholder, setEditingStakeholder] =
+    useState<FranchiseeStakeholder | null>(null);
   const [selectedStationId, setSelectedStationId] = useState<string>("");
 
   const updateFranchisee = useUpdateFranchisee(id);
   const updateCommission = useUpdateCommission(id);
   const { data: stakeholders } = useFranchiseeStakeholders(id);
   const createStakeholder = useCreateStakeholder(id);
+  const updateStakeholder = useUpdateStakeholder(id);
   const submitKYC = useSubmitKYC();
   const assignStations = useAssignStations(id);
   const unassignStation = useUnassignStation(id);
@@ -149,21 +160,67 @@ export default function FranchiseeDetailPage() {
     });
   };
 
-  const handleStakeholderCreate = (e: React.FormEvent<HTMLFormElement>) => {
+  const handleStakeholderSubmit = (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const formData = new FormData(e.currentTarget);
-    const payload: StakeholderCreate = {
-      name: String(formData.get("name") || "").trim(),
-      email: String(formData.get("email") || "").trim(),
-      phone_primary: String(formData.get("phone_primary") || "").trim() || undefined,
-      relationship_director: formData.get("relationship_director") === "on",
-      relationship_executive: formData.get("relationship_executive") === "on",
-      pan_number: String(formData.get("pan_number") || "").trim() || undefined,
-    };
-    if (!payload.name || !payload.email) return;
-    createStakeholder.mutate(payload, {
-      onSuccess: () => setShowStakeholderDialog(false),
-    });
+    const text = (k: string) =>
+      String(formData.get(k) || "").trim() || undefined;
+    const residential =
+      text("res_street") || text("res_city") || text("res_state") ||
+      text("res_postal_code") || text("res_country")
+        ? {
+            street: text("res_street"),
+            city: text("res_city"),
+            state: text("res_state"),
+            postal_code: text("res_postal_code"),
+            country: text("res_country") || "IN",
+          }
+        : undefined;
+
+    if (editingStakeholder) {
+      const payload: StakeholderUpdate = {
+        name: text("name"),
+        email: text("email"),
+        phone_primary: text("phone_primary"),
+        relationship_director: formData.get("relationship_director") === "on",
+        relationship_executive: formData.get("relationship_executive") === "on",
+        pan_number: text("pan_number"),
+        residential,
+      };
+      updateStakeholder.mutate(
+        { stakeholderId: editingStakeholder.id, body: payload },
+        {
+          onSuccess: () => {
+            setShowStakeholderDialog(false);
+            setEditingStakeholder(null);
+          },
+        }
+      );
+    } else {
+      const payload: StakeholderCreate = {
+        name: text("name") || "",
+        email: text("email") || "",
+        phone_primary: text("phone_primary"),
+        relationship_director: formData.get("relationship_director") === "on",
+        relationship_executive: formData.get("relationship_executive") === "on",
+        pan_number: text("pan_number"),
+        residential,
+      };
+      if (!payload.name || !payload.email) return;
+      createStakeholder.mutate(payload, {
+        onSuccess: () => setShowStakeholderDialog(false),
+      });
+    }
+  };
+
+  const openStakeholderEdit = (s: FranchiseeStakeholder) => {
+    setEditingStakeholder(s);
+    setShowStakeholderDialog(true);
+  };
+
+  const openStakeholderCreate = () => {
+    setEditingStakeholder(null);
+    setShowStakeholderDialog(true);
   };
 
   const handleAssignStation = () => {
@@ -351,6 +408,36 @@ export default function FranchiseeDetailPage() {
                 {franchisee.notes}
               </div>
             )}
+            {franchisee.kyc_verifications &&
+              Object.keys(franchisee.kyc_verifications).length > 0 && (
+                <div className="col-span-2 border-t pt-3 mt-2">
+                  <p className="text-muted-foreground text-xs mb-2">
+                    Razorpay KYC verification status (from webhook payloads):
+                  </p>
+                  <div className="grid grid-cols-2 gap-y-1 text-sm">
+                    {Object.entries(
+                      franchisee.kyc_verifications as Record<string, unknown>
+                    ).map(([key, value]) => (
+                      <div key={key} className="flex gap-2">
+                        <span className="text-muted-foreground">
+                          {key.replace(/_/g, " ")}:
+                        </span>
+                        <span className="font-mono text-xs">
+                          {typeof value === "string" || typeof value === "number"
+                            ? String(value)
+                            : JSON.stringify(value)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            {franchisee.status_reason && (
+              <div className="col-span-2 text-sm text-orange-700">
+                <span className="text-muted-foreground">KYC needs clarification:</span>{" "}
+                {franchisee.status_reason}
+              </div>
+            )}
           </CardContent>
         </Card>
 
@@ -360,7 +447,7 @@ export default function FranchiseeDetailPage() {
             <CardTitle className="flex items-center gap-2">
               <Users className="w-4 h-4" /> Stakeholders
             </CardTitle>
-            <Button size="sm" onClick={() => setShowStakeholderDialog(true)}>
+            <Button size="sm" onClick={openStakeholderCreate}>
               <UserPlus className="w-4 h-4 mr-1" /> Add Stakeholder
             </Button>
           </CardHeader>
@@ -377,8 +464,10 @@ export default function FranchiseeDetailPage() {
                     <TableHead>Name</TableHead>
                     <TableHead>Email</TableHead>
                     <TableHead>Phone</TableHead>
+                    <TableHead>PAN</TableHead>
                     <TableHead>Razorpay ID</TableHead>
                     <TableHead>Roles</TableHead>
+                    <TableHead className="w-16"></TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -391,6 +480,9 @@ export default function FranchiseeDetailPage() {
                       <TableCell className="text-sm text-muted-foreground">
                         {s.phone_primary || "-"}
                       </TableCell>
+                      <TableCell className="text-xs font-mono">
+                        {s.pan_number || "—"}
+                      </TableCell>
                       <TableCell className="text-xs font-mono text-muted-foreground">
                         {s.razorpay_stakeholder_id || "—"}
                       </TableCell>
@@ -401,6 +493,16 @@ export default function FranchiseeDetailPage() {
                         {s.relationship_executive && (
                           <Badge variant="secondary" className="text-xs">executive</Badge>
                         )}
+                      </TableCell>
+                      <TableCell>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => openStakeholderEdit(s)}
+                          title="Edit stakeholder"
+                        >
+                          <Pencil className="w-3 h-3" />
+                        </Button>
                       </TableCell>
                     </TableRow>
                   ))}
@@ -756,6 +858,21 @@ export default function FranchiseeDetailPage() {
                   placeholder="Current account"
                 />
               </div>
+              <div className="space-y-2">
+                <Label htmlFor="bank_account_type">Account Type</Label>
+                <Select
+                  name="bank_account_type"
+                  defaultValue={franchisee.bank_account_type || "savings"}
+                >
+                  <SelectTrigger id="bank_account_type">
+                    <SelectValue placeholder="Savings" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="savings">Savings</SelectItem>
+                    <SelectItem value="current">Current</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
               <div className="space-y-2 col-span-2">
                 <Label htmlFor="notes">Notes</Label>
                 <Input
@@ -780,52 +897,157 @@ export default function FranchiseeDetailPage() {
           </DialogContent>
         </Dialog>
 
-        {/* Add Stakeholder Dialog */}
+        {/* Stakeholder Dialog (create + edit) */}
         <Dialog
           open={showStakeholderDialog}
-          onOpenChange={setShowStakeholderDialog}
+          onOpenChange={(open) => {
+            setShowStakeholderDialog(open);
+            if (!open) setEditingStakeholder(null);
+          }}
         >
-          <DialogContent>
+          <DialogContent className="max-w-lg">
             <DialogHeader>
-              <DialogTitle>Add Stakeholder</DialogTitle>
+              <DialogTitle>
+                {editingStakeholder ? "Edit Stakeholder" : "Add Stakeholder"}
+              </DialogTitle>
             </DialogHeader>
-            <form onSubmit={handleStakeholderCreate} className="space-y-4">
+            <form
+              key={editingStakeholder?.id ?? "new"}
+              onSubmit={handleStakeholderSubmit}
+              className="space-y-4"
+            >
               <div className="space-y-2">
                 <Label htmlFor="sh_name">Full Name</Label>
-                <Input id="sh_name" name="name" required />
+                <Input
+                  id="sh_name"
+                  name="name"
+                  required
+                  defaultValue={editingStakeholder?.name || ""}
+                />
               </div>
               <div className="space-y-2">
                 <Label htmlFor="sh_email">Email</Label>
-                <Input id="sh_email" name="email" type="email" required />
+                <Input
+                  id="sh_email"
+                  name="email"
+                  type="email"
+                  required
+                  defaultValue={editingStakeholder?.email || ""}
+                />
               </div>
               <div className="space-y-2">
                 <Label htmlFor="sh_phone">Primary Phone (optional)</Label>
-                <Input id="sh_phone" name="phone_primary" placeholder="10-digit number" />
+                <Input
+                  id="sh_phone"
+                  name="phone_primary"
+                  placeholder="10-digit number"
+                  defaultValue={editingStakeholder?.phone_primary || ""}
+                />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="sh_pan">PAN (optional)</Label>
-                <Input id="sh_pan" name="pan_number" placeholder="ABCDE1234F" maxLength={10} />
+                <Label htmlFor="sh_pan">
+                  PAN <span className="text-xs text-muted-foreground">(required by Razorpay for KYC)</span>
+                </Label>
+                <Input
+                  id="sh_pan"
+                  name="pan_number"
+                  placeholder="ABCDE1234F"
+                  maxLength={10}
+                  defaultValue={editingStakeholder?.pan_number || ""}
+                />
               </div>
-              <div className="flex items-center gap-4">
+              <div className="space-y-2 border-t pt-4">
+                <h4 className="text-sm font-medium">Residential address (optional, recommended for KYC)</h4>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="res_street">Street</Label>
+                <Input
+                  id="res_street"
+                  name="res_street"
+                  defaultValue={editingStakeholder?.residential_street || ""}
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <Label htmlFor="res_city">City</Label>
+                  <Input
+                    id="res_city"
+                    name="res_city"
+                    defaultValue={editingStakeholder?.residential_city || ""}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="res_state">State</Label>
+                  <Input
+                    id="res_state"
+                    name="res_state"
+                    defaultValue={editingStakeholder?.residential_state || ""}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="res_postal_code">PIN Code</Label>
+                  <Input
+                    id="res_postal_code"
+                    name="res_postal_code"
+                    maxLength={10}
+                    defaultValue={editingStakeholder?.residential_postal_code || ""}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="res_country">Country</Label>
+                  <Input
+                    id="res_country"
+                    name="res_country"
+                    maxLength={2}
+                    defaultValue={editingStakeholder?.residential_country || "IN"}
+                  />
+                </div>
+              </div>
+              <div className="flex items-center gap-4 border-t pt-4">
                 <label className="flex items-center gap-2 text-sm">
-                  <input type="checkbox" name="relationship_director" defaultChecked />
+                  <input
+                    type="checkbox"
+                    name="relationship_director"
+                    defaultChecked={editingStakeholder?.relationship_director ?? false}
+                  />
                   Director
                 </label>
                 <label className="flex items-center gap-2 text-sm">
-                  <input type="checkbox" name="relationship_executive" defaultChecked />
+                  <input
+                    type="checkbox"
+                    name="relationship_executive"
+                    defaultChecked={editingStakeholder?.relationship_executive ?? true}
+                  />
                   Executive
                 </label>
+                <p className="text-xs text-muted-foreground ml-auto">
+                  For INDIVIDUAL/PROPRIETORSHIP, Director is typically off.
+                </p>
               </div>
               <DialogFooter>
                 <Button
                   type="button"
                   variant="outline"
-                  onClick={() => setShowStakeholderDialog(false)}
+                  onClick={() => {
+                    setShowStakeholderDialog(false);
+                    setEditingStakeholder(null);
+                  }}
                 >
                   Cancel
                 </Button>
-                <Button type="submit" disabled={createStakeholder.isPending}>
-                  {createStakeholder.isPending ? "Adding…" : "Add"}
+                <Button
+                  type="submit"
+                  disabled={
+                    createStakeholder.isPending || updateStakeholder.isPending
+                  }
+                >
+                  {editingStakeholder
+                    ? updateStakeholder.isPending
+                      ? "Saving…"
+                      : "Save"
+                    : createStakeholder.isPending
+                    ? "Adding…"
+                    : "Add"}
                 </Button>
               </DialogFooter>
             </form>

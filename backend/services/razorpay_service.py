@@ -482,6 +482,20 @@ class RazorpayService:
             logger.error("Failed to fetch account %s: %s", account_id, e)
             raise
 
+    def update_linked_account(self, account_id: str, data: Dict) -> Dict:
+        """PATCH /v2/accounts/{id} — amend account fields post-create.
+        Some fields (notably ``business_type``) are locked by Razorpay
+        once set; the SDK surfaces those as BadRequestError."""
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        try:
+            result = self.client.account.edit(account_id, data)
+            logger.info("Linked account updated: %s", account_id)
+            return result
+        except Exception as e:
+            logger.error("Failed to update account %s: %s", account_id, e)
+            raise
+
     # ─── Route product configuration + stakeholders (KYC submission) ───
 
     def request_product_configuration(
@@ -557,6 +571,42 @@ class RazorpayService:
         except Exception as e:
             logger.error(
                 "Failed to list stakeholders on %s: %s", account_id, e
+            )
+            raise
+
+    def fetch_stakeholder(self, account_id: str, stakeholder_id: str) -> Dict:
+        """GET /v2/accounts/{id}/stakeholders/{sid} — read single stakeholder."""
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        try:
+            return self.client.stakeholder.fetch(account_id, stakeholder_id)
+        except Exception as e:
+            logger.error(
+                "Failed to fetch stakeholder %s on %s: %s",
+                stakeholder_id, account_id, e,
+            )
+            raise
+
+    def update_stakeholder(
+        self, account_id: str, stakeholder_id: str, data: Dict
+    ) -> Dict:
+        """PATCH /v2/accounts/{id}/stakeholders/{sid} — amend stakeholder
+        fields. Used to add ``kyc.pan`` / ``addresses.residential`` to a
+        stakeholder created earlier without them."""
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        try:
+            result = self.client.stakeholder.edit(
+                account_id, stakeholder_id, data
+            )
+            logger.info(
+                "Stakeholder updated: %s on %s", stakeholder_id, account_id
+            )
+            return result
+        except Exception as e:
+            logger.error(
+                "Failed to update stakeholder %s on %s: %s",
+                stakeholder_id, account_id, e,
             )
             raise
 

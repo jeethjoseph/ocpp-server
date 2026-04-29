@@ -581,6 +581,7 @@ class Franchisee(Model):
     bank_account_name = fields.CharField(max_length=255, null=True)
     bank_account_number = fields.CharField(max_length=30, null=True)
     bank_ifsc_code = fields.CharField(max_length=11, null=True)
+    bank_account_type = fields.CharField(max_length=10, null=True)
 
     # Razorpay Route integration
     razorpay_account_id = fields.CharField(
@@ -593,6 +594,7 @@ class Franchisee(Model):
     razorpay_onboarding_url = fields.CharField(max_length=500, null=True)
     kyc_submitted_at = fields.DatetimeField(null=True)
     kyc_verified_at = fields.DatetimeField(null=True)
+    kyc_verifications = fields.JSONField(null=True)
     # Route transfer gates (driven by account.* webhooks)
     transfers_enabled = fields.BooleanField(default=True)
     funds_on_hold = fields.BooleanField(default=False)
@@ -663,6 +665,11 @@ class FranchiseeStakeholder(Model):
     relationship_director = fields.BooleanField(default=True)
     relationship_executive = fields.BooleanField(default=True)
     pan_number = fields.CharField(max_length=10, null=True)
+    residential_street = fields.CharField(max_length=255, null=True)
+    residential_city = fields.CharField(max_length=100, null=True)
+    residential_state = fields.CharField(max_length=100, null=True)
+    residential_postal_code = fields.CharField(max_length=10, null=True)
+    residential_country = fields.CharField(max_length=2, default="IN")
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)
 

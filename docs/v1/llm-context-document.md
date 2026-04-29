@@ -201,17 +201,42 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
     Razorpay dashboard's broken KYC Form): `ensure_product_config`
     POSTs `/v2/accounts/{id}/products` and persists the returned
     `product_id` on `Franchisee.razorpay_product_id`; `submit_bank_details`
-    PATCHes the product config with `settlements` from the franchisee's
-    bank fields; `add_stakeholder` POSTs to `/stakeholders` and mirrors
-    the result into `FranchiseeStakeholder`. The top-level
+    PATCHes the product config with `settlements` (incl. optional
+    `account_type` from `Franchisee.bank_account_type`) plus
+    `tnc_accepted: true` (re-sent on every PATCH per Razorpay's
+    update-product-config doc); `add_stakeholder` POSTs to
+    `/stakeholders` with `kyc.pan` + optional `addresses.residential`
+    and mirrors the result into `FranchiseeStakeholder`. The top-level
     `submit_kyc(franchisee_id)` orchestrates ensure_product_config +
     submit_bank_details + fetch, returning `{activation_status,
-    requirements[], stakeholder_count}`. `reconcile_razorpay` back-fills
-    product_id + stakeholder rows for accounts pushed to Razorpay outside
-    this flow (e.g. via one-off scripts). Razorpay's dashboard KYC Form
-    omits stakeholder entry for `business_type=not_yet_registered`
-    (proprietorship), so the API path is the only way to get past
-    `activation_status: created` for those accounts.
+    requirements[], stakeholder_count}`. `update_stakeholder` PATCHes
+    an existing Razorpay stakeholder + persists locally — used to
+    backfill PAN / residential address when admins forgot at create
+    time. `reconcile_razorpay` back-fills product_id + stakeholder rows
+    for accounts pushed to Razorpay outside this flow (e.g. via one-off
+    scripts). Razorpay's dashboard KYC Form omits stakeholder entry for
+    `business_type=not_yet_registered` (proprietorship), so the API path
+    is the only way to get past `activation_status: created` for those
+    accounts.
+  - **Relationship defaults by business_type** (`_relationship_defaults`):
+    INDIVIDUAL / PROPRIETORSHIP → `(director=False, executive=True)` —
+    proprietors aren't directors. PARTNERSHIP / PRIVATE_LIMITED / LLP →
+    `(True, True)`. The wrong defaults (uniform `True/True`) caused the
+    `acc_Sg73UwyOU3jziR` stuck-account audit, even though Razorpay
+    accepted them on the wire — they're semantically wrong metadata for
+    individuals and may delay automated review.
+  - **`addresses.operational`** mirrors `addresses.registered` on
+    `create_linked_account` so Razorpay's review pipeline has both. After
+    create, we log a WARNING if Razorpay echoes back a `business_type`
+    different from what we sent (Razorpay silently downgraded
+    `individual` → `not_yet_registered` for `acc_Sg73UwyOU3jziR`).
+  - **KYC verification status** — Razorpay ships per-dimension
+    verification fields (`bank_details_verification_status`,
+    `poi_verification_status`, `poa_verification_status`, etc.) on
+    `account.under_review` / `account.needs_clarification` payloads.
+    These are persisted on `Franchisee.kyc_verifications` (JSONB) and
+    surfaced on the admin detail page so admins can see which dimension
+    is still being checked beyond the top-level activation status.
   - End-to-end UX: admin fills Business Details (business_type, address,
     city, state, pincode, bank) + adds at least one Stakeholder on
     `/admin/franchisees/[id]`, clicks "Start Razorpay onboarding" (creates
@@ -232,7 +257,11 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
     remains. `transfer_fee` is NOT deducted at calc time — it's
     populated after the fact from the `settlement.processed` webhook
     (Razorpay's actual per-transfer fee).
-  - `initiate_transfer(entry)` calls
+  - `initiate_transfer(entry)` enforces a **24-hour cooling period**
+    after `franchisee.activated_at` (Razorpay rejects transfers within
+    24h of activation). Within the window the entry is parked as
+    `ON_HOLD` with `failure_reason="cooling_period"` and picked up by
+    `retry_failed_transfers` later. Otherwise calls
     `razorpay_service.create_transfer` with a stable idempotency key
     (the ledger entry's `idempotency_key`) so retries are safe.
     Skips + marks `ON_HOLD` when `franchisee.transfers_enabled=False`

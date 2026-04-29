@@ -22,6 +22,7 @@ import {
   FranchiseeListResponse,
   FranchiseeStakeholder,
   StakeholderCreate,
+  StakeholderUpdate,
   SubmitKYCResponse,
   CommissionUpdate,
   CommissionAuditEntry,
@@ -769,6 +770,16 @@ export const franchiseeService = {
   createStakeholder: (id: number, body: StakeholderCreate) =>
     api.post<FranchiseeStakeholder>(
       `/api/admin/franchisees/${id}/stakeholders`,
+      body
+    ),
+
+  updateStakeholder: (
+    id: number,
+    stakeholderId: number,
+    body: StakeholderUpdate
+  ) =>
+    api.put<FranchiseeStakeholder>(
+      `/api/admin/franchisees/${id}/stakeholders/${stakeholderId}`,
       body
     ),
 

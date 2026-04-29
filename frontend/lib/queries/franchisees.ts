@@ -5,6 +5,7 @@ import {
   FranchiseeUpdate,
   CommissionUpdate,
   StakeholderCreate,
+  StakeholderUpdate,
 } from "@/types/api";
 import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
@@ -220,6 +221,27 @@ export function useCreateStakeholder(id: number) {
     onError: (err) => {
       const msg = err instanceof Error ? err.message : String(err);
       toast.error(`Could not add stakeholder: ${msg}`);
+    },
+  });
+}
+
+export function useUpdateStakeholder(id: number) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      stakeholderId,
+      body,
+    }: {
+      stakeholderId: number;
+      body: StakeholderUpdate;
+    }) => franchiseeService.updateStakeholder(id, stakeholderId, body),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: franchiseeKeys.stakeholders(id) });
+      toast.success("Stakeholder updated.");
+    },
+    onError: (err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error(`Could not update stakeholder: ${msg}`);
     },
   });
 }

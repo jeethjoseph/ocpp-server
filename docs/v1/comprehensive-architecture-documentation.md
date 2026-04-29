@@ -2327,7 +2327,39 @@ Implementation notes:
    account status (`transfers_enabled`, `funds_on_hold`) gates every
    transfer attempt; when gated, the entry is marked `ON_HOLD` and
    retried automatically when a subsequent `account.funds_unhold` /
-   `account.activated` webhook flips the gate off.
+   `account.activated` webhook flips the gate off. A separate
+   **24-hour cooling-period guard** in `initiate_transfer` parks
+   transfers as `ON_HOLD` with `failure_reason="cooling_period"` when
+   `franchisee.activated_at` is within the last 24h — Razorpay
+   rejects transfers in that window.
+
+5. **KYC payload shape** (post-2026-04 audit; documented to prevent
+   regression of the `acc_Sg73UwyOU3jziR` stuck-account pattern):
+   - `create_linked_account` payload sends `type: "route"` (canonical
+     and required per Razorpay's `create-linked-account` API spec) and
+     mirrors `addresses.registered` into `addresses.operational`. After
+     create, a WARNING is logged if Razorpay echoes a different
+     `business_type` than we sent (Razorpay silently downgraded
+     `individual` → `not_yet_registered` for `acc_Sg73UwyOU3jziR`).
+   - `add_stakeholder` derives `(director, executive)` defaults from
+     the franchisee's `business_type` via `_relationship_defaults` —
+     INDIVIDUAL/PROPRIETORSHIP get `(False, True)` (no "director" of an
+     individual), corporate types get `(True, True)`. Stakeholder
+     payload includes `kyc.pan` and optional `addresses.residential`.
+   - `submit_bank_details` PATCH includes `tnc_accepted: true` (per
+     Razorpay's `update-product-config` doc) plus optional
+     `account_type` (`savings`/`current`) when the franchisee row has
+     `bank_account_type` populated.
+   - `update_stakeholder` (PUT
+     `/api/admin/franchisees/{id}/stakeholders/{sid}`) PATCHes an
+     existing Razorpay stakeholder so admins can backfill PAN /
+     residential address without recreating.
+   - `handle_account_webhook` correctly parses `requirements` as a list
+     of `{field_reference, resolution_url, reason_code, status}` dicts
+     (NOT a dict — fixed in migration-23 era code) and persists
+     Razorpay's `verification` subtree on `Franchisee.kyc_verifications`
+     (JSONB) so admins can see per-dimension KYC progress beyond the
+     top-level `activation_status`.
 
 Complementary transparency surfaces (all read-only, franchisee name
 sourced from the `Charger → Station → Franchisee` FK chain):
