@@ -225,11 +225,15 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
     `acc_Sg73UwyOU3jziR` stuck-account audit, even though Razorpay
     accepted them on the wire — they're semantically wrong metadata for
     individuals and may delay automated review.
-  - **`addresses.operational`** mirrors `addresses.registered` on
-    `create_linked_account` so Razorpay's review pipeline has both. After
-    create, we log a WARNING if Razorpay echoes back a `business_type`
-    different from what we sent (Razorpay silently downgraded
-    `individual` → `not_yet_registered` for `acc_Sg73UwyOU3jziR`).
+  - **`addresses.registered` only** on `create_linked_account` —
+    Razorpay rejects `addresses.operational` for `business_type:
+    individual` with `"operational is/are not required and should not be
+    sent"` (verified 2026-04-29 via `razorpay_api_log`; the Tier 1+2
+    hypothesis that `operational` was a documented optional field turned
+    out to be wrong). After create, we log a WARNING if Razorpay echoes
+    back a `business_type` different from what we sent (Razorpay
+    silently downgraded `individual` → `not_yet_registered` for
+    `acc_Sg73UwyOU3jziR`).
   - **KYC verification status** — Razorpay ships per-dimension
     verification fields (`bank_details_verification_status`,
     `poi_verification_status`, `poa_verification_status`, etc.) on

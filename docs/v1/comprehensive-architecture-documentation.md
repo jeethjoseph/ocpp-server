@@ -2337,8 +2337,10 @@ Implementation notes:
    regression of the `acc_Sg73UwyOU3jziR` stuck-account pattern):
    - `create_linked_account` payload sends `type: "route"` (canonical
      and required per Razorpay's `create-linked-account` API spec) and
-     mirrors `addresses.registered` into `addresses.operational`. After
-     create, a WARNING is logged if Razorpay echoes a different
+     `addresses.registered` only — Razorpay rejects `operational` for
+     `business_type: individual` with `"operational is/are not required
+     and should not be sent"` (caught 2026-04-29 via the new audit log).
+     After create, a WARNING is logged if Razorpay echoes a different
      `business_type` than we sent (Razorpay silently downgraded
      `individual` → `not_yet_registered` for `acc_Sg73UwyOU3jziR`).
    - `add_stakeholder` derives `(director, executive)` defaults from

@@ -69,9 +69,11 @@ def test_relationship_defaults_handles_enum_member_with_value_attr():
 # ─── create_linked_account payload shape ────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_create_linked_account_payload_keeps_type_route_and_mirrors_addresses():
-    """`type: 'route'` is documented and required. `addresses.operational`
-    must mirror `addresses.registered` so Razorpay's review has both."""
+async def test_create_linked_account_payload_keeps_type_route_and_only_registered_address():
+    """`type: 'route'` is documented and required. Only `addresses.registered`
+    is sent — Razorpay 400s with "operational is/are not required and should
+    not be sent" if we include `operational` (verified against live API
+    2026-04-29; see `razorpay_api_log` row from that date)."""
     franchisee = MagicMock()
     franchisee.id = 42
     franchisee.razorpay_account_id = None
@@ -115,8 +117,8 @@ async def test_create_linked_account_payload_keeps_type_route_and_mirrors_addres
     assert captured["payload"]["business_type"] == "individual"
     addresses = captured["payload"]["profile"]["addresses"]
     assert "registered" in addresses
-    assert "operational" in addresses
-    assert addresses["registered"] == addresses["operational"]
+    # Razorpay rejects `operational` — must NOT be sent.
+    assert "operational" not in addresses
     assert addresses["registered"]["country"] == "IN"
 
 

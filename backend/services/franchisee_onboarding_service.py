@@ -161,19 +161,14 @@ class FranchiseeOnboardingService:
                 "category": "services",
                 "subcategory": "service_stations",
                 "addresses": {
-                    # Razorpay's `addresses` accepts both `registered` and
-                    # `operational`. Mirroring the registered address as
-                    # operational gives the review queue both touchpoints
-                    # at once; updating operational separately later via
-                    # account.edit is cheap if it ever diverges.
+                    # Only `registered` is accepted by Razorpay's create
+                    # endpoint for `business_type: individual`. We tried
+                    # mirroring as `operational` (per a since-retracted
+                    # reading of the docs) and Razorpay 400'd with:
+                    # "operational is/are not required and should not be
+                    # sent". Captured by `razorpay_api_log` on
+                    # 2026-04-29; do not re-add without verifying first.
                     "registered": {
-                        **_split_street(franchisee.address, franchisee.city),
-                        "city": franchisee.city,
-                        "state": (franchisee.state or "").upper(),
-                        "postal_code": franchisee.pincode,
-                        "country": "IN",
-                    },
-                    "operational": {
                         **_split_street(franchisee.address, franchisee.city),
                         "city": franchisee.city,
                         "state": (franchisee.state or "").upper(),
