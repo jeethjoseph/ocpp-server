@@ -826,7 +826,7 @@ export default function FranchiseeDetailPage() {
 
         {/* Business Details Edit Dialog */}
         <Dialog open={showBusinessDialog} onOpenChange={setShowBusinessDialog}>
-          <DialogContent className="max-w-xl">
+          <DialogContent className="max-w-xl max-h-[90vh] overflow-y-auto">
             <DialogHeader>
               <DialogTitle>Edit Business Details</DialogTitle>
             </DialogHeader>
@@ -1038,7 +1038,7 @@ export default function FranchiseeDetailPage() {
             if (!open) setEditingStakeholder(null);
           }}
         >
-          <DialogContent className="max-w-lg">
+          <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto">
             <DialogHeader>
               <DialogTitle>
                 {editingStakeholder ? "Edit Stakeholder" : "Add Stakeholder"}
@@ -1240,7 +1240,7 @@ export default function FranchiseeDetailPage() {
             if (!open) setDeleteRazorpayConfirmInput("");
           }}
         >
-          <DialogContent className="max-w-lg">
+          <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto">
             <DialogHeader>
               <DialogTitle className="text-red-700">
                 Delete Razorpay Linked Account
