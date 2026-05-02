@@ -58,6 +58,14 @@ services:
       # Used by Clerk invitation service to build the redirect URL that
       # Clerk's magic-link email points to after sign-up completes.
       - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3000}
+      # Razorpay Route (franchisee linked-account payouts) — defaults
+      # match staging/prod compose files. Set RAZORPAY_ROUTE_ENABLED=true
+      # in backend/.env when testing the settlement flow locally.
+      - RAZORPAY_ROUTE_ENABLED=${RAZORPAY_ROUTE_ENABLED:-false}
+      - MINIMUM_TRANSFER_AMOUNT=${MINIMUM_TRANSFER_AMOUNT:-1.00}
+      - MAX_TRANSFER_RETRIES=${MAX_TRANSFER_RETRIES:-3}
+      - FRANCHISEE_PAYOUT_RETRY_INTERVAL_SECONDS=${FRANCHISEE_PAYOUT_RETRY_INTERVAL_SECONDS:-600}
+      - RAZORPAY_PLATFORM_FEE_PERCENT=${RAZORPAY_PLATFORM_FEE_PERCENT:-2.0}
     volumes:
       - ./backend:/app
       - backend_firmware:/app/firmware_files

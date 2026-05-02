@@ -535,6 +535,8 @@ export interface Franchisee {
   razorpay_account_status?: string | null;
   razorpay_product_id?: string | null;
   razorpay_onboarding_url?: string | null;
+  transfers_enabled: boolean;
+  funds_on_hold: boolean;
   bank_account_name?: string | null;
   bank_account_number?: string | null;
   bank_ifsc_code?: string | null;
@@ -645,6 +647,30 @@ export interface SubmitKYCResponse {
     resolution_url?: string;
   }>;
   stakeholder_count: number;
+}
+
+export interface AdminSettlementEntry {
+  id: number;
+  transaction_id: number;
+  payment_method: string;
+  gross_amount: string;
+  refund_amount: string;
+  pg_fee_amount: string;
+  net_amount: string;
+  gst_collected: string;
+  net_excl_gst: string;
+  commission_percent: string;
+  platform_commission: string;
+  tds_amount: string;
+  transfer_fee: string;
+  franchisee_payout: string;
+  energy_consumed_kwh: number;
+  settlement_status: string;
+  razorpay_payment_id?: string | null;
+  razorpay_transfer_id?: string | null;
+  failure_reason?: string | null;
+  retry_count: number;
+  created_at: string;
 }
 
 export interface FranchiseeListResponse {

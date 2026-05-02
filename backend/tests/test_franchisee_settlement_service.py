@@ -5,7 +5,7 @@ Pure-logic tests — no DB, no network. The SDK mock asserts the exact
 headers Razorpay sees for transfer.create / payment.refund calls.
 """
 from decimal import Decimal
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -108,3 +108,153 @@ def test_refund_payment_passes_idempotency_header():
     assert call.args[0] == "pay_test"
     assert call.args[1]["amount"] == 10000  # rupees → paise
     assert call.kwargs["headers"] == {"X-Refund-Idempotency": "qr_payment_42"}
+
+
+def _build_razorpay_service():
+    """Construct a RazorpayService with credentials but without invoking
+    the real client constructor (which validates network connectivity)."""
+    from services.razorpay_service import RazorpayService
+
+    svc = RazorpayService.__new__(RazorpayService)
+    svc.api_key = "rzp_test_key"
+    svc.api_secret = "rzp_test_secret"
+    svc.client = MagicMock()  # is_configured() checks client is not None
+    return svc
+
+
+def _mock_requests_post(json_body, status_code=200):
+    """Build a MagicMock that mimics requests.Response for requests.post."""
+    resp = MagicMock()
+    resp.json.return_value = json_body
+    resp.status_code = status_code
+    resp.ok = 200 <= status_code < 300
+    resp.text = str(json_body)
+    return resp
+
+
+@pytest.mark.asyncio
+async def test_create_payment_transfer_uses_payment_endpoint():
+    """The HTTP request must go to /v1/payments/{id}/transfers with the
+    correct body shape and HTTP basic auth credentials."""
+    svc = _build_razorpay_service()
+
+    response_body = {
+        "entity": "collection",
+        "count": 1,
+        "items": [{
+            "id": "trf_xyz",
+            "source": "pay_abc",
+            "recipient": "acc_def",
+            "amount": 583,
+            "currency": "INR",
+            "fees": 2,
+        }],
+    }
+
+    fake_log_cls = MagicMock()
+    fake_log_cls.create = AsyncMock()
+
+    with patch(
+        "services.razorpay_service.requests.post",
+        return_value=_mock_requests_post(response_body),
+    ) as mock_post, patch(
+        "models.RazorpayApiLog", fake_log_cls, create=True
+    ):
+        result = await svc.create_payment_transfer(
+            payment_id="pay_abc",
+            account_id="acc_def",
+            amount_paise=583,
+            notes={"transaction_id": "90"},
+            franchisee_id=2,
+        )
+
+    assert result["id"] == "trf_xyz"
+    mock_post.assert_called_once()
+    call = mock_post.call_args
+    assert call.args[0] == "https://api.razorpay.com/v1/payments/pay_abc/transfers"
+    assert call.kwargs["json"] == {
+        "transfers": [{
+            "account": "acc_def",
+            "amount": 583,
+            "currency": "INR",
+            "notes": {"transaction_id": "90"},
+        }]
+    }
+    assert call.kwargs["auth"] == ("rzp_test_key", "rzp_test_secret")
+
+
+@pytest.mark.asyncio
+async def test_create_payment_transfer_writes_audit_log_on_success():
+    """Successful 200 response must produce one RazorpayApiLog row with
+    success=True and the response body recorded."""
+    svc = _build_razorpay_service()
+
+    response_body = {
+        "entity": "collection",
+        "items": [{"id": "trf_xyz", "amount": 583}],
+    }
+    captured_log = {}
+
+    async def fake_create(**kw):
+        captured_log.update(kw)
+        return MagicMock()
+
+    fake_log_cls = MagicMock()
+    fake_log_cls.create = AsyncMock(side_effect=fake_create)
+
+    with patch(
+        "services.razorpay_service.requests.post",
+        return_value=_mock_requests_post(response_body),
+    ), patch("models.RazorpayApiLog", fake_log_cls, create=True):
+        await svc.create_payment_transfer(
+            payment_id="pay_abc",
+            account_id="acc_def",
+            amount_paise=583,
+            franchisee_id=2,
+        )
+
+    fake_log_cls.create.assert_awaited_once()
+    assert captured_log["method"] == "POST"
+    assert captured_log["endpoint"] == "POST /v1/payments/pay_abc/transfers"
+    assert captured_log["success"] is True
+    assert captured_log["franchisee_id"] == 2
+    assert captured_log["razorpay_account_id"] == "acc_def"
+
+
+@pytest.mark.asyncio
+async def test_create_payment_transfer_logs_failure_and_raises():
+    """A 400 response must produce an audit row with success=False and
+    re-raise so the settlement caller marks the ledger FAILED."""
+    import razorpay
+    svc = _build_razorpay_service()
+
+    error_body = {
+        "error": {
+            "code": "BAD_REQUEST_ERROR",
+            "description": "The sum of amount requested for transfer is greater than the captured amount",
+        }
+    }
+    captured_log = {}
+
+    async def fake_create(**kw):
+        captured_log.update(kw)
+        return MagicMock()
+
+    fake_log_cls = MagicMock()
+    fake_log_cls.create = AsyncMock(side_effect=fake_create)
+
+    with patch(
+        "services.razorpay_service.requests.post",
+        return_value=_mock_requests_post(error_body, status_code=400),
+    ), patch("models.RazorpayApiLog", fake_log_cls, create=True):
+        with pytest.raises(razorpay.errors.BadRequestError):
+            await svc.create_payment_transfer(
+                payment_id="pay_abc",
+                account_id="acc_def",
+                amount_paise=999999,
+            )
+
+    fake_log_cls.create.assert_awaited_once()
+    assert captured_log["success"] is False
+    assert captured_log["response_status"] == 400
+    assert "captured amount" in (captured_log["error_message"] or "")

@@ -2322,16 +2322,31 @@ Implementation notes:
    platform-wide.
 4. Route transfer lifecycle: settlement service creates a
    `CommissionLedgerEntry` after QR billing + refund complete, then
-   calls `create_transfer` with `X-Transfer-Idempotency` set to the
-   ledger entry's stable idempotency key. The franchisee's Route
-   account status (`transfers_enabled`, `funds_on_hold`) gates every
-   transfer attempt; when gated, the entry is marked `ON_HOLD` and
-   retried automatically when a subsequent `account.funds_unhold` /
-   `account.activated` webhook flips the gate off. A separate
-   **24-hour cooling-period guard** in `initiate_transfer` parks
-   transfers as `ON_HOLD` with `failure_reason="cooling_period"` when
-   `franchisee.activated_at` is within the last 24h — Razorpay
-   rejects transfers in that window.
+   `initiate_transfer` picks one of two Razorpay endpoints based on
+   whether the ledger entry carries a source `razorpay_payment_id`:
+   - **QR sessions** → `create_payment_transfer` → `POST /v1/payments/
+     {payment_id}/transfers` (no on-demand activation needed; Razorpay
+     enforces `sum(transfers) ≤ captured_amount`). Each call writes a
+     `RazorpayApiLog` audit row with full request/response wire data.
+     Application-level idempotency: `_validate_ledger_for_transfer`
+     rejects a second ledger row with the same `razorpay_payment_id`.
+   - **Wallet sessions** → `create_transfer` → `POST /v1/transfers`
+     with `X-Transfer-Idempotency` header. **This endpoint requires an
+     on-demand Razorpay merchant feature** ("Direct Transfers"); until
+     ops opens a support ticket against the parent merchant the call
+     fails with `400 "This feature is not enabled for this merchant."`
+     The retry service will keep marking these `FAILED` until the flag
+     flips.
+
+   The franchisee's Route account status (`transfers_enabled`,
+   `funds_on_hold`) gates every transfer attempt; when gated, the
+   entry is marked `ON_HOLD` and retried automatically when a
+   subsequent `account.funds_unhold` / `account.activated` webhook
+   flips the gate off. A separate **24-hour cooling-period guard** in
+   `initiate_transfer` parks transfers as `ON_HOLD` with
+   `failure_reason="cooling_period"` when `franchisee.activated_at`
+   is within the last 24h — Razorpay rejects transfers in that
+   window.
 
 5. **KYC payload shape** (post-2026-04 audit; documented to prevent
    regression of the `acc_Sg73UwyOU3jziR` stuck-account pattern):
@@ -2343,6 +2358,19 @@ Implementation notes:
      After create, a WARNING is logged if Razorpay echoes a different
      `business_type` than we sent (Razorpay silently downgraded
      `individual` → `not_yet_registered` for `acc_Sg73UwyOU3jziR`).
+     `profile.category/subcategory` is hardcoded to
+     `services / automotive_service_shops` (lowercase). Razorpay's
+     enum is **lowercase-strict** — UPPERCASE 400s with
+     `"Invalid business subcategory"`. Earlier values
+     (`utilities/electric_vehicle_charging`, then
+     `services/service_stations`) were silently rejected by KYC
+     review and parked accounts in `needs_clarification +
+     requirements: []` (broken Razorpay-side state machine — the
+     subcategory rejection isn't surfaced through `requirements[]`).
+     Diagnostic PATCH on `acc_SjK7ZBzAfiA4QF` (2026-04-30) confirmed
+     `automotive_service_shops` activates immediately; see
+     `docs/razorpay-onboarding-acc_SjK7ZBzAfiA4QF.md` "Resolution"
+     section and project memory `project_razorpay_subcategory_fix`.
    - `add_stakeholder` derives `(director, executive)` defaults from
      the franchisee's `business_type` via `_relationship_defaults` —
      INDIVIDUAL/PROPRIETORSHIP get `(False, True)` (no "director" of an
@@ -2357,6 +2385,39 @@ Implementation notes:
      elsewhere (verified 2026-04-29 via the audit log on a fresh
      onboarding). The `Franchisee.bank_account_type` column stays for
      invoicing / reconciliation use.
+     **Name-chain advisory (not enforced):** Razorpay requires the
+     bank passbook account-holder name == `settlements.beneficiary_name`
+     (PATCH product config) == `legal_business_name` (POST /v2/accounts).
+     Today `beneficiary_name` is `franchisee.bank_account_name` and
+     `legal_business_name` is `franchisee.business_name` — two
+     independent admin inputs with no equality guarantee. The
+     franchisee detail page surfaces an advisory note in the Bank
+     Account section. Hard enforcement is pending confirmation that
+     the rule applies uniformly across all `business_type` values.
+   - **Pre-transfer validator** (`_validate_ledger_for_transfer` in
+     `franchisee_settlement_service.py`) runs six foolproof checks
+     before any `create_transfer` SDK call: positive payout, payout ≤
+     gross − refund, components sum to gross within a 2-paisa
+     tolerance, settlement_status not in a terminal state, franchisee
+     has a matching razorpay_account_id, and razorpay_payment_id
+     (when present) hasn't already been used on a sibling ledger
+     entry's transfer. Math/state failures mark the entry FAILED with
+     a `validation_*` `failure_reason` and do NOT increment
+     retry_count — they require admin investigation. Razorpay-side
+     audit linkage is achieved by enriching the transfer's `notes`
+     dict with `transaction_id`, `ledger_entry_id`, `franchisee_id`,
+     `voltlync_payment_id` (source payment_id or "wallet"), and
+     `idempotency_key`.
+   - **Background payout retry service**
+     (`services/franchisee_payout_retry_service.py`, mirrors the
+     `data_retention_service` pattern) wakes every
+     `FRANCHISEE_PAYOUT_RETRY_INTERVAL_SECONDS` (default 600) and
+     calls `retry_failed_transfers()` to drain ON_HOLD/FAILED entries
+     after cooling-period / funds_unhold gates clear. Started from
+     `main.py:@app.on_event("startup")`; no-op when
+     `RAZORPAY_ROUTE_ENABLED != "true"`. Closes the manual-retry-only
+     gap that previously left `account.funds_unhold` and
+     `account.activated` webhook firings without an automated trigger.
    - `update_stakeholder` (PUT
      `/api/admin/franchisees/{id}/stakeholders/{sid}`) PATCHes an
      existing Razorpay stakeholder so admins can backfill PAN /

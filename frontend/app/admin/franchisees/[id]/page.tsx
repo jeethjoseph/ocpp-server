@@ -14,6 +14,10 @@ import {
   Send,
   Trash2,
   Users,
+  Banknote,
+  Pause,
+  Play,
+  RefreshCw,
 } from "lucide-react";
 
 import { AdminOnly } from "@/components/RoleWrapper";
@@ -51,6 +55,7 @@ import {
   FranchiseeStakeholder,
   StakeholderCreate,
   StakeholderUpdate,
+  SubmitKYCResponse,
 } from "@/types/api";
 import {
   useFranchisee,
@@ -68,6 +73,10 @@ import {
   useSubmitKYC,
   useDeleteRazorpayAccount,
   useRazorpayApiLogs,
+  useAdminFranchiseeSettlements,
+  useRetryFailedSettlements,
+  useHoldSettlement,
+  useReleaseSettlement,
 } from "@/lib/queries/franchisees";
 import { useStations } from "@/lib/queries/stations";
 
@@ -79,6 +88,16 @@ const STATUS_COLORS: Record<string, string> = {
   ACTIVE: "bg-green-100 text-green-800",
   SUSPENDED: "bg-red-100 text-red-800",
   DEACTIVATED: "bg-gray-300 text-gray-700",
+};
+
+const SETTLEMENT_STATUS_COLORS: Record<string, string> = {
+  PENDING: "bg-yellow-100 text-yellow-800",
+  TRANSFER_INITIATED: "bg-blue-100 text-blue-800",
+  TRANSFER_PROCESSED: "bg-green-100 text-green-800",
+  SETTLED: "bg-blue-100 text-blue-800",
+  FAILED: "bg-red-100 text-red-800",
+  ON_HOLD: "bg-orange-100 text-orange-800",
+  REVERSED: "bg-gray-200 text-gray-700",
 };
 
 export default function FranchiseeDetailPage() {
@@ -100,6 +119,7 @@ export default function FranchiseeDetailPage() {
   const [selectedStationId, setSelectedStationId] = useState<string>("");
   const [showDeleteRazorpayDialog, setShowDeleteRazorpayDialog] = useState(false);
   const [deleteRazorpayConfirmInput, setDeleteRazorpayConfirmInput] = useState("");
+  const [kycResult, setKycResult] = useState<SubmitKYCResponse | null>(null);
 
   const updateFranchisee = useUpdateFranchisee(id);
   const updateCommission = useUpdateCommission(id);
@@ -110,6 +130,15 @@ export default function FranchiseeDetailPage() {
   const { data: apiLogs } = useRazorpayApiLogs(id);
   const [expandedLogId, setExpandedLogId] = useState<number | null>(null);
   const submitKYC = useSubmitKYC();
+  const [settlementsPage, setSettlementsPage] = useState(1);
+  const settlementsLimit = 10;
+  const { data: settlementsData } = useAdminFranchiseeSettlements(id, {
+    page: settlementsPage,
+    limit: settlementsLimit,
+  });
+  const retrySettlements = useRetryFailedSettlements(id);
+  const holdSettlement = useHoldSettlement(id);
+  const releaseSettlement = useReleaseSettlement(id);
   const assignStations = useAssignStations(id);
   const unassignStation = useUnassignStation(id);
   const resendInvitation = useResendInvitation();
@@ -281,7 +310,11 @@ export default function FranchiseeDetailPage() {
             <Button
               variant="outline"
               size="sm"
-              onClick={() => submitKYC.mutate(id)}
+              onClick={() =>
+                submitKYC.mutate(id, {
+                  onSuccess: (data) => setKycResult(data),
+                })
+              }
               disabled={
                 submitKYC.isPending ||
                 !(stakeholders && stakeholders.length > 0) ||
@@ -321,6 +354,24 @@ export default function FranchiseeDetailPage() {
           >
             {franchisee.status.replace(/_/g, " ")}
           </Badge>
+          {franchisee.funds_on_hold && (
+            <Badge
+              className="bg-red-100 text-red-800"
+              variant="secondary"
+              title="Razorpay has placed funds on hold for this account"
+            >
+              Funds On Hold
+            </Badge>
+          )}
+          {franchisee.razorpay_account_id && !franchisee.transfers_enabled && (
+            <Badge
+              className="bg-amber-100 text-amber-800"
+              variant="secondary"
+              title="Transfers are disabled for this account (KYC pending or admin paused)"
+            >
+              Transfers Disabled
+            </Badge>
+          )}
         </div>
 
         {/* Overview Cards */}
@@ -544,6 +595,54 @@ export default function FranchiseeDetailPage() {
           </CardContent>
         </Card>
 
+        {/* KYC Requirements (last submit-kyc response) */}
+        {kycResult && kycResult.requirements && kycResult.requirements.length > 0 && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Send className="w-4 h-4" /> KYC Requirements
+                <span className="text-xs font-normal text-muted-foreground ml-2">
+                  From last <code>submit-kyc</code> response. Razorpay activation_status:{" "}
+                  <strong>{kycResult.activation_status}</strong>
+                </span>
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <ul className="space-y-2 text-sm">
+                {kycResult.requirements.map((req, idx) => (
+                  <li
+                    key={`${req.field_reference}-${idx}`}
+                    className="flex items-start gap-2"
+                  >
+                    <Badge
+                      variant="secondary"
+                      className="mt-0.5 bg-orange-100 text-orange-800"
+                    >
+                      {req.status.replace(/_/g, " ")}
+                    </Badge>
+                    <div className="flex-1">
+                      <code className="text-xs">{req.field_reference}</code>
+                      <span className="text-muted-foreground ml-2">
+                        ({req.reason_code})
+                      </span>
+                      {req.resolution_url && (
+                        <a
+                          href={req.resolution_url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="ml-2 text-xs text-blue-600 underline"
+                        >
+                          resolution
+                        </a>
+                      )}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </CardContent>
+          </Card>
+        )}
+
         {/* Razorpay API Audit Log */}
         <Card>
           <CardHeader>
@@ -651,6 +750,176 @@ export default function FranchiseeDetailPage() {
                   })}
                 </TableBody>
               </Table>
+            )}
+          </CardContent>
+        </Card>
+
+        {/* Settlement Ledger */}
+        <Card>
+          <CardHeader className="flex flex-row items-center justify-between">
+            <CardTitle className="flex items-center gap-2">
+              <Banknote className="w-4 h-4" /> Settlement Ledger
+              <span className="text-xs font-normal text-muted-foreground ml-2">
+                Per-session commission entries and payout state.
+              </span>
+            </CardTitle>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => retrySettlements.mutate()}
+              disabled={retrySettlements.isPending}
+              title="Retry all FAILED and ON_HOLD entries for this franchisee"
+            >
+              <RefreshCw className="w-4 h-4 mr-1" />
+              {retrySettlements.isPending ? "Retrying…" : "Retry Failed/On-Hold"}
+            </Button>
+          </CardHeader>
+          <CardContent>
+            {!settlementsData || settlementsData.data.length === 0 ? (
+              <p className="text-muted-foreground text-center py-4 text-sm">
+                No settlement entries yet.
+              </p>
+            ) : (
+              <>
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="w-32">When</TableHead>
+                      <TableHead className="w-20">Method</TableHead>
+                      <TableHead className="w-24 text-right">Gross</TableHead>
+                      <TableHead className="w-24 text-right">Payout</TableHead>
+                      <TableHead className="w-16 text-right">Comm %</TableHead>
+                      <TableHead className="w-32">Status</TableHead>
+                      <TableHead>Razorpay IDs</TableHead>
+                      <TableHead className="w-24">Actions</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {settlementsData.data.map((entry) => (
+                      <TableRow key={entry.id}>
+                        <TableCell className="text-xs">
+                          {new Date(entry.created_at).toLocaleString()}
+                        </TableCell>
+                        <TableCell className="text-xs">
+                          {entry.payment_method}
+                        </TableCell>
+                        <TableCell className="text-right text-xs">
+                          ₹{entry.gross_amount}
+                        </TableCell>
+                        <TableCell className="text-right text-xs">
+                          ₹{entry.franchisee_payout}
+                        </TableCell>
+                        <TableCell className="text-right text-xs">
+                          {entry.commission_percent}
+                        </TableCell>
+                        <TableCell>
+                          <Badge
+                            variant="secondary"
+                            className={
+                              SETTLEMENT_STATUS_COLORS[entry.settlement_status] || ""
+                            }
+                          >
+                            {entry.settlement_status.replace(/_/g, " ")}
+                          </Badge>
+                          {entry.failure_reason && (
+                            <div
+                              className="text-xs text-red-600 mt-1 truncate max-w-[200px]"
+                              title={entry.failure_reason}
+                            >
+                              {entry.failure_reason}
+                            </div>
+                          )}
+                        </TableCell>
+                        <TableCell className="text-xs font-mono">
+                          {entry.razorpay_payment_id && (
+                            <div
+                              className="truncate max-w-[140px]"
+                              title={entry.razorpay_payment_id}
+                            >
+                              pay: {entry.razorpay_payment_id.slice(-8)}
+                            </div>
+                          )}
+                          {entry.razorpay_transfer_id && (
+                            <div
+                              className="truncate max-w-[140px]"
+                              title={entry.razorpay_transfer_id}
+                            >
+                              trf: {entry.razorpay_transfer_id.slice(-8)}
+                            </div>
+                          )}
+                          {!entry.razorpay_payment_id &&
+                            !entry.razorpay_transfer_id && (
+                              <span className="text-muted-foreground">—</span>
+                            )}
+                        </TableCell>
+                        <TableCell>
+                          <div className="flex gap-1">
+                            {[
+                              "PENDING",
+                              "TRANSFER_INITIATED",
+                            ].includes(entry.settlement_status) && (
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                onClick={() => holdSettlement.mutate(entry.id)}
+                                disabled={holdSettlement.isPending}
+                                title="Place this entry on hold"
+                              >
+                                <Pause className="w-3 h-3" />
+                              </Button>
+                            )}
+                            {entry.settlement_status === "ON_HOLD" && (
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                onClick={() =>
+                                  releaseSettlement.mutate(entry.id)
+                                }
+                                disabled={releaseSettlement.isPending}
+                                title="Release back to PENDING"
+                              >
+                                <Play className="w-3 h-3" />
+                              </Button>
+                            )}
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+                <div className="flex justify-between items-center mt-4 text-sm text-muted-foreground">
+                  <span>
+                    Showing{" "}
+                    {(settlementsPage - 1) * settlementsLimit + 1}–
+                    {Math.min(
+                      settlementsPage * settlementsLimit,
+                      settlementsData.total
+                    )}{" "}
+                    of {settlementsData.total}
+                  </span>
+                  <div className="flex gap-2">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={settlementsPage === 1}
+                      onClick={() => setSettlementsPage((p) => p - 1)}
+                    >
+                      Previous
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={
+                        settlementsPage * settlementsLimit >=
+                        settlementsData.total
+                      }
+                      onClick={() => setSettlementsPage((p) => p + 1)}
+                    >
+                      Next
+                    </Button>
+                  </div>
+                </div>
+              </>
             )}
           </CardContent>
         </Card>
@@ -972,6 +1241,13 @@ export default function FranchiseeDetailPage() {
               </div>
               <div className="col-span-2 border-t pt-4 mt-2">
                 <h4 className="text-sm font-medium mb-2">Bank Account (for Razorpay settlements)</h4>
+                <p className="text-xs text-muted-foreground">
+                  Razorpay requirement: the <strong>Account Holder Name</strong> below must match
+                  both (a) the name on the franchisee&apos;s bank passbook / cancelled cheque and
+                  (b) the <strong>Business Name</strong> in the Business Details section above.
+                  Mismatches cause Razorpay KYC to silently hold the account in
+                  <code> needs_clarification</code>.
+                </p>
               </div>
               <div className="space-y-2 col-span-2">
                 <Label htmlFor="bank_account_name">Account Holder Name</Label>
@@ -979,7 +1255,7 @@ export default function FranchiseeDetailPage() {
                   id="bank_account_name"
                   name="bank_account_name"
                   defaultValue={franchisee.bank_account_name || ""}
-                  placeholder="Must match cancelled cheque"
+                  placeholder="Must match cancelled cheque AND Business Name"
                 />
               </div>
               <div className="space-y-2">

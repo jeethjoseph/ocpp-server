@@ -1,6 +1,7 @@
 # Razorpay service for payment integration
 import os
 import razorpay
+import requests
 import hmac
 import hashlib
 import logging
@@ -511,8 +512,9 @@ class RazorpayService:
         - SDK exceptions are re-raised AFTER the log row is written.
         - Audit-write failures are SWALLOWED so SDK behaviour is
           preserved (logged at ERROR level for ops visibility).
-        - Used by the onboarding-chain wrappers only; transfers /
-          refunds / payments / QR ops are intentionally NOT audited.
+        - Used by onboarding-chain wrappers and ``create_payment_transfer``
+          (Route payment-based transfers). Refunds, payment captures, and
+          QR webhook ingestion remain unaudited here.
         """
         masked_request = _mask_sensitive(request_body) if request_body else None
         response_body = None
@@ -811,6 +813,90 @@ class RazorpayService:
                 account_id, amount_paise, e,
             )
             raise
+
+    async def create_payment_transfer(
+        self,
+        payment_id: str,
+        account_id: str,
+        amount_paise: int,
+        notes: Optional[Dict] = None,
+        franchisee_id: Optional[int] = None,
+    ) -> Dict:
+        """Create a Route transfer from a captured payment to a linked account.
+
+        Calls ``POST /v1/payments/{payment_id}/transfers``. Unlike the
+        standalone ``POST /v1/transfers`` (see ``create_transfer``), this
+        endpoint requires no separate Razorpay-side feature activation —
+        Route account + active linked account is sufficient.
+
+        The only documented constraint is
+        ``sum(transfers on payment) <= captured_amount`` (refunds reduce
+        the effective transferable amount). Application-level idempotency
+        is enforced by ``_validate_ledger_for_transfer`` which rejects
+        duplicate transfers on the same ``razorpay_payment_id``.
+
+        Razorpay returns ``{"entity":"collection","items":[<transfer>]}``;
+        this method unwraps and returns ``items[0]`` so callers can use
+        ``result.get("id")`` interchangeably with ``create_transfer``.
+        """
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+
+        url = f"https://api.razorpay.com/v1/payments/{payment_id}/transfers"
+        transfer_obj: Dict = {
+            "account": account_id,
+            "amount": amount_paise,
+            "currency": "INR",
+        }
+        if notes:
+            transfer_obj["notes"] = notes
+        body = {"transfers": [transfer_obj]}
+
+        def _do_call():
+            resp = requests.post(
+                url,
+                json=body,
+                auth=(self.api_key, self.api_secret),
+                timeout=30,
+            )
+            try:
+                parsed = resp.json()
+            except ValueError:
+                parsed = {"raw": resp.text}
+            if not resp.ok:
+                description = ""
+                if isinstance(parsed, dict):
+                    description = (
+                        parsed.get("error", {}).get("description") or ""
+                    )
+                description = description or f"HTTP {resp.status_code}"
+                if resp.status_code == 400:
+                    raise razorpay.errors.BadRequestError(description)
+                if resp.status_code in (502, 503, 504):
+                    raise razorpay.errors.GatewayError(description)
+                raise Exception(f"HTTP {resp.status_code}: {description}")
+            return parsed
+
+        response = await self._audit_call(
+            method="POST",
+            endpoint=f"POST /v1/payments/{payment_id}/transfers",
+            request_body=body,
+            sdk_call=_do_call,
+            franchisee_id=franchisee_id,
+            account_id=account_id,
+        )
+
+        items = response.get("items") if isinstance(response, dict) else None
+        if not items:
+            raise Exception(
+                f"Unexpected payment-transfer response shape: {response}"
+            )
+        transfer = items[0]
+        logger.info(
+            "Payment transfer created: %s on %s -> %s (%d paise)",
+            transfer.get("id"), payment_id, account_id, amount_paise,
+        )
+        return transfer
 
     def fetch_transfer(self, transfer_id: str) -> Dict:
         """Fetch transfer status."""

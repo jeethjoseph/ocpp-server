@@ -134,7 +134,10 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
   - **QR code creation**: `create_qr_code(payee_name, description, account_id=None)`, `close_qr_code(id, account_id=None)`, `fetch_qr_code(id, account_id=None)`. `account_id` is still accepted for backward-compatible close/fetch on legacy franchisee-scoped QRs but NEW QRs are always created with `account_id=None` (platform-owned); the franchisee's share is transferred post-settlement via Route.
   - **Helpers**: `build_qr_payee_name(business_name, charger_name)` composes the `name` metadata (50-char cap; falls back to "VoltLync" when no franchisee). `build_qr_description(...)` composes the rendered descriptor line.
   - **Refunds**: `refund_payment(payment_id, amount, notes, idempotency_key)` — `idempotency_key` is sent as `X-Refund-Idempotency` so retries dedupe server-side. Callers use `f"qr_payment_{id}"` as the stable key.
-  - **Route transfers**: `create_transfer(account_id, amount_paise, notes, idempotency_key)` — `idempotency_key` is sent as `X-Transfer-Idempotency`. Retries with the same key are deduped by Razorpay (replays original response); same key + different body → 400.
+  - **Known issue — webhook fees vs settled fees**: `qr_code.credited` webhook delivers Razorpay's *plan-rate* fee, which gets zeroed for UPI P2M ≤ ₹2000 by settlement time without notification. `_resolve_platform_fee` trusts the webhook value. Causes small under-refunds and under-payouts. Documented at `docs/known-issues.md#1`.
+  - **Route transfers**: two endpoints, picked in `franchisee_settlement_service.initiate_transfer` based on whether the ledger entry has a source `razorpay_payment_id`:
+    - **Payment-based** (QR sessions): `create_payment_transfer(payment_id, account_id, amount_paise, notes, franchisee_id)` → `POST /v1/payments/{id}/transfers`. No on-demand activation required. Wraps `requests.post` directly (not the SDK) and writes a `RazorpayApiLog` audit row via `_audit_call`. Razorpay's only constraint is `sum(transfers) ≤ captured_amount`; refunds reduce the effective transferable amount. App-level idempotency comes from `_validate_ledger_for_transfer`'s `razorpay_payment_id` collision check (no `X-Transfer-Idempotency` header is sent).
+    - **Direct** (wallet sessions): `create_transfer(account_id, amount_paise, notes, idempotency_key)` → `POST /v1/transfers`. `idempotency_key` is sent as `X-Transfer-Idempotency`. **This endpoint is gated by an on-demand Razorpay merchant feature** ("Direct Transfers") and returns `400 "This feature is not enabled for this merchant."` until ops opens a support ticket on the parent merchant.
   - **Linked accounts**: `create_linked_account(payload)` — caller builds the payload including `reference_id=f"franchisee_{id}"`, `business_type`, `contact_name`, and `profile.category/subcategory` + `profile.addresses.registered` (street1/street2/city/state/postal_code/country). The addresses block is mandatory per Razorpay; `franchisee_onboarding_service` fails early with a readable `RuntimeError` when `address`, `city`, `state`, or `pincode` is missing on the Franchisee record. Razorpay SDK errors are caught in `routers/franchisees.onboard_to_razorpay` and returned as HTTP 400 with the Razorpay message so the admin UI shows the actual cause, not "Internal Server Error". Razorpay emails the franchisee a KYC invite directly; no hosted onboarding URL is relied on.
   - Test/Live mode support
 - **`monitoring_service.py`** - Sentry + New Relic integration
@@ -173,16 +176,26 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
   - Needs `CLERK_SECRET_KEY` and `FRONTEND_URL` env vars.
 - **`franchisee_onboarding_service.py`** - **Razorpay Route KYC flow**
   - `create_linked_account(franchisee_id)` creates a Razorpay linked
-    account with full payload: `reference_id=f"franchisee_{id}"`,
-    `legal_business_name`, `customer_facing_business_name`,
-    `business_type` (mapped via `_BUSINESS_TYPE_MAP` from our
-    `FranchiseeBusinessTypeEnum`), `contact_name`, `profile.category/
-    subcategory` (utilities / electric_vehicle_charging). Fails fast
-    with a `RuntimeError` if `business_type` is not yet set on the
-    franchisee — admin must fill it via the Business Details edit
-    dialog before calling onboarding. Persists any optional
-    `hosted_onboarding_url` from the response (best-effort; Razorpay
-    emails the franchisee directly regardless).
+    account with full payload: `reference_id=f"f_{id}_{epoch}"`
+    (≤20 chars per Razorpay's hard cap), `legal_business_name`,
+    `customer_facing_business_name`, `business_type` (mapped via
+    `_BUSINESS_TYPE_MAP` from our `FranchiseeBusinessTypeEnum`),
+    `contact_name`, `profile.category/subcategory`
+    (`services / automotive_service_shops`). Fails fast with a
+    `RuntimeError` if `business_type` is not yet set on the franchisee
+    — admin must fill it via the Business Details edit dialog before
+    calling onboarding. Persists any optional `hosted_onboarding_url`
+    from the response (best-effort; Razorpay emails the franchisee
+    directly regardless).
+    **Subcategory history (2026-04-30):** earlier versions sent
+    `utilities/electric_vehicle_charging` then `services/service_stations`.
+    Both were rejected by KYC review and parked accounts in
+    `needs_clarification + requirements: []` (broken signal —
+    Razorpay's API enum is lowercase-strict and `service_stations` is
+    not in support's approved subset). Diagnostic PATCH on
+    `acc_SjK7ZBzAfiA4QF` confirmed `automotive_service_shops`
+    activates immediately — see `docs/razorpay-onboarding-acc_SjK7ZBzAfiA4QF.md`
+    "Resolution" section.
   - `handle_account_webhook(event_type, data)` advances the franchisee
     status machine on Razorpay account events. Subscribed events
     handled: `account.activated`, `account.instantly_activated`,
@@ -209,6 +222,38 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
     Razorpay's update-product-config doc). The
     `Franchisee.bank_account_type` column is kept locally for
     invoicing / reconciliation but is NOT sent to Razorpay.
+  - **Pre-transfer validator** (`_validate_ledger_for_transfer`) runs
+    six foolproof checks before each `create_transfer`: positive
+    payout, payout ≤ gross − refund, components sum to gross within
+    a 2-paisa tolerance, settlement_status not in a terminal state,
+    franchisee has a matching razorpay_account_id, and
+    razorpay_payment_id (when present) hasn't already been used on a
+    sibling ledger entry's transfer. Math/state failures mark the
+    entry FAILED but do NOT increment retry_count — they require admin
+    investigation, not blind retry.
+  - **Background payout retry service**
+    (`backend/services/franchisee_payout_retry_service.py`, started
+    from `main.py` startup) wakes every
+    `FRANCHISEE_PAYOUT_RETRY_INTERVAL_SECONDS` (default 600) and calls
+    `retry_failed_transfers()` to drain ON_HOLD/FAILED entries. No-op
+    when `RAZORPAY_ROUTE_ENABLED != "true"`. Closes the loop on
+    cooling-period and funds_unhold gates that have since cleared.
+  - **Razorpay-side audit notes**: `create_transfer` payload `notes`
+    carries `transaction_id`, `ledger_entry_id`, `franchisee_id`,
+    `voltlync_payment_id` (the source `razorpay_payment_id` or
+    "wallet"), and `idempotency_key`, so an operator looking at a
+    transfer in the Razorpay dashboard can trace back to the
+    originating payment without joining our DB.
+    **Name-chain requirement (advisory only, not enforced):** Razorpay
+    requires the bank-passbook account-holder name ==
+    `settlements.beneficiary_name` (PATCH product config) ==
+    `legal_business_name` (POST /v2/accounts). Today
+    `beneficiary_name` is sourced from `franchisee.bank_account_name`
+    while `legal_business_name` comes from `franchisee.business_name`;
+    nothing enforces equality. The franchisee detail page surfaces an
+    advisory note in the Bank Account section. Hard enforcement is
+    pending confirmation from Razorpay support that the rule applies
+    uniformly across all `business_type` values.
     `add_stakeholder` POSTs to
     `/stakeholders` with `kyc.pan` + optional `addresses.residential`
     and mirrors the result into `FranchiseeStakeholder`. The top-level

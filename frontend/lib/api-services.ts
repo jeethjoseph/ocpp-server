@@ -28,6 +28,7 @@ import {
   CommissionUpdate,
   CommissionAuditEntry,
   FranchiseeStation,
+  AdminSettlementEntry,
 } from "@/types/api";
 
 export const stationService = {
@@ -801,6 +802,44 @@ export const franchiseeService = {
   listRazorpayApiLogs: (id: number, limit = 50) =>
     api.get<RazorpayApiLog[]>(
       `/api/admin/franchisees/${id}/razorpay-api-logs?limit=${limit}`
+    ),
+
+  // ─── Settlement ledger (admin) ────────────────────────────────
+  listSettlements: (
+    id: number,
+    params: { page?: number; limit?: number; status?: string } = {}
+  ) => {
+    const searchParams = new URLSearchParams();
+    if (params.page) searchParams.set("page", params.page.toString());
+    if (params.limit) searchParams.set("limit", params.limit.toString());
+    if (params.status) searchParams.set("status", params.status);
+    const query = searchParams.toString();
+    return api.get<{
+      data: AdminSettlementEntry[];
+      total: number;
+      page: number;
+      limit: number;
+    }>(
+      `/api/admin/franchisees/${id}/settlements${query ? `?${query}` : ""}`
+    );
+  },
+
+  retryFailedSettlements: (id: number) =>
+    api.post<{ message: string }>(
+      `/api/admin/franchisees/${id}/settlements/retry-failed`,
+      {}
+    ),
+
+  holdSettlement: (id: number, entryId: number) =>
+    api.post<{ message: string }>(
+      `/api/admin/franchisees/${id}/settlements/${entryId}/hold`,
+      {}
+    ),
+
+  releaseSettlement: (id: number, entryId: number) =>
+    api.post<{ message: string }>(
+      `/api/admin/franchisees/${id}/settlements/${entryId}/release`,
+      {}
     ),
 };
 

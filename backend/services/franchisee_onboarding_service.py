@@ -161,14 +161,21 @@ class FranchiseeOnboardingService:
             # `address` on comma / newline when the admin provided a
             # multi-part string; otherwise fall back to `city` so
             # street2 is never empty.
-            # Razorpay's category/subcategory enum does not have a
-            # dedicated EV-charging code. `services/service_stations`
-            # maps to the MCC globally used for fuel/EV stations and is
-            # the closest accepted pair. If Razorpay ever adds a
-            # dedicated EV code we should switch.
+            # Razorpay's category/subcategory enum is lowercase-strict:
+            # UPPERCASE values 400 with "Invalid business subcategory"
+            # even when the value is otherwise in the enum.
+            # `services/service_stations` is in the underlying enum but
+            # KYC review silently rejects it and parks the account in
+            # `needs_clarification` with empty `requirements[]` (broken
+            # signal — see acc_Sg73UwyOU3jziR + acc_SjK7ZBzAfiA4QF).
+            # `services/automotive_service_shops` is in support's
+            # approved subset and was verified on 2026-04-30 to flip
+            # acc_SjK7ZBzAfiA4QF from `needs_clarification` →
+            # `activated` via PATCH. See
+            # docs/razorpay-onboarding-acc_SjK7ZBzAfiA4QF.md.
             "profile": {
                 "category": "services",
-                "subcategory": "service_stations",
+                "subcategory": "automotive_service_shops",
                 "addresses": {
                     # Only `registered` is accepted by Razorpay's create
                     # endpoint for `business_type: individual`. We tried

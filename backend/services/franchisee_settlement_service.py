@@ -35,6 +35,16 @@ MIN_TRANSFER_AMOUNT = Decimal(
     os.getenv("MINIMUM_TRANSFER_AMOUNT", "1.00")
 )
 MAX_TRANSFER_RETRIES = int(os.getenv("MAX_TRANSFER_RETRIES", "3"))
+# Tolerance for the gross == sum-of-components sanity check. A 2-paisa
+# window absorbs DECIMAL rounding across six successive quantize() calls
+# in calculate_settlement. Tighten to 0.01 once we confirm in production.
+SUM_TOLERANCE = Decimal("0.02")
+# settlement_status values for which a transfer attempt is allowed.
+_TRANSFERABLE_STATUSES = {
+    SettlementStatusEnum.PENDING,
+    SettlementStatusEnum.ON_HOLD,
+    SettlementStatusEnum.FAILED,
+}
 
 
 class FranchiseeSettlementService:
@@ -226,6 +236,55 @@ class FranchiseeSettlementService:
         return entry
 
     @staticmethod
+    async def _validate_ledger_for_transfer(
+        entry: CommissionLedgerEntry,
+        franchisee: Franchisee,
+    ) -> Optional[str]:
+        """Foolproof pre-flight checks before any money moves.
+
+        Returns ``None`` when the entry is safe to transfer, or a
+        ``failure_reason`` string when a check fails. Callers should
+        mark the entry FAILED with this reason and NOT increment
+        ``retry_count`` — math/state failures require admin
+        investigation, not blind retry.
+        """
+        if entry.franchisee_payout <= Decimal("0"):
+            return "validation_payout_not_positive"
+
+        if entry.franchisee_payout > entry.gross_amount - entry.refund_amount:
+            return "validation_payout_exceeds_net_paid"
+
+        components_sum = (
+            entry.franchisee_payout
+            + entry.platform_commission
+            + entry.tds_amount
+            + entry.gst_collected
+            + entry.pg_fee_amount
+            + entry.refund_amount
+        )
+        if abs(components_sum - entry.gross_amount) > SUM_TOLERANCE:
+            return "validation_components_do_not_sum_to_gross"
+
+        if entry.settlement_status not in _TRANSFERABLE_STATUSES:
+            return f"validation_terminal_status_{entry.settlement_status.value}"
+
+        if (
+            not franchisee.razorpay_account_id
+            or franchisee.id != entry.franchisee_id
+        ):
+            return "validation_franchisee_account_mismatch"
+
+        if entry.razorpay_payment_id:
+            collision = await CommissionLedgerEntry.filter(
+                razorpay_payment_id=entry.razorpay_payment_id,
+                razorpay_transfer_id__not_isnull=True,
+            ).exclude(id=entry.id).first()
+            if collision:
+                return "validation_payment_id_already_transferred"
+
+        return None
+
+    @staticmethod
     async def initiate_transfer(
         entry: CommissionLedgerEntry,
     ) -> bool:
@@ -279,27 +338,77 @@ class FranchiseeSettlementService:
                 )
                 return False
 
+        # Foolproof commission-math + state checks. Math/state failures
+        # are NOT retried — they require admin investigation.
+        validation_failure = (
+            await FranchiseeSettlementService._validate_ledger_for_transfer(
+                entry, franchisee
+            )
+        )
+        if validation_failure:
+            await CommissionLedgerEntry.filter(id=entry.id).update(
+                settlement_status=SettlementStatusEnum.FAILED,
+                failure_reason=validation_failure,
+            )
+            logger.error(
+                "Transfer rejected for entry %s by validator: %s",
+                entry.id, validation_failure,
+            )
+            return False
+
         amount_paise = int(entry.franchisee_payout * 100)
         if amount_paise < 100:  # Razorpay minimum Rs.1
             return False
 
-        try:
-            result = razorpay_service.create_transfer(
-                account_id=franchisee.razorpay_account_id,
-                amount_paise=amount_paise,
-                notes={
-                    "transaction_id": str(entry.transaction_id),
-                    "franchisee_id": str(franchisee.id),
-                    "idempotency_key": entry.idempotency_key,
-                },
-                idempotency_key=entry.idempotency_key,
-            )
+        notes = {
+            "transaction_id": str(entry.transaction_id),
+            "ledger_entry_id": str(entry.id),
+            "franchisee_id": str(franchisee.id),
+            "voltlync_payment_id": entry.razorpay_payment_id or "wallet",
+            "idempotency_key": entry.idempotency_key,
+        }
 
-            await CommissionLedgerEntry.filter(id=entry.id).update(
-                settlement_status=SettlementStatusEnum.TRANSFER_INITIATED,
-                razorpay_transfer_id=result.get("id"),
-                transfer_initiated_at=datetime.utcnow(),
-            )
+        try:
+            if entry.razorpay_payment_id:
+                # QR session — payment-based transfer (no on-demand activation
+                # needed, captured-amount is the only Razorpay-side gate).
+                result = await razorpay_service.create_payment_transfer(
+                    payment_id=entry.razorpay_payment_id,
+                    account_id=franchisee.razorpay_account_id,
+                    amount_paise=amount_paise,
+                    notes=notes,
+                    franchisee_id=franchisee.id,
+                )
+            else:
+                # Wallet session — direct transfer from platform balance.
+                # Requires Razorpay support to activate ``POST /v1/transfers``.
+                result = razorpay_service.create_transfer(
+                    account_id=franchisee.razorpay_account_id,
+                    amount_paise=amount_paise,
+                    notes=notes,
+                    idempotency_key=entry.idempotency_key,
+                )
+
+            updates = {
+                "settlement_status": SettlementStatusEnum.TRANSFER_INITIATED,
+                "razorpay_transfer_id": result.get("id"),
+                "transfer_initiated_at": datetime.utcnow(),
+                # Clear any stale failure from a previous attempt — a
+                # successful retry shouldn't leave the old error visible.
+                "failure_reason": None,
+            }
+            # Capture fees from the synchronous POST response when present
+            # (settlement.processed will overwrite later if Razorpay sends
+            # an updated value, but bare-id settlement payloads can leave
+            # this 0.00 forever, so prefer to grab it now).
+            fee_paise = result.get("fees")
+            tax_paise = result.get("tax") or 0
+            if fee_paise is not None:
+                total_paise = Decimal(str(fee_paise)) + Decimal(str(tax_paise))
+                updates["transfer_fee"] = (total_paise / Decimal("100")).quantize(
+                    TWO_DP, ROUND_HALF_UP
+                )
+            await CommissionLedgerEntry.filter(id=entry.id).update(**updates)
             logger.info(
                 "Transfer initiated: entry=%s transfer=%s",
                 entry.id, result.get("id"),
@@ -343,6 +452,7 @@ class FranchiseeSettlementService:
             await CommissionLedgerEntry.filter(id=entry.id).update(
                 settlement_status=SettlementStatusEnum.TRANSFER_PROCESSED,
                 transfer_processed_at=datetime.utcnow(),
+                failure_reason=None,
             )
             logger.info("Transfer processed: %s", transfer_id)
 
@@ -407,6 +517,7 @@ class FranchiseeSettlementService:
             updates = {
                 "settlement_status": SettlementStatusEnum.SETTLED,
                 "settled_at": now,
+                "failure_reason": None,
             }
             fee = fee_by_transfer.get(entry.razorpay_transfer_id)
             if fee is not None:

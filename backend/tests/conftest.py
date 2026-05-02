@@ -83,8 +83,13 @@ async def client() -> AsyncGenerator[AsyncClient, None]:
         await Tortoise.generate_schemas()
         
         # Clean up database before each test (order matters for FK constraints)
-        from models import WalletTransaction, MeterValue
+        from models import (
+            WalletTransaction, MeterValue,
+            CommissionLedgerEntry, FranchiseeStakeholder, Franchisee,
+        )
         await MeterValue.all().delete()
+        await CommissionLedgerEntry.all().delete()
+        await FranchiseeStakeholder.all().delete()
         await WalletTransaction.all().delete()
         await Wallet.all().delete()
         await Transaction.all().delete()
@@ -92,6 +97,7 @@ async def client() -> AsyncGenerator[AsyncClient, None]:
         await Connector.all().delete()
         await Charger.all().delete()
         await ChargingStation.all().delete()
+        await Franchisee.all().delete()
         await OCPPLog.all().delete()
         await VehicleProfile.all().delete()
         await User.all().delete()
@@ -174,6 +180,81 @@ async def test_wallet(test_user):
 
 
 @pytest.fixture
+async def test_franchisee():
+    """Create a Franchisee row activated for transfers, past cooling period.
+
+    Defaults aim at the happy-path: ACTIVE status, transfers_enabled=True,
+    funds_on_hold=False, activated_at well outside the 24h cooling window.
+    Override individual fields by passing a different fixture or by
+    mutating the returned row in the test.
+    """
+    from datetime import datetime, timedelta, timezone
+    from decimal import Decimal
+    import random
+    from models import Franchisee, FranchiseeStatusEnum
+    suffix = random.randint(100000000, 999999999)
+    return await Franchisee.create(
+        business_name=f"Test Franchisee {suffix}",
+        contact_name="Test Contact",
+        contact_email=f"franchisee_{suffix}@voltlync.test",
+        contact_phone=f"9{suffix}",
+        commission_percent=Decimal("20.00"),
+        tds_rate_percent=Decimal("10.00"),
+        status=FranchiseeStatusEnum.ACTIVE,
+        razorpay_account_id=f"acc_test_{suffix}",
+        transfers_enabled=True,
+        funds_on_hold=False,
+        activated_at=datetime.now(timezone.utc) - timedelta(days=2),
+    )
+
+
+@pytest.fixture
+async def test_commission_ledger_entry(test_franchisee, test_charger, test_user):
+    """Create a CommissionLedgerEntry in PENDING state with consistent
+    commission math (gross == sum of components).
+
+    Requires `test_charger` + `test_user` so the linked Transaction row
+    exists; mirrors the production process_settlement flow.
+    """
+    from decimal import Decimal
+    from models import (
+        CommissionLedgerEntry, SettlementStatusEnum, Transaction,
+        TransactionStatusEnum,
+    )
+    txn = await Transaction.create(
+        charger=test_charger,
+        user=test_user,
+        transaction_status=TransactionStatusEnum.COMPLETED,
+    )
+    # Math: gross 1000 = refund 0 + pg 0 + gst 152.54 + commission 169.49
+    #                  + tds 84.75 + payout 593.22.
+    # net_amount = 1000, net_excl_gst = 847.46, commission@20% = 169.49,
+    # tds@10% = 84.75, payout = 593.22.
+    return await CommissionLedgerEntry.create(
+        transaction=txn,
+        franchisee=test_franchisee,
+        gross_amount=Decimal("1000.00"),
+        payment_method="QR_UPI",
+        razorpay_payment_id=f"pay_test_{txn.id}",
+        refund_amount=Decimal("0.00"),
+        pg_fee_amount=Decimal("0.00"),
+        net_amount=Decimal("1000.00"),
+        gst_collected=Decimal("152.54"),
+        net_excl_gst=Decimal("847.46"),
+        commission_percent=Decimal("20.00"),
+        platform_commission=Decimal("169.49"),
+        tds_rate_percent=Decimal("10.00"),
+        tds_amount=Decimal("84.75"),
+        transfer_fee=Decimal("0.00"),
+        franchisee_payout=Decimal("593.22"),
+        energy_consumed_kwh=10.0,
+        tariff_rate_per_kwh=Decimal("15.00"),
+        settlement_status=SettlementStatusEnum.PENDING,
+        idempotency_key=f"txn_{txn.id}",
+    )
+
+
+@pytest.fixture
 async def test_admin_user():
     """Create a test admin user. Use with `client_admin` to bypass admin auth.
 
@@ -236,8 +317,13 @@ async def _init_test_db_async():
 
 async def _cleanup_test_db_async():
     """Delete all rows in FK-safe order."""
-    from models import WalletTransaction, MeterValue
+    from models import (
+        WalletTransaction, MeterValue,
+        CommissionLedgerEntry, FranchiseeStakeholder, Franchisee,
+    )
     await MeterValue.all().delete()
+    await CommissionLedgerEntry.all().delete()
+    await FranchiseeStakeholder.all().delete()
     await WalletTransaction.all().delete()
     await Wallet.all().delete()
     await Transaction.all().delete()
@@ -245,6 +331,7 @@ async def _cleanup_test_db_async():
     await Connector.all().delete()
     await Charger.all().delete()
     await ChargingStation.all().delete()
+    await Franchisee.all().delete()
     await OCPPLog.all().delete()
     await VehicleProfile.all().delete()
     await User.all().delete()

@@ -100,6 +100,8 @@ class FranchiseeResponse(BaseModel):
     razorpay_product_id: Optional[str] = None
     razorpay_onboarding_url: Optional[str] = None
     kyc_verifications: Optional[dict] = None
+    transfers_enabled: bool = False
+    funds_on_hold: bool = False
     bank_account_name: Optional[str] = None
     bank_account_number: Optional[str] = None
     bank_ifsc_code: Optional[str] = None
@@ -670,8 +672,10 @@ async def list_settlements(
                 "franchisee_payout": str(e.franchisee_payout),
                 "energy_consumed_kwh": e.energy_consumed_kwh,
                 "settlement_status": e.settlement_status.value if hasattr(e.settlement_status, "value") else str(e.settlement_status),
+                "razorpay_payment_id": e.razorpay_payment_id,
                 "razorpay_transfer_id": e.razorpay_transfer_id,
                 "failure_reason": e.failure_reason,
+                "retry_count": e.retry_count,
                 "created_at": e.created_at.isoformat(),
             }
             for e in entries

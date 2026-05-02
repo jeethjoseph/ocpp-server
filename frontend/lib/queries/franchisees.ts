@@ -25,6 +25,8 @@ export const franchiseeKeys = {
     [...franchiseeKeys.detail(id), "commission-history"] as const,
   stakeholders: (id: number) =>
     [...franchiseeKeys.detail(id), "stakeholders"] as const,
+  settlements: (id: number, params: Record<string, unknown>) =>
+    [...franchiseeKeys.detail(id), "settlements", params] as const,
 };
 
 export function useFranchisees(
@@ -311,6 +313,74 @@ export function useSubmitKYC() {
     onError: (err) => {
       const msg = err instanceof Error ? err.message : String(err);
       toast.error(`KYC submit failed: ${msg}`);
+    },
+  });
+}
+
+// ─── Settlement ledger (admin) ───────────────────────────────────────
+
+export function useAdminFranchiseeSettlements(
+  id: number,
+  params: { page?: number; limit?: number; status?: string } = {}
+) {
+  const { isAuthReady } = useAuth();
+  return useQuery({
+    queryKey: franchiseeKeys.settlements(id, params),
+    queryFn: () => franchiseeService.listSettlements(id, params),
+    enabled: isAuthReady && !!id,
+    staleTime: 1000 * 30,
+  });
+}
+
+export function useRetryFailedSettlements(id: number) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => franchiseeService.retryFailedSettlements(id),
+    onSuccess: (res) => {
+      queryClient.invalidateQueries({
+        queryKey: [...franchiseeKeys.detail(id), "settlements"],
+      });
+      toast.success(res.message);
+    },
+    onError: (err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error(`Retry failed: ${msg}`);
+    },
+  });
+}
+
+export function useHoldSettlement(id: number) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (entryId: number) =>
+      franchiseeService.holdSettlement(id, entryId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: [...franchiseeKeys.detail(id), "settlements"],
+      });
+      toast.success("Settlement placed on hold");
+    },
+    onError: (err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error(`Hold failed: ${msg}`);
+    },
+  });
+}
+
+export function useReleaseSettlement(id: number) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (entryId: number) =>
+      franchiseeService.releaseSettlement(id, entryId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: [...franchiseeKeys.detail(id), "settlements"],
+      });
+      toast.success("Settlement released");
+    },
+    onError: (err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error(`Release failed: ${msg}`);
     },
   });
 }

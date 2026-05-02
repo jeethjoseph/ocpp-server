@@ -1669,6 +1669,14 @@ async def startup_event():
     cleanup_interval_hours = int(os.environ.get("CLEANUP_INTERVAL_HOURS", "24"))
     await start_data_retention_service(retention_days=retention_days, cleanup_interval_hours=cleanup_interval_hours)
 
+    # Start franchisee payout retry service (drains ON_HOLD/FAILED ledger entries
+    # after cooling-period / funds_unhold gates clear). No-op when
+    # RAZORPAY_ROUTE_ENABLED != "true".
+    from services.franchisee_payout_retry_service import (
+        start_franchisee_payout_retry_service,
+    )
+    await start_franchisee_payout_retry_service()
+
     logger.info("Database initialized with Tortoise ORM")
     logger.info("Redis connection established")
     logger.info("Periodic cleanup task started")
@@ -1708,6 +1716,12 @@ async def shutdown_event():
     # Stop data retention service
     from services.data_retention_service import stop_data_retention_service
     await stop_data_retention_service()
+
+    # Stop franchisee payout retry service
+    from services.franchisee_payout_retry_service import (
+        stop_franchisee_payout_retry_service,
+    )
+    await stop_franchisee_payout_retry_service()
 
     await close_db()
     await redis_manager.disconnect()
