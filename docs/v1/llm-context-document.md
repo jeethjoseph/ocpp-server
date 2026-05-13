@@ -138,6 +138,7 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
   - **Route transfers**: two endpoints, picked in `franchisee_settlement_service.initiate_transfer` based on whether the ledger entry has a source `razorpay_payment_id`:
     - **Payment-based** (QR sessions): `create_payment_transfer(payment_id, account_id, amount_paise, notes, franchisee_id)` → `POST /v1/payments/{id}/transfers`. No on-demand activation required. Wraps `requests.post` directly (not the SDK) and writes a `RazorpayApiLog` audit row via `_audit_call`. Razorpay's only constraint is `sum(transfers) ≤ captured_amount`; refunds reduce the effective transferable amount. App-level idempotency comes from `_validate_ledger_for_transfer`'s `razorpay_payment_id` collision check (no `X-Transfer-Idempotency` header is sent).
     - **Direct** (wallet sessions): `create_transfer(account_id, amount_paise, notes, idempotency_key)` → `POST /v1/transfers`. `idempotency_key` is sent as `X-Transfer-Idempotency`. **This endpoint is gated by an on-demand Razorpay merchant feature** ("Direct Transfers") and returns `400 "This feature is not enabled for this merchant."` until ops opens a support ticket on the parent merchant.
+  - **`WALLET_SETTLEMENT_ENABLED` env flag** (default `false`): until the Direct Transfers feature is activated, wallet-session ledger entries are parked in `ON_HOLD` with `failure_reason="wallet_settlement_not_activated"` and **skipped by `retry_failed_transfers`** (the retry sweep filters out entries with `razorpay_payment_id IS NULL` while the flag is off). When ops activates the feature on Razorpay and flips the flag to `true`, the same retry sweep picks the held entries up automatically. QR/UPI settlements (which use the payment-based endpoint) are unaffected by this flag. Wallet top-ups themselves are not gated — admins/users can still top-up and use wallet credit at VoltLync-owned chargers; only franchisee-bound transfers are deferred.
   - **Linked accounts**: `create_linked_account(payload)` — caller builds the payload including `reference_id=f"franchisee_{id}"`, `business_type`, `contact_name`, and `profile.category/subcategory` + `profile.addresses.registered` (street1/street2/city/state/postal_code/country). The addresses block is mandatory per Razorpay; `franchisee_onboarding_service` fails early with a readable `RuntimeError` when `address`, `city`, `state`, or `pincode` is missing on the Franchisee record. Razorpay SDK errors are caught in `routers/franchisees.onboard_to_razorpay` and returned as HTTP 400 with the Razorpay message so the admin UI shows the actual cause, not "Internal Server Error". Razorpay emails the franchisee a KYC invite directly; no hosted onboarding URL is relied on.
   - Test/Live mode support
 - **`monitoring_service.py`** - Sentry + New Relic integration
@@ -329,14 +330,19 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
     right after `process_qr_session_billing` returns (refund already
     issued). Creates a `CommissionLedgerEntry` with `idempotency_key=
     f"txn_{id}"` capturing the gross → net → franchisee_payout split.
-    Immediately calls `initiate_transfer` if the franchisee is ACTIVE
-    with a linked account and payout ≥ `MINIMUM_TRANSFER_AMOUNT` (₹1).
+    If `franchisee_payout < MINIMUM_TRANSFER_AMOUNT` (₹1) the entry is
+    marked `BELOW_THRESHOLD` (terminal — retry sweep ignores it).
+    Otherwise calls `initiate_transfer` if the franchisee is ACTIVE
+    with a linked account.
   - `calculate_settlement(...)` is the pure math: `net_excl_gst =
-    gross - refund - pg_fee - gst_collected`; `platform_commission`
-    and `tds_amount` come off that; `franchisee_payout` is what
-    remains. `transfer_fee` is NOT deducted at calc time — it's
-    populated after the fact from the `settlement.processed` webhook
-    (Razorpay's actual per-transfer fee).
+    gross - refund - pg_fee - gst_collected`; `platform_commission =
+    net_excl_gst × commission_pct`; `franchisee_earning = net_excl_gst
+    − platform_commission`; **`tds_amount = franchisee_earning ×
+    tds_pct`** (TDS base is post-commission, not net_excl_gst, so
+    we don't over-withhold on platform's own income); `franchisee_payout
+    = franchisee_earning − tds_amount`. `transfer_fee` is NOT deducted
+    at calc time — it's populated after the fact from the
+    `settlement.processed` webhook (Razorpay's actual per-transfer fee).
   - `initiate_transfer(entry)` enforces a **24-hour cooling period**
     after `franchisee.activated_at` (Razorpay rejects transfers within
     24h of activation). Within the window the entry is parked as
@@ -544,7 +550,8 @@ connector (id, charger_id, connector_id, connector_type, max_power_kw) -- connec
 tariff (id, station_id, rate_per_kwh, gst_percent) -- gst_percent default 18.00, applied on top of energy charge
 
 -- OCPP Transactions
-transaction (id, user_id, charger_id, start_meter_kwh, end_meter_kwh, transaction_status, suspended_at, resumed_at, resume_count, energy_charge, gst_amount, total_billed)
+transaction (id, user_id, charger_id, start_meter_kwh, end_meter_kwh, transaction_status, suspended_at, resumed_at, resume_count, energy_charge, gst_amount, gst_rate_percent, total_billed)
+-- `gst_rate_percent` is snapshotted from the tariff at billing time so invoices stay stable if the tariff later changes.
 meter_value (id, transaction_id, reading_kwh, current, voltage, power_kw)
 
 -- Firmware Management
@@ -560,6 +567,18 @@ charger_error (id, charger_id, connector_id, status, error_code, vendor_error_co
 -- QR-Based Appless Payments (NEW)
 charger_qr_code (id, charger_id, razorpay_qr_code_id, image_url, short_url, is_active) -- Razorpay UPI QR codes
 qr_payment (id, charger_id, charger_qr_code_id, user_id, transaction_id, razorpay_payment_id, amount_paid, customer_vpa, customer_name, customer_contact, energy_cost, gst_amount, platform_fee, razorpay_commission, razorpay_gst, fee_source, refund_amount, razorpay_refund_id, status, failure_reason, metadata) -- Payment lifecycle with actual Razorpay fee tracking
+
+-- GST Invoicing (customer-facing tax invoice per session)
+-- VoltLync is the GST supplier on every invoice (merchant-of-record under Razorpay Route).
+-- `franchisee_id` is preserved on gst_invoice as reporting metadata only — it does NOT drive supplier identity.
+gst_invoice_counter (id, series, financial_year, last_number) -- Single counter per (series, FY); franchisee column dropped in migration 28.
+gst_invoice (id, invoice_number, series, financial_year, transaction_id, franchisee_id, user_id, supplier_name, supplier_gstin, supplier_state_code, customer_name, customer_identifier, station_name, place_of_supply_state_code, charger_id_str, energy_consumed_kwh, tariff_rate_incl_tax, hsn_sac_code, gst_rate_percent, energy_taxable_value, gateway_charges, gateway_hsn_code, total_taxable_value, is_inter_state, cgst_rate, cgst_amount, sgst_rate, sgst_amount, igst_rate, igst_amount, total_tax, total_amount, amount_in_words, payment_method, transaction_amount, pdf_url)
+-- `series` = 'WAL' (wallet) or 'QR' (UPI guest); invoice_number format: VL/{SERIES}/{FY_NODASH}/{SEQ:05d}.
+-- `transaction_amount` is post-refund (amount_paid - refund_amount for QR).
+-- `pdf_url` holds an S3 object key, populated lazily on first download (presigned URL served at /api/.../pdf endpoints).
+-- Invoice generation is blocked at the service layer when VOLTLYNC_GSTIN env var is empty (CGST Rule 46).
+-- Cancellation infrastructure was removed: invoices are immutable once issued.
+-- Credit notes are not modelled today — refunds are baked into transaction_amount; revisit if/when B2B (ITC-claiming customers) is introduced.
 
 -- Audit & Webhooks
 audit_event (id, event_type, entity_type, entity_id, details, created_at) -- System audit trail
@@ -743,6 +762,12 @@ Transactions:
 GET /transactions - List transactions with filtering and analytics summary
 GET /transactions/{id} - Transaction details
 GET /transactions/{id}/meter-values - Energy consumption data with chart data
+
+GST Filings (admin window at /admin/gst-filings):
+GET /invoices - Paginated invoice list with filters: financial_year, series (WAL|QR), franchisee_id, start_date/end_date (ISO 8601 with TZ, applied to invoice_date), place_of_supply_state_code, is_inter_state, q (free-text invoice number / customer)
+GET /invoices/summary - Aggregate totals (count, taxable, CGST/SGST/IGST, total) over the same filtered set, plus by_series counts
+GET /invoices/export.csv - Streaming CSV (text/csv, StreamingResponse) — one row per invoice with every GSTR-1-relevant column; respects all list filters
+GET /invoices/{id}/pdf - Lazy S3 upload + presigned-URL redirect (302) for the customer-facing invoice PDF
 ```
 
 ### User APIs
@@ -1141,6 +1166,33 @@ source .venv/bin/activate
 aerich migrate --name "description"  # Generate migration
 aerich upgrade  # Apply migration to database
 ```
+
+### Seeding the Dev DB
+Seed scripts live in `backend/scripts/` and run inside the backend container
+(no local venv needed — matches `feedback_docker_exec`). All scripts are
+idempotent.
+
+```bash
+# One-shot orchestrator — runs every seeder in order on a shared connection
+make seed CLERK_ADMIN_ID=user_xxx ADMIN_EMAIL=you@example.com
+# Equivalent direct invocation:
+docker exec -e CLERK_ADMIN_ID=user_xxx -e ADMIN_EMAIL=you@example.com \
+    ocpp-backend python scripts/seed_all.py
+```
+
+Env vars:
+- `CLERK_ADMIN_ID` — your Clerk user id; seeded as the ADMIN user.
+- `ADMIN_EMAIL` — required because `app_user.email` is NOT NULL UNIQUE. Default `admin@voltlync.dev`.
+- `CLERK_USER_ID` / `USER_EMAIL` — optional, for a second regular user.
+
+Scripts:
+- `seed_docker.py` — core: users + wallets, 5 Bangalore stations, 10 chargers, global tariff (₹12/kWh, 18% GST), 5 completed transactions with billing fields filled.
+- `seed_franchisees.py` — 3 franchisees (`ACTIVE` "Bangalore EV Partners", `KYC_UNDER_REVIEW` "Pending KYC LLP", `SUSPENDED` "Suspended Owner"), 1 stakeholder, links MG Road + Koramangala stations to the ACTIVE franchisee.
+- `seed_all.py` — orchestrator. Opens one Tortoise connection and runs each seeder; individual seeders no-op their own init/close when `Tortoise._inited`.
+
+Adding a new seeder: implement a `Seeder` class with `init_db`/`close_db`/`seed_all`, follow the `_owns_connection` pattern in `seed_docker.py`, then append the class to `SEEDERS` in `seed_all.py`. Idempotency convention: `get_or_create` keyed on the natural unique field (`clerk_user_id`, `name`, `charge_point_string_id`, `contact_email`, etc).
+
+Out of scope (deferred): QR payments, commission ledger entries (when built, call `FranchiseeSettlementService.process_settlement()` rather than raw inserts), firmware files. Operational/event tables (AuditLog, OCPPLog, WebhookEvent, etc.) are populated by runtime traffic, not by seed scripts.
 
 ---
 

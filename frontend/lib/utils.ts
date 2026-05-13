@@ -13,3 +13,17 @@ export function isSocketCharger(
     false
   );
 }
+
+const INR_FORMATTER = new Intl.NumberFormat("en-IN", {
+  style: "currency",
+  currency: "INR",
+  maximumFractionDigits: 2,
+  minimumFractionDigits: 2,
+});
+
+export function formatINR(value: string | number | null | undefined): string {
+  if (value === null || value === undefined || value === "") return "₹—";
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(n)) return "₹—";
+  return INR_FORMATTER.format(n);
+}

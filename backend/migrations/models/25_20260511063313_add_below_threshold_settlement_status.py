@@ -1,0 +1,24 @@
+from tortoise import BaseDBAsyncClient
+
+
+async def upgrade(db: BaseDBAsyncClient) -> str:
+    return """
+        COMMENT ON COLUMN "commission_ledger_entry"."settlement_status" IS 'PENDING: PENDING
+TRANSFER_INITIATED: TRANSFER_INITIATED
+TRANSFER_PROCESSED: TRANSFER_PROCESSED
+SETTLED: SETTLED
+FAILED: FAILED
+REVERSED: REVERSED
+ON_HOLD: ON_HOLD
+BELOW_THRESHOLD: BELOW_THRESHOLD';"""
+
+
+async def downgrade(db: BaseDBAsyncClient) -> str:
+    return """
+        COMMENT ON COLUMN "commission_ledger_entry"."settlement_status" IS 'PENDING: PENDING
+TRANSFER_INITIATED: TRANSFER_INITIATED
+TRANSFER_PROCESSED: TRANSFER_PROCESSED
+SETTLED: SETTLED
+FAILED: FAILED
+REVERSED: REVERSED
+ON_HOLD: ON_HOLD';"""

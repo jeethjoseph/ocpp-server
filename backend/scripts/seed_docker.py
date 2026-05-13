@@ -1,312 +1,289 @@
 #!/usr/bin/env python3
 """
-Docker Development Seed Script for OCPP Server
-Creates sample data with support for real Clerk user IDs
+Docker Development Seed Script for OCPP Server.
 
-Usage:
-    # Basic seed with fake users:
-    python scripts/seed_docker.py
+Run inside the backend container:
+    docker exec ocpp-backend python scripts/seed_docker.py
 
-    # Seed with your real Clerk user ID as admin:
-    CLERK_ADMIN_ID=user_xxxx python scripts/seed_docker.py
+Env vars consumed:
+    CLERK_ADMIN_ID   - your Clerk user_id; seeded as ADMIN if set
+    ADMIN_EMAIL      - email for the admin user (default: admin@voltlync.dev)
+    CLERK_USER_ID    - your Clerk user_id for a regular USER record
+    USER_EMAIL       - email for that user (default: user@voltlync.dev)
 
-    # Or set multiple users:
-    CLERK_ADMIN_ID=user_xxxx CLERK_USER_ID=user_yyyy python scripts/seed_docker.py
+Idempotent: re-running skips rows that already exist (keyed on natural unique
+fields — clerk_user_id, station name, charger string id, etc).
 """
 
 import asyncio
 import os
-import sys
-from datetime import datetime, timedelta
-from decimal import Decimal
 import random
+import sys
+from datetime import timedelta
+from decimal import Decimal
 
-# Add the parent directory to the path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tortoise import Tortoise
+
 from models import (
-    User, UserRoleEnum,
-    Wallet, WalletTransaction, TransactionTypeEnum,
-    ChargingStation, Charger, ChargerStatusEnum, Connector,
-    Tariff, Transaction, TransactionStatusEnum,
-    MeterValue, OCPPLog, MessageDirectionEnum
+    AuthProviderEnum,
+    Charger,
+    ChargerStatusEnum,
+    ChargingStation,
+    Connector,
+    Tariff,
+    Transaction,
+    TransactionStatusEnum,
+    User,
+    UserRoleEnum,
+    Wallet,
 )
+from scripts._db import build_tortoise_config, utc_now
 
-# Database URL for Docker
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    f"postgres://{os.getenv('DB_USER', 'ocpp')}:{os.getenv('DB_PASSWORD', 'ocpp_password')}@{os.getenv('DB_HOST', 'postgres')}:{os.getenv('DB_PORT', '5432')}/{os.getenv('DB_NAME', 'ocpp_db')}"
-)
 
-TORTOISE_CONFIG = {
-    "connections": {"default": DATABASE_URL},
-    "apps": {
-        "models": {
-            "models": ["models", "aerich.models"],
-            "default_connection": "default",
-        },
-    },
-}
+STATIONS_DATA = [
+    {"name": "MG Road Station", "latitude": 12.9716, "longitude": 77.5946,
+     "address": "MG Road, Bangalore", "pincode": "560001"},
+    {"name": "Koramangala Hub", "latitude": 12.9352, "longitude": 77.6245,
+     "address": "Koramangala, Bangalore", "pincode": "560034"},
+    {"name": "Whitefield Plaza", "latitude": 12.9698, "longitude": 77.7500,
+     "address": "Whitefield, Bangalore", "pincode": "560066"},
+    {"name": "Electronic City", "latitude": 12.8399, "longitude": 77.6770,
+     "address": "Electronic City, Bangalore", "pincode": "560100"},
+    {"name": "Indiranagar Station", "latitude": 12.9784, "longitude": 77.6408,
+     "address": "Indiranagar, Bangalore", "pincode": "560038"},
+]
+
 
 class DockerSeeder:
     def __init__(self):
-        self.users = []
-        self.stations = []
-        self.chargers = []
-        self.transactions = []
+        self.users: list[User] = []
+        self.stations: list[ChargingStation] = []
+        self.chargers: list[Charger] = []
+        self.transactions: list[Transaction] = []
+        self.tariff_rate = Decimal("12.00")
+        self.gst_percent = Decimal("18.00")
 
-        # Get real Clerk IDs from environment
         self.clerk_admin_id = os.getenv("CLERK_ADMIN_ID")
+        self.admin_email = os.getenv("ADMIN_EMAIL", "admin@voltlync.dev")
         self.clerk_user_id = os.getenv("CLERK_USER_ID")
+        self.user_email = os.getenv("USER_EMAIL", "user@voltlync.dev")
+
+        self._owns_connection = False
 
     async def init_db(self):
-        await Tortoise.init(config=TORTOISE_CONFIG)
+        # Tortoise._inited is private API but the documented public alternative
+        # (Tortoise.get_connection) raises when uninitialized, which is the
+        # condition we want to detect. Stable across Tortoise 0.20+.
+        if Tortoise._inited:
+            return
+        await Tortoise.init(config=build_tortoise_config())
+        self._owns_connection = True
         print("✅ Database connection established")
-        print(f"   Using: {DATABASE_URL.split('@')[1] if '@' in DATABASE_URL else DATABASE_URL}")
 
     async def close_db(self):
-        await Tortoise.close_connections()
-        print("✅ Database connection closed")
+        if self._owns_connection:
+            await Tortoise.close_connections()
+            print("✅ Database connection closed")
 
-    async def create_users(self):
-        """Create users - prioritizes real Clerk IDs if provided"""
-        print("👥 Creating users...")
-
-        users_data = []
-
-        # Real admin user (if Clerk ID provided)
-        if self.clerk_admin_id:
-            users_data.append({
-                "clerk_user_id": self.clerk_admin_id,
-                "phone_number": "+919999999999",
-                "full_name": "Admin User (You)",
-                "role": UserRoleEnum.ADMIN,
-                "is_active": True,
-            })
-            print(f"  📌 Will create ADMIN with your Clerk ID: {self.clerk_admin_id[:20]}...")
-        else:
-            # Fake admin
-            users_data.append({
-                "clerk_user_id": "clerk_admin_fake_001",
-                "phone_number": "+911234567890",
-                "full_name": "Test Admin",
-                "role": UserRoleEnum.ADMIN,
-                "is_active": True,
-            })
-            print("  ⚠️  No CLERK_ADMIN_ID set - creating fake admin")
-
-        # Real regular user (if Clerk ID provided)
+    def _users_data(self) -> list[dict]:
+        admin = {
+            "clerk_user_id": self.clerk_admin_id or "clerk_admin_fake_001",
+            "email": self.admin_email,
+            "phone_number": "+919999999999",
+            "full_name": "Admin User (You)" if self.clerk_admin_id else "Test Admin",
+            "role": UserRoleEnum.ADMIN,
+        }
+        regular = []
         if self.clerk_user_id:
-            users_data.append({
+            regular.append({
                 "clerk_user_id": self.clerk_user_id,
+                "email": self.user_email,
                 "phone_number": "+918888888888",
                 "full_name": "Test User (You)",
                 "role": UserRoleEnum.USER,
-                "is_active": True,
             })
+        regular.extend([
+            {"clerk_user_id": "clerk_user_fake_001", "email": "alice@voltlync.dev",
+             "phone_number": "+911111111111", "full_name": "Alice Driver", "role": UserRoleEnum.USER},
+            {"clerk_user_id": "clerk_user_fake_002", "email": "bob@voltlync.dev",
+             "phone_number": "+912222222222", "full_name": "Bob Tesla", "role": UserRoleEnum.USER},
+            {"clerk_user_id": "clerk_user_fake_003", "email": "carol@voltlync.dev",
+             "phone_number": "+913333333333", "full_name": "Carol Green", "role": UserRoleEnum.USER},
+        ])
+        return [admin, *regular]
 
-        # Additional fake users for testing
-        fake_users = [
-            {"clerk_user_id": "clerk_user_fake_001", "phone_number": "+911111111111", "full_name": "Alice Driver", "role": UserRoleEnum.USER},
-            {"clerk_user_id": "clerk_user_fake_002", "phone_number": "+912222222222", "full_name": "Bob Tesla", "role": UserRoleEnum.USER},
-            {"clerk_user_id": "clerk_user_fake_003", "phone_number": "+913333333333", "full_name": "Carol Green", "role": UserRoleEnum.USER},
-        ]
-        users_data.extend(fake_users)
-
-        for user_data in users_data:
-            user_data["is_active"] = user_data.get("is_active", True)
-            try:
-                # Check if user already exists
-                existing = await User.filter(clerk_user_id=user_data["clerk_user_id"]).first()
-                if existing:
-                    print(f"  ⏭️  User already exists: {user_data['full_name']}")
-                    self.users.append(existing)
-                    continue
-
-                user = await User.create(**user_data)
-                self.users.append(user)
-                role_emoji = "👑" if user.role == UserRoleEnum.ADMIN else "👤"
-                print(f"  ✅ Created {role_emoji} {user.role.value}: {user.full_name}")
-            except Exception as e:
-                print(f"  ❌ Failed to create {user_data['full_name']}: {e}")
+    async def create_users(self):
+        print("👥 Creating users...")
+        for data in self._users_data():
+            defaults = {
+                **data,
+                "auth_provider": AuthProviderEnum.CLERK,
+                "is_email_verified": True,
+                "is_active": True,
+            }
+            clerk_id = defaults.pop("clerk_user_id")
+            user, created = await User.get_or_create(
+                clerk_user_id=clerk_id, defaults=defaults
+            )
+            if not created:
+                user.email = data["email"]
+                user.role = data["role"]
+                await user.save()
+                print(f"  ⏭️  Updated existing user: {user.full_name}")
+            else:
+                emoji = "👑" if user.role == UserRoleEnum.ADMIN else "👤"
+                print(f"  ✅ Created {emoji} {user.role.value}: {user.full_name}")
+            self.users.append(user)
 
     async def create_wallets(self):
-        """Create wallets for all users"""
         print("💰 Creating wallets...")
-
         for user in self.users:
-            try:
-                existing = await Wallet.filter(user=user).first()
-                if existing:
-                    print(f"  ⏭️  Wallet exists for {user.full_name}: ₹{existing.balance}")
-                    continue
-
-                balance = Decimal("1000.00") if user.role == UserRoleEnum.ADMIN else Decimal("500.00")
-                wallet = await Wallet.create(user=user, balance=balance)
-                print(f"  ✅ Created wallet for {user.full_name}: ₹{balance}")
-            except Exception as e:
-                print(f"  ❌ Failed to create wallet for {user.full_name}: {e}")
+            balance = Decimal("1000.00") if user.role == UserRoleEnum.ADMIN else Decimal("500.00")
+            wallet, created = await Wallet.get_or_create(
+                user=user, defaults={"balance": balance}
+            )
+            marker = "✅ Created" if created else "⏭️  Exists"
+            print(f"  {marker} wallet for {user.full_name}: ₹{wallet.balance:.2f}")
 
     async def create_stations_and_chargers(self):
-        """Create charging infrastructure"""
         print("🔌 Creating charging stations and chargers...")
+        for data in STATIONS_DATA:
+            station = await self._upsert_station(data)
+            self.stations.append(station)
+            await self._upsert_chargers_for(station)
 
-        stations_data = [
-            {"name": "MG Road Station", "latitude": 12.9716, "longitude": 77.5946, "address": "MG Road, Bangalore"},
-            {"name": "Koramangala Hub", "latitude": 12.9352, "longitude": 77.6245, "address": "Koramangala, Bangalore"},
-            {"name": "Whitefield Plaza", "latitude": 12.9698, "longitude": 77.7500, "address": "Whitefield, Bangalore"},
-            {"name": "Electronic City", "latitude": 12.8399, "longitude": 77.6770, "address": "Electronic City, Bangalore"},
-            {"name": "Indiranagar Station", "latitude": 12.9784, "longitude": 77.6408, "address": "Indiranagar, Bangalore"},
-        ]
+    async def _upsert_station(self, data: dict) -> ChargingStation:
+        defaults = {
+            "latitude": data["latitude"],
+            "longitude": data["longitude"],
+            "address": data["address"],
+            "state": "Karnataka",
+            "state_code": "29",
+            "pincode": data["pincode"],
+        }
+        station, created = await ChargingStation.get_or_create(
+            name=data["name"], defaults=defaults
+        )
+        marker = "✅ Created" if created else "⏭️  Exists"
+        print(f"  {marker} station: {station.name}")
+        return station
 
-        for station_data in stations_data:
-            try:
-                existing = await ChargingStation.filter(name=station_data["name"]).first()
-                if existing:
-                    self.stations.append(existing)
-                    print(f"  ⏭️  Station exists: {station_data['name']}")
-                    # Still load chargers for this station
-                    chargers = await Charger.filter(station=existing).all()
-                    self.chargers.extend(chargers)
-                    continue
-
-                station = await ChargingStation.create(**station_data)
-                self.stations.append(station)
-                print(f"  ✅ Created station: {station.name}")
-
-                # Create 2 chargers per station
-                for i in range(2):
-                    charger_id = f"{station.name.replace(' ', '_').upper()}_{i+1:02d}"
-                    charger = await Charger.create(
-                        charge_point_string_id=charger_id,
-                        station=station,
-                        name=f"Charger {i+1}",
-                        model="FastCharge Pro",
-                        vendor="ChargePoint",
-                        serial_number=f"SN{random.randint(100000, 999999)}",
-                        firmware_version="v2.1.0",
-                        latest_status=ChargerStatusEnum.AVAILABLE,
-                        last_heart_beat_time=datetime.now()
-                    )
-                    self.chargers.append(charger)
-
-                    # Create connector
-                    await Connector.create(
-                        charger=charger,
-                        connector_id=1,
-                        connector_type="CCS",
-                        max_power_kw=50.0
-                    )
-                    print(f"    ✅ Charger: {charger_id}")
-
-            except Exception as e:
-                print(f"  ❌ Failed: {e}")
+    async def _upsert_chargers_for(self, station: ChargingStation):
+        base_id = station.name.replace(" ", "_").upper()
+        for i in range(2):
+            charger_id = f"{base_id}_{i + 1:02d}"
+            defaults = {
+                "external_charger_id": charger_id,
+                "station": station,
+                "name": f"Charger {i + 1}",
+                "model": "FastCharge Pro",
+                "vendor": "ChargePoint",
+                "serial_number": f"SN{random.randint(100000, 999999)}",
+                "firmware_version": "v2.1.0",
+                "latest_status": ChargerStatusEnum.AVAILABLE,
+                "last_heart_beat_time": utc_now(),
+            }
+            charger, created = await Charger.get_or_create(
+                charge_point_string_id=charger_id, defaults=defaults
+            )
+            self.chargers.append(charger)
+            if created:
+                await Connector.create(
+                    charger=charger, connector_id=1,
+                    connector_type="CCS", max_power_kw=50.0,
+                )
+                print(f"    ✅ Charger: {charger_id}")
+            else:
+                print(f"    ⏭️  Charger exists: {charger_id}")
 
     async def create_tariff(self):
-        """Create global tariff"""
         print("💵 Creating tariff...")
-
-        existing = await Tariff.filter(is_global=True).first()
-        if existing:
-            print(f"  ⏭️  Global tariff exists: ₹{existing.rate_per_kwh}/kWh")
-            return
-
-        await Tariff.create(rate_per_kwh=Decimal("12.00"), is_global=True)
-        print("  ✅ Created global tariff: ₹12.00/kWh")
+        tariff, created = await Tariff.get_or_create(
+            is_global=True,
+            defaults={
+                "rate_per_kwh": self.tariff_rate,
+                "gst_percent": self.gst_percent,
+                "hsn_sac_code": "998714",
+            },
+        )
+        marker = "✅ Created" if created else "⏭️  Exists"
+        print(f"  {marker} global tariff: ₹{tariff.rate_per_kwh}/kWh @ {tariff.gst_percent}% GST")
 
     async def create_sample_transactions(self):
-        """Create some sample charging transactions"""
         print("⚡ Creating sample transactions...")
-
-        if not self.users or not self.chargers:
-            print("  ⚠️  No users or chargers - skipping transactions")
-            return
-
         regular_users = [u for u in self.users if u.role == UserRoleEnum.USER]
-        if not regular_users:
-            print("  ⚠️  No regular users - skipping transactions")
+        if not regular_users or not self.chargers:
+            print("  ⚠️  No regular users or chargers - skipping")
             return
-
+        existing_count = await Transaction.all().count()
+        if existing_count >= 5:
+            print(f"  ⏭️  {existing_count} transactions already present - skipping")
+            return
         for i in range(5):
-            user = random.choice(regular_users)
-            charger = random.choice(self.chargers)
+            txn = await self._create_one_transaction(i, regular_users)
+            self.transactions.append(txn)
 
-            start_time = datetime.now() - timedelta(days=random.randint(1, 30))
-            end_time = start_time + timedelta(minutes=random.randint(30, 120))
-            energy = random.uniform(10, 40)
+    async def _create_one_transaction(self, idx: int, users: list[User]) -> Transaction:
+        user = random.choice(users)
+        charger = random.choice(self.chargers)
+        start = utc_now() - timedelta(days=random.randint(1, 30))
+        end = start + timedelta(minutes=random.randint(30, 120))
+        energy_kwh = round(random.uniform(10, 40), 2)
 
-            try:
-                txn = await Transaction.create(
-                    user=user,
-                    charger=charger,
-                    start_meter_kwh=1000 + i * 100,
-                    end_meter_kwh=1000 + i * 100 + energy,
-                    energy_consumed_kwh=energy,
-                    end_time=end_time,
-                    transaction_status=TransactionStatusEnum.COMPLETED,
-                    stop_reason="Completed normally"
-                )
-                # Update start_time
-                txn.start_time = start_time
-                await txn.save()
+        energy_charge = (Decimal(str(energy_kwh)) * self.tariff_rate).quantize(Decimal("0.01"))
+        gst_amount = (energy_charge * self.gst_percent / Decimal("100")).quantize(Decimal("0.01"))
+        total_billed = (energy_charge + gst_amount).quantize(Decimal("0.01"))
 
-                self.transactions.append(txn)
-                print(f"  ✅ Transaction #{txn.id}: {energy:.1f} kWh at {charger.name}")
-            except Exception as e:
-                print(f"  ❌ Failed: {e}")
+        txn = await Transaction.create(
+            user=user, charger=charger,
+            start_meter_kwh=1000 + idx * 100,
+            end_meter_kwh=1000 + idx * 100 + energy_kwh,
+            energy_consumed_kwh=energy_kwh,
+            end_time=end,
+            transaction_status=TransactionStatusEnum.COMPLETED,
+            stop_reason="Completed normally",
+            energy_charge=energy_charge,
+            gst_amount=gst_amount,
+            total_billed=total_billed,
+        )
+        txn.start_time = start
+        await txn.save()
+        print(f"  ✅ Txn #{txn.id}: {energy_kwh} kWh, ₹{total_billed} (incl. GST)")
+        return txn
 
     async def seed_all(self):
-        """Run all seeding operations"""
         print("=" * 60)
         print("🐳 Docker Development Database Seeder")
         print("=" * 60)
-
         if self.clerk_admin_id:
-            print(f"✅ CLERK_ADMIN_ID detected - you'll be seeded as admin")
+            print(f"✅ CLERK_ADMIN_ID set ({self.clerk_admin_id[:20]}...) — seeding you as admin")
         else:
-            print("💡 Tip: Set CLERK_ADMIN_ID=your_clerk_id to seed yourself as admin")
-
+            print("💡 Tip: set CLERK_ADMIN_ID to seed your real Clerk user as admin")
         print()
 
+        await self.init_db()
         try:
-            await self.init_db()
-
             await self.create_users()
             await self.create_wallets()
             await self.create_stations_and_chargers()
             await self.create_tariff()
             await self.create_sample_transactions()
-
-            print()
-            print("=" * 60)
-            print("🎉 Seeding completed!")
-            print("=" * 60)
-            print(f"📊 Summary:")
-            print(f"   Users: {len(self.users)}")
-            print(f"   Stations: {len(self.stations)}")
-            print(f"   Chargers: {len(self.chargers)}")
-            print(f"   Transactions: {len(self.transactions)}")
-
-            if self.clerk_admin_id:
-                print()
-                print("🔐 Your admin account is ready - refresh the browser!")
-            else:
-                print()
-                print("⚠️  To login as admin, run:")
-                print(f"   CLERK_ADMIN_ID=your_clerk_user_id python scripts/seed_docker.py")
-
-        except Exception as e:
-            print(f"❌ Error during seeding: {e}")
-            import traceback
-            traceback.print_exc()
-            raise
         finally:
             await self.close_db()
 
+        print()
+        print("=" * 60)
+        print("🎉 Core seeding completed")
+        print("=" * 60)
+        print(f"   Users: {len(self.users)}  Stations: {len(self.stations)}  "
+              f"Chargers: {len(self.chargers)}  Txns: {len(self.transactions)}")
+
+
 async def main():
-    seeder = DockerSeeder()
-    await seeder.seed_all()
+    await DockerSeeder().seed_all()
+
 
 if __name__ == "__main__":
     asyncio.run(main())

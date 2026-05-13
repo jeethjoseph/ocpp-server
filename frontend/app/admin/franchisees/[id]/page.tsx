@@ -18,6 +18,7 @@ import {
   Pause,
   Play,
   RefreshCw,
+  MinusCircle,
 } from "lucide-react";
 
 import { AdminOnly } from "@/components/RoleWrapper";
@@ -79,6 +80,7 @@ import {
   useReleaseSettlement,
 } from "@/lib/queries/franchisees";
 import { useStations } from "@/lib/queries/stations";
+import { formatINR } from "@/lib/utils";
 
 const STATUS_COLORS: Record<string, string> = {
   DRAFT: "bg-gray-100 text-gray-800",
@@ -98,6 +100,7 @@ const SETTLEMENT_STATUS_COLORS: Record<string, string> = {
   FAILED: "bg-red-100 text-red-800",
   ON_HOLD: "bg-orange-100 text-orange-800",
   REVERSED: "bg-gray-200 text-gray-700",
+  BELOW_THRESHOLD: "bg-slate-100 text-slate-700",
 };
 
 export default function FranchiseeDetailPage() {
@@ -139,6 +142,16 @@ export default function FranchiseeDetailPage() {
   const retrySettlements = useRetryFailedSettlements(id);
   const holdSettlement = useHoldSettlement(id);
   const releaseSettlement = useReleaseSettlement(id);
+  const [pendingSettlementAction, setPendingSettlementAction] = useState<
+    | {
+        kind: "hold" | "release";
+        entryId: number;
+        payout: string;
+        currentStatus: string;
+      }
+    | { kind: "retry" }
+    | null
+  >(null);
   const assignStations = useAssignStations(id);
   const unassignStation = useUnassignStation(id);
   const resendInvitation = useResendInvitation();
@@ -766,7 +779,7 @@ export default function FranchiseeDetailPage() {
             <Button
               size="sm"
               variant="outline"
-              onClick={() => retrySettlements.mutate()}
+              onClick={() => setPendingSettlementAction({ kind: "retry" })}
               disabled={retrySettlements.isPending}
               title="Retry all FAILED and ON_HOLD entries for this franchisee"
             >
@@ -804,10 +817,10 @@ export default function FranchiseeDetailPage() {
                           {entry.payment_method}
                         </TableCell>
                         <TableCell className="text-right text-xs">
-                          ₹{entry.gross_amount}
+                          {formatINR(entry.gross_amount)}
                         </TableCell>
                         <TableCell className="text-right text-xs">
-                          ₹{entry.franchisee_payout}
+                          {formatINR(entry.franchisee_payout)}
                         </TableCell>
                         <TableCell className="text-right text-xs">
                           {entry.commission_percent}
@@ -815,10 +828,11 @@ export default function FranchiseeDetailPage() {
                         <TableCell>
                           <Badge
                             variant="secondary"
-                            className={
-                              SETTLEMENT_STATUS_COLORS[entry.settlement_status] || ""
-                            }
+                            className={`${SETTLEMENT_STATUS_COLORS[entry.settlement_status] || ""} inline-flex items-center gap-1`}
                           >
+                            {entry.settlement_status === "BELOW_THRESHOLD" && (
+                              <MinusCircle className="h-3 w-3" />
+                            )}
                             {entry.settlement_status.replace(/_/g, " ")}
                           </Badge>
                           {entry.failure_reason && (
@@ -861,7 +875,14 @@ export default function FranchiseeDetailPage() {
                               <Button
                                 size="sm"
                                 variant="ghost"
-                                onClick={() => holdSettlement.mutate(entry.id)}
+                                onClick={() =>
+                                  setPendingSettlementAction({
+                                    kind: "hold",
+                                    entryId: entry.id,
+                                    payout: entry.franchisee_payout,
+                                    currentStatus: entry.settlement_status,
+                                  })
+                                }
                                 disabled={holdSettlement.isPending}
                                 title="Place this entry on hold"
                               >
@@ -873,7 +894,12 @@ export default function FranchiseeDetailPage() {
                                 size="sm"
                                 variant="ghost"
                                 onClick={() =>
-                                  releaseSettlement.mutate(entry.id)
+                                  setPendingSettlementAction({
+                                    kind: "release",
+                                    entryId: entry.id,
+                                    payout: entry.franchisee_payout,
+                                    currentStatus: entry.settlement_status,
+                                  })
                                 }
                                 disabled={releaseSettlement.isPending}
                                 title="Release back to PENDING"
@@ -1598,6 +1624,100 @@ export default function FranchiseeDetailPage() {
               >
                 <Trash2 className="w-4 h-4 mr-2" />
                 {deleteRazorpayAccount.isPending ? "Deleting…" : "Delete"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        {/* Settlement action confirmation (Hold / Release / Retry) */}
+        <Dialog
+          open={pendingSettlementAction !== null}
+          onOpenChange={(open) => {
+            if (!open) setPendingSettlementAction(null);
+          }}
+        >
+          <DialogContent className="max-w-md">
+            <DialogHeader>
+              <DialogTitle>
+                {pendingSettlementAction?.kind === "hold" && "Hold settlement?"}
+                {pendingSettlementAction?.kind === "release" && "Release settlement?"}
+                {pendingSettlementAction?.kind === "retry" && "Retry failed/on-hold transfers?"}
+              </DialogTitle>
+            </DialogHeader>
+            <div className="space-y-3 text-sm">
+              {pendingSettlementAction?.kind === "hold" && (
+                <>
+                  <p>
+                    This will move entry #{pendingSettlementAction.entryId} (payout{" "}
+                    <span className="font-semibold">
+                      {formatINR(pendingSettlementAction.payout)}
+                    </span>
+                    , currently {pendingSettlementAction.currentStatus.replace(/_/g, " ")}) to
+                    ON_HOLD. The background retry sweep will skip it until you release.
+                  </p>
+                </>
+              )}
+              {pendingSettlementAction?.kind === "release" && (
+                <>
+                  <p>
+                    This will move entry #{pendingSettlementAction.entryId} (payout{" "}
+                    <span className="font-semibold">
+                      {formatINR(pendingSettlementAction.payout)}
+                    </span>
+                    ) back to PENDING. The next retry tick will attempt the transfer to
+                    {franchisee && (
+                      <>
+                        {" "}
+                        <span className="font-semibold">{franchisee.business_name}</span>
+                      </>
+                    )}
+                    .
+                  </p>
+                </>
+              )}
+              {pendingSettlementAction?.kind === "retry" && (
+                <p>
+                  This will immediately attempt every FAILED and ON_HOLD entry for{" "}
+                  {franchisee && (
+                    <span className="font-semibold">{franchisee.business_name}</span>
+                  )}
+                  . Idempotency keys protect against duplicate transfers, but real money
+                  movement is possible.
+                </p>
+              )}
+            </div>
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setPendingSettlementAction(null)}
+              >
+                Cancel
+              </Button>
+              <Button
+                onClick={() => {
+                  if (!pendingSettlementAction) return;
+                  if (pendingSettlementAction.kind === "hold") {
+                    holdSettlement.mutate(pendingSettlementAction.entryId, {
+                      onSettled: () => setPendingSettlementAction(null),
+                    });
+                  } else if (pendingSettlementAction.kind === "release") {
+                    releaseSettlement.mutate(pendingSettlementAction.entryId, {
+                      onSettled: () => setPendingSettlementAction(null),
+                    });
+                  } else {
+                    retrySettlements.mutate(undefined, {
+                      onSettled: () => setPendingSettlementAction(null),
+                    });
+                  }
+                }}
+                disabled={
+                  holdSettlement.isPending ||
+                  releaseSettlement.isPending ||
+                  retrySettlements.isPending
+                }
+              >
+                Confirm
               </Button>
             </DialogFooter>
           </DialogContent>

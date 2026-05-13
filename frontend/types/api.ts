@@ -106,6 +106,10 @@ export interface ChargerDetail {
     name: string;
     address: string;
     franchisee_name?: string | null;
+    // True when the station is franchisee-owned AND
+    // WALLET_SETTLEMENT_ENABLED is off on the backend. UI hides the wallet
+    // payment button so wallet draws don't accrue stuck settlements.
+    wallet_payment_disabled?: boolean;
   };
   connectors: Connector[];
   transactions?: Array<{

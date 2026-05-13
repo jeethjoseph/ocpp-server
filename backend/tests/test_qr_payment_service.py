@@ -500,3 +500,102 @@ def test_zero_decimal_serializes_as_string():
     # The old buggy pattern:
     buggy = str(val) if val else None
     assert buggy is None  # confirms the bug existed
+
+
+# ============================================================================
+# Budget cap on over-consumption in process_qr_session_billing
+# ============================================================================
+
+async def _make_qr_billing_fixture(qr_charger, qr_code, qr_tariff, energy_consumed_kwh: float):
+    """Set up a QR payment + transaction at the CHARGING state with the
+    given energy_consumed_kwh ready for process_qr_session_billing to run."""
+    import uuid
+    user = await User.create(
+        email=f"u-{uuid.uuid4().hex[:8]}@v.test",
+        phone_number=f"9{uuid.uuid4().int % 1000000000:09d}",
+        auth_provider=AuthProviderEnum.UPI_GUEST,
+    )
+    txn = await Transaction.create(
+        user=user,
+        charger=qr_charger,
+        energy_consumed_kwh=energy_consumed_kwh,
+        transaction_status=TransactionStatusEnum.COMPLETED,
+    )
+    qr_payment = await QRPayment.create(
+        razorpay_payment_id=f"pay_{uuid.uuid4().hex[:10]}",
+        razorpay_qr_code_id=qr_code.razorpay_qr_code_id,
+        charger=qr_charger,
+        charger_qr_code=qr_code,
+        user=user,
+        transaction=txn,
+        customer_vpa="testpayer@oksbi",
+        amount_paid=Decimal("20.00"),
+        platform_fee=Decimal("0.24"),
+        razorpay_commission=Decimal("0.20"),
+        razorpay_gst=Decimal("0.04"),
+        fee_source="webhook",
+        status=QRPaymentStatusEnum.CHARGING,
+    )
+    return user, txn, qr_payment
+
+
+@pytest.mark.asyncio
+async def test_qr_billing_caps_energy_at_budget(client, qr_charger, qr_code, qr_tariff, caplog):
+    """Over-consumption is capped at the budgeted pre-tax ceiling.
+
+    amount_paid=20, platform_fee=0.24 → budget_incl_tax=19.76 →
+    budget_excl_tax=19.76/1.18=16.75. Driving 5.0 kWh at ₹15/kWh would
+    cost ₹75 uncapped, so this firmly tests the cap.
+    """
+    import logging
+    _, txn, qr_payment = await _make_qr_billing_fixture(
+        qr_charger, qr_code, qr_tariff, energy_consumed_kwh=5.0
+    )
+
+    with patch("services.qr_payment_service.redis_manager") as mock_redis:
+        mock_redis.delete_qr_session = AsyncMock()
+        with caplog.at_level(logging.WARNING, logger="ocpp-server"):
+            await QRPaymentService.process_qr_session_billing(txn.id)
+
+    await qr_payment.refresh_from_db()
+    await txn.refresh_from_db()
+
+    expected_billable_excl_tax = Decimal("16.75")  # (20 - 0.24) / 1.18
+    expected_gst = (expected_billable_excl_tax * Decimal("18") / Decimal("100")).quantize(Decimal("0.01"))
+
+    assert qr_payment.energy_cost == expected_billable_excl_tax
+    assert qr_payment.gst_amount == expected_gst
+    assert qr_payment.refund_amount is None or qr_payment.refund_amount == Decimal("0")
+    assert txn.energy_charge == expected_billable_excl_tax
+    assert txn.gst_amount == expected_gst
+    # Authoritative meter reading on the transaction is untouched.
+    assert txn.energy_consumed_kwh == 5.0
+    # Warning logged so ops can quantify over-delivery.
+    assert any("over-consumption capped" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_qr_billing_under_budget_is_unchanged(client, qr_charger, qr_code, qr_tariff):
+    """Under-budget consumption is unaffected by the cap (regression guard).
+
+    0.5 kWh × ₹15 = ₹7.50 + GST ₹1.35 = ₹8.85, which is well under the
+    ₹19.76 budget. Cap should not kick in; refund should flow.
+    """
+    _, txn, qr_payment = await _make_qr_billing_fixture(
+        qr_charger, qr_code, qr_tariff, energy_consumed_kwh=0.5
+    )
+
+    with patch("services.qr_payment_service.redis_manager") as mock_redis:
+        mock_redis.delete_qr_session = AsyncMock()
+        with patch("services.qr_payment_service.razorpay_service") as mock_rzp:
+            mock_rzp.refund_payment.return_value = {"id": "rfnd_test_001"}
+            await QRPaymentService.process_qr_session_billing(txn.id)
+
+    await qr_payment.refresh_from_db()
+    await txn.refresh_from_db()
+
+    assert qr_payment.energy_cost == Decimal("7.50")
+    assert qr_payment.gst_amount == Decimal("1.35")
+    # Refund = 20 - 0.24 - 7.50 - 1.35 = 10.91
+    assert qr_payment.refund_amount == Decimal("10.91")
+    assert txn.energy_charge == Decimal("7.50")

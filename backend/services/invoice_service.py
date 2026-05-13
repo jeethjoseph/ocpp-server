@@ -20,19 +20,19 @@ from models import (
     Charger,
     Connector,
     ChargingStation,
-    Franchisee,
     GSTInvoice,
-    GSTInvoiceStatusEnum,
     GSTInvoiceCounter,
     QRPayment,
     User,
 )
+from services.wallet_service import WalletService
 
 logger = logging.getLogger("ocpp-server")
 
 TWO_DP = Decimal("0.01")
 
-# VoltLync company details (used when station has no franchisee)
+# VoltLync is the supplier on every customer-facing invoice (merchant-of-record
+# under Razorpay Route). Franchisees are reporting metadata only.
 VOLTLYNC_NAME = os.getenv("VOLTLYNC_BUSINESS_NAME", "VOLTLYNC PRIVATE LIMITED")
 VOLTLYNC_GSTIN = os.getenv("VOLTLYNC_GSTIN", "")
 VOLTLYNC_ADDRESS = os.getenv("VOLTLYNC_ADDRESS", "")
@@ -74,13 +74,15 @@ class InvoiceService:
     @staticmethod
     @atomic()
     async def get_next_invoice_number(
-        franchisee_id: Optional[int],
         series: str,
         financial_year: str,
     ) -> str:
-        """Atomic counter increment using SELECT FOR UPDATE."""
+        """Atomic counter increment using SELECT FOR UPDATE.
+
+        Supplier is always VoltLync, so a single counter row per (series, FY)
+        owns the sequence — `VL/{SERIES}/{FY_NODASH}/{SEQ:05d}`.
+        """
         counter = await GSTInvoiceCounter.filter(
-            franchisee_id=franchisee_id,
             series=series,
             financial_year=financial_year,
         ).select_for_update().first()
@@ -91,77 +93,84 @@ class InvoiceService:
             seq = counter.last_number
         else:
             counter = await GSTInvoiceCounter.create(
-                franchisee_id=franchisee_id,
                 series=series,
                 financial_year=financial_year,
                 last_number=1,
             )
             seq = 1
 
-        # Format: VL/F{franchisee_id}/{SERIES}/{FY}/{SEQ}
-        # For VoltLync-owned: VL/{SERIES}/{FY}/{SEQ}
         fy_short = financial_year.replace("-", "")
-        if franchisee_id:
-            prefix = f"VL/F{franchisee_id}"
-        else:
-            prefix = "VL"
-        return f"{prefix}/{series}/{fy_short}/{seq:05d}"
+        return f"VL/{series}/{fy_short}/{seq:05d}"
 
     @staticmethod
     def determine_gst_split(
         supplier_state_code: Optional[str],
         station_state_code: Optional[str],
-        total_taxable: Decimal,
-        gst_rate: Decimal = Decimal("18"),
+        energy_taxable: Decimal,
+        energy_tax: Decimal,
+        gateway_taxable: Decimal,
+        gateway_tax: Decimal,
+        gst_rate: Decimal,
     ) -> dict:
-        """Determine CGST+SGST (intra-state) vs IGST (inter-state)."""
+        """Split pre-computed tax amounts across CGST+SGST (intra-state) or IGST (inter-state).
+
+        Inputs are the stored taxable values and tax amounts; we only decide
+        which buckets to put them in.
+        """
         is_inter = (
             supplier_state_code
             and station_state_code
             and supplier_state_code != station_state_code
         )
 
+        total_tax = energy_tax + gateway_tax
+
         if is_inter:
-            igst_rate = gst_rate
-            igst_amount = (total_taxable * igst_rate / 100).quantize(
-                TWO_DP, ROUND_HALF_UP
-            )
             return {
                 "is_inter_state": True,
                 "cgst_rate": None, "cgst_amount": None,
                 "sgst_rate": None, "sgst_amount": None,
-                "igst_rate": igst_rate, "igst_amount": igst_amount,
-                "total_tax": igst_amount,
-            }
-        else:
-            half_rate = (gst_rate / 2).quantize(TWO_DP, ROUND_HALF_UP)
-            half_tax = (total_taxable * half_rate / 100).quantize(
-                TWO_DP, ROUND_HALF_UP
-            )
-            return {
-                "is_inter_state": False,
-                "cgst_rate": half_rate, "cgst_amount": half_tax,
-                "sgst_rate": half_rate, "sgst_amount": half_tax,
-                "igst_rate": None, "igst_amount": None,
-                "total_tax": half_tax + half_tax,
+                "igst_rate": gst_rate, "igst_amount": total_tax,
+                "total_tax": total_tax,
             }
 
+        half_rate = (gst_rate / 2).quantize(TWO_DP, ROUND_HALF_UP)
+        half_tax = (total_tax / 2).quantize(TWO_DP, ROUND_HALF_UP)
+        # Keep paise balance: SGST absorbs any 1-paise residual from /2 rounding
+        sgst_amount = total_tax - half_tax
+        return {
+            "is_inter_state": False,
+            "cgst_rate": half_rate, "cgst_amount": half_tax,
+            "sgst_rate": half_rate, "sgst_amount": sgst_amount,
+            "igst_rate": None, "igst_amount": None,
+            "total_tax": total_tax,
+        }
+
     @staticmethod
+    @atomic()
     async def generate_invoice(
         transaction_id: int,
     ) -> Optional[GSTInvoice]:
-        """Generate a GST invoice for a completed transaction."""
+        """Generate a GST invoice for a completed transaction.
 
-        # Idempotency
+        Wrapped in @atomic() and locks the Transaction row to serialise
+        concurrent callers — prevents duplicate invoices and gaps in the
+        per-(franchisee, series, FY) invoice number sequence.
+        """
+
+        # Lock the transaction row first so concurrent callers serialise here.
+        txn = await Transaction.filter(
+            id=transaction_id
+        ).select_for_update().first()
+        if not txn:
+            return None
+
+        # Idempotency check (now race-free under the row lock).
         existing = await GSTInvoice.filter(
             transaction_id=transaction_id
         ).first()
         if existing:
             return existing
-
-        txn = await Transaction.filter(id=transaction_id).first()
-        if not txn:
-            return None
 
         energy = txn.energy_consumed_kwh or 0
         if energy <= 0:
@@ -177,25 +186,29 @@ class InvoiceService:
         if not station:
             return None
 
-        franchisee = None
-        if station.franchisee_id:
-            franchisee = await Franchisee.filter(
-                id=station.franchisee_id
-            ).first()
+        # `franchisee_id` is preserved on the invoice as reporting metadata
+        # (which station owner served the session) but is NOT the supplier.
+        # VoltLync is merchant-of-record under Razorpay Route: customers pay
+        # VoltLync, VoltLync issues the invoice, VoltLync settles the
+        # franchisee separately via a Route transfer. The franchisee's GST
+        # relationship with VoltLync is a different invoice flow.
+        franchisee_id = station.franchisee_id
 
-        # Supplier details
-        if franchisee:
-            supplier_name = franchisee.business_name
-            supplier_gstin = franchisee.gstin
-            supplier_address = franchisee.address
-            supplier_state = franchisee.state
-            supplier_state_code = franchisee.state_code
-        else:
-            supplier_name = VOLTLYNC_NAME
-            supplier_gstin = VOLTLYNC_GSTIN
-            supplier_address = VOLTLYNC_ADDRESS
-            supplier_state = VOLTLYNC_STATE
-            supplier_state_code = VOLTLYNC_STATE_CODE
+        supplier_name = VOLTLYNC_NAME
+        supplier_gstin = VOLTLYNC_GSTIN
+        supplier_address = VOLTLYNC_ADDRESS
+        supplier_state = VOLTLYNC_STATE
+        supplier_state_code = VOLTLYNC_STATE_CODE
+
+        # Compliance guard: a tax invoice without supplier GSTIN is invalid
+        # under CGST Rule 46. Skip issuance until VoltLync has a GSTIN
+        # configured via the VOLTLYNC_GSTIN env var.
+        if not supplier_gstin:
+            logger.error(
+                "GST invoice NOT issued for txn %s: VOLTLYNC_GSTIN not configured",
+                transaction_id,
+            )
+            return None
 
         # Customer details
         user = await User.filter(id=txn.user_id).first()
@@ -205,53 +218,76 @@ class InvoiceService:
 
         if qr_payment:
             payment_method = "UPI"
-            customer_name = qr_payment.customer_name
-            customer_identifier = qr_payment.customer_vpa or qr_payment.customer_contact
-            transaction_amount = qr_payment.amount_paid
-            refund_amount = qr_payment.refund_amount or Decimal("0")
-            gateway_charges_raw = (
-                (qr_payment.razorpay_commission or Decimal("0"))
-                + (qr_payment.razorpay_gst or Decimal("0"))
+            # QR customers identify by VPA — use it as the name fallback
+            customer_name = (
+                qr_payment.customer_name
+                or qr_payment.customer_vpa
+                or qr_payment.customer_contact
             )
+            customer_identifier = qr_payment.customer_vpa or qr_payment.customer_contact
+            transaction_amount = (
+                (qr_payment.amount_paid or Decimal("0"))
+                - (qr_payment.refund_amount or Decimal("0"))
+            )
+            gateway_taxable = qr_payment.razorpay_commission or Decimal("0")
+            gateway_tax = qr_payment.razorpay_gst or Decimal("0")
             series = "QR"
         else:
             payment_method = "WALLET"
             customer_name = user.full_name if user else None
             customer_identifier = user.email if user else None
             transaction_amount = txn.total_billed
-            refund_amount = None
-            gateway_charges_raw = Decimal("0")
+            gateway_taxable = Decimal("0")
+            gateway_tax = Decimal("0")
             series = "WAL"
 
-        # Billing calculations
-        energy_charge = txn.energy_charge or Decimal("0")
-        gst_on_energy = txn.gst_amount or Decimal("0")
-        total_bill = energy_charge + gst_on_energy
+        # Use stored taxable values directly — no reverse-calc, no /1.18.
+        energy_taxable = txn.energy_charge or Decimal("0")
+        energy_tax = txn.gst_amount or Decimal("0")
+        total_taxable = energy_taxable + gateway_taxable
+        gst_rate = txn.gst_rate_percent or Decimal("18.00")
 
-        # Tax-inclusive tariff rate for display
-        tariff_rate_incl = (
-            (total_bill / Decimal(str(energy))).quantize(TWO_DP, ROUND_HALF_UP)
-            if energy > 0 else Decimal("0")
-        )
-
-        # Back out taxable values
-        total_taxable = (total_bill / Decimal("1.18")).quantize(
-            TWO_DP, ROUND_HALF_UP
-        )
-        # Gateway charges (pre-tax portion, included in total_taxable)
-        gateway_taxable = (
-            gateway_charges_raw / Decimal("1.18")
-        ).quantize(TWO_DP, ROUND_HALF_UP) if gateway_charges_raw > 0 else Decimal("0")
-        energy_taxable = total_taxable - gateway_taxable
-
-        # GST split
+        # GST split (just buckets — totals come from stored values)
         gst_split = InvoiceService.determine_gst_split(
             supplier_state_code=supplier_state_code,
             station_state_code=station.state_code,
-            total_taxable=total_taxable,
+            energy_taxable=energy_taxable,
+            energy_tax=energy_tax,
+            gateway_taxable=gateway_taxable,
+            gateway_tax=gateway_tax,
+            gst_rate=gst_rate,
         )
 
         total_amount = total_taxable + gst_split["total_tax"]
+
+        # Tariff (needed both for HSN/SAC and for deriving billable_kwh on QR
+        # invoices, where `txn.energy_charge` may be capped at the budget).
+        tariff = await WalletService.get_applicable_tariff(charger.id)
+        hsn_sac_code = (tariff.hsn_sac_code if tariff else None) or "996749"
+
+        # Billable kWh — what the customer is being billed for. For QR sessions
+        # this can be less than `txn.energy_consumed_kwh` when the charger
+        # over-delivered past the budget cap; the over-delivery is absorbed by
+        # the operator and doesn't appear on the customer's invoice.
+        # For WAL sessions `energy_charge = actual_kwh × rate`, so this equals
+        # the actual reading.
+        if tariff and tariff.rate_per_kwh and energy_taxable > 0:
+            billable_kwh = float(
+                (energy_taxable / tariff.rate_per_kwh).quantize(
+                    Decimal("0.001"), rounding=ROUND_HALF_UP
+                )
+            )
+        else:
+            billable_kwh = energy
+
+        # Tax-inclusive tariff rate for display — derived from billable_kwh so
+        # the line-item math reconciles (rate × kWh = total).
+        tariff_rate_incl = (
+            ((energy_taxable + energy_tax) / Decimal(str(billable_kwh))).quantize(
+                TWO_DP, ROUND_HALF_UP
+            )
+            if billable_kwh > 0 else Decimal("0")
+        )
 
         # Connector type
         connector = await Connector.filter(charger_id=charger.id).first()
@@ -268,15 +304,16 @@ class InvoiceService:
         now = datetime.utcnow()
         fy = _get_financial_year(now)
         invoice_number = await InvoiceService.get_next_invoice_number(
-            franchisee_id=franchisee.id if franchisee else None,
             series=series,
             financial_year=fy,
         )
 
         invoice = await GSTInvoice.create(
             invoice_number=invoice_number,
+            series=series,
+            financial_year=fy,
             transaction=txn,
-            franchisee=franchisee,
+            franchisee_id=franchisee_id,
             user=user,
             supplier_name=supplier_name,
             supplier_gstin=supplier_gstin,
@@ -287,12 +324,15 @@ class InvoiceService:
             customer_identifier=customer_identifier,
             station_name=station.name,
             station_location=f"{station.address or ''}, {station.state or ''}".strip(", "),
+            place_of_supply_state_code=station.state_code,
             charger_id_str=charger.charge_point_string_id,
             connector_type=connector_type,
-            energy_consumed_kwh=energy,
+            energy_consumed_kwh=billable_kwh,
             tariff_rate_incl_tax=tariff_rate_incl,
             charged_on=txn.start_time,
             duration_seconds=duration_seconds,
+            hsn_sac_code=hsn_sac_code,
+            gst_rate_percent=gst_rate,
             energy_taxable_value=energy_taxable,
             gateway_charges=gateway_taxable,
             total_taxable_value=total_taxable,
@@ -308,7 +348,6 @@ class InvoiceService:
             amount_in_words=_amount_in_words(total_amount),
             payment_method=payment_method,
             transaction_amount=transaction_amount,
-            refund_amount=refund_amount,
         )
 
         logger.info(
@@ -459,23 +498,11 @@ class InvoiceService:
             ))
             elements.append(Spacer(1, 3*mm))
 
-        # Payment info
+        # Payment info — transaction_amount is net of refund
         pay_text = f"<b>Payment Method:</b> {invoice.payment_method or ''}"
         if invoice.transaction_amount:
-            pay_text += f"&nbsp;&nbsp;&nbsp;&nbsp;<b>Transaction Amount:</b> {invoice.transaction_amount:.2f}"
+            pay_text += f"&nbsp;&nbsp;&nbsp;&nbsp;<b>Amount Paid:</b> {invoice.transaction_amount:.2f}"
         elements.append(Paragraph(pay_text, normal_style))
-
-        if invoice.refund_amount and invoice.refund_amount > 0:
-            elements.append(Paragraph(
-                f"<b>Refund processing:</b> Takes 3-5 working days&nbsp;&nbsp;&nbsp;&nbsp;"
-                f"<b>Amount:</b> {invoice.refund_amount:.2f}",
-                normal_style,
-            ))
-            elements.append(Paragraph(
-                "Amount will be credited to customer's bank account within "
-                "5-7 working days after the refund has processed",
-                small_style,
-            ))
 
         elements.append(Spacer(1, 8*mm))
 

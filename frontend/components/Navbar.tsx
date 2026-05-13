@@ -21,6 +21,7 @@ const adminNavigation = [
   { name: 'Chargers', href: '/admin/chargers' },
   { name: 'QR Codes', href: '/admin/qr-codes' },
   { name: 'Franchisees', href: '/admin/franchisees' },
+  { name: 'GST Filings', href: '/admin/gst-filings' },
   { name: 'Firmware', href: '/admin/firmware' },
   { name: 'Users', href: '/admin/users' },
 ];

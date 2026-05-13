@@ -96,17 +96,23 @@ export default function AdminDashboard() {
             <h3 className="text-lg font-semibold mb-2">Transaction Monitoring</h3>
             <p className="text-gray-600 mb-4">Monitor all charging transactions</p>
             <div className="space-y-2">
-              <Link 
-                href="/admin/transactions" 
+              <Link
+                href="/admin/transactions"
                 className="block text-blue-600 hover:text-blue-800 font-medium"
               >
                 View Transactions →
               </Link>
-              <Link 
-                href="/admin/reports" 
+              <Link
+                href="/admin/reports"
                 className="block text-orange-600 hover:text-orange-800 font-medium"
               >
                 Generate Reports →
+              </Link>
+              <Link
+                href="/admin/settlements/stuck"
+                className="block text-amber-600 hover:text-amber-800 font-medium"
+              >
+                Stuck Settlements →
               </Link>
             </div>
           </Card>

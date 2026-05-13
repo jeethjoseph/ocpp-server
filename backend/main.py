@@ -1525,10 +1525,11 @@ from routers import qr_codes, public_qr_transactions
 app.include_router(qr_codes.router)
 app.include_router(public_qr_transactions.router)
 
-from routers import franchisees, franchisee_portal, invoices
+from routers import franchisees, franchisee_portal, invoices, admin_settlements
 app.include_router(franchisees.router)
 app.include_router(franchisee_portal.router)
 app.include_router(invoices.router)
+app.include_router(admin_settlements.router)
 
 # OCPP WebSocket endpoint (connection management + message handling)
 from routers import ocpp_ws
@@ -1677,6 +1678,10 @@ async def startup_event():
     )
     await start_franchisee_payout_retry_service()
 
+    # Start stuck-payout detector (Sentry alert on entries past threshold).
+    from services.stuck_payout_detector import start_stuck_payout_detector
+    await start_stuck_payout_detector()
+
     logger.info("Database initialized with Tortoise ORM")
     logger.info("Redis connection established")
     logger.info("Periodic cleanup task started")
@@ -1722,6 +1727,10 @@ async def shutdown_event():
         stop_franchisee_payout_retry_service,
     )
     await stop_franchisee_payout_retry_service()
+
+    # Stop stuck-payout detector
+    from services.stuck_payout_detector import stop_stuck_payout_detector
+    await stop_stuck_payout_detector()
 
     await close_db()
     await redis_manager.disconnect()

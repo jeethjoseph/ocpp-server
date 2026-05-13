@@ -1,12 +1,15 @@
 # Razorpay service for payment integration
+import asyncio
 import os
 import razorpay
-import requests
+import httpx
 import hmac
 import hashlib
 import logging
 from typing import Dict, Optional, Tuple
 from decimal import Decimal
+
+from utils import mask_vpa
 
 logger = logging.getLogger(__name__)
 
@@ -410,10 +413,10 @@ class RazorpayService:
             return None
         try:
             result = self.client.payment.validateVpa({"vpa": vpa})
-            logger.info(f"VPA validation for {vpa}: success={result.get('success')}")
+            logger.info(f"VPA validation for {mask_vpa(vpa)}: success={result.get('success')}")
             return result
         except Exception as e:
-            logger.error(f"Failed to validate VPA {vpa}: {e}")
+            logger.error(f"Failed to validate VPA {mask_vpa(vpa)}: {e}")
             return None
 
     def refund_payment(
@@ -505,13 +508,18 @@ class RazorpayService:
         sdk_call,
         franchisee_id: Optional[int] = None,
         account_id: Optional[str] = None,
+        critical: bool = False,
     ) -> Dict:
         """Run a sync Razorpay SDK call and persist a single
         ``RazorpayApiLog`` row capturing request + response (PII masked).
 
         - SDK exceptions are re-raised AFTER the log row is written.
-        - Audit-write failures are SWALLOWED so SDK behaviour is
-          preserved (logged at ERROR level for ops visibility).
+        - Audit-write failures are normally swallowed (logged at ERROR
+          level for ops visibility) so SDK behaviour is preserved.
+          When ``critical=True`` (money-moving calls), audit-write
+          failures are re-raised AFTER the SDK result is captured —
+          callers need to know that a real side effect happened without
+          a trace so they can compensate / page on-call.
         - Used by onboarding-chain wrappers and ``create_payment_transfer``
           (Route payment-based transfers). Refunds, payment captures, and
           QR webhook ingestion remain unaudited here.
@@ -523,7 +531,12 @@ class RazorpayService:
         success = False
         sdk_exc: Optional[BaseException] = None
         try:
+            # Support both sync SDK calls (return value) and async callers
+            # (coroutine). httpx-based callers need the async branch so the
+            # event loop isn't blocked on the HTTP round-trip.
             response_body = sdk_call()
+            if asyncio.iscoroutine(response_body):
+                response_body = await response_body
             success = True
         except razorpay.errors.BadRequestError as e:
             response_status = 400
@@ -558,10 +571,16 @@ class RazorpayService:
         except Exception as audit_err:
             logger.error(
                 "Failed to write razorpay_api_log row for %s %s: %s — "
-                "audit write swallowed; SDK call %s.",
+                "audit write %s; SDK call %s.",
                 method, endpoint, audit_err,
+                "re-raised (critical=True)" if critical else "swallowed",
                 "succeeded" if success else "failed",
             )
+            if critical and sdk_exc is None:
+                # SDK side-effect happened; caller MUST know we couldn't
+                # record it. Don't mask SDK exceptions if the call also
+                # failed — those take precedence below.
+                raise
 
         if sdk_exc is not None:
             raise sdk_exc
@@ -821,6 +840,7 @@ class RazorpayService:
         amount_paise: int,
         notes: Optional[Dict] = None,
         franchisee_id: Optional[int] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Dict:
         """Create a Route transfer from a captured payment to a linked account.
 
@@ -831,9 +851,16 @@ class RazorpayService:
 
         The only documented constraint is
         ``sum(transfers on payment) <= captured_amount`` (refunds reduce
-        the effective transferable amount). Application-level idempotency
-        is enforced by ``_validate_ledger_for_transfer`` which rejects
-        duplicate transfers on the same ``razorpay_payment_id``.
+        the effective transferable amount). Two layers of idempotency:
+
+        1. App-level: ``_validate_ledger_for_transfer`` rejects duplicate
+           transfers on the same ``razorpay_payment_id`` once the prior
+           transfer has been recorded on the ledger entry.
+        2. Network-level: ``idempotency_key`` (sent as ``X-Transfer-Idempotency``
+           header) lets Razorpay deduplicate retries when the original POST
+           timed out before we recorded the transfer id. Same key + same body
+           returns the original response; same key + different body returns
+           400. Callers should pass the ledger entry's stable ``idempotency_key``.
 
         Razorpay returns ``{"entity":"collection","items":[<transfer>]}``;
         this method unwraps and returns ``items[0]`` so callers can use
@@ -852,18 +879,26 @@ class RazorpayService:
             transfer_obj["notes"] = notes
         body = {"transfers": [transfer_obj]}
 
-        def _do_call():
-            resp = requests.post(
-                url,
-                json=body,
-                auth=(self.api_key, self.api_secret),
-                timeout=30,
-            )
+        headers: Dict[str, str] = {}
+        if idempotency_key:
+            headers["X-Transfer-Idempotency"] = idempotency_key
+
+        async def _do_call():
+            # httpx.AsyncClient — non-blocking; the previous sync ``requests``
+            # call stalled the event loop for the full Razorpay round-trip
+            # (up to 30s), serialising every other concurrent task.
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    url,
+                    json=body,
+                    headers=headers or None,
+                    auth=(self.api_key, self.api_secret),
+                )
             try:
                 parsed = resp.json()
-            except ValueError:
+            except Exception:
                 parsed = {"raw": resp.text}
-            if not resp.ok:
+            if resp.is_error:
                 description = ""
                 if isinstance(parsed, dict):
                     description = (
@@ -884,6 +919,7 @@ class RazorpayService:
             sdk_call=_do_call,
             franchisee_id=franchisee_id,
             account_id=account_id,
+            critical=True,
         )
 
         items = response.get("items") if isinstance(response, dict) else None

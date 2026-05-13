@@ -9,7 +9,7 @@ After each charging session completes billing, this service:
 
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, Dict
 
@@ -35,6 +35,16 @@ MIN_TRANSFER_AMOUNT = Decimal(
     os.getenv("MINIMUM_TRANSFER_AMOUNT", "1.00")
 )
 MAX_TRANSFER_RETRIES = int(os.getenv("MAX_TRANSFER_RETRIES", "3"))
+# Wallet-funded charging sessions have no per-session Razorpay payment_id, so
+# settling them to a franchisee requires the standalone POST /v1/transfers
+# endpoint (Razorpay-side "Direct Transfer" feature). Until that feature is
+# activated on the merchant account, leave this flag off — wallet-session
+# ledger entries are parked in ON_HOLD with failure_reason
+# ``wallet_settlement_not_activated`` and the retry loop skips them. When the
+# feature is activated, flip to "true" and the existing retry sweep picks
+# them up. QR (UPI) settlements are unaffected by this flag.
+WALLET_SETTLEMENT_ENABLED = os.getenv("WALLET_SETTLEMENT_ENABLED", "false").lower() == "true"
+WALLET_HOLD_REASON = "wallet_settlement_not_activated"
 # Tolerance for the gross == sum-of-components sanity check. A 2-paisa
 # window absorbs DECIMAL rounding across six successive quantize() calls
 # in calculate_settlement. Tighten to 0.01 once we confirm in production.
@@ -88,11 +98,18 @@ class FranchiseeSettlementService:
         platform_commission = (
             net_excl_gst * commission_pct / Decimal("100")
         ).quantize(TWO_DP, ROUND_HALF_UP)
+        # TDS is withheld from the franchisee's earning (post-commission),
+        # not from the pre-commission net. Withholding on a base that
+        # includes the platform's own commission would over-deduct from
+        # the franchisee on every settlement.
+        franchisee_earning = (
+            net_excl_gst - platform_commission
+        ).quantize(TWO_DP, ROUND_HALF_UP)
         tds_amount = (
-            net_excl_gst * tds_pct / Decimal("100")
+            franchisee_earning * tds_pct / Decimal("100")
         ).quantize(TWO_DP, ROUND_HALF_UP)
         franchisee_payout = (
-            net_excl_gst - platform_commission - tds_amount
+            franchisee_earning - tds_amount
         ).quantize(TWO_DP, ROUND_HALF_UP)
 
         return {
@@ -225,11 +242,16 @@ class FranchiseeSettlementService:
             payment_method,
         )
 
-        # Attempt transfer if Route is enabled and franchisee is active
-        if (
+        # Sub-floor payouts never transfer: mark terminal so the retry
+        # sweep doesn't pick them up and PENDING keeps its "awaiting
+        # transfer attempt" meaning.
+        if calc["franchisee_payout"] < MIN_TRANSFER_AMOUNT:
+            await CommissionLedgerEntry.filter(id=entry.id).update(
+                settlement_status=SettlementStatusEnum.BELOW_THRESHOLD,
+            )
+        elif (
             franchisee.status == FranchiseeStatusEnum.ACTIVE
             and franchisee.razorpay_account_id
-            and calc["franchisee_payout"] >= MIN_TRANSFER_AMOUNT
         ):
             await FranchiseeSettlementService.initiate_transfer(entry)
 
@@ -322,12 +344,27 @@ class FranchiseeSettlementService:
             )
             return False
 
+        # Wallet-session gate. Wallet entries have no razorpay_payment_id and
+        # require POST /v1/transfers, which is a separately-activated Razorpay
+        # feature. Park ON_HOLD until WALLET_SETTLEMENT_ENABLED is flipped on;
+        # `retry_failed_transfers` filters these out so the loop doesn't churn.
+        if entry.razorpay_payment_id is None and not WALLET_SETTLEMENT_ENABLED:
+            await CommissionLedgerEntry.filter(id=entry.id).update(
+                settlement_status=SettlementStatusEnum.ON_HOLD,
+                failure_reason=WALLET_HOLD_REASON,
+            )
+            logger.info(
+                "Transfer for entry %s held: wallet settlement disabled by env flag",
+                entry.id,
+            )
+            return False
+
         # Razorpay enforces a 24-hour cooling period after a linked account
         # is activated before transfers can be initiated. Park as ON_HOLD
         # so retry_failed_transfers picks it up after the window closes.
         if franchisee.activated_at:
             cooling_until = franchisee.activated_at + timedelta(hours=24)
-            if datetime.utcnow() < cooling_until.replace(tzinfo=None):
+            if datetime.now(timezone.utc) < cooling_until:
                 await CommissionLedgerEntry.filter(id=entry.id).update(
                     settlement_status=SettlementStatusEnum.ON_HOLD,
                     failure_reason="cooling_period",
@@ -368,16 +405,43 @@ class FranchiseeSettlementService:
             "idempotency_key": entry.idempotency_key,
         }
 
+        # Atomic claim: flip status to TRANSFER_INITIATED conditional on the
+        # row still being in a transferable state. Closes the read-then-write
+        # race a concurrent webhook or sweep could exploit between
+        # ``_validate_ledger_for_transfer`` and the Razorpay call. If 0 rows
+        # update, another worker won — bail without contacting Razorpay.
+        claim_time = datetime.now(timezone.utc)
+        claimed = await CommissionLedgerEntry.filter(
+            id=entry.id,
+            settlement_status__in=list(_TRANSFERABLE_STATUSES),
+        ).update(
+            settlement_status=SettlementStatusEnum.TRANSFER_INITIATED,
+            transfer_initiated_at=claim_time,
+            # Clear any stale failure from a previous attempt — a successful
+            # retry shouldn't leave the old error visible.
+            failure_reason=None,
+        )
+        if not claimed:
+            logger.info(
+                "Entry %s: atomic claim lost (status changed mid-flight) — skipping transfer.",
+                entry.id,
+            )
+            return False
+
         try:
             if entry.razorpay_payment_id:
                 # QR session — payment-based transfer (no on-demand activation
                 # needed, captured-amount is the only Razorpay-side gate).
+                # idempotency_key guards against double-transfer when an
+                # earlier POST timed out before we recorded the transfer id:
+                # Razorpay returns the original response on key collision.
                 result = await razorpay_service.create_payment_transfer(
                     payment_id=entry.razorpay_payment_id,
                     account_id=franchisee.razorpay_account_id,
                     amount_paise=amount_paise,
                     notes=notes,
                     franchisee_id=franchisee.id,
+                    idempotency_key=entry.idempotency_key,
                 )
             else:
                 # Wallet session — direct transfer from platform balance.
@@ -389,14 +453,9 @@ class FranchiseeSettlementService:
                     idempotency_key=entry.idempotency_key,
                 )
 
-            updates = {
-                "settlement_status": SettlementStatusEnum.TRANSFER_INITIATED,
-                "razorpay_transfer_id": result.get("id"),
-                "transfer_initiated_at": datetime.utcnow(),
-                # Clear any stale failure from a previous attempt — a
-                # successful retry shouldn't leave the old error visible.
-                "failure_reason": None,
-            }
+            # Status + transfer_initiated_at were set by the atomic claim;
+            # just record the Razorpay-side artefacts.
+            updates = {"razorpay_transfer_id": result.get("id")}
             # Capture fees from the synchronous POST response when present
             # (settlement.processed will overwrite later if Razorpay sends
             # an updated value, but bare-id settlement payloads can leave
@@ -419,6 +478,9 @@ class FranchiseeSettlementService:
             logger.error(
                 "Transfer failed for entry %s: %s", entry.id, e
             )
+            # Revert the optimistic claim. We own the row's status during
+            # this function (claim → Razorpay → revert/finalize), so an
+            # unconditional flip back to FAILED is safe.
             await CommissionLedgerEntry.filter(id=entry.id).update(
                 settlement_status=SettlementStatusEnum.FAILED,
                 failure_reason=str(e)[:500],
@@ -451,7 +513,7 @@ class FranchiseeSettlementService:
         if event_type == "transfer.processed":
             await CommissionLedgerEntry.filter(id=entry.id).update(
                 settlement_status=SettlementStatusEnum.TRANSFER_PROCESSED,
-                transfer_processed_at=datetime.utcnow(),
+                transfer_processed_at=datetime.now(timezone.utc),
                 failure_reason=None,
             )
             logger.info("Transfer processed: %s", transfer_id)
@@ -509,10 +571,15 @@ class FranchiseeSettlementService:
                         TWO_DP, ROUND_HALF_UP
                     )
 
+        # Razorpay re-delivers webhooks; the filter excludes already-SETTLED
+        # rows so settled_at / transfer_fee are frozen at first observation.
+        # Without this guard, a replay 5 minutes (or 5 days) later would shift
+        # settled_at forward and could over-write transfer_fee with a stale
+        # value from the replay payload.
         entries = await CommissionLedgerEntry.filter(
-            razorpay_transfer_id__in=transfer_ids
-        ).all()
-        now = datetime.utcnow()
+            razorpay_transfer_id__in=transfer_ids,
+        ).exclude(settlement_status=SettlementStatusEnum.SETTLED).all()
+        now = datetime.now(timezone.utc)
         for entry in entries:
             updates = {
                 "settlement_status": SettlementStatusEnum.SETTLED,
@@ -533,7 +600,14 @@ class FranchiseeSettlementService:
         """Retry FAILED and ON_HOLD entries that haven't exceeded max
         retries. ON_HOLD entries are picked up after a subsequent
         ``account.funds_unhold`` / ``account.activated`` webhook flips
-        the gating flags back on."""
+        the gating flags back on.
+
+        When ``WALLET_SETTLEMENT_ENABLED`` is false, wallet-session entries
+        (no razorpay_payment_id) are excluded from the sweep so the loop
+        doesn't churn against the same broken endpoint every cycle. When the
+        flag is later flipped on, this filter disappears and those entries
+        are picked up automatically by the next sweep.
+        """
         query = CommissionLedgerEntry.filter(
             settlement_status__in=[
                 SettlementStatusEnum.FAILED,
@@ -543,6 +617,8 @@ class FranchiseeSettlementService:
         )
         if franchisee_id:
             query = query.filter(franchisee_id=franchisee_id)
+        if not WALLET_SETTLEMENT_ENABLED:
+            query = query.filter(razorpay_payment_id__not_isnull=True)
 
         entries = await query.all()
         success_count = 0

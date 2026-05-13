@@ -122,6 +122,7 @@ class SettlementStatusEnum(str, enum.Enum):
     FAILED = "FAILED"
     REVERSED = "REVERSED"
     ON_HOLD = "ON_HOLD"
+    BELOW_THRESHOLD = "BELOW_THRESHOLD"
 
 class CommissionChangeReasonEnum(str, enum.Enum):
     INITIAL_SETUP = "INITIAL_SETUP"
@@ -129,11 +130,6 @@ class CommissionChangeReasonEnum(str, enum.Enum):
     PERFORMANCE_ADJUSTMENT = "PERFORMANCE_ADJUSTMENT"
     PROMOTION = "PROMOTION"
     ADMIN_OVERRIDE = "ADMIN_OVERRIDE"
-
-class GSTInvoiceStatusEnum(str, enum.Enum):
-    ISSUED = "ISSUED"
-    CANCELLED = "CANCELLED"
-
 
 # Models
 class User(Model):
@@ -351,6 +347,7 @@ class Transaction(Model):
     # Billing fields (populated after StopTransaction)
     energy_charge = fields.DecimalField(max_digits=10, decimal_places=2, null=True)  # Pre-GST energy cost
     gst_amount = fields.DecimalField(max_digits=10, decimal_places=2, null=True)     # GST on energy_charge
+    gst_rate_percent = fields.DecimalField(max_digits=5, decimal_places=2, default=18.00)  # GST rate snapshot at billing
     total_billed = fields.DecimalField(max_digits=10, decimal_places=2, null=True)   # energy_charge + gst
 
     # Relationships
@@ -785,6 +782,7 @@ class CommissionLedgerEntry(Model):
 
     class Meta:
         table = "commission_ledger_entry"
+        indexes = [("settlement_status", "retry_count")]
 
 
 class CommissionAuditLog(Model):
@@ -811,19 +809,19 @@ class CommissionAuditLog(Model):
 # GST Invoice Models
 
 class GSTInvoiceCounter(Model):
-    """Sequential invoice numbering per (franchisee, series, FY).
-    franchisee=NULL means VoltLync is the supplier."""
+    """Sequential invoice numbering per (series, FY).
+
+    VoltLync is the supplier on every customer-facing invoice, so a single
+    counter row per (series, FY) owns the sequence.
+    """
     id = fields.IntField(pk=True)
-    franchisee = fields.ForeignKeyField(
-        "models.Franchisee", related_name="invoice_counters", null=True
-    )
-    series = fields.CharField(max_length=10)  # WALLET, QR
+    series = fields.CharField(max_length=10)  # WAL or QR
     financial_year = fields.CharField(max_length=10)  # e.g. 2026-27
     last_number = fields.IntField(default=0)
 
     class Meta:
         table = "gst_invoice_counter"
-        unique_together = [("franchisee", "series", "financial_year")]
+        unique_together = [("series", "financial_year")]
 
 
 class GSTInvoice(Model):
@@ -832,16 +830,17 @@ class GSTInvoice(Model):
     created_at = fields.DatetimeField(auto_now_add=True)
 
     # Identity
-    invoice_number = fields.CharField(max_length=50, unique=True)
-    status = fields.CharEnumField(
-        GSTInvoiceStatusEnum, default=GSTInvoiceStatusEnum.ISSUED
-    )
+    invoice_number = fields.CharField(max_length=50)
+    series = fields.CharField(max_length=10, default="WAL")  # WAL or QR
+    financial_year = fields.CharField(max_length=10)  # e.g. 2026-27
     invoice_date = fields.DatetimeField(auto_now_add=True)
 
     # Links
     transaction = fields.OneToOneField(
         "models.Transaction", related_name="gst_invoice"
     )
+    # Reporting metadata only: which station owner served the session.
+    # VoltLync remains the GST supplier in every case (see supplier_* fields).
     franchisee = fields.ForeignKeyField(
         "models.Franchisee", related_name="gst_invoices", null=True
     )
@@ -849,7 +848,7 @@ class GSTInvoice(Model):
         "models.User", related_name="gst_invoices", null=True
     )
 
-    # Supplier snapshot (franchisee or VoltLync)
+    # Supplier snapshot — always VoltLync (merchant-of-record under Razorpay Route)
     supplier_name = fields.CharField(max_length=255)
     supplier_gstin = fields.CharField(max_length=20, null=True)
     supplier_address = fields.TextField(null=True)
@@ -861,9 +860,10 @@ class GSTInvoice(Model):
     customer_identifier = fields.CharField(max_length=255, null=True)  # UPI ID, email, phone
     customer_address = fields.TextField(null=True)
 
-    # Station/Charger snapshot
+    # Station/Charger snapshot (place-of-supply state code frozen at issue)
     station_name = fields.CharField(max_length=255, null=True)
     station_location = fields.CharField(max_length=500, null=True)
+    place_of_supply_state_code = fields.CharField(max_length=5, null=True)
     charger_id_str = fields.CharField(max_length=255, null=True)
     connector_type = fields.CharField(max_length=50, null=True)
 
@@ -872,7 +872,8 @@ class GSTInvoice(Model):
     tariff_rate_incl_tax = fields.DecimalField(max_digits=10, decimal_places=2)
     charged_on = fields.DatetimeField(null=True)
     duration_seconds = fields.IntField(null=True)
-    hsn_sac_code = fields.CharField(max_length=10, default="998749")
+    hsn_sac_code = fields.CharField(max_length=10, default="996749")
+    gst_rate_percent = fields.DecimalField(max_digits=5, decimal_places=2, default=18.00)
 
     # Line items (pre-tax)
     energy_taxable_value = fields.DecimalField(max_digits=10, decimal_places=2)
@@ -896,52 +897,18 @@ class GSTInvoice(Model):
     total_amount = fields.DecimalField(max_digits=10, decimal_places=2)
     amount_in_words = fields.CharField(max_length=500, null=True)
 
-    # Payment info (for QR sessions)
+    # Payment info — `transaction_amount` is net of refund (= amount_paid - refund_amount for QR)
     payment_method = fields.CharField(max_length=20, null=True)  # UPI, WALLET
     transaction_amount = fields.DecimalField(
         max_digits=10, decimal_places=2, null=True
-    )  # What customer paid (QR prepayment)
-    refund_amount = fields.DecimalField(
-        max_digits=10, decimal_places=2, null=True
     )
 
-    # PDF
+    # PDF (S3 key once uploaded; served via presigned URL)
     pdf_url = fields.CharField(max_length=500, null=True)
-
-    # Audit
-    cancelled_at = fields.DatetimeField(null=True)
-    cancellation_reason = fields.TextField(null=True)
 
     class Meta:
         table = "gst_invoice"
-
-
-class GSTCreditNote(Model):
-    """Credit note against a GST invoice (for refunds/corrections)."""
-    id = fields.IntField(pk=True)
-    created_at = fields.DatetimeField(auto_now_add=True)
-
-    credit_note_number = fields.CharField(max_length=50, unique=True)
-    original_invoice = fields.ForeignKeyField(
-        "models.GSTInvoice", related_name="credit_notes"
-    )
-    franchisee = fields.ForeignKeyField(
-        "models.Franchisee", related_name="credit_notes", null=True
-    )
-
-    reason = fields.CharField(max_length=255)
-    credit_amount = fields.DecimalField(max_digits=10, decimal_places=2)
-
-    # Tax mirror
-    cgst_amount = fields.DecimalField(max_digits=10, decimal_places=2, null=True)
-    sgst_amount = fields.DecimalField(max_digits=10, decimal_places=2, null=True)
-    igst_amount = fields.DecimalField(max_digits=10, decimal_places=2, null=True)
-
-    issue_date = fields.DatetimeField(auto_now_add=True)
-    pdf_url = fields.CharField(max_length=500, null=True)
-
-    class Meta:
-        table = "gst_credit_note"
+        unique_together = [("series", "financial_year", "invoice_number")]
 
 
 # Pydantic models for API serialization

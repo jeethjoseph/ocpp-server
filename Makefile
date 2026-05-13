@@ -174,10 +174,18 @@ migrate:
 	@echo "🔄 Running migrations..."
 	cd $(BACKEND_DIR) && source .venv/bin/activate && aerich upgrade
 
-# Run seed script
+# Run seed script (via docker exec — orchestrates seed_docker + seed_franchisees)
+# Usage:
+#   make seed
+#   CLERK_ADMIN_ID=user_xxx ADMIN_EMAIL=you@example.com make seed
 seed:
-	@echo "🌱 Seeding database..."
-	cd $(BACKEND_DIR) && source .venv/bin/activate && python scripts/seed_data.py
+	@echo "🌱 Seeding database via docker exec..."
+	@docker exec \
+		-e CLERK_ADMIN_ID=$(CLERK_ADMIN_ID) \
+		-e ADMIN_EMAIL=$(ADMIN_EMAIL) \
+		-e CLERK_USER_ID=$(CLERK_USER_ID) \
+		-e USER_EMAIL=$(USER_EMAIL) \
+		ocpp-backend python scripts/seed_all.py
 
 # Initial development setup (for first time)
 setup-dev: db-create-user db-create
@@ -615,23 +623,25 @@ docker-init-db:
 	docker compose exec backend aerich init-db
 	@echo "✅ Database initialized!"
 
-# Run seed script in Docker
-docker-seed:
-	@echo "🌱 Seeding database in Docker..."
-	docker compose exec backend python scripts/seed_data.py
+# Run seed orchestrator in Docker (alias for `seed`, kept for docs compatibility)
+docker-seed: seed
 	@echo "✅ Database seeded!"
 
-# Run Docker-specific seed script (supports CLERK_ADMIN_ID)
-# Usage: make docker-seed-dev CLERK_ADMIN_ID=user_xxxxx
+# Run Docker-specific seed orchestrator (supports CLERK_ADMIN_ID + ADMIN_EMAIL)
+# Usage: make docker-seed-dev CLERK_ADMIN_ID=user_xxxxx ADMIN_EMAIL=you@example.com
 docker-seed-dev:
 	@echo "🌱 Seeding Docker database for development..."
 	@if [ -n "$(CLERK_ADMIN_ID)" ]; then \
 		echo "📌 Using CLERK_ADMIN_ID: $(CLERK_ADMIN_ID)"; \
-		docker compose exec -e CLERK_ADMIN_ID=$(CLERK_ADMIN_ID) backend python scripts/seed_docker.py; \
 	else \
 		echo "💡 Tip: Run with CLERK_ADMIN_ID=your_id to seed yourself as admin"; \
-		docker compose exec backend python scripts/seed_docker.py; \
 	fi
+	@docker compose exec \
+		-e CLERK_ADMIN_ID=$(CLERK_ADMIN_ID) \
+		-e ADMIN_EMAIL=$(ADMIN_EMAIL) \
+		-e CLERK_USER_ID=$(CLERK_USER_ID) \
+		-e USER_EMAIL=$(USER_EMAIL) \
+		backend python scripts/seed_all.py
 
 # Reset Docker database completely (WARNING: destroys all data)
 docker-db-reset:

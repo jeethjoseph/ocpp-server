@@ -689,10 +689,16 @@ async def get_charger_by_string_id(
 
     This endpoint accepts alphanumeric charge point IDs like 'AIRPORT_EXPRESS_CHARGING_01'
     and returns the same data structure as the admin endpoint but uses string IDs.
+
+    The response carries ``station.wallet_payment_disabled``: true when the
+    charger sits on a franchisee-owned station and the wallet-settlement
+    feature flag is off. Frontends hide the "Pay from Wallet" affordance in
+    that case so wallet draws don't accrue indefinitely-held settlements.
     """
     from models import Charger, ChargingStation, Connector
     from redis_manager import redis_manager
     from datetime import datetime, timezone
+    from services.franchisee_settlement_service import WALLET_SETTLEMENT_ENABLED
 
     try:
         # Look up charger by charge_point_string_id
@@ -755,6 +761,14 @@ async def get_charger_by_string_id(
                     charger.station.franchisee.business_name
                     if charger.station.franchisee else None
                 ),
+                # Frontend hides the wallet-pay button when this is true.
+                # The settlement service can't currently push franchisee
+                # payouts for wallet sessions until Razorpay activates the
+                # direct-transfer feature; until then, allowing wallet at a
+                # franchisee charger would accrue ON_HOLD ledger entries.
+                "wallet_payment_disabled": bool(
+                    charger.station.franchisee_id
+                ) and not WALLET_SETTLEMENT_ENABLED,
             },
             "connectors": [
                 {

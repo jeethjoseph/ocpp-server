@@ -467,7 +467,13 @@ class QRPaymentService:
         tariff_rate = tariff.rate_per_kwh if tariff else Decimal('0')
         gst_percent = tariff.gst_percent if tariff else Decimal('18')
         platform_fee = await _resolve_platform_fee(qr_payment)
-        budget_limit = float(qr_payment.amount_paid - platform_fee)
+        # Store budget as an integer paise value — Decimal money should
+        # never round-trip through float in Redis. Consumers read this
+        # back as Decimal via ``Decimal(...) / Decimal("100")``.
+        budget_limit_paise = int(
+            ((qr_payment.amount_paid - platform_fee) * Decimal("100"))
+            .quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        )
         await qr_payment.save()
 
         transaction = await Transaction.filter(id=transaction_id).first()
@@ -476,7 +482,7 @@ class QRPaymentService:
             "qr_payment_id": qr_payment.id,
             "amount_paid": float(qr_payment.amount_paid),
             "platform_fee": float(platform_fee),
-            "budget_limit": budget_limit,
+            "budget_limit_paise": budget_limit_paise,
             "tariff_rate": float(tariff_rate),
             "gst_percent": float(gst_percent),
             "start_meter_kwh": transaction.start_meter_kwh if transaction else 0,
@@ -484,7 +490,8 @@ class QRPaymentService:
         }
         await redis_manager.set_qr_session(transaction_id, session_data)
 
-        logger.info(f"Linked QR payment {qr_payment.id} to transaction {transaction_id}, budget_limit=₹{budget_limit}")
+        budget_rupees = Decimal(budget_limit_paise) / Decimal("100")
+        logger.info(f"Linked QR payment {qr_payment.id} to transaction {transaction_id}, budget_limit=₹{budget_rupees}")
         return qr_payment
 
     @staticmethod
@@ -507,14 +514,17 @@ class QRPaymentService:
             gst_percent = tariff.gst_percent if tariff else Decimal('18')
             platform_fee = await _resolve_platform_fee(qr_payment)
             await qr_payment.save()
-            budget_limit = float(qr_payment.amount_paid - platform_fee)
+            budget_limit_paise = int(
+                ((qr_payment.amount_paid - platform_fee) * Decimal("100"))
+                .quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+            )
 
             transaction = await Transaction.filter(id=transaction_id).first()
             session = {
                 "qr_payment_id": qr_payment.id,
                 "amount_paid": float(qr_payment.amount_paid),
                 "platform_fee": float(platform_fee),
-                "budget_limit": budget_limit,
+                "budget_limit_paise": budget_limit_paise,
                 "tariff_rate": float(tariff_rate),
                 "gst_percent": float(gst_percent),
                 "start_meter_kwh": transaction.start_meter_kwh if transaction else 0,
@@ -522,7 +532,12 @@ class QRPaymentService:
             }
             await redis_manager.set_qr_session(transaction_id, session)
 
-        budget_limit = Decimal(str(session["budget_limit"]))
+        # Read paise-int (new format), fall back to legacy float "budget_limit"
+        # for one release cycle to drain in-flight Redis keys (TTL 24h).
+        if "budget_limit_paise" in session:
+            budget_limit = Decimal(session["budget_limit_paise"]) / Decimal("100")
+        else:
+            budget_limit = Decimal(str(session["budget_limit"]))
         tariff_rate = Decimal(str(session["tariff_rate"]))
         gst_percent = Decimal(str(session.get("gst_percent", 18.0)))
         start_meter = Decimal(str(session["start_meter_kwh"]))
@@ -553,8 +568,10 @@ class QRPaymentService:
             if transaction:
                 # Schedule as background task — do NOT await here.
                 # This runs inside the MeterValues handler; awaiting would deadlock
-                # because the CALLRESULT hasn't been sent yet.
-                asyncio.create_task(
+                # because the CALLRESULT hasn't been sent yet. Use ``safe_create_task``
+                # so a failing auto-stop is logged rather than dropped silently
+                # (the budget-exceeded session would otherwise keep charging).
+                safe_create_task(
                     QRPaymentService._send_remote_stop(transaction, transaction_id)
                 )
 
@@ -595,19 +612,43 @@ class QRPaymentService:
         tariff = await WalletService.get_applicable_tariff(qr_payment.charger_id)
         tariff_rate = tariff.rate_per_kwh if tariff else Decimal('0')
         gst_percent = tariff.gst_percent if tariff else Decimal('18')
+        platform_fee = await _resolve_platform_fee(qr_payment)
 
         if tariff_rate:
-            energy_cost = (Decimal(str(energy_kwh)) * tariff_rate).quantize(
+            uncapped_energy_cost = (Decimal(str(energy_kwh)) * tariff_rate).quantize(
                 Decimal('0.01'), rounding=ROUND_HALF_UP
             )
+            # Cap billable energy at the budgeted pre-tax ceiling. The budget
+            # enforced in Redis is `amount_paid - platform_fee` (tax-inclusive).
+            # The charger keeps delivering for a few seconds after we send
+            # RemoteStopTransaction, so the metered kWh can overshoot the
+            # budget. Without this cap, the customer would be billed for
+            # energy they never paid for and the refund would clamp to zero,
+            # silently shifting the GST liability onto VoltLync.
+            budget_incl_tax = qr_payment.amount_paid - platform_fee
+            gst_multiplier = Decimal('1') + (gst_percent / Decimal('100'))
+            budget_excl_tax = (budget_incl_tax / gst_multiplier).quantize(
+                Decimal('0.01'), rounding=ROUND_HALF_UP
+            )
+            energy_cost = min(uncapped_energy_cost, budget_excl_tax)
+            if uncapped_energy_cost > budget_excl_tax:
+                over_kwh = float(
+                    Decimal(str(energy_kwh)) - (budget_excl_tax / tariff_rate)
+                )
+                logger.warning(
+                    "QR over-consumption capped for txn %s: "
+                    "delivered=%.3fkWh, billable=%.3fkWh, over_delivery=%.3fkWh, "
+                    "uncapped_cost=₹%s, capped_cost=₹%s",
+                    transaction_id, energy_kwh,
+                    float(budget_excl_tax / tariff_rate), over_kwh,
+                    uncapped_energy_cost, energy_cost,
+                )
             gst_amount = (energy_cost * gst_percent / Decimal('100')).quantize(
                 Decimal('0.01'), rounding=ROUND_HALF_UP
             )
         else:
             energy_cost = Decimal('0.00')
             gst_amount = Decimal('0.00')
-
-        platform_fee = await _resolve_platform_fee(qr_payment)
 
         refund = max(Decimal('0'), qr_payment.amount_paid - energy_cost - gst_amount - platform_fee)
 
@@ -620,6 +661,7 @@ class QRPaymentService:
         await Transaction.filter(id=transaction_id).update(
             energy_charge=energy_cost,
             gst_amount=gst_amount,
+            gst_rate_percent=gst_percent,
             total_billed=energy_cost + gst_amount,
         )
 

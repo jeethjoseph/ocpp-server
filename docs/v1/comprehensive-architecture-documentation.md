@@ -410,7 +410,19 @@ class QRPaymentService:
         """Called from MeterValues: calculates cost vs budget, schedules RemoteStop if exceeded"""
 
     async def process_qr_session_billing(transaction_id)
-        """Called from StopTransaction: calculates final cost, issues partial refund for unused balance"""
+        """Called from StopTransaction: calculates final cost (capped at budget),
+        issues partial refund for unused balance.
+
+        Over-consumption cap: the charger keeps delivering for a few seconds
+        after we send RemoteStopTransaction, so metered kWh can overshoot the
+        Redis-enforced budget. Billable energy_cost is capped at the budgeted
+        pre-tax ceiling = (amount_paid - platform_fee) / (1 + gst%/100). The
+        over-delivered energy is absorbed by the operator and logged as a
+        WARNING. transaction.energy_consumed_kwh remains the authoritative
+        meter reading; only billable values on qr_payment and on the invoice
+        reflect the cap. The customer-facing invoice's `energy_consumed_kwh`
+        column is the *billable* kWh (energy_charge / tariff_rate) so the
+        line-item math reconciles."""
 
     async def handle_charging_failure(transaction_id)
         """Handles failures: sets status=FAILED, issues full refund"""
@@ -1823,7 +1835,8 @@ CREATE TABLE transaction (
     end_meter_kwh DECIMAL(10, 3),
     energy_consumed_kwh DECIMAL(10, 3),
     energy_charge DECIMAL(10, 2),       -- energy_kwh × rate_per_kwh
-    gst_amount DECIMAL(10, 2),          -- GST on energy_charge (18% default)
+    gst_amount DECIMAL(10, 2),          -- GST on energy_charge
+    gst_rate_percent DECIMAL(5, 2) DEFAULT 18.00,  -- rate snapshot at billing
     total_billed DECIMAL(10, 2),        -- energy_charge + gst_amount
     start_time TIMESTAMP DEFAULT NOW(),
     end_time TIMESTAMP,
@@ -2470,6 +2483,36 @@ sourced from the `Charger → Station → Franchisee` FK chain):
 - `/api/users/charger/{id}` surfaces `station.franchisee_name`.
 - The `/my-charges`, `/stations`, `/charge/[id]` and `StationMap` popup all render an "Operator:" line when populated.
 - The GST invoice PDF has always included the franchisee's business name as the supplier (no change needed there).
+
+### GST Tax Invoicing
+
+**Supplier identity: VoltLync, always.** Every customer-facing GST invoice carries VoltLync's name, GSTIN, address, and state code in the `supplier_*` columns, regardless of whether the charging session ran at a VoltLync-owned or a franchisee-owned station. This matches the Razorpay Route operating model: VoltLync is the merchant of record, customers pay VoltLync's UPI/wallet, VoltLync remits output GST, and franchisees receive their share as a Route transfer (minus commission) — a flow that's accounted separately and doesn't surface on the customer-facing invoice. `gst_invoice.franchisee_id` is preserved as reporting metadata (so admin filings can tell which station owner served each session) but does not drive any supplier column.
+
+Per-session, customer-facing tax invoice generated for every completed charging session. Schema and code live in:
+- `backend/models.py` — `GSTInvoice`, `GSTInvoiceCounter`
+- `backend/services/invoice_service.py` — generation + PDF rendering
+- `backend/routers/invoices.py` — list endpoints, PDF redirect
+- `backend/services/s3_service.py` — PDF persistence (S3, lazy)
+
+**Sequencing.** Invoice numbers are issued per `(series, financial_year)`. `series` is `WAL` for wallet-funded sessions and `QR` for UPI-guest sessions. Format: `VL/{SERIES}/{FY_NODASH}/{SEQ:05d}` — e.g. `VL/QR/202627/00017`. The counter row is incremented under `SELECT FOR UPDATE` and the full `generate_invoice` call holds a row lock on the underlying `transaction` to prevent gaps from concurrent callers. (Migration 28 reset existing rows to a gapless per-(series, FY) sequence after the supplier model was corrected.)
+
+**Tax math.** `gst_rate_percent` is snapshotted onto the `transaction` row at billing time (from `tariff.gst_percent`). The invoice reads stored taxable values directly — `energy_taxable_value = transaction.energy_charge`, `gateway_charges = qr_payment.razorpay_commission`. No reverse-calc from a tax-inclusive total. CGST+SGST (intra-state) vs IGST (inter-state) is decided by comparing `supplier_state_code` to the station's `state_code`; the latter is frozen on the invoice as `place_of_supply_state_code`.
+
+**Compliance guards.**
+- A tax invoice without supplier GSTIN is not valid under CGST Rule 46. `generate_invoice` aborts and logs an error when the supplier (`Franchisee.gstin` or `VOLTLYNC_GSTIN`) is empty.
+- HSN/SAC defaults to `996749` on the invoice; per-tariff `hsn_sac_code` overrides it when set.
+- GST state codes are 2-digit numeric (per CBIC). Mismatched alpha codes (e.g. `"KL"`) would silently break the intra-state check; normalise via `backend/scripts/backfill_gst_schema.py` if older rows are found.
+
+**Refunds.** Credit notes and refund vouchers are not modelled. The invoice's `transaction_amount` is net of refund (`amount_paid − refund_amount` for QR sessions). When B2B customers (with claimable Input Tax Credit) are introduced, a `gst_credit_note` table and IRP integration (IRN/signed QR/cancellation ack) will need to be added — schema today is B2C-only.
+
+**PDF persistence.** PDFs are rendered with ReportLab and uploaded to S3 lazily on first download request. `gst_invoice.pdf_url` stores the S3 key; downloads redirect to a 15-minute presigned URL. Env vars: `AWS_S3_INVOICE_BUCKET`, `AWS_REGION`. Credentials resolve via the EC2 instance role on staging/prod and via `AWS_PROFILE=voltlync` locally.
+
+**Cancellation.** Invoices are immutable once issued. Cancellation columns (`status`, `cancelled_at`, `cancellation_reason`) and the orphaned `gst_credit_note` table were removed in migration 27.
+
+**Admin "GST Filings" window.** `/admin/gst-filings` (frontend page at `frontend/app/admin/gst-filings/page.tsx`) is the accountant-facing UI: filterable table of every `gst_invoice` row plus top-of-page totals. Backed by three admin-only endpoints in `backend/routers/invoices.py`:
+- `GET /api/admin/invoices` — paginated list with filters: `financial_year`, `series`, `franchisee_id`, `start_date`/`end_date` (ISO 8601 with TZ, applied to `invoice_date`), `place_of_supply_state_code`, `is_inter_state`, `q` (free-text matches invoice number / customer name / customer identifier).
+- `GET /api/admin/invoices/summary` — aggregates (count, total taxable, CGST/SGST/IGST sums, total amount, by-series counts) over the same filtered set.
+- `GET /api/admin/invoices/export.csv` — streaming flat CSV with one row per invoice and every GSTR-1-relevant column. Filename `gst_invoices_{fy_or_all}_{YYYY-MM-DD}.csv`. Memory stays flat regardless of result size — rows yielded one at a time via `StreamingResponse`. Sectional GSTR-1 exports (B2C state-wise, HSN summary) are deliberately out of scope; revisit if the CA explicitly needs them.
 
 ### Role-Based Access Control (RBAC)
 
@@ -3622,7 +3665,9 @@ make staging-logs     # Tail staging container logs
 
 # Development
 make docker-build     # Build all images
-make docker-seed      # Seed database with test data
+make seed             # Seed dev DB (users, stations, chargers, franchisees)
+                      # Pass CLERK_ADMIN_ID=user_xxx ADMIN_EMAIL=you@... to seed yourself as admin
+                      # `make docker-seed` is kept as an alias
 ```
 
 ### Environment Configuration

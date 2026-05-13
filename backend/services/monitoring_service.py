@@ -399,6 +399,34 @@ class SentryHelper:
         except Exception as e:
             logger.debug(f"Failed to capture exception to Sentry: {e}")
 
+    @staticmethod
+    def capture_message(
+        message: str,
+        level: str = "warning",
+        extra: Optional[Dict] = None,
+        tags: Optional[Dict[str, Any]] = None,
+    ):
+        """Manually capture a non-exception event to Sentry.
+
+        Use for things like "we noticed N stuck settlements" — not an
+        error, but an operational signal worth paging on at threshold.
+        """
+        if not _sentry_enabled:
+            return
+
+        try:
+            import sentry_sdk
+            with sentry_sdk.push_scope() as scope:
+                if extra:
+                    for key, value in extra.items():
+                        scope.set_extra(key, value)
+                if tags:
+                    for key, value in tags.items():
+                        scope.set_tag(key, str(value))
+                sentry_sdk.capture_message(message, level=level)
+        except Exception as e:
+            logger.debug(f"Failed to capture message to Sentry: {e}")
+
 
 # ==================== OCPP-SPECIFIC METRICS ====================
 

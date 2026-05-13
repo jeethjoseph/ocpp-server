@@ -45,7 +45,7 @@ async def test_validator_rejects_payout_exceeding_net_paid(
     client, test_commission_ledger_entry, test_franchisee
 ):
     test_commission_ledger_entry.refund_amount = Decimal("950.00")
-    # payout (593.22) now > gross (1000) - refund (950) = 50
+    # payout (610.17) now > gross (1000) - refund (950) = 50
     failure = (
         await FranchiseeSettlementService._validate_ledger_for_transfer(
             test_commission_ledger_entry, test_franchisee
@@ -79,6 +79,22 @@ async def test_validator_rejects_terminal_status(
         )
     )
     assert failure == "validation_terminal_status_TRANSFER_PROCESSED"
+
+
+async def test_validator_rejects_below_threshold_status(
+    client, test_commission_ledger_entry, test_franchisee
+):
+    """BELOW_THRESHOLD is terminal — sub-floor payouts must never
+    be retried by the validator or the retry sweep."""
+    test_commission_ledger_entry.settlement_status = (
+        SettlementStatusEnum.BELOW_THRESHOLD
+    )
+    failure = (
+        await FranchiseeSettlementService._validate_ledger_for_transfer(
+            test_commission_ledger_entry, test_franchisee
+        )
+    )
+    assert failure == "validation_terminal_status_BELOW_THRESHOLD"
 
 
 async def test_validator_rejects_franchisee_account_mismatch(
@@ -183,12 +199,16 @@ async def test_initiate_transfer_uses_direct_endpoint_for_wallet(
     client, test_commission_ledger_entry, test_franchisee
 ):
     """Wallet ledger entries (no razorpay_payment_id) must fall back to
-    direct create_transfer; create_payment_transfer must NOT fire."""
+    direct create_transfer; create_payment_transfer must NOT fire. Requires
+    WALLET_SETTLEMENT_ENABLED=True; the gate is exercised separately."""
     test_commission_ledger_entry.razorpay_payment_id = None
     test_commission_ledger_entry.payment_method = "WALLET"
     await test_commission_ledger_entry.save()
 
-    with patch("services.razorpay_service.razorpay_service") as mock_rzp:
+    with patch(
+        "services.franchisee_settlement_service.WALLET_SETTLEMENT_ENABLED",
+        True,
+    ), patch("services.razorpay_service.razorpay_service") as mock_rzp:
         mock_rzp.is_route_enabled.return_value = True
         mock_rzp.create_payment_transfer = AsyncMock(
             return_value={"id": "trf_via_payment"}
@@ -208,3 +228,96 @@ async def test_initiate_transfer_uses_direct_endpoint_for_wallet(
     refreshed = await CommissionLedgerEntry.get(id=test_commission_ledger_entry.id)
     assert refreshed.razorpay_transfer_id == "trf_direct"
     assert refreshed.settlement_status == SettlementStatusEnum.TRANSFER_INITIATED
+
+
+async def test_initiate_transfer_holds_wallet_when_flag_disabled(
+    client, test_commission_ledger_entry, test_franchisee
+):
+    """Wallet ledger entry with WALLET_SETTLEMENT_ENABLED=False must park
+    ON_HOLD with the documented failure_reason and never contact Razorpay."""
+    test_commission_ledger_entry.razorpay_payment_id = None
+    test_commission_ledger_entry.payment_method = "WALLET"
+    await test_commission_ledger_entry.save()
+
+    with patch(
+        "services.franchisee_settlement_service.WALLET_SETTLEMENT_ENABLED",
+        False,
+    ), patch("services.razorpay_service.razorpay_service") as mock_rzp:
+        mock_rzp.is_route_enabled.return_value = True
+        mock_rzp.create_payment_transfer = AsyncMock()
+        mock_rzp.create_transfer = MagicMock()
+
+        ok = await FranchiseeSettlementService.initiate_transfer(
+            test_commission_ledger_entry
+        )
+
+    assert ok is False
+    mock_rzp.create_payment_transfer.assert_not_awaited()
+    mock_rzp.create_transfer.assert_not_called()
+
+    refreshed = await CommissionLedgerEntry.get(id=test_commission_ledger_entry.id)
+    assert refreshed.settlement_status == SettlementStatusEnum.ON_HOLD
+    assert refreshed.failure_reason == "wallet_settlement_not_activated"
+
+
+async def test_retry_sweep_skips_wallet_entries_when_flag_disabled(
+    client, test_commission_ledger_entry, test_franchisee
+):
+    """retry_failed_transfers must not loop on wallet entries while the
+    feature is gated off. Without this filter the entries would re-attempt
+    and re-fail on every retry cycle, exhausting MAX_TRANSFER_RETRIES."""
+    test_commission_ledger_entry.razorpay_payment_id = None
+    test_commission_ledger_entry.payment_method = "WALLET"
+    test_commission_ledger_entry.settlement_status = SettlementStatusEnum.ON_HOLD
+    test_commission_ledger_entry.failure_reason = "wallet_settlement_not_activated"
+    await test_commission_ledger_entry.save()
+
+    with patch(
+        "services.franchisee_settlement_service.WALLET_SETTLEMENT_ENABLED",
+        False,
+    ), patch("services.razorpay_service.razorpay_service") as mock_rzp:
+        mock_rzp.is_route_enabled.return_value = True
+        mock_rzp.create_transfer = MagicMock(return_value={"id": "should_not_fire"})
+
+        success, total = await FranchiseeSettlementService.retry_failed_transfers()
+
+    assert (success, total) == (0, 0)
+    mock_rzp.create_transfer.assert_not_called()
+
+
+async def test_initiate_transfer_skips_when_status_changed_mid_flight(
+    client, test_commission_ledger_entry, test_franchisee
+):
+    """Regression for the retry-sweep race: between the SELECT in
+    retry_failed_transfers and the SDK call inside initiate_transfer,
+    a webhook may flip the entry to TRANSFER_PROCESSED. The in-memory
+    object still says transferable; the DB row no longer does. The
+    last-mile re-fetch must catch this and bail without calling
+    Razorpay."""
+    # In-memory object reflects an old transferable state.
+    test_commission_ledger_entry.settlement_status = SettlementStatusEnum.PENDING
+    # Simulate the concurrent webhook by directly flipping the DB row.
+    await CommissionLedgerEntry.filter(
+        id=test_commission_ledger_entry.id
+    ).update(settlement_status=SettlementStatusEnum.TRANSFER_PROCESSED)
+
+    with patch("services.razorpay_service.razorpay_service") as mock_rzp:
+        mock_rzp.is_route_enabled.return_value = True
+        mock_rzp.create_payment_transfer = AsyncMock(
+            return_value={"id": "should_not_fire"}
+        )
+        mock_rzp.create_transfer = MagicMock(
+            return_value={"id": "should_not_fire"}
+        )
+
+        ok = await FranchiseeSettlementService.initiate_transfer(
+            test_commission_ledger_entry
+        )
+
+    assert ok is False
+    mock_rzp.create_payment_transfer.assert_not_awaited()
+    mock_rzp.create_transfer.assert_not_called()
+    refreshed = await CommissionLedgerEntry.get(
+        id=test_commission_ledger_entry.id
+    )
+    assert refreshed.settlement_status == SettlementStatusEnum.TRANSFER_PROCESSED

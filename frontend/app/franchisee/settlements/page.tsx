@@ -14,8 +14,9 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { Banknote } from "lucide-react";
+import { Banknote, MinusCircle } from "lucide-react";
 import Link from "next/link";
+import { formatINR } from "@/lib/utils";
 
 const STATUS_COLORS: Record<string, string> = {
   PENDING: "bg-yellow-100 text-yellow-800",
@@ -23,11 +24,16 @@ const STATUS_COLORS: Record<string, string> = {
   FAILED: "bg-red-100 text-red-800",
   ON_HOLD: "bg-orange-100 text-orange-800",
   SETTLED: "bg-blue-100 text-blue-800",
+  BELOW_THRESHOLD: "bg-slate-100 text-slate-700",
 };
 
 function SettlementStatusBadge({ status }: { status: string }) {
   return (
-    <Badge variant="secondary" className={STATUS_COLORS[status] || ""}>
+    <Badge
+      variant="secondary"
+      className={`${STATUS_COLORS[status] || ""} inline-flex items-center gap-1`}
+    >
+      {status === "BELOW_THRESHOLD" && <MinusCircle className="h-3 w-3" />}
       {status.replace(/_/g, " ")}
     </Badge>
   );
@@ -115,10 +121,10 @@ function SettlementsContent() {
                       {entry.payment_method || "-"}
                     </TableCell>
                     <TableCell className="text-right font-medium">
-                      {entry.gross_amount}
+                      {formatINR(entry.gross_amount)}
                     </TableCell>
                     <TableCell className="text-right font-medium text-green-600">
-                      {entry.franchisee_payout}
+                      {formatINR(entry.franchisee_payout)}
                     </TableCell>
                     <TableCell className="text-right">
                       {entry.commission_percent}%

@@ -226,10 +226,11 @@ async def test_commission_ledger_entry(test_franchisee, test_charger, test_user)
         user=test_user,
         transaction_status=TransactionStatusEnum.COMPLETED,
     )
-    # Math: gross 1000 = refund 0 + pg 0 + gst 152.54 + commission 169.49
-    #                  + tds 84.75 + payout 593.22.
+    # Math (TDS on post-commission earning):
+    #   gross 1000 = refund 0 + pg 0 + gst 152.54 + commission 169.49
+    #              + tds 67.80 + payout 610.17.
     # net_amount = 1000, net_excl_gst = 847.46, commission@20% = 169.49,
-    # tds@10% = 84.75, payout = 593.22.
+    # earning = 847.46 - 169.49 = 677.97, tds@10% = 67.80, payout = 610.17.
     return await CommissionLedgerEntry.create(
         transaction=txn,
         franchisee=test_franchisee,
@@ -244,9 +245,9 @@ async def test_commission_ledger_entry(test_franchisee, test_charger, test_user)
         commission_percent=Decimal("20.00"),
         platform_commission=Decimal("169.49"),
         tds_rate_percent=Decimal("10.00"),
-        tds_amount=Decimal("84.75"),
+        tds_amount=Decimal("67.80"),
         transfer_fee=Decimal("0.00"),
-        franchisee_payout=Decimal("593.22"),
+        franchisee_payout=Decimal("610.17"),
         energy_consumed_kwh=10.0,
         tariff_rate_per_kwh=Decimal("15.00"),
         settlement_status=SettlementStatusEnum.PENDING,
@@ -284,6 +285,39 @@ async def client_admin(client, test_admin_user):
     (anything that uses `require_admin()` or `require_user_or_admin()`).
     """
     app.dependency_overrides[get_current_user_with_db] = lambda: test_admin_user
+    try:
+        yield client
+    finally:
+        app.dependency_overrides.pop(get_current_user_with_db, None)
+
+
+@pytest.fixture
+async def test_franchisee_user(test_franchisee):
+    """Create a User with FRANCHISEE role linked to the test_franchisee row.
+
+    Mirrors `test_admin_user`. Pairs with `client_franchisee` to exercise
+    the portal endpoints under realistic auth: the User → Franchisee link is
+    what ``require_franchisee()`` resolves.
+    """
+    import random
+    suffix = random.randint(100000000, 999999999)
+    user = await User.create(
+        email=f"franchisee_user_{suffix}@voltlync.test",
+        phone_number=f"9{suffix}",
+        role=UserRoleEnum.FRANCHISEE,
+    )
+    test_franchisee.user = user
+    await test_franchisee.save()
+    return user
+
+
+@pytest.fixture
+async def client_franchisee(client, test_franchisee_user):
+    """HTTP test client with FRANCHISEE auth dependency overridden.
+
+    Use for `require_franchisee()` / `require_admin_or_franchisee()` paths.
+    """
+    app.dependency_overrides[get_current_user_with_db] = lambda: test_franchisee_user
     try:
         yield client
     finally:

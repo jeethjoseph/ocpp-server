@@ -5,7 +5,7 @@ Pure-logic tests — no DB, no network. Razorpay SDK calls and model
 queries are mocked so the assertions describe the wire payloads we send.
 """
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -238,15 +238,12 @@ async def test_handle_account_webhook_parses_requirements_as_list():
 
     captured_updates = {}
 
-    def capture_update(**kwargs):
+    async def capture_update(**kwargs):
         captured_updates.update(kwargs)
-        return AsyncMock(return_value=None)()
 
     with patch("models.Franchisee.filter") as mock_filter:
         mock_filter.return_value.first = AsyncMock(return_value=franchisee)
-        mock_filter.return_value.update = AsyncMock(
-            side_effect=lambda **kw: capture_update(**kw)
-        )
+        mock_filter.return_value.update = AsyncMock(side_effect=capture_update)
         await FranchiseeOnboardingService.handle_account_webhook(
             "account.needs_clarification",
             {
@@ -330,7 +327,7 @@ async def test_initiate_transfer_holds_within_24h_of_activation():
     franchisee.razorpay_account_id = "acc_x"
     franchisee.funds_on_hold = False
     franchisee.transfers_enabled = True
-    franchisee.activated_at = datetime.utcnow() - timedelta(hours=2)
+    franchisee.activated_at = datetime.now(timezone.utc) - timedelta(hours=2)
 
     rzp = MagicMock()
     rzp.is_route_enabled.return_value = True

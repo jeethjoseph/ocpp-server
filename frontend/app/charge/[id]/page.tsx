@@ -166,10 +166,18 @@ export default function UserChargePage() {
     }
   };
 
+  const walletDisabled = !!station?.wallet_payment_disabled;
+
   const canStartCharging = () => {
     const statusReady = charger?.latest_status === "Preparing" ||
       (isSocketCharger && charger?.latest_status === "Available");
-    return charger && statusReady && charger.connection_status && !currentTransactionId;
+    return (
+      charger &&
+      statusReady &&
+      charger.connection_status &&
+      !currentTransactionId &&
+      !walletDisabled
+    );
   };
 
   const canStopCharging = () => {
@@ -287,7 +295,9 @@ export default function UserChargePage() {
           {!canStartCharging() && !currentTransactionId && (
             <div className="bg-yellow-50 dark:bg-yellow-900/30 border border-yellow-200 dark:border-yellow-700 p-4 rounded-lg">
               <p className="text-sm text-center text-yellow-800 dark:text-yellow-200 font-medium">
-                {!charger.connection_status
+                {walletDisabled
+                  ? "Wallet charging is not available at this station. Please scan the QR code on the charger to pay via UPI."
+                  : !charger.connection_status
                   ? "⚠️ Charger is offline"
                   : charger.latest_status !== "Preparing" &&
                     !(isSocketCharger && charger.latest_status === "Available")

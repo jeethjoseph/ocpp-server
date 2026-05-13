@@ -198,6 +198,7 @@ class WalletService:
                 await Transaction.filter(id=transaction_id).update(
                     energy_charge=energy_charge,
                     gst_amount=gst_amount,
+                    gst_rate_percent=gst_percent,
                     total_billed=billing_amount,
                 )
 
