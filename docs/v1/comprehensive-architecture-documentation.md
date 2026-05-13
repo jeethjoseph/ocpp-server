@@ -430,8 +430,12 @@ class QRPaymentService:
 
 **Configuration**:
 - `RAZORPAY_PLATFORM_FEE_PERCENT`: 2.0% fallback (actual fee extracted from Razorpay webhook/API)
-- `MINIMUM_REFUND_AMOUNT`: ₹1.0 (env var)
 - `QR_PAYMENT_PENDING_TIMEOUT`: 300 seconds (env var)
+
+**Refund / over-consumption policy (effective 2026-05-13)**:
+- **Positive balance** (customer paid more than they used) → **always refunded** via Razorpay, regardless of amount. The historical `MINIMUM_REFUND_AMOUNT` threshold has been removed.
+- **Negative balance** (customer used more energy than they paid for, due to stop-signal latency) → **operator absorbs**. Existing budget cap on `energy_charge` stays; `Custom/QR/OverConsumptionCapped` / `Custom/QR/OverDeliveryKwh` metrics continue tracking magnitude.
+- **Invariant**: `transaction_amount = total_amount + refund_amount` holds on every new QR invoice.
 
 **Error Handling**:
 - **Idempotency**: Checks `razorpay_payment_id` uniqueness before processing
@@ -441,7 +445,6 @@ class QRPaymentService:
 - **Plug-in timeout**: Background task polls 10s intervals for 5 minutes, refunds on timeout
 - **RemoteStart failure**: Up to 2 retries with 5s delay, full refund if all fail
 - **Budget exceeded**: Schedules RemoteStopTransaction as asyncio.create_task (avoids deadlock)
-- **Refund below minimum**: Amounts <₹1.0 absorbed as operator credit (Razorpay fee > refund)
 
 **Redis Session Cache**:
 ```
@@ -1528,7 +1531,6 @@ REFUND_FAILED
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `RAZORPAY_PLATFORM_FEE_PERCENT` | 2.0 | Fallback fee estimate (%) when actual Razorpay fee unavailable |
-| `MINIMUM_REFUND_AMOUNT` | 1.0 | Minimum refund amount in ₹ (below this, absorbed) |
 | `QR_PAYMENT_PENDING_TIMEOUT` | 300 | Seconds before a payment is considered stale |
 
 ### Test Script
@@ -4795,7 +4797,7 @@ CORS_ORIGINS = [
   - `GET /api/admin/qr-codes/{id}/payments` - Payment history
   - `POST /webhooks/razorpay` (qr_code.credited event) - Webhook handler
 - **Database Migrations**: 3 new migrations (10, 11, 12)
-- **Configuration**: `RAZORPAY_PLATFORM_FEE_PERCENT`, `MINIMUM_REFUND_AMOUNT`, `QR_PAYMENT_PENDING_TIMEOUT`
+- **Configuration**: `RAZORPAY_PLATFORM_FEE_PERCENT`, `QR_PAYMENT_PENDING_TIMEOUT`
 - **Files Added**:
   - `backend/services/qr_payment_service.py` - Core service (~600 lines)
   - `backend/routers/qr_codes.py` - Admin API router

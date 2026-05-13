@@ -369,6 +369,7 @@ class InvoiceService:
             gst_rate_percent=gst_rate,
             energy_taxable_value=energy_taxable,
             gateway_charges=gateway_taxable,
+            gateway_gst=(qr_payment.razorpay_gst if qr_payment else None),
             total_taxable_value=total_taxable,
             is_inter_state=gst_split["is_inter_state"],
             cgst_rate=gst_split["cgst_rate"],

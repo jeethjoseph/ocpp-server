@@ -103,6 +103,9 @@ async def backfill_invoice(invoice: GSTInvoice, dry_run: bool) -> dict:
         "place_of_supply_state_code": place_of_supply,
         "energy_taxable_value": energy_taxable,
         "gateway_charges": gateway_taxable or Decimal("0"),
+        # Safety net for migration 30's inline backfill — re-snapshot the
+        # webhook-sourced gateway GST in case the migration missed a row.
+        "gateway_gst": (qr_payment.razorpay_gst if qr_payment and qr_payment.razorpay_gst is not None else None),
         "total_taxable_value": total_taxable,
         "cgst_amount": tax_split["cgst_amount"],
         "sgst_amount": tax_split["sgst_amount"],

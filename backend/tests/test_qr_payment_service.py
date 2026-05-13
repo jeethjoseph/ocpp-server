@@ -599,3 +599,34 @@ async def test_qr_billing_under_budget_is_unchanged(client, qr_charger, qr_code,
     # Refund = 20 - 0.24 - 7.50 - 1.35 = 10.91
     assert qr_payment.refund_amount == Decimal("10.91")
     assert txn.energy_charge == Decimal("7.50")
+
+
+@pytest.mark.asyncio
+async def test_qr_billing_tiny_positive_balance_is_refunded(client, qr_charger, qr_code, qr_tariff):
+    """Even sub-rupee positive balances are refunded — the historical
+    MINIMUM_REFUND_AMOUNT threshold has been removed.
+
+    Driving 1.116 kWh × ₹15 = ₹16.74 + GST ₹3.01 = ₹19.75 against a
+    ₹19.76 budget leaves a ₹0.01 positive balance — below the old ₹1
+    threshold. The session must still issue a Razorpay refund.
+    """
+    _, txn, qr_payment = await _make_qr_billing_fixture(
+        qr_charger, qr_code, qr_tariff, energy_consumed_kwh=1.116,
+    )
+
+    with patch("services.qr_payment_service.redis_manager") as mock_redis:
+        mock_redis.delete_qr_session = AsyncMock()
+        with patch("services.qr_payment_service.razorpay_service") as mock_rzp:
+            mock_rzp.refund_payment.return_value = {"id": "rfnd_tiny_001"}
+            await QRPaymentService.process_qr_session_billing(txn.id)
+
+    await qr_payment.refresh_from_db()
+
+    assert qr_payment.refund_amount is not None
+    assert qr_payment.refund_amount > Decimal("0")
+    assert qr_payment.refund_amount < Decimal("1.00")
+    assert qr_payment.status == QRPaymentStatusEnum.REFUNDED
+    assert qr_payment.razorpay_refund_id == "rfnd_tiny_001"
+    mock_rzp.refund_payment.assert_called_once()
+    call_kwargs = mock_rzp.refund_payment.call_args.kwargs
+    assert call_kwargs["amount"] == qr_payment.refund_amount

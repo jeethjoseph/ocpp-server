@@ -896,6 +896,13 @@ class GSTInvoice(Model):
     gateway_charges = fields.DecimalField(
         max_digits=10, decimal_places=2, default=0
     )
+    # Razorpay's GST on its commission — sourced verbatim from the webhook
+    # (qr_payment.razorpay_gst). Snapshotted here so the per-invoice gateway
+    # tax is queryable without joining qr_payment, and the monthly ITC claim
+    # has a single source of truth. NULL for wallet sessions (no gateway).
+    gateway_gst = fields.DecimalField(
+        max_digits=10, decimal_places=2, null=True
+    )
     gateway_hsn_code = fields.CharField(max_length=10, default="997158")
     total_taxable_value = fields.DecimalField(max_digits=10, decimal_places=2)
 

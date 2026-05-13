@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 
 # Configuration from environment
 RAZORPAY_PLATFORM_FEE_PERCENT = Decimal(os.getenv("RAZORPAY_PLATFORM_FEE_PERCENT", "2.0"))
-MINIMUM_REFUND_AMOUNT = Decimal(os.getenv("MINIMUM_REFUND_AMOUNT", "1.0"))
 QR_PAYMENT_PENDING_TIMEOUT = int(os.getenv("QR_PAYMENT_PENDING_TIMEOUT", "300"))
 
 SYSTEM_GUEST_EMAIL = "guest@system.powerlync.com"
@@ -679,7 +678,11 @@ class QRPaymentService:
             f"GST({gst_percent}%)=₹{gst_amount}, platform_fee=₹{platform_fee}, refund=₹{refund}"
         )
 
-        if refund >= MINIMUM_REFUND_AMOUNT:
+        # Always refund any positive balance (no minimum-refund threshold).
+        # Prepaid policy: customer gets every paisa back if they didn't use it.
+        # Negative balance (over-consumption past budget) is absorbed as
+        # operator loss — handled separately in the cap logic above.
+        if refund > 0:
             qr_payment.refund_amount = refund
             try:
                 refund_result = razorpay_service.refund_payment(
@@ -695,8 +698,6 @@ class QRPaymentService:
                 qr_payment.status = QRPaymentStatusEnum.REFUND_FAILED
                 qr_payment.failure_reason = str(e)
                 logger.error(f"Refund failed for QR payment {qr_payment.id}: {e}", exc_info=True)
-        else:
-            logger.info(f"Refund ₹{refund} below minimum ₹{MINIMUM_REFUND_AMOUNT}, absorbed as operator credit")
 
         await qr_payment.save()
 
@@ -756,9 +757,9 @@ class QRPaymentService:
             locked.platform_fee = platform_fee
             refund_amount = locked.amount_paid - platform_fee
 
-            if refund_amount < MINIMUM_REFUND_AMOUNT:
+            if refund_amount <= 0:
                 await locked.save()  # Persist fee data even if refund is skipped
-                logger.info(f"Refund amount ₹{refund_amount} below minimum, skipping")
+                logger.info(f"Refund amount ₹{refund_amount} is zero/negative, skipping")
                 return
 
             locked.refund_amount = refund_amount

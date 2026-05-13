@@ -28,6 +28,7 @@ export interface GSTInvoice {
   gst_rate_percent: string | null;
   energy_taxable_value: string | null;
   gateway_charges: string | null;
+  gateway_gst: string | null;
   total_taxable_value: string | null;
   cgst_rate: string | null;
   cgst_amount: string | null;

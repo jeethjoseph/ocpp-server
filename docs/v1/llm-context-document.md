@@ -100,7 +100,9 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
   - `process_qr_session_billing()` - Called from StopTransaction, calculates cost with GST, issues refund. Formula: `energy_charge = energy_kwh * rate`, `gst = energy_charge * gst_percent / 100`, `refund = amount_paid - energy_charge - gst - platform_fee`
   - `_resolve_platform_fee()` - Resolves actual Razorpay fee: webhook payload → API fetch → 2% estimate fallback
   - Fee fields on QRPayment: `platform_fee` (total fee), `razorpay_commission` (fee - tax), `razorpay_gst` (tax), `fee_source` ('webhook'|'api'|'estimated')
-  - Config: `RAZORPAY_PLATFORM_FEE_PERCENT=2.0` (fallback only), `MINIMUM_REFUND_AMOUNT=1.0`, `QR_PAYMENT_PENDING_TIMEOUT=300`
+  - Config: `RAZORPAY_PLATFORM_FEE_PERCENT=2.0` (fallback only), `QR_PAYMENT_PENDING_TIMEOUT=300`
+  - **Refund policy (2026-05-13)**: any positive balance is refunded via Razorpay regardless of magnitude — the historical `MINIMUM_REFUND_AMOUNT` threshold has been removed. Negative balance (over-delivered energy) is absorbed as operator loss. Invariant `transaction_amount = total_amount + refund_amount` holds on every new QR invoice.
+  - **`gst_invoice.gateway_gst`** snapshots `qr_payment.razorpay_gst` (verbatim webhook value) at issue time. NULL for wallet rows. Backs monthly ITC reconciliation against Razorpay's GST invoice — see `docs/gst-itc-on-gateway.md`.
 - **`wallet_service.py`** - Billing calculations and automated payment processing
   - Zero energy transaction handling (no billing for 0 kWh)
   - Wallet top-up processing with idempotency (`process_wallet_topup()`)

@@ -224,6 +224,7 @@ async def test_csv_export_headers_and_content(client_admin):
         "invoice_number", "supplier_gstin", "place_of_supply_state_code",
         "cgst_amount", "total_amount", "hsn_sac_code", "gst_rate_percent",
         "series", "financial_year",
+        "gateway_charges", "gateway_gst",
     ]:
         assert col in rows[0], f"CSV missing column: {col}"
 

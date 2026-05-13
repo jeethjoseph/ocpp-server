@@ -345,3 +345,37 @@ async def test_per_franchisee_counter_isolation(client):
     assert inv_b1.invoice_number.endswith("/00001")
     assert f"/F{franchisee_a.id}/" in inv_a1.invoice_number
     assert f"/F{franchisee_b.id}/" in inv_b1.invoice_number
+
+
+@pytest.mark.asyncio
+async def test_invoice_total_plus_refund_equals_amount_paid(client):
+    """Prepaid invariant: for QR invoices, total_amount + refund_amount
+    equals the gross UPI payment (transaction_amount = amount_paid). Holds
+    once the MINIMUM_REFUND_AMOUNT threshold is gone — every paisa is
+    accounted for either as billed line items or as a refund."""
+    _, _, txn, _, qr_payment = await _make_session(with_qr=True, energy_kwh=0.5)
+
+    invoice = await InvoiceService.generate_invoice(txn.id)
+
+    assert invoice is not None
+    reconciled = (invoice.total_amount or Decimal("0")) + (invoice.refund_amount or Decimal("0"))
+    assert abs(reconciled - invoice.transaction_amount) <= Decimal("0.02")
+    assert invoice.transaction_amount == qr_payment.amount_paid
+
+
+@pytest.mark.asyncio
+async def test_invoice_gateway_gst_snapshotted_from_qr_payment(client):
+    """generate_invoice snapshots qr_payment.razorpay_gst onto gateway_gst.
+    For wallet sessions (no qr_payment), gateway_gst is None."""
+    _, _, qr_txn, _, qr_payment = await _make_session(with_qr=True)
+    qr_invoice = await InvoiceService.generate_invoice(qr_txn.id)
+
+    assert qr_invoice is not None
+    assert qr_invoice.gateway_gst == qr_payment.razorpay_gst
+    assert qr_invoice.gateway_gst == Decimal("0.04")
+
+    _, _, wallet_txn, _, _ = await _make_session()
+    wallet_invoice = await InvoiceService.generate_invoice(wallet_txn.id)
+
+    assert wallet_invoice is not None
+    assert wallet_invoice.gateway_gst is None
