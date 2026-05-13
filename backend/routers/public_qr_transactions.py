@@ -4,8 +4,9 @@ import logging
 from fastapi import APIRouter, HTTPException, Query, Request
 from typing import Optional
 
-from models import QRPayment, QRPaymentStatusEnum
+from models import GSTInvoice, QRPayment, QRPaymentStatusEnum
 from redis_manager import redis_manager
+from routers.invoices import serve_invoice_pdf
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/public/qr-transactions", tags=["Public QR Transactions"])
@@ -99,3 +100,36 @@ async def get_transactions_by_vpa(
     logger.info(f"QR txn lookup: vpa={masked_vpa}, results={total}, page={page}")
 
     return {"data": results, "total": total, "page": page, "limit": limit}
+
+
+@router.get("/{qr_payment_id}/invoice/pdf")
+async def public_invoice_pdf(
+    qr_payment_id: int,
+    request: Request,
+    vpa: str = Query(..., description="Customer's UPI VPA — must match the QR payment"),
+):
+    """Public PDF download — customer authenticates by knowing their own VPA.
+
+    Rate-limited per IP. Same trust model as the QR-transactions list endpoint:
+    the VPA is treated as the implicit credential. We don't leak whether a
+    qr_payment exists for an unknown id vs. wrong VPA — both return 404.
+    """
+    client_ip = request.client.host if request.client else "unknown"
+    await _check_rate_limit(client_ip)
+    vpa = _validate_vpa_format(vpa)
+
+    qr_payment = await QRPayment.filter(id=qr_payment_id).first()
+    if not qr_payment or (qr_payment.customer_vpa or "").lower() != vpa.lower():
+        # Indistinguishable error so we don't disclose whether the id exists.
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    if not qr_payment.transaction_id:
+        raise HTTPException(status_code=404, detail="Invoice not available for this payment")
+
+    invoice = await GSTInvoice.filter(transaction_id=qr_payment.transaction_id).first()
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not available for this payment")
+
+    masked_vpa = f"***{vpa[-6:]}" if len(vpa) > 6 else "***"
+    logger.info(f"Public invoice PDF: qr_payment_id={qr_payment_id}, vpa={masked_vpa}")
+    return await serve_invoice_pdf(invoice.id)

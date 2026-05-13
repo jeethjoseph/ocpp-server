@@ -29,6 +29,7 @@ import {
   useAdminGSTInvoices,
   useAdminGSTInvoicesSummary,
   downloadGSTInvoicesCSV,
+  viewInvoicePDF,
   type GSTInvoiceFilters,
 } from "@/lib/queries/admin-gst-invoices";
 import { formatINR } from "@/lib/utils";
@@ -271,7 +272,8 @@ export default function AdminGSTFilingsPage() {
                       <TableHead>Customer</TableHead>
                       <TableHead>Operated by</TableHead>
                       <TableHead>PoS</TableHead>
-                      <TableHead className="text-right">Taxable</TableHead>
+                      <TableHead className="text-right" title="Pre-tax platform/Razorpay commission billed on the invoice as HSN 997158">Gateway</TableHead>
+                      <TableHead className="text-right" title="Pre-tax taxable value (energy + gateway combined)">Taxable</TableHead>
                       <TableHead className="text-right">Tax</TableHead>
                       <TableHead className="text-right">Total</TableHead>
                       <TableHead className="text-right">Refund</TableHead>
@@ -323,6 +325,11 @@ export default function AdminGSTFilingsPage() {
                             <span className="ml-1 text-amber-600">(inter)</span>
                           )}
                         </TableCell>
+                        <TableCell className="text-right text-sm text-muted-foreground">
+                          {inv.gateway_charges && Number(inv.gateway_charges) > 0
+                            ? formatINR(inv.gateway_charges)
+                            : "—"}
+                        </TableCell>
                         <TableCell className="text-right text-sm">
                           {formatINR(inv.total_taxable_value ?? "0")}
                         </TableCell>
@@ -338,13 +345,19 @@ export default function AdminGSTFilingsPage() {
                             : "—"}
                         </TableCell>
                         <TableCell>
-                          <Link
-                            href={`/api/transactions/${inv.transaction_id}/invoice/pdf`}
-                            target="_blank"
-                            className="text-xs text-blue-600 hover:underline"
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              try {
+                                await viewInvoicePDF(inv.transaction_id);
+                              } catch (e) {
+                                alert(`PDF open failed: ${(e as Error).message}`);
+                              }
+                            }}
+                            className="text-xs text-blue-600 hover:underline cursor-pointer"
                           >
                             PDF
-                          </Link>
+                          </button>
                         </TableCell>
                       </TableRow>
                     ))}

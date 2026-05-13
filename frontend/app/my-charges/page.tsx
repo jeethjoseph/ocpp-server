@@ -23,8 +23,9 @@ import {
   AlertCircle,
   RefreshCw,
   Navigation,
+  Download,
 } from "lucide-react";
-import { usePublicQRTransactions } from "@/lib/queries/public-qr-transactions";
+import { usePublicQRTransactions, viewPublicInvoicePDF } from "@/lib/queries/public-qr-transactions";
 import { usePublicStationMap } from "@/lib/queries/public-station-map";
 import { QRTransactionItem } from "@/lib/api-services";
 import type { StationWithDistance } from "@/components/StationMap";
@@ -109,7 +110,7 @@ function getErrorMessage(error: Error): string {
   return "Something went wrong. Please try again.";
 }
 
-function TransactionCard({ txn }: { txn: QRTransactionItem }) {
+function TransactionCard({ txn, vpa }: { txn: QRTransactionItem; vpa: string }) {
   return (
     <Card className="border-0 shadow-md bg-card">
       <CardContent className="p-4 space-y-3">
@@ -212,6 +213,24 @@ function TransactionCard({ txn }: { txn: QRTransactionItem }) {
               </span>
             </div>
           )}
+
+        {(txn.status === "COMPLETED" || txn.status === "REFUNDED") && (
+          <Button
+            variant="outline"
+            size="sm"
+            className="w-full mt-2"
+            onClick={async () => {
+              try {
+                await viewPublicInvoicePDF(txn.id, vpa);
+              } catch (e) {
+                alert(`PDF download failed: ${(e as Error).message}`);
+              }
+            }}
+          >
+            <Download className="h-4 w-4 mr-2" />
+            Download GST Invoice
+          </Button>
+        )}
       </CardContent>
     </Card>
   );
@@ -505,7 +524,7 @@ export default function MyChargesPage() {
 
                 <div className="space-y-3">
                   {data.data.map((txn) => (
-                    <TransactionCard key={txn.id} txn={txn} />
+                    <TransactionCard key={txn.id} txn={txn} vpa={searchedVpa} />
                   ))}
                 </div>
 

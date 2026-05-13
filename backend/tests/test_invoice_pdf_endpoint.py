@@ -192,3 +192,130 @@ async def test_admin_pdf_download_404_for_unknown_invoice(client_admin):
         follow_redirects=False,
     )
     assert res.status_code == 404
+
+
+# ─── Public PDF endpoint (VPA-as-credential) ──────────────────────────
+
+
+async def _make_qr_session_with_invoice(vpa: str):
+    """Set up a QR session + qr_payment row + invoice. Returns the QRPayment."""
+    import uuid as _uuid
+    from models import ChargerQRCode, QRPayment, QRPaymentStatusEnum
+
+    station = await ChargingStation.create(
+        name="Public PDF Test", state="Kerala", state_code="32",
+    )
+    charger = await Charger.create(
+        charge_point_string_id=f"pub-{_uuid.uuid4().hex[:8]}",
+        station=station,
+        latest_status=ChargerStatusEnum.AVAILABLE,
+    )
+    await Connector.create(charger=charger, connector_id=1, connector_type="Type2")
+    await Tariff.create(
+        charger=charger, rate_per_kwh=Decimal("20.00"),
+        gst_percent=Decimal("18.00"), is_global=False, hsn_sac_code="996749",
+    )
+    user = await User.create(
+        email=f"pub-{_uuid.uuid4().hex[:8]}@v.test",
+        phone_number=f"9{_uuid.uuid4().int % 1000000000:09d}",
+    )
+    txn = await Transaction.create(
+        user=user, charger=charger,
+        energy_consumed_kwh=1.0,
+        energy_charge=Decimal("20.00"),
+        gst_amount=Decimal("3.60"),
+        gst_rate_percent=Decimal("18.00"),
+        total_billed=Decimal("23.60"),
+        transaction_status=TransactionStatusEnum.COMPLETED,
+    )
+    qr_code = await ChargerQRCode.create(
+        charger=charger,
+        razorpay_qr_code_id=f"qr_{_uuid.uuid4().hex[:8]}",
+        image_url=f"https://r/{_uuid.uuid4().hex[:6]}.png",
+        is_active=True,
+    )
+    qr_payment = await QRPayment.create(
+        razorpay_payment_id=f"pay_{_uuid.uuid4().hex[:10]}",
+        razorpay_qr_code_id=qr_code.razorpay_qr_code_id,
+        charger=charger, charger_qr_code=qr_code, user=user,
+        transaction=txn,
+        customer_vpa=vpa,
+        amount_paid=Decimal("25.00"),
+        platform_fee=Decimal("0.24"),
+        razorpay_commission=Decimal("0.20"),
+        razorpay_gst=Decimal("0.04"),
+        status=QRPaymentStatusEnum.COMPLETED,
+    )
+    invoice = await _svc.InvoiceService.generate_invoice(txn.id)
+    assert invoice is not None
+    return qr_payment, invoice
+
+
+@pytest.mark.asyncio
+async def test_public_pdf_with_matching_vpa_serves_invoice(client):
+    """Customer with the right VPA can download their own invoice PDF."""
+    qr_payment, invoice = await _make_qr_session_with_invoice("alice@oksbi")
+
+    with patch("routers.invoices.s3_service") as mock_s3:
+        mock_s3.upload_invoice_pdf.return_value = "invoices/k.pdf"
+        mock_s3.generate_presigned_url.return_value = "https://s3.test/signed"
+        res = await client.get(
+            f"/api/public/qr-transactions/{qr_payment.id}/invoice/pdf?vpa=alice@oksbi",
+            follow_redirects=False,
+        )
+
+    assert res.status_code == 302
+    assert res.headers["location"] == "https://s3.test/signed"
+
+
+@pytest.mark.asyncio
+async def test_public_pdf_with_wrong_vpa_returns_404(client):
+    """A different VPA must not be able to download someone else's invoice."""
+    qr_payment, _ = await _make_qr_session_with_invoice("alice@oksbi")
+
+    with patch("routers.invoices.s3_service") as mock_s3:
+        mock_s3.upload_invoice_pdf.return_value = "invoices/k.pdf"
+        mock_s3.generate_presigned_url.return_value = "https://s3.test/signed"
+        res = await client.get(
+            f"/api/public/qr-transactions/{qr_payment.id}/invoice/pdf?vpa=eve@oksbi",
+            follow_redirects=False,
+        )
+
+    assert res.status_code == 404
+    # 404 message identical to the unknown-id case — don't disclose existence
+    mock_s3.upload_invoice_pdf.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_public_pdf_for_unknown_qr_payment_returns_404(client):
+    res = await client.get(
+        "/api/public/qr-transactions/999999/invoice/pdf?vpa=alice@oksbi",
+        follow_redirects=False,
+    )
+    assert res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_public_pdf_invalid_vpa_format_returns_400(client):
+    qr_payment, _ = await _make_qr_session_with_invoice("alice@oksbi")
+    res = await client.get(
+        f"/api/public/qr-transactions/{qr_payment.id}/invoice/pdf?vpa=not-a-vpa",
+        follow_redirects=False,
+    )
+    assert res.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_public_pdf_vpa_match_is_case_insensitive(client):
+    """VPAs are normalised lowercase. Customer can use any case in the URL."""
+    qr_payment, _ = await _make_qr_session_with_invoice("alice@oksbi")
+
+    with patch("routers.invoices.s3_service") as mock_s3:
+        mock_s3.upload_invoice_pdf.return_value = "invoices/k.pdf"
+        mock_s3.generate_presigned_url.return_value = "https://s3.test/signed"
+        res = await client.get(
+            f"/api/public/qr-transactions/{qr_payment.id}/invoice/pdf?vpa=ALICE@oksbi",
+            follow_redirects=False,
+        )
+
+    assert res.status_code == 302

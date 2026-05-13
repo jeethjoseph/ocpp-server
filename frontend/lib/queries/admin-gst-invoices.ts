@@ -132,6 +132,42 @@ export function useAdminGSTInvoicesSummary(
   });
 }
 
+/** Open an invoice PDF in a new tab. The backend endpoint requires Bearer
+ * auth, so we can't just point a plain `<a href>` at it — we have to fetch
+ * with the auth header, follow the 302 to S3 (or the inline-streamed PDF
+ * fallback), and open the result as a blob URL. */
+export async function viewInvoicePDF(transactionId: number): Promise<void> {
+  const baseUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+  const url = `${baseUrl}/api/transactions/${transactionId}/invoice/pdf`;
+
+  const getToken = getGlobalGetToken();
+  const token = getToken ? await getToken() : null;
+
+  const res = await fetch(url, {
+    method: "GET",
+    headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+    redirect: "follow", // backend may 302 to a presigned S3 URL
+  });
+  if (!res.ok) {
+    throw new Error(`PDF fetch failed: ${res.status} ${res.statusText}`);
+  }
+
+  const blob = await res.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const newTab = window.open(objectUrl, "_blank");
+  if (!newTab) {
+    // Popup blocked — fall back to forcing a download via anchor click
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = `invoice_${transactionId}.pdf`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+  // Revoke after a minute so memory frees but the open tab stays usable.
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+}
+
 /** Fetches the filtered CSV from the backend with the current auth token and
  * triggers a browser download. The endpoint requires admin Bearer auth, so we
  * can't just point `window.location` at it — we have to fetch + blob. */

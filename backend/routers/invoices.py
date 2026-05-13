@@ -276,7 +276,7 @@ async def admin_download_invoice_pdf(
     _admin: User = Depends(require_admin()),
 ):
     """Download invoice PDF (admin)."""
-    return await _serve_invoice_pdf(invoice_id)
+    return await serve_invoice_pdf(invoice_id)
 
 
 # ─── Franchisee portal invoice endpoints ─────────────────────────────
@@ -316,7 +316,7 @@ async def franchisee_download_invoice_pdf(
     ).first()
     if not invoice:
         raise HTTPException(status_code=404, detail="Invoice not found")
-    return await _serve_invoice_pdf(invoice_id)
+    return await serve_invoice_pdf(invoice_id)
 
 
 # ─── Transaction-level invoice download ──────────────────────────────
@@ -332,7 +332,7 @@ async def download_transaction_invoice_pdf(
     ).first()
     if not invoice:
         raise HTTPException(status_code=404, detail="Invoice not found for this transaction")
-    return await _serve_invoice_pdf(invoice.id)
+    return await serve_invoice_pdf(invoice.id)
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────
@@ -385,7 +385,7 @@ def _invoice_to_dict(inv: GSTInvoice) -> dict:
     }
 
 
-async def _serve_invoice_pdf(invoice_id: int):
+async def serve_invoice_pdf(invoice_id: int):
     """Lazy S3 upload + presigned-URL redirect, with inline fallback.
 
     Happy path: generate PDF on first request, upload to S3, persist the key
