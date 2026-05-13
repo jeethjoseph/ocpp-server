@@ -35,6 +35,24 @@ aws s3api put-public-access-block --bucket $BUCKET \
 aws s3api put-bucket-encryption --bucket $BUCKET \
   --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
 
+# CORS — REQUIRED so the frontend's authenticated fetch can follow the
+# 302 redirect to the presigned S3 URL. Without this, browsers see no
+# Access-Control-Allow-Origin on the S3 response and the fetch() throws
+# "Failed to fetch". Allow all three deploy origins:
+aws s3api put-bucket-cors --bucket $BUCKET --cors-configuration '{
+  "CORSRules": [{
+    "AllowedHeaders": ["*"],
+    "AllowedMethods": ["GET", "HEAD"],
+    "AllowedOrigins": [
+      "https://staging.voltlync.com",
+      "https://app.voltlync.com",
+      "http://localhost:3000"
+    ],
+    "ExposeHeaders": ["ETag", "Content-Disposition", "Content-Length"],
+    "MaxAgeSeconds": 3600
+  }]
+}'
+
 # Find the EC2 instance role
 aws ec2 describe-instances --instance-ids i-00fd9fb3c2b48932a \
   --query "Reservations[0].Instances[0].IamInstanceProfile.Arn" --output text
