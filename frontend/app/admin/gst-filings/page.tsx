@@ -1,8 +1,15 @@
 "use client";
 
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import Link from "next/link";
-import { ChevronLeft, ChevronRight, FileText, Download } from "lucide-react";
+import {
+  ChevronLeft,
+  ChevronRight,
+  ChevronDown,
+  ChevronUp,
+  FileText,
+  Download,
+} from "lucide-react";
 
 import { AdminOnly } from "@/components/RoleWrapper";
 import { Button } from "@/components/ui/button";
@@ -30,6 +37,7 @@ import {
   useAdminGSTInvoicesSummary,
   downloadGSTInvoicesCSV,
   viewInvoicePDF,
+  type GSTInvoice,
   type GSTInvoiceFilters,
 } from "@/lib/queries/admin-gst-invoices";
 import { formatINR } from "@/lib/utils";
@@ -47,6 +55,29 @@ function toIsoEnd(dateStr: string): string | undefined {
   return `${dateStr}T23:59:59Z`;
 }
 
+function formatDuration(seconds: number | null): string {
+  if (!seconds || seconds <= 0) return "—";
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+function formatDateTime(iso: string | null): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return `${d.toLocaleDateString("en-IN")} ${d.toLocaleTimeString("en-IN", {
+    hour: "2-digit",
+    minute: "2-digit",
+  })}`;
+}
+
+function decimalOrDash(v: string | null | undefined): string {
+  return v && Number(v) !== 0 ? formatINR(v) : "—";
+}
+
 export default function AdminGSTFilingsPage() {
   const [page, setPage] = useState(1);
   const [financialYear, setFinancialYear] = useState<string>("");
@@ -56,6 +87,16 @@ export default function AdminGSTFilingsPage() {
   const [interStateMode, setInterStateMode] = useState<string>("");
   const [q, setQ] = useState<string>("");
   const [exporting, setExporting] = useState(false);
+  const [expanded, setExpanded] = useState<Set<number>>(new Set());
+
+  const toggleExpand = (id: number) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
 
   const filters: GSTInvoiceFilters = {
     financial_year: financialYear || undefined,
@@ -266,101 +307,129 @@ export default function AdminGSTFilingsPage() {
                 <Table>
                   <TableHeader>
                     <TableRow>
+                      <TableHead className="w-8"></TableHead>
                       <TableHead>Invoice #</TableHead>
                       <TableHead>Date</TableHead>
                       <TableHead>Series</TableHead>
                       <TableHead>Customer</TableHead>
                       <TableHead>Operated by</TableHead>
-                      <TableHead>PoS</TableHead>
-                      <TableHead className="text-right" title="Pre-tax platform/Razorpay commission billed on the invoice as HSN 997158">Gateway</TableHead>
-                      <TableHead className="text-right" title="Pre-tax taxable value (energy + gateway combined)">Taxable</TableHead>
-                      <TableHead className="text-right">Tax</TableHead>
-                      <TableHead className="text-right">Total</TableHead>
-                      <TableHead className="text-right">Refund</TableHead>
+                      <TableHead title="HSN/SAC code for the energy line">HSN</TableHead>
+                      <TableHead className="text-right">kWh</TableHead>
+                      <TableHead className="text-right" title="Pre-tax taxable value (energy + gateway combined)">Taxable ₹</TableHead>
+                      <TableHead className="text-right">GST %</TableHead>
+                      <TableHead className="text-right">CGST ₹</TableHead>
+                      <TableHead className="text-right">SGST ₹</TableHead>
+                      <TableHead className="text-right">IGST ₹</TableHead>
+                      <TableHead className="text-right">Total ₹</TableHead>
+                      <TableHead className="text-right">Refund ₹</TableHead>
                       <TableHead></TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {data.data.map((inv) => (
-                      <TableRow key={inv.id}>
-                        <TableCell className="text-sm font-mono">
-                          {inv.invoice_number}
-                        </TableCell>
-                        <TableCell className="text-xs">
-                          {inv.invoice_date
-                            ? new Date(inv.invoice_date).toLocaleDateString("en-IN")
-                            : "—"}
-                        </TableCell>
-                        <TableCell>
-                          <Badge variant="secondary">{inv.series}</Badge>
-                        </TableCell>
-                        <TableCell className="text-sm">
-                          <div className="truncate max-w-[200px]" title={inv.customer_name ?? ""}>
-                            {inv.customer_name || "—"}
-                          </div>
-                          <div className="text-xs text-muted-foreground truncate max-w-[200px]">
-                            {inv.customer_identifier || ""}
-                          </div>
-                        </TableCell>
-                        <TableCell className="text-sm">
-                          {inv.franchisee_business_name ? (
-                            <div
-                              className="truncate max-w-[180px]"
-                              title={inv.franchisee_business_name}
-                            >
-                              {inv.franchisee_business_name}
-                              {inv.franchisee_gstin && (
-                                <div className="text-xs text-muted-foreground">
-                                  {inv.franchisee_gstin}
-                                </div>
-                              )}
-                            </div>
-                          ) : (
-                            <span className="text-xs text-muted-foreground">VoltLync-owned</span>
-                          )}
-                        </TableCell>
-                        <TableCell className="text-xs">
-                          {inv.place_of_supply_state_code || "—"}
-                          {inv.is_inter_state && (
-                            <span className="ml-1 text-amber-600">(inter)</span>
-                          )}
-                        </TableCell>
-                        <TableCell className="text-right text-sm text-muted-foreground">
-                          {inv.gateway_charges && Number(inv.gateway_charges) > 0
-                            ? formatINR(inv.gateway_charges)
-                            : "—"}
-                        </TableCell>
-                        <TableCell className="text-right text-sm">
-                          {formatINR(inv.total_taxable_value ?? "0")}
-                        </TableCell>
-                        <TableCell className="text-right text-sm">
-                          {formatINR(inv.total_tax ?? "0")}
-                        </TableCell>
-                        <TableCell className="text-right text-sm font-medium">
-                          {formatINR(inv.total_amount ?? "0")}
-                        </TableCell>
-                        <TableCell className="text-right text-sm">
-                          {inv.refund_amount && Number(inv.refund_amount) > 0
-                            ? formatINR(inv.refund_amount)
-                            : "—"}
-                        </TableCell>
-                        <TableCell>
-                          <button
-                            type="button"
-                            onClick={async () => {
-                              try {
-                                await viewInvoicePDF(inv.transaction_id);
-                              } catch (e) {
-                                alert(`PDF open failed: ${(e as Error).message}`);
-                              }
-                            }}
-                            className="text-xs text-blue-600 hover:underline cursor-pointer"
+                    {data.data.map((inv) => {
+                      const isOpen = expanded.has(inv.id);
+                      return (
+                        <Fragment key={inv.id}>
+                          <TableRow
+                            className="cursor-pointer hover:bg-muted/30"
+                            onClick={() => toggleExpand(inv.id)}
                           >
-                            PDF
-                          </button>
-                        </TableCell>
-                      </TableRow>
-                    ))}
+                            <TableCell className="w-8 p-2">
+                              {isOpen ? (
+                                <ChevronUp className="w-4 h-4 text-muted-foreground" />
+                              ) : (
+                                <ChevronDown className="w-4 h-4 text-muted-foreground" />
+                              )}
+                            </TableCell>
+                            <TableCell className="text-sm font-mono">
+                              {inv.invoice_number}
+                            </TableCell>
+                            <TableCell className="text-xs">
+                              {inv.invoice_date
+                                ? new Date(inv.invoice_date).toLocaleDateString("en-IN")
+                                : "—"}
+                            </TableCell>
+                            <TableCell>
+                              <Badge variant="secondary">{inv.series}</Badge>
+                            </TableCell>
+                            <TableCell className="text-sm">
+                              <div className="truncate max-w-[200px]" title={inv.customer_name ?? ""}>
+                                {inv.customer_name || "—"}
+                              </div>
+                              <div className="text-xs text-muted-foreground truncate max-w-[200px]">
+                                {inv.customer_identifier || ""}
+                              </div>
+                            </TableCell>
+                            <TableCell className="text-sm">
+                              {inv.franchisee_business_name ? (
+                                <div
+                                  className="truncate max-w-[180px]"
+                                  title={inv.franchisee_business_name}
+                                >
+                                  {inv.franchisee_business_name}
+                                  {inv.franchisee_gstin && (
+                                    <div className="text-xs text-muted-foreground">
+                                      {inv.franchisee_gstin}
+                                    </div>
+                                  )}
+                                </div>
+                              ) : (
+                                <span className="text-xs text-muted-foreground">VoltLync-owned</span>
+                              )}
+                            </TableCell>
+                            <TableCell className="text-xs font-mono">
+                              {inv.hsn_sac_code || "—"}
+                            </TableCell>
+                            <TableCell className="text-right text-sm tabular-nums">
+                              {inv.energy_consumed_kwh.toFixed(2)}
+                            </TableCell>
+                            <TableCell className="text-right text-sm tabular-nums">
+                              {formatINR(inv.total_taxable_value ?? "0")}
+                            </TableCell>
+                            <TableCell className="text-right text-xs tabular-nums text-muted-foreground">
+                              {inv.gst_rate_percent ? `${Number(inv.gst_rate_percent)}%` : "—"}
+                            </TableCell>
+                            <TableCell className="text-right text-sm tabular-nums">
+                              {decimalOrDash(inv.cgst_amount)}
+                            </TableCell>
+                            <TableCell className="text-right text-sm tabular-nums">
+                              {decimalOrDash(inv.sgst_amount)}
+                            </TableCell>
+                            <TableCell className="text-right text-sm tabular-nums">
+                              {decimalOrDash(inv.igst_amount)}
+                            </TableCell>
+                            <TableCell className="text-right text-sm font-medium tabular-nums">
+                              {formatINR(inv.total_amount ?? "0")}
+                            </TableCell>
+                            <TableCell className="text-right text-sm tabular-nums">
+                              {decimalOrDash(inv.refund_amount)}
+                            </TableCell>
+                            <TableCell onClick={(e) => e.stopPropagation()}>
+                              <button
+                                type="button"
+                                onClick={async () => {
+                                  try {
+                                    await viewInvoicePDF(inv.transaction_id);
+                                  } catch (e) {
+                                    alert(`PDF open failed: ${(e as Error).message}`);
+                                  }
+                                }}
+                                className="text-xs text-blue-600 hover:underline cursor-pointer"
+                              >
+                                PDF
+                              </button>
+                            </TableCell>
+                          </TableRow>
+                          {isOpen && (
+                            <TableRow className="bg-muted/20">
+                              <TableCell colSpan={16} className="p-0">
+                                <InvoiceDetail inv={inv} />
+                              </TableCell>
+                            </TableRow>
+                          )}
+                        </Fragment>
+                      );
+                    })}
                   </TableBody>
                 </Table>
               </div>
@@ -408,5 +477,169 @@ function SummaryCard({ label, value }: { label: string; value: string }) {
         <div className="text-xl font-semibold mt-1">{value}</div>
       </CardContent>
     </Card>
+  );
+}
+
+function DetailField({
+  label,
+  value,
+  mono = false,
+}: {
+  label: string;
+  value: React.ReactNode;
+  mono?: boolean;
+}) {
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+        {label}
+      </div>
+      <div className={`text-sm ${mono ? "font-mono" : ""}`}>{value}</div>
+    </div>
+  );
+}
+
+function InvoiceDetail({ inv }: { inv: GSTInvoice }) {
+  const hasGateway = inv.gateway_charges && Number(inv.gateway_charges) > 0;
+  return (
+    <div className="px-6 py-4 space-y-4 text-sm">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <DetailField label="Financial year" value={inv.financial_year} />
+        <DetailField
+          label="Place of supply"
+          value={
+            <>
+              {inv.place_of_supply_state_code || "—"}
+              {inv.is_inter_state && (
+                <span className="ml-1 text-amber-600 text-xs">(inter-state)</span>
+              )}
+            </>
+          }
+        />
+        <DetailField label="Station" value={inv.station_name || "—"} />
+        <DetailField label="Charger" value={inv.charger_id_str || "—"} mono />
+        <DetailField label="Connector" value={inv.connector_type || "—"} />
+        <DetailField
+          label="Charged on"
+          value={formatDateTime(inv.charged_on)}
+        />
+        <DetailField label="Duration" value={formatDuration(inv.duration_seconds)} />
+        <DetailField
+          label="Tariff / kWh (incl. tax)"
+          value={inv.tariff_rate_incl_tax ? formatINR(inv.tariff_rate_incl_tax) : "—"}
+        />
+      </div>
+
+      <div className="border rounded-md overflow-hidden">
+        <table className="w-full text-sm">
+          <thead className="bg-muted/40 text-xs uppercase tracking-wide">
+            <tr>
+              <th className="text-left p-2">Line</th>
+              <th className="text-left p-2">HSN</th>
+              <th className="text-right p-2">Taxable ₹</th>
+              <th className="text-right p-2">GST ₹</th>
+              <th className="text-right p-2">Total ₹</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr className="border-t">
+              <td className="p-2">Energy ({inv.energy_consumed_kwh.toFixed(2)} kWh)</td>
+              <td className="p-2 font-mono text-xs">{inv.hsn_sac_code}</td>
+              <td className="p-2 text-right tabular-nums">
+                {formatINR(inv.energy_taxable_value ?? "0")}
+              </td>
+              <td className="p-2 text-right tabular-nums text-muted-foreground">
+                {/* GST on energy = total_tax - gateway_gst (if any) */}
+                {formatINR(
+                  String(
+                    Number(inv.total_tax ?? 0) - Number(inv.gateway_gst ?? 0)
+                  )
+                )}
+              </td>
+              <td className="p-2 text-right tabular-nums">
+                {formatINR(
+                  String(
+                    Number(inv.energy_taxable_value ?? 0) +
+                      (Number(inv.total_tax ?? 0) - Number(inv.gateway_gst ?? 0))
+                  )
+                )}
+              </td>
+            </tr>
+            {hasGateway && (
+              <tr className="border-t">
+                <td className="p-2">Gateway charges</td>
+                <td className="p-2 font-mono text-xs">{inv.gateway_hsn_code || "—"}</td>
+                <td className="p-2 text-right tabular-nums">
+                  {formatINR(inv.gateway_charges ?? "0")}
+                </td>
+                <td className="p-2 text-right tabular-nums text-muted-foreground">
+                  {decimalOrDash(inv.gateway_gst)}
+                </td>
+                <td className="p-2 text-right tabular-nums">
+                  {formatINR(
+                    String(
+                      Number(inv.gateway_charges ?? 0) + Number(inv.gateway_gst ?? 0)
+                    )
+                  )}
+                </td>
+              </tr>
+            )}
+          </tbody>
+          <tfoot className="bg-muted/40">
+            <tr className="border-t font-medium">
+              <td className="p-2" colSpan={2}>Tax breakdown</td>
+              <td className="p-2 text-right tabular-nums">
+                {formatINR(inv.total_taxable_value ?? "0")}
+              </td>
+              <td className="p-2 text-right tabular-nums">
+                {formatINR(inv.total_tax ?? "0")}
+              </td>
+              <td className="p-2 text-right tabular-nums">
+                {formatINR(inv.total_amount ?? "0")}
+              </td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        {!inv.is_inter_state ? (
+          <>
+            <DetailField
+              label={`CGST ${inv.cgst_rate ? `${Number(inv.cgst_rate)}%` : ""}`}
+              value={decimalOrDash(inv.cgst_amount)}
+            />
+            <DetailField
+              label={`SGST ${inv.sgst_rate ? `${Number(inv.sgst_rate)}%` : ""}`}
+              value={decimalOrDash(inv.sgst_amount)}
+            />
+          </>
+        ) : (
+          <DetailField
+            label={`IGST ${inv.igst_rate ? `${Number(inv.igst_rate)}%` : ""}`}
+            value={decimalOrDash(inv.igst_amount)}
+          />
+        )}
+        <DetailField label="Total tax" value={formatINR(inv.total_tax ?? "0")} />
+        <DetailField
+          label="Payment method"
+          value={inv.payment_method || "—"}
+        />
+        <DetailField
+          label="Transaction ₹"
+          value={inv.transaction_amount ? formatINR(inv.transaction_amount) : "—"}
+        />
+        <DetailField
+          label="Refund ₹"
+          value={decimalOrDash(inv.refund_amount)}
+        />
+      </div>
+
+      {inv.amount_in_words && (
+        <div className="text-xs text-muted-foreground italic">
+          {inv.amount_in_words}
+        </div>
+      )}
+    </div>
   );
 }

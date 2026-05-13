@@ -769,10 +769,11 @@ GET /transactions/{id} - Transaction details
 GET /transactions/{id}/meter-values - Energy consumption data with chart data
 
 GST Filings (admin window at /admin/gst-filings):
-GET /invoices - Paginated invoice list with filters: financial_year, series (WAL|QR), franchisee_id, start_date/end_date (ISO 8601 with TZ, applied to invoice_date), place_of_supply_state_code, is_inter_state, q (free-text invoice number / customer)
+GET /invoices - Paginated invoice list with filters: financial_year, series (WAL|QR), franchisee_id, start_date/end_date (ISO 8601 with TZ, applied to invoice_date), place_of_supply_state_code, is_inter_state, q (free-text invoice number / customer). JSON response carries the full PDF-equivalent field set (tariff_rate_incl_tax, charged_on, duration_seconds, gateway_hsn_code, station_location, connector_type, supplier/customer addresses, amount_in_words) so the UI's expandable detail panel renders without extra calls.
 GET /invoices/summary - Aggregate totals (count, taxable, CGST/SGST/IGST, total) over the same filtered set, plus by_series counts
-GET /invoices/export.csv - Streaming CSV (text/csv, StreamingResponse) — one row per invoice with every GSTR-1-relevant column; respects all list filters
+GET /invoices/export.csv - Streaming CSV (text/csv, StreamingResponse) — one row per invoice; superset of UI columns including tariff/kWh, charged_on, duration_seconds, gateway HSN, station_location, connector_type, addresses, amount_in_words; respects all list filters
 GET /invoices/{id}/pdf - Lazy S3 upload + presigned-URL redirect (302) for the customer-facing invoice PDF
+UI: lean default columns (Invoice#, Date, Series, Customer, Operated by, HSN, kWh, Taxable ₹, GST %, CGST ₹, SGST ₹, IGST ₹, Total ₹, Refund ₹); click a row to expand a tally-friendly detail panel with PoS, station/charger/connector, charged-on, duration, tariff, energy + gateway line breakdowns, payment method, txn ₹, amount in words. PoS column intentionally removed from the main row.
 ```
 
 ### User APIs
