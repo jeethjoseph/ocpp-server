@@ -8,6 +8,7 @@ export for GSTR-1 reconciliation.
 import csv
 import io
 import logging
+import time
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional
@@ -25,6 +26,7 @@ from auth_middleware import (
 )
 from services.invoice_service import InvoiceService
 from services import s3_service
+from services.monitoring_service import MetricsCollector
 
 logger = logging.getLogger("ocpp-server")
 
@@ -192,6 +194,8 @@ async def admin_invoices_summary(
 CSV_COLUMNS = [
     "invoice_number", "invoice_date", "financial_year", "series",
     "supplier_name", "supplier_gstin", "supplier_state_code",
+    "franchisee_id", "franchisee_business_name", "franchisee_gstin",
+    "franchisee_address", "franchisee_state", "franchisee_state_code",
     "customer_name", "customer_identifier",
     "place_of_supply_state_code", "is_inter_state",
     "station_name", "charger_id_str", "energy_consumed_kwh",
@@ -200,8 +204,8 @@ CSV_COLUMNS = [
     "cgst_rate", "cgst_amount", "sgst_rate", "sgst_amount",
     "igst_rate", "igst_amount",
     "total_tax", "total_amount",
-    "payment_method", "transaction_amount",
-    "franchisee_id", "transaction_id",
+    "payment_method", "transaction_amount", "refund_amount",
+    "transaction_id",
 ]
 
 
@@ -346,6 +350,12 @@ def _invoice_to_dict(inv: GSTInvoice) -> dict:
         "supplier_name": inv.supplier_name,
         "supplier_gstin": inv.supplier_gstin,
         "supplier_state_code": inv.supplier_state_code,
+        # Substore (Razorpay disclosure) — NULL for VoltLync-owned stations
+        "franchisee_business_name": inv.franchisee_business_name,
+        "franchisee_gstin": inv.franchisee_gstin,
+        "franchisee_address": inv.franchisee_address,
+        "franchisee_state": inv.franchisee_state,
+        "franchisee_state_code": inv.franchisee_state_code,
         "customer_name": inv.customer_name,
         "customer_identifier": inv.customer_identifier,
         "place_of_supply_state_code": inv.place_of_supply_state_code,
@@ -368,27 +378,81 @@ def _invoice_to_dict(inv: GSTInvoice) -> dict:
         "total_amount": _d(inv.total_amount),
         "payment_method": inv.payment_method,
         "transaction_amount": _d(inv.transaction_amount),
+        "refund_amount": _d(inv.refund_amount),
         "transaction_id": inv.transaction_id,
         "franchisee_id": inv.franchisee_id,
         "created_at": inv.created_at.isoformat(),
     }
 
 
-async def _serve_invoice_pdf(invoice_id: int) -> RedirectResponse:
-    """Lazy S3 upload + presigned-URL redirect.
+async def _serve_invoice_pdf(invoice_id: int):
+    """Lazy S3 upload + presigned-URL redirect, with inline fallback.
 
-    First request: generate PDF, upload to S3, persist key on `pdf_url`,
-    redirect to presigned URL. Subsequent requests: redirect immediately.
+    Happy path: generate PDF on first request, upload to S3, persist the key
+    on `pdf_url`, redirect to a presigned URL. Subsequent requests: redirect
+    immediately.
+
+    Fallback: if S3 isn't configured or any S3 call fails (transient outage,
+    IAM misconfiguration, bucket missing), stream the freshly-generated PDF
+    inline so the admin/franchisee can still download. Logs the failure so
+    ops sees it and can fix S3 without 500-ing the API.
     """
     invoice = await GSTInvoice.filter(id=invoice_id).first()
     if not invoice:
         raise HTTPException(status_code=404, detail="Invoice not found")
 
-    if not invoice.pdf_url:
-        pdf_bytes = InvoiceService.generate_pdf(invoice)
+    # Already uploaded — redirect to presigned URL. Catch S3 failures so a
+    # transient outage doesn't break the download (regenerate inline instead).
+    if invoice.pdf_url:
+        try:
+            presigned = s3_service.generate_presigned_url(invoice.pdf_url)
+            MetricsCollector.increment_counter("Custom/Invoice/PdfDownload/Cached")
+            return RedirectResponse(url=presigned, status_code=302)
+        except Exception as e:
+            logger.warning(
+                "S3 presign failed for invoice %s (key=%s); falling back to "
+                "inline streaming. Error: %s",
+                invoice.id, invoice.pdf_url, e,
+            )
+            MetricsCollector.increment_counter("Custom/Invoice/PdfDownload/InlineFallback")
+            return _stream_pdf_inline(invoice)
+
+    # Not uploaded yet — generate, try to upload, then either redirect or
+    # stream inline if S3 is unavailable.
+    pdf_gen_start = time.perf_counter()
+    pdf_bytes = InvoiceService.generate_pdf(invoice)
+    MetricsCollector.record_metric(
+        "Custom/Invoice/PdfGeneration/DurationMs",
+        (time.perf_counter() - pdf_gen_start) * 1000.0,
+    )
+    try:
         key = s3_service.upload_invoice_pdf(invoice, pdf_bytes)
         invoice.pdf_url = key
         await invoice.save(update_fields=["pdf_url"])
+        presigned = s3_service.generate_presigned_url(key)
+        MetricsCollector.increment_counter("Custom/S3/InvoiceUpload/Success")
+        return RedirectResponse(url=presigned, status_code=302)
+    except Exception as e:
+        logger.warning(
+            "S3 upload failed for invoice %s; serving PDF inline. Error: %s",
+            invoice.id, e,
+        )
+        MetricsCollector.increment_counter("Custom/S3/InvoiceUpload/Failed")
+        MetricsCollector.increment_counter("Custom/Invoice/PdfDownload/InlineFallback")
+        return _stream_pdf_inline(invoice, pdf_bytes=pdf_bytes)
 
-    presigned = s3_service.generate_presigned_url(invoice.pdf_url)
-    return RedirectResponse(url=presigned, status_code=302)
+
+def _stream_pdf_inline(invoice: GSTInvoice, pdf_bytes: bytes = None):
+    """Stream a freshly-generated PDF as the response body. Used as the
+    fallback when S3 is unavailable."""
+    import io
+    if pdf_bytes is None:
+        pdf_bytes = InvoiceService.generate_pdf(invoice)
+    safe_number = invoice.invoice_number.replace("/", "_")
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'inline; filename="invoice_{safe_number}.pdf"',
+        },
+    )

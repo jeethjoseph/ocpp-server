@@ -1636,6 +1636,25 @@ async def startup_event():
     await init_db()
     await redis_manager.connect()
 
+    # Compliance preflight: GST invoices cannot be issued without a supplier
+    # GSTIN (CGST Rule 46). Surface this loudly at boot rather than silently
+    # at per-session issuance time, so a misconfigured deploy doesn't accrue
+    # un-invoiced sessions for hours before anyone notices.
+    if not os.getenv("VOLTLYNC_GSTIN"):
+        logger.error(
+            "STARTUP WARNING: VOLTLYNC_GSTIN is not configured. "
+            "Customer-facing GST invoices will NOT be issued until this is "
+            "set (see backend/services/invoice_service.py:generate_invoice). "
+            "All charging sessions will complete and be billed, but no "
+            "gst_invoice row will be created."
+        )
+    if not os.getenv("AWS_S3_INVOICE_BUCKET"):
+        logger.warning(
+            "STARTUP WARNING: AWS_S3_INVOICE_BUCKET is not configured. "
+            "PDF generation will fall back to inline streaming (no S3 "
+            "persistence); first download per invoice will be slow."
+        )
+
     # Ensure system guest user exists for QR payment fallback
     from services.qr_payment_service import ensure_guest_user
     try:

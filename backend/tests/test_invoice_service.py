@@ -148,14 +148,16 @@ async def test_qr_invoice_uses_vpa_as_customer_name(client):
 
 
 @pytest.mark.asyncio
-async def test_qr_transaction_amount_is_post_refund(client):
-    """transaction_amount on the invoice = amount_paid - refund_amount."""
+async def test_qr_invoice_shows_gross_payment_and_refund_separately(client):
+    """For QR sessions: transaction_amount is the gross UPI payment;
+    refund_amount is the absolute amount returned to the customer.
+    Mirrors the substore PDF mockup which shows both as separate lines."""
     _, _, txn, _, qr_payment = await _make_session(with_qr=True)
 
     invoice = await InvoiceService.generate_invoice(txn.id)
 
-    expected = qr_payment.amount_paid - qr_payment.refund_amount
-    assert invoice.transaction_amount == expected
+    assert invoice.transaction_amount == qr_payment.amount_paid
+    assert invoice.refund_amount == qr_payment.refund_amount
 
 
 @pytest.mark.asyncio
@@ -255,42 +257,91 @@ async def test_qr_invoice_kwh_is_billable_not_actual(client):
     assert abs(reconciled - energy_incl_tax) < Decimal("0.05")
 
 
-@pytest.mark.asyncio
-async def test_franchisee_owned_station_invoice_has_voltlync_supplier(client):
-    """Sessions at franchisee-owned stations: VoltLync remains the GST supplier.
-
-    The franchisee is captured on `gst_invoice.franchisee_id` for reporting
-    (so we can tell which station owner served the session) but never drives
-    the supplier columns. VoltLync is the merchant-of-record.
-    """
+async def _make_franchisee(business_name="Some Franchisee Pvt Ltd",
+                            gstin="29ZZZZZ9999Z1Z5", state_code="29"):
+    """Create a Franchisee fixture for the substore tests."""
     from datetime import date
     from decimal import Decimal as D
     from models import Franchisee, FranchiseeStatusEnum
-
-    franchisee = await Franchisee.create(
-        business_name="Some Franchisee Pvt Ltd",
-        contact_name="Alice",
-        contact_email="alice@franchisee.test",
-        contact_phone="9123456789",
-        gstin="29ZZZZZ9999Z1Z5",          # franchisee's own GSTIN
-        state="Karnataka",
-        state_code="29",                   # would have given different supplier_state_code
+    import uuid as _uuid
+    suffix = _uuid.uuid4().hex[:6]
+    return await Franchisee.create(
+        business_name=business_name,
+        contact_name=f"Contact {suffix}",
+        contact_email=f"{suffix}@franchisee.test",
+        contact_phone=f"9{_uuid.uuid4().int % 1000000000:09d}",
+        gstin=gstin,
+        address=f"Test address {suffix}",
+        state="Karnataka" if state_code == "29" else "Kerala",
+        state_code=state_code,
         commission_percent=D("20.00"),
         tds_rate_percent=D("10.00"),
         commission_effective_from=date.today(),
         status=FranchiseeStatusEnum.ACTIVE,
     )
 
+
+@pytest.mark.asyncio
+async def test_franchisee_owned_station_invoice_has_voltlync_supplier(client):
+    """Sessions at franchisee-owned stations: VoltLync remains the GST supplier,
+    the franchisee is snapshotted as the operator (for the 'Operated by' block),
+    and the invoice number carries the F{franchisee_id} segment."""
+    franchisee = await _make_franchisee()
+
     _, _, txn, _, _ = await _make_session(franchisee=franchisee)
     invoice = await InvoiceService.generate_invoice(txn.id)
 
     assert invoice is not None
-    # Supplier = VoltLync, NOT the franchisee
+    # Supplier = VoltLync (GST merchant-of-record), NOT the franchisee
     assert invoice.supplier_name == "VOLTLYNC PRIVATE LIMITED"
     assert invoice.supplier_gstin == "32ABCDE1234F1Z5"
     assert invoice.supplier_state_code == "32"
-    # But franchisee_id is still on the row for reporting
+    # Franchisee identity snapshotted for the "Operated by" disclosure
     assert invoice.franchisee_id == franchisee.id
-    # And invoice number has no F{id} segment
+    assert invoice.franchisee_business_name == "Some Franchisee Pvt Ltd"
+    assert invoice.franchisee_gstin == "29ZZZZZ9999Z1Z5"
+    assert invoice.franchisee_state_code == "29"
+    # Invoice number carries the F{id} segment per substore model
+    assert invoice.invoice_number.startswith(f"VL/F{franchisee.id}/WAL/")
+
+
+@pytest.mark.asyncio
+async def test_voltlync_owned_station_invoice_no_franchisee_block(client):
+    """VoltLync-owned stations: franchisee snapshot columns are NULL; invoice
+    number has no F-segment. The PDF then omits the 'Operated by' block."""
+    _, _, txn, _, _ = await _make_session(franchisee=None)
+
+    invoice = await InvoiceService.generate_invoice(txn.id)
+
+    assert invoice is not None
+    assert invoice.franchisee_id is None
+    assert invoice.franchisee_business_name is None
+    assert invoice.franchisee_gstin is None
     assert invoice.invoice_number.startswith("VL/WAL/")
     assert "/F" not in invoice.invoice_number
+
+
+@pytest.mark.asyncio
+async def test_per_franchisee_counter_isolation(client):
+    """Each franchisee has its own running sequence per (series, FY).
+    Two invoices from franchisee A and one from franchisee B should give
+    A: 00001, 00002 and B: 00001 independently."""
+    franchisee_a = await _make_franchisee(
+        business_name="A Pvt Ltd", gstin="29AAAAA1111A1Z1", state_code="29"
+    )
+    franchisee_b = await _make_franchisee(
+        business_name="B Pvt Ltd", gstin="32BBBBB2222B1Z2", state_code="32"
+    )
+
+    _, _, txn_a1, _, _ = await _make_session(franchisee=franchisee_a)
+    inv_a1 = await InvoiceService.generate_invoice(txn_a1.id)
+    _, _, txn_a2, _, _ = await _make_session(franchisee=franchisee_a)
+    inv_a2 = await InvoiceService.generate_invoice(txn_a2.id)
+    _, _, txn_b1, _, _ = await _make_session(franchisee=franchisee_b)
+    inv_b1 = await InvoiceService.generate_invoice(txn_b1.id)
+
+    assert inv_a1.invoice_number.endswith("/00001")
+    assert inv_a2.invoice_number.endswith("/00002")
+    assert inv_b1.invoice_number.endswith("/00001")
+    assert f"/F{franchisee_a.id}/" in inv_a1.invoice_number
+    assert f"/F{franchisee_b.id}/" in inv_b1.invoice_number

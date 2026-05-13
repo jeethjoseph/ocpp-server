@@ -2486,7 +2486,9 @@ sourced from the `Charger → Station → Franchisee` FK chain):
 
 ### GST Tax Invoicing
 
-**Supplier identity: VoltLync, always.** Every customer-facing GST invoice carries VoltLync's name, GSTIN, address, and state code in the `supplier_*` columns, regardless of whether the charging session ran at a VoltLync-owned or a franchisee-owned station. This matches the Razorpay Route operating model: VoltLync is the merchant of record, customers pay VoltLync's UPI/wallet, VoltLync remits output GST, and franchisees receive their share as a Route transfer (minus commission) — a flow that's accounted separately and doesn't surface on the customer-facing invoice. `gst_invoice.franchisee_id` is preserved as reporting metadata (so admin filings can tell which station owner served each session) but does not drive any supplier column.
+**Supplier identity: VoltLync, always.** Every customer-facing GST invoice carries VoltLync's name, GSTIN, address, and state code in the `supplier_*` columns. VoltLync is the GST merchant-of-record (Razorpay Route MOR model): customers pay VoltLync, VoltLync remits output GST, and franchisees receive their share via Route transfer.
+
+**Franchisee as substore (Razorpay disclosure).** Razorpay's payer-payee transparency rule requires that customers can clearly identify the payee when a third party delivers the goods or service. Since franchisees physically operate the chargers, every invoice tied to a franchisee-owned station snapshots the franchisee's `business_name`, `gstin`, `address`, `state`, and `state_code` onto the row and renders an "Operated by" block on the PDF below the VoltLync supplier block. Invoices for VoltLync-owned stations omit the block entirely. The `franchisee_id` FK on the invoice drives both this disclosure and the per-franchisee numbering (see Sequencing).
 
 Per-session, customer-facing tax invoice generated for every completed charging session. Schema and code live in:
 - `backend/models.py` — `GSTInvoice`, `GSTInvoiceCounter`
@@ -2494,7 +2496,12 @@ Per-session, customer-facing tax invoice generated for every completed charging 
 - `backend/routers/invoices.py` — list endpoints, PDF redirect
 - `backend/services/s3_service.py` — PDF persistence (S3, lazy)
 
-**Sequencing.** Invoice numbers are issued per `(series, financial_year)`. `series` is `WAL` for wallet-funded sessions and `QR` for UPI-guest sessions. Format: `VL/{SERIES}/{FY_NODASH}/{SEQ:05d}` — e.g. `VL/QR/202627/00017`. The counter row is incremented under `SELECT FOR UPDATE` and the full `generate_invoice` call holds a row lock on the underlying `transaction` to prevent gaps from concurrent callers. (Migration 28 reset existing rows to a gapless per-(series, FY) sequence after the supplier model was corrected.)
+**Sequencing.** Invoice numbers are issued per `(franchisee_id, series, financial_year)` — each franchisee operates as a substore with its own running sequence. `series` is `WAL` for wallet-funded sessions, `QR` for UPI-guest sessions. Format:
+
+- `VL/F{franchisee_id}/{SERIES}/{FY_NODASH}/{SEQ:05d}` — franchisee-owned station (e.g. `VL/F5/QR/202627/00017`)
+- `VL/{SERIES}/{FY_NODASH}/{SEQ:05d}` — VoltLync-owned station (e.g. `VL/QR/202627/00001`)
+
+The counter row is incremented under `SELECT FOR UPDATE` and the full `generate_invoice` call holds a row lock on the underlying `transaction` to prevent gaps from concurrent callers. Migration 28 briefly consolidated counters across franchisees; migration 29 reverted to per-franchisee sequences (with snapshot fields added) to satisfy Razorpay disclosure.
 
 **Tax math.** `gst_rate_percent` is snapshotted onto the `transaction` row at billing time (from `tariff.gst_percent`). The invoice reads stored taxable values directly — `energy_taxable_value = transaction.energy_charge`, `gateway_charges = qr_payment.razorpay_commission`. No reverse-calc from a tax-inclusive total. CGST+SGST (intra-state) vs IGST (inter-state) is decided by comparing `supplier_state_code` to the station's `state_code`; the latter is frozen on the invoice as `place_of_supply_state_code`.
 

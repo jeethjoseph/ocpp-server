@@ -16,6 +16,7 @@ from models import (
 )
 from services.razorpay_service import razorpay_service, RazorpayAlreadyRefundedError, extract_fee_from_payment
 from services.wallet_service import WalletService
+from services.monitoring_service import MetricsCollector
 from redis_manager import redis_manager
 from core.connection_manager import connection_manager
 from crud import log_audit_event
@@ -642,6 +643,13 @@ class QRPaymentService:
                     transaction_id, energy_kwh,
                     float(budget_excl_tax / tariff_rate), over_kwh,
                     uncapped_energy_cost, energy_cost,
+                )
+                # Emit metrics so ops can quantify how much electricity is
+                # being absorbed past the budget. A non-zero rate here is a
+                # signal to tighten the auto-stop reaction time.
+                MetricsCollector.increment_counter("Custom/QR/OverConsumptionCapped")
+                MetricsCollector.record_metric(
+                    "Custom/QR/OverDeliveryKwh", over_kwh
                 )
             gst_amount = (energy_cost * gst_percent / Decimal('100')).quantize(
                 Decimal('0.01'), rounding=ROUND_HALF_UP

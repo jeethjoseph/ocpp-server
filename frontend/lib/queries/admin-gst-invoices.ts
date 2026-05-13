@@ -11,6 +11,12 @@ export interface GSTInvoice {
   supplier_name: string;
   supplier_gstin: string | null;
   supplier_state_code: string | null;
+  // Substore (Razorpay disclosure) — null for VoltLync-owned stations
+  franchisee_business_name: string | null;
+  franchisee_gstin: string | null;
+  franchisee_address: string | null;
+  franchisee_state: string | null;
+  franchisee_state_code: string | null;
   customer_name: string | null;
   customer_identifier: string | null;
   place_of_supply_state_code: string | null;
@@ -33,6 +39,7 @@ export interface GSTInvoice {
   total_amount: string | null;
   payment_method: string | null;
   transaction_amount: string | null;
+  refund_amount: string | null;
   transaction_id: number;
   franchisee_id: number | null;
   created_at: string;

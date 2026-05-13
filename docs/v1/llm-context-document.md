@@ -570,15 +570,18 @@ qr_payment (id, charger_id, charger_qr_code_id, user_id, transaction_id, razorpa
 
 -- GST Invoicing (customer-facing tax invoice per session)
 -- VoltLync is the GST supplier on every invoice (merchant-of-record under Razorpay Route).
--- `franchisee_id` is preserved on gst_invoice as reporting metadata only — it does NOT drive supplier identity.
-gst_invoice_counter (id, series, financial_year, last_number) -- Single counter per (series, FY); franchisee column dropped in migration 28.
-gst_invoice (id, invoice_number, series, financial_year, transaction_id, franchisee_id, user_id, supplier_name, supplier_gstin, supplier_state_code, customer_name, customer_identifier, station_name, place_of_supply_state_code, charger_id_str, energy_consumed_kwh, tariff_rate_incl_tax, hsn_sac_code, gst_rate_percent, energy_taxable_value, gateway_charges, gateway_hsn_code, total_taxable_value, is_inter_state, cgst_rate, cgst_amount, sgst_rate, sgst_amount, igst_rate, igst_amount, total_tax, total_amount, amount_in_words, payment_method, transaction_amount, pdf_url)
--- `series` = 'WAL' (wallet) or 'QR' (UPI guest); invoice_number format: VL/{SERIES}/{FY_NODASH}/{SEQ:05d}.
--- `transaction_amount` is post-refund (amount_paid - refund_amount for QR).
+-- Each franchisee operates as a substore — snapshot identity on the invoice, per-franchisee numbering, "Operated by" block on PDF (Razorpay payer-payee transparency rule).
+gst_invoice_counter (id, franchisee_id, series, financial_year, last_number) -- One row per (franchisee, series, FY); NULL franchisee = VoltLync-owned. Restored in migration 29.
+gst_invoice (id, invoice_number, series, financial_year, transaction_id, franchisee_id, user_id, supplier_name, supplier_gstin, supplier_state_code, franchisee_business_name, franchisee_gstin, franchisee_address, franchisee_state, franchisee_state_code, customer_name, customer_identifier, station_name, place_of_supply_state_code, charger_id_str, energy_consumed_kwh, tariff_rate_incl_tax, hsn_sac_code, gst_rate_percent, energy_taxable_value, gateway_charges, gateway_hsn_code, total_taxable_value, is_inter_state, cgst_rate, cgst_amount, sgst_rate, sgst_amount, igst_rate, igst_amount, total_tax, total_amount, amount_in_words, payment_method, transaction_amount, refund_amount, pdf_url)
+-- `series` = 'WAL' (wallet) or 'QR' (UPI guest).
+-- invoice_number format: VL/F{franchisee_id}/{SERIES}/{FY_NODASH}/{SEQ:05d} for franchisee-owned, VL/{SERIES}/{FY_NODASH}/{SEQ:05d} for VoltLync-owned.
+-- `transaction_amount` is the gross UPI payment; `refund_amount` is what was returned to the customer (NULL/0 for wallet sessions).
+-- `franchisee_*` snapshot columns drive the "Operated by:" block on the PDF; NULL for VoltLync-owned stations (block is omitted).
+-- `energy_consumed_kwh` on the invoice is the BILLABLE kWh after the QR cap fix — not the raw meter reading on transaction.energy_consumed_kwh.
 -- `pdf_url` holds an S3 object key, populated lazily on first download (presigned URL served at /api/.../pdf endpoints).
 -- Invoice generation is blocked at the service layer when VOLTLYNC_GSTIN env var is empty (CGST Rule 46).
 -- Cancellation infrastructure was removed: invoices are immutable once issued.
--- Credit notes are not modelled today — refunds are baked into transaction_amount; revisit if/when B2B (ITC-claiming customers) is introduced.
+-- Credit notes are not modelled today; revisit if/when B2B (ITC-claiming customers) is introduced.
 
 -- Audit & Webhooks
 audit_event (id, event_type, entity_type, entity_id, details, created_at) -- System audit trail

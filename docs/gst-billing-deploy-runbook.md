@@ -8,6 +8,7 @@ This runbook covers the deploy of the GST invoice schema overhaul:
 
 - Migration 27 — schema cleanup (drops cancellation/credit-note infra, adds `gst_rate_percent` / `place_of_supply_state_code` / `series` / `financial_year`, fixes HSN default, replaces global UNIQUE with partial indexes)
 - Migration 28 — supplier-always-VoltLync correction (drops `gst_invoice_counter.franchisee_id`, renumbers existing invoices to gapless `VL/{SERIES}/{FY}/{SEQ:05d}`, normalizes supplier identity)
+- Migration 29 — franchisee-as-substore (re-adds counter `franchisee_id`, adds `franchisee_*` snapshot columns + `refund_amount` to `gst_invoice`, re-renumbers per-(franchisee, series, FY), backfills snapshot fields from live `franchisee` table). Per Razorpay's payer-payee transparency rule.
 - New S3-backed PDF storage (`services/s3_service.py`, lazy upload on first download)
 - New admin "GST Filings" page at `/admin/gst-filings`
 - One-off backfill script for data the migrations can't express in SQL alone
@@ -133,8 +134,8 @@ docker exec ocpp-backend python scripts/backfill_gst_schema.py
 
 | Script | Run via | Does |
 |---|---|---|
-| `aerich upgrade` | `make staging-migrate` | Schema changes + inline SQL backfill of `series`/`financial_year`/`invoice_number`/`supplier_name`+`supplier_state`+`supplier_state_code`. |
-| `backfill_gst_schema.py` | `docker exec ocpp-backend python scripts/...` | Fills `place_of_supply_state_code`, recomputes taxable/tax/total from stored `txn.energy_charge`/`qr_payment.razorpay_*`, sets `transaction_amount = amount_paid - refund_amount` for QR, sets `supplier_gstin`/`supplier_address` from env vars. |
+| `aerich upgrade` | `make staging-migrate` | Applies migrations 27, 28, **and 29** in sequence. Includes inline SQL renumbering (twice — flat in 28, per-franchisee in 29), supplier normalization, franchisee snapshot backfill, counter rebuild, and refund/gross split restoration. |
+| `backfill_gst_schema.py` | `docker exec ocpp-backend python scripts/...` | Fills `place_of_supply_state_code` from station, recomputes taxable/tax/total from stored `txn.energy_charge`/`qr_payment.razorpay_*`, restores gross `transaction_amount = amount_paid` + explicit `refund_amount`, sets `supplier_gstin`/`supplier_address` and `franchisee_*` snapshot fields from env vars and the live franchisee table. |
 
 The backfill script is idempotent — safe to re-run if needed.
 
@@ -229,26 +230,20 @@ make staging-deploy                        # rebuild with old code
 
 ### 5c. Full restore (code + DB)
 
-The reliable one. Brings staging back to bit-for-bit pre-deploy state.
+The reliable one. Brings staging back to bit-for-bit pre-deploy state. Now a single Make target.
 
 ```bash
-# 1. Stop the app so nothing writes to the DB during restore
+# On the EC2
 cd /home/ec2-user/ocpp-server
-docker compose -f docker-compose.staging.yml --env-file .env.staging stop backend frontend
 
-# 2. Drop and recreate the DB, then load the dump
-docker compose -f docker-compose.staging.yml --env-file .env.staging exec -T postgres sh -c '
-  psql -U $POSTGRES_USER -d postgres -c "DROP DATABASE IF EXISTS $POSTGRES_DB;" &&
-  psql -U $POSTGRES_USER -d postgres -c "CREATE DATABASE $POSTGRES_DB OWNER $POSTGRES_USER;"
-'
-docker compose -f docker-compose.staging.yml --env-file .env.staging exec -T postgres sh -c '
-  psql -U $POSTGRES_USER -d $POSTGRES_DB
-' < backups/staging_backup_<TIMESTAMP>.sql
+# 1. Restore the DB from the newest dump (stops backend+frontend, drops+recreates DB,
+#    loads dump, restarts). Pass DUMP=backups/specific_file.sql to pick a non-newest dump.
+make staging-restore-db
 
-# 3. Revert code to the rollback commit (from your laptop, easiest)
+# 2. Revert code to the rollback commit (from your laptop)
 git push origin <rollback-commit-hash>:develop --force
 
-# 4. Back on the EC2 — rebuild + restart with the old code
+# 3. Back on the EC2 — rebuild + restart with the old code
 make staging-deploy
 ```
 
@@ -309,7 +304,7 @@ The dress rehearsal is **doubly** worth doing for prod — use the prod dump in 
 
 ## 8. Known follow-ups (not blocking)
 
-- **`make staging-restore-db` / `make prod-restore-db` targets** — would make step 5c's DB restore a single command. Worth adding to the Makefile.
+- ~~**`make staging-restore-db` / `make prod-restore-db` targets**~~ — done. Step 5c is now a single command.
 - **S3 lifecycle rules** — move objects to `STANDARD_IA` after 90d, `GLACIER` after 1y. Required for the 6-year CGST Rule 56 retention. Not blocking deploy.
 - **Tag the rollback commit** — `git tag pre-gst-billing-deploy <hash>` before deploy gives a named reference instead of a hash. Optional.
 

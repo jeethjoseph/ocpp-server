@@ -36,6 +36,7 @@ from scripts._db import build_tortoise_config
 from models import (
     Charger,
     ChargingStation,
+    Franchisee,
     GSTInvoice,
     QRPayment,
     Tariff,
@@ -86,13 +87,15 @@ async def backfill_invoice(invoice: GSTInvoice, dry_run: bool) -> dict:
     total_tax = energy_tax + (gateway_tax or Decimal("0"))
     total_amount = total_taxable + total_tax
 
+    # Gross/refund split — restored to two-line model per the substore plan.
+    # `transaction_amount` is the gross UPI payment; `refund_amount` is the
+    # amount returned to the customer (NULL for wallet).
     if qr_payment:
-        transaction_amount = (
-            (qr_payment.amount_paid or Decimal("0"))
-            - (qr_payment.refund_amount or Decimal("0"))
-        )
+        transaction_amount = qr_payment.amount_paid or Decimal("0")
+        refund_amount = qr_payment.refund_amount or Decimal("0")
     else:
         transaction_amount = txn.total_billed
+        refund_amount = None
 
     tax_split = _split_tax(total_tax, invoice.is_inter_state)
 
@@ -107,6 +110,7 @@ async def backfill_invoice(invoice: GSTInvoice, dry_run: bool) -> dict:
         "total_tax": total_tax,
         "total_amount": total_amount,
         "transaction_amount": transaction_amount,
+        "refund_amount": refund_amount,
         "hsn_sac_code": CORRECTED_HSN,
         "gst_rate_percent": invoice.gst_rate_percent or Decimal("18"),
         # Supplier identity — always VoltLync. Migration 28 already normalized
@@ -119,6 +123,18 @@ async def backfill_invoice(invoice: GSTInvoice, dry_run: bool) -> dict:
         "supplier_state": VOLTLYNC_STATE,
         "supplier_state_code": VOLTLYNC_STATE_CODE,
     }
+
+    # Franchisee operator snapshot for the "Operated by" PDF block. Migration
+    # 29 backfills these inline; we re-write here so re-runs against a
+    # partially-migrated DB stay consistent.
+    if invoice.franchisee_id:
+        franchisee = await Franchisee.filter(id=invoice.franchisee_id).first()
+        if franchisee:
+            update_fields["franchisee_business_name"] = franchisee.business_name
+            update_fields["franchisee_gstin"]         = franchisee.gstin
+            update_fields["franchisee_address"]       = franchisee.address
+            update_fields["franchisee_state"]         = franchisee.state
+            update_fields["franchisee_state_code"]    = franchisee.state_code
 
     summary = {"id": invoice.id, "number": invoice.invoice_number, **{
         k: str(v) for k, v in update_fields.items()

@@ -1,8 +1,12 @@
 """GST invoice generation service.
 
 Generates per-session tax invoices for ALL completed charging sessions.
-Supplier = Franchisee (if station is franchisee-owned) or VoltLync.
-PDF layout matches the provided sample invoice.
+Supplier = VoltLync (single GST merchant-of-record). The franchisee operator
+of the station is snapshotted onto each invoice and rendered as an
+"Operated by:" block on the PDF, per Razorpay's linked-account disclosure
+requirement. Invoice numbering is per-(franchisee, series, FY) — each
+franchisee operates as a substore with its own running sequence; VoltLync-
+owned stations share a NULL-franchisee sequence.
 """
 
 import io
@@ -20,19 +24,22 @@ from models import (
     Charger,
     Connector,
     ChargingStation,
+    Franchisee,
     GSTInvoice,
     GSTInvoiceCounter,
     QRPayment,
     User,
 )
 from services.wallet_service import WalletService
+from services.monitoring_service import MetricsCollector
 
 logger = logging.getLogger("ocpp-server")
 
 TWO_DP = Decimal("0.01")
 
 # VoltLync is the supplier on every customer-facing invoice (merchant-of-record
-# under Razorpay Route). Franchisees are reporting metadata only.
+# under Razorpay Route). Franchisee operator details are snapshotted onto the
+# invoice separately and rendered as the "Operated by" block on the PDF.
 VOLTLYNC_NAME = os.getenv("VOLTLYNC_BUSINESS_NAME", "VOLTLYNC PRIVATE LIMITED")
 VOLTLYNC_GSTIN = os.getenv("VOLTLYNC_GSTIN", "")
 VOLTLYNC_ADDRESS = os.getenv("VOLTLYNC_ADDRESS", "")
@@ -74,15 +81,22 @@ class InvoiceService:
     @staticmethod
     @atomic()
     async def get_next_invoice_number(
+        franchisee_id: Optional[int],
         series: str,
         financial_year: str,
     ) -> str:
         """Atomic counter increment using SELECT FOR UPDATE.
 
-        Supplier is always VoltLync, so a single counter row per (series, FY)
-        owns the sequence — `VL/{SERIES}/{FY_NODASH}/{SEQ:05d}`.
+        Per-(franchisee, series, FY) sequence. Each franchisee is a substore
+        with its own running counter; VoltLync-owned stations (franchisee_id
+        IS NULL) share a single sequence per (series, FY).
+
+        Number format:
+          VL/F{franchisee_id}/{SERIES}/{FY_NODASH}/{SEQ:05d}   for franchisee-owned
+          VL/{SERIES}/{FY_NODASH}/{SEQ:05d}                     for VoltLync-owned
         """
         counter = await GSTInvoiceCounter.filter(
+            franchisee_id=franchisee_id,
             series=series,
             financial_year=financial_year,
         ).select_for_update().first()
@@ -93,6 +107,7 @@ class InvoiceService:
             seq = counter.last_number
         else:
             counter = await GSTInvoiceCounter.create(
+                franchisee_id=franchisee_id,
                 series=series,
                 financial_year=financial_year,
                 last_number=1,
@@ -100,7 +115,8 @@ class InvoiceService:
             seq = 1
 
         fy_short = financial_year.replace("-", "")
-        return f"VL/{series}/{fy_short}/{seq:05d}"
+        prefix = f"VL/F{franchisee_id}" if franchisee_id else "VL"
+        return f"{prefix}/{series}/{fy_short}/{seq:05d}"
 
     @staticmethod
     def determine_gst_split(
@@ -186,19 +202,28 @@ class InvoiceService:
         if not station:
             return None
 
-        # `franchisee_id` is preserved on the invoice as reporting metadata
-        # (which station owner served the session) but is NOT the supplier.
-        # VoltLync is merchant-of-record under Razorpay Route: customers pay
-        # VoltLync, VoltLync issues the invoice, VoltLync settles the
-        # franchisee separately via a Route transfer. The franchisee's GST
-        # relationship with VoltLync is a different invoice flow.
+        # Supplier (GST merchant-of-record) is always VoltLync. The franchisee
+        # operating the station is captured separately as a snapshot for the
+        # "Operated by" disclosure block on the PDF (Razorpay requirement).
         franchisee_id = station.franchisee_id
+        franchisee = (
+            await Franchisee.filter(id=franchisee_id).first()
+            if franchisee_id else None
+        )
 
         supplier_name = VOLTLYNC_NAME
         supplier_gstin = VOLTLYNC_GSTIN
         supplier_address = VOLTLYNC_ADDRESS
         supplier_state = VOLTLYNC_STATE
         supplier_state_code = VOLTLYNC_STATE_CODE
+
+        # Franchisee operator snapshot. All NULL for VoltLync-owned stations
+        # — the PDF then omits the "Operated by" block entirely.
+        franchisee_business_name = franchisee.business_name if franchisee else None
+        franchisee_gstin = franchisee.gstin if franchisee else None
+        franchisee_address = franchisee.address if franchisee else None
+        franchisee_state = franchisee.state if franchisee else None
+        franchisee_state_code = franchisee.state_code if franchisee else None
 
         # Compliance guard: a tax invoice without supplier GSTIN is invalid
         # under CGST Rule 46. Skip issuance until VoltLync has a GSTIN
@@ -208,6 +233,7 @@ class InvoiceService:
                 "GST invoice NOT issued for txn %s: VOLTLYNC_GSTIN not configured",
                 transaction_id,
             )
+            MetricsCollector.increment_counter("Custom/Invoice/GstinMissing")
             return None
 
         # Customer details
@@ -225,10 +251,11 @@ class InvoiceService:
                 or qr_payment.customer_contact
             )
             customer_identifier = qr_payment.customer_vpa or qr_payment.customer_contact
-            transaction_amount = (
-                (qr_payment.amount_paid or Decimal("0"))
-                - (qr_payment.refund_amount or Decimal("0"))
-            )
+            # `transaction_amount` is the gross UPI payment; `refund_amount`
+            # captures whatever was returned to the customer. Rendered as
+            # two separate lines on the PDF.
+            transaction_amount = qr_payment.amount_paid or Decimal("0")
+            refund_amount = qr_payment.refund_amount or Decimal("0")
             gateway_taxable = qr_payment.razorpay_commission or Decimal("0")
             gateway_tax = qr_payment.razorpay_gst or Decimal("0")
             series = "QR"
@@ -237,6 +264,7 @@ class InvoiceService:
             customer_name = user.full_name if user else None
             customer_identifier = user.email if user else None
             transaction_amount = txn.total_billed
+            refund_amount = None
             gateway_taxable = Decimal("0")
             gateway_tax = Decimal("0")
             series = "WAL"
@@ -304,6 +332,7 @@ class InvoiceService:
         now = datetime.utcnow()
         fy = _get_financial_year(now)
         invoice_number = await InvoiceService.get_next_invoice_number(
+            franchisee_id=franchisee_id,
             series=series,
             financial_year=fy,
         )
@@ -320,6 +349,11 @@ class InvoiceService:
             supplier_address=supplier_address,
             supplier_state=supplier_state,
             supplier_state_code=supplier_state_code,
+            franchisee_business_name=franchisee_business_name,
+            franchisee_gstin=franchisee_gstin,
+            franchisee_address=franchisee_address,
+            franchisee_state=franchisee_state,
+            franchisee_state_code=franchisee_state_code,
             customer_name=customer_name,
             customer_identifier=customer_identifier,
             station_name=station.name,
@@ -348,11 +382,16 @@ class InvoiceService:
             amount_in_words=_amount_in_words(total_amount),
             payment_method=payment_method,
             transaction_amount=transaction_amount,
+            refund_amount=refund_amount,
         )
 
         logger.info(
             "GST invoice generated: %s for txn %s",
             invoice_number, transaction_id,
+        )
+        MetricsCollector.increment_counter("Custom/Invoice/Issued")
+        MetricsCollector.record_metric(
+            "Custom/Invoice/TotalAmount", float(total_amount)
         )
         return invoice
 
@@ -418,7 +457,25 @@ class InvoiceService:
             ("LINEBELOW", (0, 0), (-1, 0), 0.5, colors.lightgrey),
         ]))
         elements.append(t)
-        elements.append(Spacer(1, 4*mm))
+        elements.append(Spacer(1, 2*mm))
+
+        # "Operated by" block — Razorpay linked-account disclosure. Renders
+        # only when this invoice is tied to a franchisee-operated station.
+        if invoice.franchisee_business_name:
+            operator_text = f"<b>Operated by:</b> {invoice.franchisee_business_name}<br/>"
+            if invoice.franchisee_address:
+                operator_text += f"{invoice.franchisee_address}<br/>"
+            if invoice.franchisee_gstin:
+                operator_text += f"GSTIN: {invoice.franchisee_gstin}"
+            operator_data = [[Paragraph(operator_text, normal_style), Paragraph("", normal_style)]]
+            t = Table(operator_data, colWidths=[250, 250])
+            t.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LINEBELOW", (0, 0), (-1, 0), 0.5, colors.lightgrey),
+            ]))
+            elements.append(t)
+            elements.append(Spacer(1, 2*mm))
+        elements.append(Spacer(1, 2*mm))
 
         # Station / Charger
         station_text = f"<b>STATION:</b> {invoice.station_name or ''}<br/>{invoice.station_location or ''}"
@@ -436,7 +493,7 @@ class InvoiceService:
         charged_on_str = invoice.charged_on.strftime("%d/%m/%Y, %I:%M %p") if invoice.charged_on else ""
         duration_str = _format_duration(invoice.duration_seconds)
 
-        header = ["HSN CODE", "ENERGY\nCONSUMED (kWh)", "TARIFF / kWh\n(Including Taxes)", "CHARGED ON", "DURATION", "AMOUNT (INR)"]
+        header = ["HSN CODE", "ENERGY BILLED\n(kWh)", "TARIFF / kWh\n(Including Taxes)", "CHARGED ON", "DURATION", "AMOUNT (INR)"]
         rows = [header]
         rows.append([
             str(invoice.hsn_sac_code),
@@ -498,11 +555,24 @@ class InvoiceService:
             ))
             elements.append(Spacer(1, 3*mm))
 
-        # Payment info — transaction_amount is net of refund
+        # Payment info — `transaction_amount` is the gross UPI payment;
+        # `refund_amount` is whatever was returned to the customer.
         pay_text = f"<b>Payment Method:</b> {invoice.payment_method or ''}"
         if invoice.transaction_amount:
-            pay_text += f"&nbsp;&nbsp;&nbsp;&nbsp;<b>Amount Paid:</b> {invoice.transaction_amount:.2f}"
+            pay_text += f"&nbsp;&nbsp;&nbsp;&nbsp;<b>Transaction Amount:</b> {invoice.transaction_amount:.2f}"
         elements.append(Paragraph(pay_text, normal_style))
+
+        if invoice.refund_amount and invoice.refund_amount > 0:
+            elements.append(Paragraph(
+                f"<b>Refund Amount:</b> {invoice.refund_amount:.2f}",
+                normal_style,
+            ))
+            elements.append(Paragraph(
+                "Refund processing: Takes 3-5 working days. Amount will be "
+                "credited to customer's bank account within 5-7 working days "
+                "after the refund has processed.",
+                small_style,
+            ))
 
         elements.append(Spacer(1, 8*mm))
 

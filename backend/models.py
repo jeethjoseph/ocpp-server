@@ -809,19 +809,25 @@ class CommissionAuditLog(Model):
 # GST Invoice Models
 
 class GSTInvoiceCounter(Model):
-    """Sequential invoice numbering per (series, FY).
+    """Sequential invoice numbering per (franchisee, series, FY).
 
-    VoltLync is the supplier on every customer-facing invoice, so a single
-    counter row per (series, FY) owns the sequence.
+    VoltLync is the GST supplier on every invoice, but each franchisee
+    operates as a substore with its own running sequence so the customer-facing
+    invoice number identifies the franchisee. NULL franchisee = VoltLync-owned.
+    NULL-aware partial unique index is in raw SQL via the migration since
+    Postgres treats NULL as distinct in regular UNIQUE indexes.
     """
     id = fields.IntField(pk=True)
+    franchisee = fields.ForeignKeyField(
+        "models.Franchisee", related_name="invoice_counters", null=True
+    )
     series = fields.CharField(max_length=10)  # WAL or QR
     financial_year = fields.CharField(max_length=10)  # e.g. 2026-27
     last_number = fields.IntField(default=0)
 
     class Meta:
         table = "gst_invoice_counter"
-        unique_together = [("series", "financial_year")]
+        unique_together = [("franchisee", "series", "financial_year")]
 
 
 class GSTInvoice(Model):
@@ -839,8 +845,10 @@ class GSTInvoice(Model):
     transaction = fields.OneToOneField(
         "models.Transaction", related_name="gst_invoice"
     )
-    # Reporting metadata only: which station owner served the session.
-    # VoltLync remains the GST supplier in every case (see supplier_* fields).
+    # Reporting metadata + substore identity on the bill. VoltLync remains
+    # the GST supplier (see supplier_* fields); the franchisee_* snapshot
+    # below is rendered on the PDF as "Operated by:" per Razorpay's
+    # linked-account disclosure rule.
     franchisee = fields.ForeignKeyField(
         "models.Franchisee", related_name="gst_invoices", null=True
     )
@@ -854,6 +862,14 @@ class GSTInvoice(Model):
     supplier_address = fields.TextField(null=True)
     supplier_state = fields.CharField(max_length=100, null=True)
     supplier_state_code = fields.CharField(max_length=5, null=True)
+
+    # Franchisee operator snapshot — rendered as the "Operated by" block on
+    # the PDF. NULL for VoltLync-owned stations (block is omitted entirely).
+    franchisee_business_name = fields.CharField(max_length=255, null=True)
+    franchisee_gstin = fields.CharField(max_length=20, null=True)
+    franchisee_address = fields.TextField(null=True)
+    franchisee_state = fields.CharField(max_length=100, null=True)
+    franchisee_state_code = fields.CharField(max_length=5, null=True)
 
     # Customer snapshot
     customer_name = fields.CharField(max_length=255, null=True)
@@ -897,9 +913,14 @@ class GSTInvoice(Model):
     total_amount = fields.DecimalField(max_digits=10, decimal_places=2)
     amount_in_words = fields.CharField(max_length=500, null=True)
 
-    # Payment info — `transaction_amount` is net of refund (= amount_paid - refund_amount for QR)
+    # Payment info — `transaction_amount` is the GROSS UPI payment for QR
+    # sessions (= qr_payment.amount_paid). `refund_amount` is what was
+    # refunded back to the customer (NULL/0 for wallet or full-use QR).
     payment_method = fields.CharField(max_length=20, null=True)  # UPI, WALLET
     transaction_amount = fields.DecimalField(
+        max_digits=10, decimal_places=2, null=True
+    )
+    refund_amount = fields.DecimalField(
         max_digits=10, decimal_places=2, null=True
     )
 
@@ -908,7 +929,7 @@ class GSTInvoice(Model):
 
     class Meta:
         table = "gst_invoice"
-        unique_together = [("series", "financial_year", "invoice_number")]
+        unique_together = [("franchisee", "series", "financial_year", "invoice_number")]
 
 
 # Pydantic models for API serialization

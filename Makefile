@@ -23,8 +23,8 @@ SCRIPTS_DIR=$(BACKEND_DIR)/scripts
 
 .PHONY: help db-reset db-reset-cloud db-first-time db-drop-user db-create-user db-drop db-create migrate seed setup-dev truncate-tables
 .PHONY: docker-dev docker-dev-detach docker-staging docker-staging-detach docker-prod docker-prod-detach docker-down docker-down-staging docker-down-prod docker-logs docker-logs-backend docker-logs-frontend docker-build docker-build-staging docker-build-prod docker-clean docker-migrate docker-staging-cert docker-prod-cert docker-cert-renew
-.PHONY: prod-push prod-pull prod-up prod-down prod-deploy prod-rebuild prod-rebuild-service prod-rebuild-clean prod-nuke prod-restart prod-logs prod-logs-backend prod-logs-frontend prod-logs-nginx prod-ps prod-cert prod-migrate prod-backup-db prod-cache-clear prod-health prod-stats prod-shell prod-bash prod-db-reset prod-seed
-.PHONY: staging-push staging-pull staging-up staging-down staging-deploy staging-rebuild staging-rebuild-service staging-rebuild-clean staging-nuke staging-restart staging-logs staging-logs-backend staging-logs-frontend staging-logs-nginx staging-ps staging-cert staging-migrate staging-backup-db staging-cache-clear staging-health staging-stats staging-shell staging-bash staging-ssm staging-db-reset staging-seed
+.PHONY: prod-push prod-pull prod-up prod-down prod-deploy prod-rebuild prod-rebuild-service prod-rebuild-clean prod-nuke prod-restart prod-logs prod-logs-backend prod-logs-frontend prod-logs-nginx prod-ps prod-cert prod-migrate prod-backup-db prod-restore-db prod-cache-clear prod-health prod-stats prod-shell prod-bash prod-db-reset prod-seed
+.PHONY: staging-push staging-pull staging-up staging-down staging-deploy staging-rebuild staging-rebuild-service staging-rebuild-clean staging-nuke staging-restart staging-logs staging-logs-backend staging-logs-frontend staging-logs-nginx staging-ps staging-cert staging-migrate staging-backup-db staging-restore-db staging-cache-clear staging-health staging-stats staging-shell staging-bash staging-ssm staging-db-reset staging-seed
 
 help:
 	@echo "OCPP Server - Available Commands"
@@ -59,6 +59,7 @@ help:
 	@echo "Database & Cache:"
 	@echo "  make prod-migrate        Run database migrations"
 	@echo "  make prod-backup-db      Backup database to backups/"
+	@echo "  make prod-restore-db     Restore DB from newest dump (or DUMP=path)"
 	@echo "  make prod-db-reset       Reset database (DANGEROUS)"
 	@echo "  make prod-seed           Run seed script"
 	@echo "  make prod-cache-clear    Clear all Redis cache"
@@ -98,6 +99,7 @@ help:
 	@echo "Database & Cache:"
 	@echo "  make staging-migrate        Run database migrations"
 	@echo "  make staging-backup-db      Backup database to backups/"
+	@echo "  make staging-restore-db     Restore DB from newest dump (or DUMP=path)"
 	@echo "  make staging-db-reset       Reset database (DANGEROUS)"
 	@echo "  make staging-seed           Run seed script"
 	@echo "  make staging-cache-clear    Clear all Redis cache"
@@ -361,6 +363,27 @@ prod-backup-db:
 	@echo "Backup saved to backups/"
 	@ls -lh backups/prod_backup_*.sql | tail -1
 
+# Restore production database from a backup file.
+# Usage:   make prod-restore-db                     (uses newest backups/prod_backup_*.sql)
+#          make prod-restore-db DUMP=backups/x.sql  (use a specific file)
+# WARNING: Drops and recreates the prod DB before restore — destroys current state.
+prod-restore-db:
+	@echo "WARNING: Restoring prod DB will DROP all current data."
+	@echo "Press Ctrl+C in 5s to cancel..."
+	@sleep 5
+	$(eval DUMP ?= $(shell ls -t backups/prod_backup_*.sql 2>/dev/null | head -1))
+	@if [ -z "$(DUMP)" ] || [ ! -f "$(DUMP)" ]; then \
+		echo "ERROR: no dump file found. Pass DUMP=path/to/file.sql or run prod-backup-db first."; \
+		exit 1; \
+	fi
+	@echo "Restoring from $(DUMP)..."
+	$(PROD_COMPOSE) stop backend frontend
+	$(PROD_COMPOSE) exec -T postgres sh -c 'psql -U $$POSTGRES_USER -d postgres -c "DROP DATABASE IF EXISTS $$POSTGRES_DB;"'
+	$(PROD_COMPOSE) exec -T postgres sh -c 'psql -U $$POSTGRES_USER -d postgres -c "CREATE DATABASE $$POSTGRES_DB OWNER $$POSTGRES_USER;"'
+	$(PROD_COMPOSE) exec -T postgres sh -c 'psql -U $$POSTGRES_USER -d $$POSTGRES_DB' < $(DUMP)
+	$(PROD_COMPOSE) start backend frontend
+	@echo "Restore complete from $(DUMP). Backend + frontend restarted."
+
 # Reset production database (DANGEROUS - requires confirmation)
 prod-db-reset:
 	@echo "WARNING: This will delete the production database!"
@@ -522,6 +545,27 @@ staging-backup-db:
 	$(STAGING_COMPOSE) exec -T postgres sh -c 'pg_dump -U $$POSTGRES_USER $$POSTGRES_DB' > backups/staging_backup_$$(date +%Y%m%d_%H%M%S).sql
 	@echo "Backup saved to backups/"
 	@ls -lh backups/staging_backup_*.sql | tail -1
+
+# Restore staging database from a backup file.
+# Usage:   make staging-restore-db                      (uses newest backups/staging_backup_*.sql)
+#          make staging-restore-db DUMP=backups/x.sql   (use a specific file)
+# WARNING: Drops and recreates the staging DB before restore — destroys current state.
+staging-restore-db:
+	@echo "WARNING: Restoring staging DB will DROP all current data."
+	@echo "Press Ctrl+C in 5s to cancel..."
+	@sleep 5
+	$(eval DUMP ?= $(shell ls -t backups/staging_backup_*.sql 2>/dev/null | head -1))
+	@if [ -z "$(DUMP)" ] || [ ! -f "$(DUMP)" ]; then \
+		echo "ERROR: no dump file found. Pass DUMP=path/to/file.sql or run staging-backup-db first."; \
+		exit 1; \
+	fi
+	@echo "Restoring from $(DUMP)..."
+	$(STAGING_COMPOSE) stop backend frontend
+	$(STAGING_COMPOSE) exec -T postgres sh -c 'psql -U $$POSTGRES_USER -d postgres -c "DROP DATABASE IF EXISTS $$POSTGRES_DB;"'
+	$(STAGING_COMPOSE) exec -T postgres sh -c 'psql -U $$POSTGRES_USER -d postgres -c "CREATE DATABASE $$POSTGRES_DB OWNER $$POSTGRES_USER;"'
+	$(STAGING_COMPOSE) exec -T postgres sh -c 'psql -U $$POSTGRES_USER -d $$POSTGRES_DB' < $(DUMP)
+	$(STAGING_COMPOSE) start backend frontend
+	@echo "Restore complete from $(DUMP). Backend + frontend restarted."
 
 # Reset staging database (DANGEROUS - requires confirmation)
 staging-db-reset:

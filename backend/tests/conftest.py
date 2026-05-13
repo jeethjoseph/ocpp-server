@@ -30,6 +30,13 @@ TEST_DB_URL = os.environ.get(
     "postgres://test_user:test_pass@postgres:5432/test_ocpp_db",
 )
 
+# Track whether the test schema has been (re)generated this pytest session.
+# First test in a session drops the whole `public` schema and regenerates it,
+# so column additions to models after a migration land without manual
+# intervention. Subsequent tests in the same session reuse the schema and
+# just clear rows in the per-function fixture below — keeps the sweep fast.
+_SCHEMA_GENERATED_THIS_SESSION = False
+
 @pytest.fixture(scope="module")
 def anyio_backend():
     return "asyncio"
@@ -80,8 +87,23 @@ async def client() -> AsyncGenerator[AsyncClient, None]:
             },
         }
         await Tortoise.init(config=config)
-        await Tortoise.generate_schemas()
-        
+        global _SCHEMA_GENERATED_THIS_SESSION
+        if not _SCHEMA_GENERATED_THIS_SESSION:
+            # First test in this session — wipe the public schema so any new
+            # columns added to models are picked up, then regenerate.
+            # `generate_schemas(safe=True)` (default) won't add columns to
+            # existing tables, causing UndefinedColumnError surprises after
+            # migrations land. This avoids the manual "drop test_ocpp_db" step.
+            from tortoise import connections as _conn2
+            conn = _conn2.get("default")
+            await conn.execute_script(
+                "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;"
+            )
+            await Tortoise.generate_schemas()
+            _SCHEMA_GENERATED_THIS_SESSION = True
+        else:
+            await Tortoise.generate_schemas()
+
         # Clean up database before each test (order matters for FK constraints)
         from models import (
             WalletTransaction, MeterValue,

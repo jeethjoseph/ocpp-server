@@ -269,10 +269,12 @@ export default function AdminGSTFilingsPage() {
                       <TableHead>Date</TableHead>
                       <TableHead>Series</TableHead>
                       <TableHead>Customer</TableHead>
+                      <TableHead>Operated by</TableHead>
                       <TableHead>PoS</TableHead>
                       <TableHead className="text-right">Taxable</TableHead>
                       <TableHead className="text-right">Tax</TableHead>
                       <TableHead className="text-right">Total</TableHead>
+                      <TableHead className="text-right">Refund</TableHead>
                       <TableHead></TableHead>
                     </TableRow>
                   </TableHeader>
@@ -298,6 +300,23 @@ export default function AdminGSTFilingsPage() {
                             {inv.customer_identifier || ""}
                           </div>
                         </TableCell>
+                        <TableCell className="text-sm">
+                          {inv.franchisee_business_name ? (
+                            <div
+                              className="truncate max-w-[180px]"
+                              title={inv.franchisee_business_name}
+                            >
+                              {inv.franchisee_business_name}
+                              {inv.franchisee_gstin && (
+                                <div className="text-xs text-muted-foreground">
+                                  {inv.franchisee_gstin}
+                                </div>
+                              )}
+                            </div>
+                          ) : (
+                            <span className="text-xs text-muted-foreground">VoltLync-owned</span>
+                          )}
+                        </TableCell>
                         <TableCell className="text-xs">
                           {inv.place_of_supply_state_code || "—"}
                           {inv.is_inter_state && (
@@ -312,6 +331,11 @@ export default function AdminGSTFilingsPage() {
                         </TableCell>
                         <TableCell className="text-right text-sm font-medium">
                           {formatINR(inv.total_amount ?? "0")}
+                        </TableCell>
+                        <TableCell className="text-right text-sm">
+                          {inv.refund_amount && Number(inv.refund_amount) > 0
+                            ? formatINR(inv.refund_amount)
+                            : "—"}
                         </TableCell>
                         <TableCell>
                           <Link
