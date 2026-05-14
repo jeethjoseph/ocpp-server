@@ -78,7 +78,7 @@ async def ensure_guest_user():
             preferred_language="en",
             notification_preferences="{}",
         )
-        await Wallet.create(user=guest, balance=Decimal("0.00"))
+        await Wallet.create(user=guest)
         logger.info("System guest user created")
     else:
         logger.info("System guest user already exists")
@@ -137,7 +137,7 @@ async def find_or_create_user_from_payment(
             preferred_language="en",
             notification_preferences="{}",
         )
-        await Wallet.create(user=user, balance=Decimal("0.00"))
+        await Wallet.create(user=user)
         logger.info(f"Created UPI_GUEST user: {mask_email(email)} (id={user.id})")
         return user
 

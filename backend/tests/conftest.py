@@ -37,6 +37,38 @@ TEST_DB_URL = os.environ.get(
 # just clear rows in the per-function fixture below — keeps the sweep fast.
 _SCHEMA_GENERATED_THIS_SESSION = False
 
+
+@pytest.fixture(autouse=True, scope="session")
+def _flush_public_endpoint_rate_limit_keys():
+    """Public endpoints (`/api/public/qr-transactions/*`) use a 20-req/min
+    per-IP rate limiter backed by Redis (`public_qr_transactions:*`).
+    Across a full test-suite run, accumulated state from earlier tests
+    can trip the limiter on later ones — manifests as 429s in
+    test_invoice_pdf_endpoint. Flush at session start so each run begins
+    with a clean window. Per-test state during a run is fine: the window
+    is 60s and the full suite runs in ~30s.
+
+    Sync fixture using asyncio.run for the Redis I/O so we don't pull in
+    pytest-asyncio's event-loop scoping (which would clash with the
+    function-scoped async runner used by every other async fixture)."""
+    import asyncio
+    redis_url = os.environ.get("REDIS_URL", "redis://redis:6379/0")
+
+    async def _flush():
+        client = redis.from_url(redis_url, decode_responses=True)
+        try:
+            keys = await client.keys("public_qr_transactions:*")
+            if keys:
+                await client.delete(*keys)
+        finally:
+            await client.aclose()
+
+    try:
+        asyncio.run(_flush())
+    except Exception:
+        pass  # Redis unavailable in some test envs — non-fatal
+    yield
+
 @pytest.fixture(scope="module")
 def anyio_backend():
     return "asyncio"
@@ -196,9 +228,19 @@ async def test_tariff(test_charger):
 
 @pytest.fixture
 async def test_wallet(test_user):
-    """Create a wallet for the test user with a default balance"""
+    """Create a wallet for the test user, seeded to ₹500 via a COMPLETED
+    TOP_UP row (balance is derived from the log; no stored column)."""
     from decimal import Decimal
-    return await Wallet.create(user=test_user, balance=Decimal("500.00"))
+    from models import WalletTransaction, TransactionTypeEnum
+    wallet = await Wallet.create(user=test_user)
+    await WalletTransaction.create(
+        wallet=wallet,
+        amount=Decimal("500.00"),
+        type=TransactionTypeEnum.TOP_UP,
+        description="Test seed top-up",
+        payment_metadata={"status": "COMPLETED"},
+    )
+    return wallet
 
 
 @pytest.fixture

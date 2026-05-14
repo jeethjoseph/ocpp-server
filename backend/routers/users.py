@@ -68,9 +68,10 @@ async def get_my_wallet(
     path-matching conflicts that could incorrectly enforce ADMIN access.
     """
     try:
-        # Get wallet balance
+        # Get wallet balance from the ledger (derived from wallet_transaction)
+        from services.wallet_service import WalletService
         wallet = await Wallet.filter(user=current_user).first()
-        wallet_balance = float(wallet.balance) if wallet and wallet.balance else 0.0
+        wallet_balance = float(await WalletService.get_balance(wallet.id)) if wallet else 0.0
 
         return {
             "wallet_balance": wallet_balance
@@ -253,11 +254,13 @@ async def list_users(
         users = await query.offset(offset).limit(limit).order_by('-created_at')
         
         # Prepare response data with computed fields
+        from services.wallet_service import WalletService
         user_data = []
         for user in users:
-            # Get wallet balance
+            # Get wallet balance from the ledger (derived from wallet_transaction)
             wallet = await Wallet.filter(user=user).first()
-            wallet_balance = float(wallet.balance) if wallet and wallet.balance else 0.0
+            wallet_balance = float(await WalletService.get_balance(wallet.id)) if wallet else 0.0
+
             
             # Get transaction counts
             total_transactions = await Transaction.filter(user=user).count()
@@ -302,10 +305,11 @@ async def get_user(
     """Get detailed user information (admin only) - only USER role users"""
     try:
         user = await User.get(id=user_id, role=UserRoleEnum.USER)
-        
-        # Get wallet balance
+
+        # Get wallet balance from the ledger (derived from wallet_transaction)
+        from services.wallet_service import WalletService
         wallet = await Wallet.filter(user=user).first()
-        wallet_balance = float(wallet.balance) if wallet and wallet.balance else 0.0
+        wallet_balance = float(await WalletService.get_balance(wallet.id)) if wallet else 0.0
         
         # Get transaction counts
         total_transactions = await Transaction.filter(user=user).count()

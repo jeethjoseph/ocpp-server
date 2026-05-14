@@ -188,15 +188,19 @@ class User(Model):
         return self.full_name or self.email.split('@')[0]
 
 class Wallet(Model):
+    """User wallet. Balance is derived from `WalletTransaction` rows via
+    `WalletService.get_balance`; there is no stored balance column post
+    migration 33. The wallet row exists to anchor FKs and to be locked
+    via `SELECT FOR UPDATE` during billing/top-up flows.
+    """
     id = fields.IntField(pk=True)
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)
     user = fields.OneToOneField("models.User", related_name="wallet")
-    balance = fields.DecimalField(max_digits=10, decimal_places=2, null=True)
-    
+
     # Relationships
     transactions: fields.ReverseRelation["WalletTransaction"]
-    
+
     class Meta:
         table = "wallet"
 
@@ -210,6 +214,22 @@ class WalletTransaction(Model):
     payment_metadata = fields.JSONField(null=True)
     razorpay_order_id = fields.CharField(max_length=64, null=True, index=True)
     created_at = fields.DatetimeField(auto_now_add=True)
+
+    async def save(self, *args, **kwargs):
+        """Reject negative amounts.
+
+        NOTE: Tortoise's `bulk_create()` does not call `save()` per row,
+        so it bypasses this validator. The DB CHECK constraint
+        `wallet_transaction_amount_non_negative` (added by migration 32,
+        validated by migration 33) is the backstop for that path — a
+        negative `bulk_create` row will raise `IntegrityError` from
+        Postgres rather than `ValueError` from here.
+        """
+        if self.amount is not None and self.amount < 0:
+            raise ValueError(
+                f"wallet_transaction.amount must be >= 0, got {self.amount}"
+            )
+        await super().save(*args, **kwargs)
 
     class Meta:
         table = "wallet_transaction"

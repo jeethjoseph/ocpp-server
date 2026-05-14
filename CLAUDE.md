@@ -11,9 +11,23 @@
 
 ## Build verification (before declaring done)
 - **Frontend**: after any `frontend/` edit, run `cd frontend && npm run build` locally. `next lint` and `tsc --noEmit` are NOT sufficient — the production build enforces `@typescript-eslint/no-unused-vars`, `react/no-unescaped-entities`, and other rules the scoped lint misses.
-- **Backend**: run `docker exec ocpp-backend pytest` for the affected test files.
+- **Backend**: run `docker exec ocpp-backend pytest` for the affected test files. Known pre-existing flake: 6 tests in `tests/test_integration.py` + `tests/test_post_boot_state.py` ERROR with `column "gst_rate_percent" does not exist` — a sync TestClient × Tortoise cross-loop schema-generation issue, **not** a regression. Verifiable by `git stash` then re-running the same tests. Treat these as the baseline for the full-suite run.
 - **Docker build parity**: when changes touch the build (new imports, new deps, config), run `docker compose build frontend` / `docker compose build backend` locally to catch image-level failures before they hit staging.
 - Never declare a change "done" based only on `tsc` output or partial lint runs — staging/prod rebuilds enforce the full ruleset.
+
+## Wallet ledger pattern (CRITICAL — non-obvious from the code alone)
+
+The wallet is an **event-sourced ledger** post migrations 32 → 33 → 34. If you're touching `wallet_service.py`, `wallet_session_service.py`, `wallet_transaction`, or any code path that reads or writes a balance, read this:
+
+- **There is no stored `wallet.balance` column.** Balance is derived: `WalletService.get_balance(wallet_id)` runs a `SUM` over `wallet_transaction`. Do not add a stored balance back. Reads are cheap (~1 ms at N=5000) with the Redis cache (`wallet_balance:{wallet_id}`) in front and a plain index on `(wallet_id)`.
+- **`wallet_transaction.amount` is always non-negative.** Direction is in `type` (`TOP_UP` credits, `CHARGE_DEDUCT` debits). Enforced by `WalletTransaction.save()` validator + DB `CHECK (amount >= 0)`. Never write a negative amount. `bulk_create` bypasses the Python validator but the DB CHECK still catches it.
+- **Only `TOP_UP` rows with `payment_metadata.status = 'COMPLETED'` count toward balance.** PENDING rows exist during the Razorpay confirmation window — they must NOT credit. CHARGE_DEDUCT rows always count.
+- **Cache invalidation happens AFTER the outer transaction commits.** `process_transaction_billing` and `process_wallet_topup` are split into thin outer wrappers + `@atomic`-decorated `_do_*` inner functions; the wrapper invalidates the cache after the inner returns. Do not move invalidation back inside the `in_transaction()` block — concurrent readers would repopulate stale data.
+- **Wallet-session budget cap mirrors QR.** On StartTransaction, `WalletSessionService.cache_session_on_start` snapshots the balance into `wallet_session:{txn_id}`. On every MeterValues frame, `check_balance_and_auto_stop` schedules `RemoteStopTransaction` via `safe_create_task` when `cost ≥ budget`. **Flag-less, at-least-once dispatch** — energy is monotonic so a lost stop self-heals on the next tick. Do not add an idempotency flag; duplicate RemoteStops are idempotent at the charger.
+- **Negative derived balance is observable, not impossible.** If the budget cap fails to fire (charger offline, network blip), `get_balance` returns a negative number, logs a warning, and emits `Custom/Wallet/NegativeBalance`. Do not clamp at the source-of-truth layer. UI/API may clamp for display.
+- **Drift detection**: `backend/scripts/reconcile_wallet_balance.py` is the nightly cron. See the rollback runbook in the comprehensive architecture doc for the cron entry.
+
+If you find yourself reaching for `wallet.balance` or writing a negative `amount`, stop and re-read this section.
 
 ## Environments
 - **Production**: `app.voltlync.com` — branch `deploy`, `docker-compose.prod.yml` + `.env.prod`, `make prod-*` targets

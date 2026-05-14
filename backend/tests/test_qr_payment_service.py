@@ -18,6 +18,7 @@ from unittest.mock import patch, AsyncMock, MagicMock
 
 from services.qr_payment_service import QRPaymentService, find_or_create_user_from_payment, _resolve_platform_fee
 from services.razorpay_service import RazorpayAlreadyRefundedError, extract_fee_from_payment
+from services.wallet_service import WalletService
 from models import (
     User, Charger, ChargingStation, Connector, ChargerQRCode, QRPayment,
     QRPaymentStatusEnum, AuthProviderEnum, ChargerStatusEnum, Transaction,
@@ -165,7 +166,8 @@ async def test_upi_guest_user_creation_from_vpa(client):
 
     wallet = await Wallet.filter(user=user).first()
     assert wallet is not None
-    assert wallet.balance == Decimal("0.00")
+    # Module C: derived balance, defaults to 0 with no transactions.
+    assert await WalletService.get_balance(wallet.id) == Decimal("0.00")
 
 
 @pytest.mark.asyncio

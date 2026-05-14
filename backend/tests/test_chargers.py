@@ -6,8 +6,10 @@ from unittest.mock import patch, MagicMock
 import uuid
 import random
 
+from decimal import Decimal
+
 from main import connected_charge_points
-from models import Charger, Connector, Transaction, OCPPLog, User, VehicleProfile, ChargerStatusEnum
+from models import Charger, Connector, Transaction, OCPPLog, Tariff, User, VehicleProfile, ChargerStatusEnum
 
 @pytest.mark.unit
 class TestChargerEndpoints:
@@ -289,5 +291,67 @@ class TestChargerEndpoints:
         data = response.json()
         assert len(data["data"]) == 2
         assert data["page"] == 1
+
+    @pytest.mark.asyncio
+    async def test_list_chargers_includes_tariff(
+        self, client_admin: AsyncClient, test_charger, test_tariff
+    ):
+        """List endpoint should populate tariff_per_kwh, tariff_gst_percent, and the derived incl-tax rate."""
+        response = await client_admin.get("/api/admin/chargers")
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        row = next(c for c in data["data"] if c["id"] == test_charger.id)
+        assert row["tariff_per_kwh"] == pytest.approx(15.0, rel=1e-6)
+        assert row["tariff_gst_percent"] == pytest.approx(18.0, rel=1e-6)
+        # 15.00 * 1.18 = 17.70
+        assert row["tariff_per_kwh_incl_tax"] == pytest.approx(17.70, rel=1e-6)
+
+    @pytest.mark.asyncio
+    async def test_update_charger_with_incl_tax_tariff(
+        self, client_admin: AsyncClient, test_charger, test_tariff
+    ):
+        """Updating with tariff_per_kwh_incl_tax should compute and store excl-tax rate using current GST %."""
+        response = await client_admin.put(
+            f"/api/admin/chargers/{test_charger.id}",
+            json={"tariff_per_kwh_incl_tax": 11.80},
+        )
+        assert response.status_code == status.HTTP_200_OK
+        # 11.80 / 1.18 = 10.0000 (4dp)
+        tariff = await Tariff.filter(charger_id=test_charger.id).first()
+        assert tariff is not None
+        assert tariff.rate_per_kwh == Decimal("10.0000")
+        assert tariff.gst_percent == Decimal("18.00")
+        assert response.json()["charger"]["tariff_per_kwh_incl_tax"] == pytest.approx(11.80, rel=1e-6)
+
+    @pytest.mark.asyncio
+    async def test_update_charger_rejects_both_tariff_forms(
+        self, client_admin: AsyncClient, test_charger
+    ):
+        """Sending both excl- and incl-tax tariff in one update should 400."""
+        response = await client_admin.put(
+            f"/api/admin/chargers/{test_charger.id}",
+            json={"tariff_per_kwh": 8.5, "tariff_per_kwh_incl_tax": 10.0},
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    @pytest.mark.asyncio
+    async def test_create_charger_with_incl_tax_tariff(
+        self, client_admin: AsyncClient, test_station
+    ):
+        """Creating a charger with tariff_per_kwh_incl_tax should store the computed excl-tax rate."""
+        payload = {
+            "station_id": test_station.id,
+            "name": "Incl-tax Charger",
+            "connectors": [{"connector_id": 1, "connector_type": "Type2", "max_power_kw": 22.0}],
+            "tariff_per_kwh_incl_tax": 23.60,
+        }
+        response = await client_admin.post("/api/admin/chargers", json=payload)
+        assert response.status_code == status.HTTP_201_CREATED
+        charger_id = response.json()["charger"]["id"]
+        tariff = await Tariff.filter(charger_id=charger_id).first()
+        assert tariff is not None
+        # 23.60 / 1.18 = 20.0000
+        assert tariff.rate_per_kwh == Decimal("20.0000")
+        assert tariff.gst_percent == Decimal("18.00")
 
 # Run with: pytest tests/test_chargers.py -v

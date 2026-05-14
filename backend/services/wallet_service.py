@@ -13,12 +13,99 @@ from models import (
     TransactionTypeEnum, TransactionStatusEnum, PaymentStatusEnum
 )
 from services.monitoring_service import trace_function, MetricsCollector, SentryHelper, OCPPMetrics
+from redis_manager import redis_manager
+from tortoise import Tortoise
 
 logger = logging.getLogger(__name__)
 
+# Canonical SQL for deriving a wallet balance from the wallet_transaction
+# log. Only TOP_UP rows whose payment_metadata.status is COMPLETED
+# contribute — PENDING and FAILED Razorpay orders must not be credited
+# until the webhook flips them to COMPLETED. CHARGE_DEDUCT rows have no
+# status field and are always final at write time, so they contribute
+# unconditionally. Tortoise 0.25 doesn't expose JSONField `->>` traversal
+# as a filter lookup, so this stays as raw SQL.
+#
+# Two other sites must stay aligned with this formula:
+#   - `scripts/reconcile_wallet_balance.py:_DERIVATION_SQL` — read-only
+#     diagnostic that compares legacy stored balance against this derivation.
+#   - `migrations/models/33_*_wallet_ledger_migration.py` — the SUM inside
+#     step 2 (drift-correction adjustment row inserts).
+# If you change the COMPLETED-TOP_UP filter or the sign convention, update
+# all three. (Migration text is frozen once shipped; only future
+# migrations would need to mirror an evolved formula.)
+_BALANCE_SQL = """
+    SELECT COALESCE(
+        SUM(
+            CASE
+                WHEN type = 'TOP_UP' AND payment_metadata->>'status' = 'COMPLETED'
+                    THEN amount
+                WHEN type = 'CHARGE_DEDUCT'
+                    THEN -amount
+                ELSE 0
+            END
+        ),
+        0
+    )::numeric AS balance
+    FROM wallet_transaction
+    WHERE wallet_id = $1
+"""
+
+
 class WalletService:
     """Service for handling wallet operations with proper locking and transactions"""
-    
+
+    @staticmethod
+    async def get_balance(wallet_id: int) -> Decimal:
+        """Return a wallet's current balance derived from the wallet_transaction log.
+
+        Balance is `SUM(amount)` over COMPLETED TOP_UP rows minus
+        `SUM(amount)` over CHARGE_DEDUCT rows. PENDING / FAILED TOP_UPs
+        (Razorpay orders that haven't been confirmed by webhook) are
+        excluded so unpaid recharges never credit the wallet.
+
+        `Tortoise.get_connection("default")` resolves through a ContextVar
+        bound to the current asyncio task, so a query issued from inside
+        an `@atomic()` block or an `async with in_transaction()` body runs
+        on the transaction's connection and sees that block's uncommitted
+        writes. Verified by `test_get_balance_sees_uncommitted_writes`.
+
+        A Redis cache shields the hot read path (/users/me); invalidated
+        post-commit by every WalletTransaction write via the outer
+        process_* wrappers.
+
+        If `balance < 0`, log a warning and emit a metric. Engineering
+        needs to see this because it means either the in-session budget
+        cap failed to fire (WalletSessionService) or this is a historical
+        session from before the cap was deployed. Display layers may
+        clamp at zero; the source-of-truth read is exact.
+        """
+        cached = await redis_manager.get_wallet_balance(wallet_id)
+        if cached is not None:
+            MetricsCollector.increment_counter("Custom/Wallet/BalanceCacheHit")
+            return Decimal(cached) / Decimal("100")
+
+        MetricsCollector.increment_counter("Custom/Wallet/BalanceCacheMiss")
+        conn = Tortoise.get_connection("default")
+        _, rows = await conn.execute_query(_BALANCE_SQL, [wallet_id])
+        balance = Decimal(rows[0]["balance"]).quantize(Decimal("0.01"))
+
+        if balance < 0:
+            logger.warning(
+                f"Negative derived balance for wallet {wallet_id}: ₹{balance}. "
+                "Indicates an unenforced budget cap or a pre-budget-cap historical session."
+            )
+            MetricsCollector.increment_counter("Custom/Wallet/NegativeBalance")
+
+        await redis_manager.set_wallet_balance(wallet_id, int(balance * 100))
+        return balance
+
+    @staticmethod
+    async def _invalidate_balance_cache(wallet_id: int) -> None:
+        """Invalidate Redis after any wallet_transaction write."""
+        await redis_manager.invalidate_wallet_balance(wallet_id)
+        MetricsCollector.increment_counter("Custom/Wallet/BalanceCacheInvalidated")
+
     @staticmethod
     async def get_applicable_tariff(charger_id: int) -> Optional[Tariff]:
         """
@@ -67,19 +154,33 @@ class WalletService:
         return energy_charge, gst_amount, total_billed
     
     @staticmethod
-    @atomic()
-    @trace_function(name="WalletService.process_transaction_billing")
     async def process_transaction_billing(transaction_id: int) -> Tuple[bool, str, Optional[Decimal]]:
-        """
-        Process billing for a completed charging transaction.
+        """Bill a completed charging transaction.
 
-        Double-billing safety: @atomic() + select_for_update() serialise concurrent
-        callers at the DB level; the idempotency check (existing CHARGE_DEDUCT lookup)
-        then catches any duplicate that slips through.
+        Thin wrapper around `_do_transaction_billing` that invalidates the
+        balance cache *after* the outer transaction commits. Doing the
+        invalidation inside the transaction races with concurrent readers:
+        a reader that arrives between the invalidation and the commit
+        repopulates the cache with stale pre-commit data, which then sticks
+        until the TTL elapses.
 
-        Returns:
-            (success: bool, message: str, amount: Optional[Decimal])
+        Returns: (success: bool, message: str, amount: Optional[Decimal])
         """
+        success, msg, amount, wallet_id = await WalletService._do_transaction_billing(
+            transaction_id
+        )
+        if success and wallet_id is not None:
+            await WalletService._invalidate_balance_cache(wallet_id)
+        return success, msg, amount
+
+    @staticmethod
+    @atomic()
+    @trace_function(name="WalletService._do_transaction_billing")
+    async def _do_transaction_billing(transaction_id: int) -> Tuple[bool, str, Optional[Decimal], Optional[int]]:
+        """Inner — does all the DB work in one transaction. Returns a 4-tuple
+        whose last element is the wallet_id when a new CHARGE_DEDUCT row was
+        written (signal for the wrapper to invalidate the cache), or None
+        for every no-op / error path."""
         try:
             # Set Sentry context
             SentryHelper.set_context("billing", {"transaction_id": transaction_id})
@@ -87,14 +188,14 @@ class WalletService:
             # Get transaction with lock
             transaction = await Transaction.filter(id=transaction_id).select_for_update().first()
             if not transaction:
-                return False, f"Transaction {transaction_id} not found", None
+                return False, f"Transaction {transaction_id} not found", None, None
 
             # Skip wallet billing for QR payment sessions
             from models import QRPayment
             qr_payment = await QRPayment.filter(transaction_id=transaction_id).first()
             if qr_payment:
                 logger.info(f"Transaction {transaction_id} is a QR payment session, skipping wallet billing")
-                return True, "QR payment session - billed via QR payment flow", Decimal('0.00')
+                return True, "QR payment session - billed via QR payment flow", Decimal('0.00'), None
 
             # Idempotency guard: skip if already billed (prevents double billing
             # when BootNotification and StopTransaction both trigger billing)
@@ -104,12 +205,12 @@ class WalletService:
             ).first()
             if existing_charge:
                 logger.info(f"Transaction {transaction_id} already billed (wallet_txn={existing_charge.id}), skipping")
-                return True, f"Already billed ₹{abs(existing_charge.amount)}", abs(existing_charge.amount)
+                return True, f"Already billed ₹{abs(existing_charge.amount)}", abs(existing_charge.amount), None
 
             # Validate transaction state
             if not transaction.energy_consumed_kwh or transaction.energy_consumed_kwh <= 0:
                 logger.info(f"Transaction {transaction_id} has no energy consumption, skipping billing")
-                return True, "No energy consumed - no billing required", Decimal('0.00')
+                return True, "No energy consumed - no billing required", Decimal('0.00'), None
             
             # Get applicable tariff
             tariff = await WalletService.get_applicable_tariff(transaction.charger_id)
@@ -125,7 +226,7 @@ class WalletService:
                     changes={"new_status": "BILLING_FAILED", "trigger": "BillingFailed", "reason": "No tariff configuration found"},
                 ))
                 safe_create_task(OCPPMetrics.record_billing_failed(transaction_id, "no_tariff"))
-                return False, "No tariff configuration found", None
+                return False, "No tariff configuration found", None, None
 
             tariff_rate = tariff.rate_per_kwh
             gst_percent = tariff.gst_percent
@@ -139,9 +240,11 @@ class WalletService:
 
             if billing_amount <= 0:
                 logger.info(f"Transaction {transaction_id} calculated amount is ₹0, skipping wallet deduction")
-                return True, "Zero amount - no billing required", Decimal('0.00')
+                return True, "Zero amount - no billing required", Decimal('0.00'), None
 
-            # Get user's wallet with lock
+            # Get user's wallet with lock — locking the wallet row still
+            # serialises concurrent billings for this user even though
+            # `balance` is no longer stored on it.
             wallet = await Wallet.filter(user_id=transaction.user_id).select_for_update().first()
             if not wallet:
                 await Transaction.filter(id=transaction_id).update(
@@ -155,29 +258,26 @@ class WalletService:
                     changes={"new_status": "BILLING_FAILED", "trigger": "BillingFailed", "reason": f"Wallet not found for user {transaction.user_id}"},
                 ))
                 safe_create_task(OCPPMetrics.record_billing_failed(transaction_id, "no_wallet"))
-                return False, f"Wallet not found for user {transaction.user_id}", None
-            
-            # Get current balance (allowing None)
-            current_balance = wallet.balance or Decimal('0.00')
+                return False, f"Wallet not found for user {transaction.user_id}", None, None
+
+            # Balance is derived from the wallet_transaction log; no stored
+            # column. The CHARGE_DEDUCT insert IS the deduction. Read the
+            # pre-balance for the metadata snapshot via the ledger helper.
+            current_balance = await WalletService.get_balance(wallet.id)
             new_balance = current_balance - billing_amount
 
             logger.info(f"Wallet billing: ₹{current_balance} - ₹{billing_amount} = ₹{new_balance}")
 
-            # TECHNICAL DEBT: This in_transaction() savepoint looks redundant with the
-            # outer @atomic(), but it's necessary. The try/except on line ~143 catches all
-            # exceptions and returns a (False, msg, None) tuple instead of re-raising.
-            # This means @atomic() always sees a normal return and always commits.
-            # Without this savepoint, if WalletTransaction.create fails but Wallet.update
-            # succeeds, the balance is deducted with no record — money vanishes.
-            # The proper fix: remove the try/except, let exceptions propagate so @atomic()
-            # can roll back naturally, and move error handling to callers. This requires
-            # updating every call site (BootNotification, StopTransaction, admin endpoints).
+            # The in_transaction() savepoint still bundles the deduction
+            # insert with the Transaction billing-breakdown update below,
+            # so a failure on the breakdown rolls back the deduction too.
+            # Cache invalidation lives in the outer wrapper so it runs
+            # AFTER commit and a concurrent reader can't repopulate stale
+            # data between the invalidation and the commit point.
             async with in_transaction():
-                await Wallet.filter(id=wallet.id).update(balance=new_balance)
-
                 await WalletTransaction.create(
                     wallet=wallet,
-                    amount=-billing_amount,  # Negative for deduction
+                    amount=billing_amount,  # Positive; direction carried by type=CHARGE_DEDUCT
                     type=TransactionTypeEnum.CHARGE_DEDUCT,
                     description=f"Charging session - {transaction.energy_consumed_kwh:.2f} kWh @ ₹{tariff_rate}/kWh + GST {gst_percent}%",
                     charging_transaction=transaction,
@@ -207,7 +307,7 @@ class WalletService:
             MetricsCollector.increment_counter("Custom/Billing/Success")
 
             logger.info(f"✅ Successfully billed transaction {transaction_id}: ₹{billing_amount}")
-            return True, f"Successfully billed ₹{billing_amount}", billing_amount
+            return True, f"Successfully billed ₹{billing_amount}", billing_amount, wallet.id
 
         except Exception as e:
             logger.error(f"❌ Error processing billing for transaction {transaction_id}: {e}", exc_info=True)
@@ -232,8 +332,8 @@ class WalletService:
             except Exception as update_error:
                 logger.error(f"Failed to update transaction status: {update_error}")
 
-            return False, f"Billing failed: {str(e)}", None
-    
+            return False, f"Billing failed: {str(e)}", None, None
+
     @staticmethod
     async def retry_failed_billing(transaction_id: int) -> Tuple[bool, str, Optional[Decimal]]:
         """
@@ -283,25 +383,39 @@ class WalletService:
         return [{"id": t.id, "user_id": t.user_id, "energy_kwh": t.energy_consumed_kwh} for t in failed_transactions]
 
     @staticmethod
-    @atomic()
-    @trace_function(name="WalletService.process_wallet_topup")
     async def process_wallet_topup(
         wallet_transaction_id: int,
         razorpay_payment_id: str,
         razorpay_signature: Optional[str] = None,
     ) -> Tuple[bool, str, Optional[Decimal]]:
-        """
-        Process wallet top-up after payment verification
+        """Process wallet top-up after payment verification.
 
-        Args:
-            wallet_transaction_id: ID of the pending wallet transaction
-            razorpay_payment_id: Payment ID from Razorpay
-            razorpay_signature: Signature from client callback;
-                None when called from webhook (webhook signature is verified upstream)
+        Thin wrapper around `_do_wallet_topup` that invalidates the balance
+        cache *after* the outer transaction commits — see the matching note
+        on `process_transaction_billing` for why the post-commit ordering
+        matters.
 
-        Returns:
-            (success: bool, message: str, new_balance: Optional[Decimal])
+        Returns: (success: bool, message: str, new_balance: Optional[Decimal])
         """
+        success, msg, new_balance, wallet_id = await WalletService._do_wallet_topup(
+            wallet_transaction_id, razorpay_payment_id, razorpay_signature
+        )
+        if success and wallet_id is not None:
+            await WalletService._invalidate_balance_cache(wallet_id)
+        return success, msg, new_balance
+
+    @staticmethod
+    @atomic()
+    @trace_function(name="WalletService._do_wallet_topup")
+    async def _do_wallet_topup(
+        wallet_transaction_id: int,
+        razorpay_payment_id: str,
+        razorpay_signature: Optional[str] = None,
+    ) -> Tuple[bool, str, Optional[Decimal], Optional[int]]:
+        """Inner — flips a PENDING WalletTransaction to COMPLETED inside one
+        transaction. Returns a 4-tuple whose last element is wallet_id when
+        a row was actually flipped (cache invalidation needed), or None on
+        idempotent / error paths."""
         try:
             # Set Sentry context
             SentryHelper.set_context("wallet_topup", {
@@ -314,22 +428,26 @@ class WalletService:
             ).select_for_update().first()
 
             if not wallet_txn:
-                return False, f"Wallet transaction {wallet_transaction_id} not found", None
+                return False, f"Wallet transaction {wallet_transaction_id} not found", None, None
 
             # Check if already completed (idempotency)
             current_status = wallet_txn.payment_metadata.get("status")
             if current_status == PaymentStatusEnum.COMPLETED.value:
                 wallet = await wallet_txn.wallet
                 logger.info(f"Wallet transaction {wallet_transaction_id} already completed, returning current balance")
-                return True, "Payment already processed", wallet.balance
+                # No state change → no cache invalidation needed.
+                return True, "Payment already processed", await WalletService.get_balance(wallet.id), None
 
-            # Get wallet with lock
+            # Get wallet with lock — balance is derived; the lock still
+            # serialises concurrent top-ups on the same wallet.
             wallet = await Wallet.filter(id=wallet_txn.wallet_id).select_for_update().first()
             if not wallet:
-                return False, "Wallet not found", None
+                return False, "Wallet not found", None, None
 
-            # Get current balance (allowing None)
-            current_balance = wallet.balance or Decimal('0.00')
+            # The PENDING wallet_transaction row created at recharge-init
+            # time becomes COMPLETED here and then contributes its amount
+            # to the derived balance.
+            current_balance = await WalletService.get_balance(wallet.id)
             top_up_amount = wallet_txn.amount
             new_balance = current_balance + top_up_amount
 
@@ -339,12 +457,10 @@ class WalletService:
                 f"₹{current_balance} + ₹{top_up_amount} = ₹{new_balance}"
             )
 
-            # Savepoint: if either update fails, both roll back together.
-            # Without this, a failure in the metadata update would leave
-            # the balance credited with no matching transaction record.
+            # Savepoint bundles the metadata update so a failure rolls back
+            # the status flip and keeps the row PENDING for retry. Cache
+            # invalidation runs in the outer wrapper after commit.
             async with in_transaction():
-                await Wallet.filter(id=wallet.id).update(balance=new_balance)
-
                 updated_metadata = wallet_txn.payment_metadata or {}
                 updated_metadata.update({
                     "status": PaymentStatusEnum.COMPLETED.value,
@@ -371,7 +487,7 @@ class WalletService:
                 f"New balance ₹{new_balance}"
             )
 
-            return True, f"Successfully added ₹{top_up_amount} to wallet", new_balance
+            return True, f"Successfully added ₹{top_up_amount} to wallet", new_balance, wallet.id
 
         except Exception as e:
             logger.error(
@@ -396,4 +512,4 @@ class WalletService:
             except Exception as update_error:
                 logger.error(f"Failed to update transaction status: {update_error}")
 
-            return False, f"Top-up failed: {str(e)}", None
+            return False, f"Top-up failed: {str(e)}", None, None

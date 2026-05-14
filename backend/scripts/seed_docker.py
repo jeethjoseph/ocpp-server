@@ -32,12 +32,15 @@ from models import (
     ChargerStatusEnum,
     ChargingStation,
     Connector,
+    PaymentStatusEnum,
     Tariff,
     Transaction,
     TransactionStatusEnum,
+    TransactionTypeEnum,
     User,
     UserRoleEnum,
     Wallet,
+    WalletTransaction,
 )
 from scripts._db import build_tortoise_config, utc_now
 
@@ -138,14 +141,25 @@ class DockerSeeder:
             self.users.append(user)
 
     async def create_wallets(self):
+        # Balance is derived from the wallet_transaction log.
+        # Seed each new wallet with one COMPLETED TOP_UP row so the
+        # derived balance matches the original seed amount.
         print("💰 Creating wallets...")
+        from services.wallet_service import WalletService
         for user in self.users:
-            balance = Decimal("1000.00") if user.role == UserRoleEnum.ADMIN else Decimal("500.00")
-            wallet, created = await Wallet.get_or_create(
-                user=user, defaults={"balance": balance}
-            )
+            seed_balance = Decimal("1000.00") if user.role == UserRoleEnum.ADMIN else Decimal("500.00")
+            wallet, created = await Wallet.get_or_create(user=user)
+            if created:
+                await WalletTransaction.create(
+                    wallet=wallet,
+                    amount=seed_balance,
+                    type=TransactionTypeEnum.TOP_UP,
+                    description="Seed top-up (dev fixture)",
+                    payment_metadata={"status": PaymentStatusEnum.COMPLETED.value},
+                )
+            balance = await WalletService.get_balance(wallet.id)
             marker = "✅ Created" if created else "⏭️  Exists"
-            print(f"  {marker} wallet for {user.full_name}: ₹{wallet.balance:.2f}")
+            print(f"  {marker} wallet for {user.full_name}: ₹{balance:.2f}")
 
     async def create_stations_and_chargers(self):
         print("🔌 Creating charging stations and chargers...")

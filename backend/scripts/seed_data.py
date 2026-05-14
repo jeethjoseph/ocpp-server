@@ -156,14 +156,22 @@ class DatabaseSeeder:
                 # Admins start with a higher balance for testing
                 initial_balance = Decimal(random.uniform(1000, 2000)).quantize(Decimal('0.01'))
                 
-            wallet, created = await Wallet.get_or_create(
-                user=user,
-                defaults={"balance": initial_balance}
-            )
+            wallet, created = await Wallet.get_or_create(user=user)
             if not created:
                 print(f"  ⏭️  Wallet already exists for {user.email}")
-            
-            # Create some top-up transactions (only for regular users to keep it simple)
+                continue
+
+            # Seed the initial balance as a COMPLETED TOP_UP row. Only
+            # COMPLETED top-ups count toward derived balance.
+            await WalletTransaction.create(
+                wallet=wallet,
+                amount=initial_balance,
+                type=TransactionTypeEnum.TOP_UP,
+                description="Seed top-up (dev fixture)",
+                payment_metadata={"status": "COMPLETED"},
+            )
+
+            # Create some additional top-up transactions (only for regular users)
             if user.role == UserRoleEnum.USER:
                 top_up_count = random.randint(2, 5)
                 for i in range(top_up_count):
@@ -174,14 +182,18 @@ class DatabaseSeeder:
                         type=TransactionTypeEnum.TOP_UP,
                         description=f"Top-up via payment gateway #{i+1}",
                         payment_metadata={
+                            "status": "COMPLETED",
                             "gateway": "stripe",
                             "payment_method": random.choice(["card", "bank_transfer"]),
                             "transaction_id": f"txn_{random.randint(100000, 999999)}"
                         },
                         created_at=datetime.now() - timedelta(days=random.randint(1, 60))
                     )
-            
-            print(f"  ✅ Created wallet for {user.email} with balance ₹{initial_balance}")
+
+            # Show derived balance (proves the ledger writes worked).
+            from services.wallet_service import WalletService
+            derived = await WalletService.get_balance(wallet.id)
+            print(f"  ✅ Created wallet for {user.email}: derived balance ₹{derived}")
 
     async def create_payment_gateways(self):
         """Create payment gateway configurations"""
@@ -451,16 +463,14 @@ class DatabaseSeeder:
                 
                 await WalletTransaction.create(
                     wallet=wallet,
-                    amount=-cost,  # Negative for deduction
+                    amount=cost,  # Positive; direction carried by type=CHARGE_DEDUCT
                     type=TransactionTypeEnum.CHARGE_DEDUCT,
                     description=f"Charging at {charger.charge_point_string_id}",
                     charging_transaction=transaction,
                     created_at=end_time
                 )
-                
-                # Update wallet balance
-                wallet.balance -= cost
-                await wallet.save()
+                # No stored wallet.balance — the CHARGE_DEDUCT row above
+                # is the deduction; balance is derived from the log.
             
         print(f"  ✅ Created {transaction_count} charging transactions")
 

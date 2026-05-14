@@ -29,6 +29,7 @@ from models import (
     GSTInvoiceCounter,
     QRPayment,
     User,
+    UserRoleEnum,
 )
 from services.wallet_service import WalletService
 from services.monitoring_service import MetricsCollector
@@ -45,6 +46,12 @@ VOLTLYNC_GSTIN = os.getenv("VOLTLYNC_GSTIN", "")
 VOLTLYNC_ADDRESS = os.getenv("VOLTLYNC_ADDRESS", "")
 VOLTLYNC_STATE = os.getenv("VOLTLYNC_STATE", "Kerala")
 VOLTLYNC_STATE_CODE = os.getenv("VOLTLYNC_STATE_CODE", "32")
+
+# Roles whose charging sessions are internal/operational (admin test-charges,
+# franchisee remote-starts on their own stations) and not customer sales —
+# generate_invoice skips these so they don't pollute the GST liability or
+# the per-franchisee invoice sequence.
+INTERNAL_ROLES = {UserRoleEnum.ADMIN, UserRoleEnum.FRANCHISEE}
 
 
 def _get_financial_year(dt: datetime) -> str:
@@ -192,6 +199,20 @@ class InvoiceService:
         if energy <= 0:
             return None
 
+        # Skip invoicing for internal-role sessions (admin test-charges or
+        # franchisee remote-starts on their own stations). These deduct from
+        # the initiator's wallet but are operational, not customer sales —
+        # issuing a customer-facing GST invoice would inflate liability and
+        # consume an invoice number for an internal event.
+        user = await User.filter(id=txn.user_id).first()
+        if user and user.role in INTERNAL_ROLES:
+            logger.info(
+                "GST invoice skipped for txn %s: %s-initiated session",
+                transaction_id, user.role.value,
+            )
+            MetricsCollector.increment_counter("Custom/Invoice/InternalRoleSkipped")
+            return None
+
         # Resolve charger -> station -> franchisee
         charger = await Charger.filter(id=txn.charger_id).first()
         if not charger:
@@ -236,8 +257,7 @@ class InvoiceService:
             MetricsCollector.increment_counter("Custom/Invoice/GstinMissing")
             return None
 
-        # Customer details
-        user = await User.filter(id=txn.user_id).first()
+        # Customer details (user already fetched above for the role-skip guard)
         qr_payment = await QRPayment.filter(
             transaction_id=transaction_id
         ).first()

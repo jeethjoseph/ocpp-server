@@ -108,6 +108,7 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
   - Wallet top-up processing with idempotency (`process_wallet_topup()`)
   - Atomic transaction processing with SELECT FOR UPDATE
   - Tariff-based billing calculation with GST: `energy_charge = energy_kwh * rate_per_kwh`, `gst = energy_charge * gst_percent / 100`, `total = energy_charge + gst` (default 18% GST, configurable per tariff via `gst_percent` field)
+  - **Admin tariff edits accept GST-inclusive input.** `POST/PUT /api/admin/chargers` accept either `tariff_per_kwh` (excl-GST, legacy) **or** `tariff_per_kwh_incl_tax` (incl-GST, new). When the incl-tax form is supplied the router computes `rate_per_kwh = incl / (1 + gst_percent/100)` quantized to 4dp and persists that as the excl-GST value, leaving billing math unchanged. Sending both forms together returns 400. `GET /api/admin/chargers` and `GET /api/admin/chargers/{id}` echo back the derived `tariff_per_kwh_incl_tax` alongside the excl-GST rate and `tariff_gst_percent`, so the admin list/edit UI can render the tax-inclusive figure without re-doing math client-side.
 - **`charger_type_service.py`** - **NEW**: Socket charger detection helpers
   - `is_socket_charger()` - DB lookup for socket connector type
   - `is_socket_charger_cached()` - In-memory cache with DB fallback
@@ -555,8 +556,9 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
 ```sql
 -- User Management (Clerk Integration + UPI_GUEST)
 user (id, clerk_user_id, phone_number, full_name, role, upi_vpa, auth_provider) -- USER/ADMIN roles, EMAIL/GOOGLE/CLERK/UPI_GUEST auth
-wallet (id, user_id, balance, currency)
-wallet_transaction (id, wallet_id, amount, type)
+wallet (id, user_id, currency) -- NO stored `balance` column post migration 33. Use `WalletService.get_balance(wallet_id)` — derives via SUM over the log, Redis-cached, invalidated on every WalletTransaction write.
+-- Wallet sessions enforce an in-session balance cap mirroring QR's pattern. On StartTransaction the wallet's available balance is snapshotted into Redis (`wallet_session:{txn_id}`, paise-int). On every MeterValues frame `WalletSessionService.check_balance_and_auto_stop` recomputes accumulated cost; when cost ≥ snapshot it schedules `RemoteStopTransaction` via `safe_create_task` (never awaits — would deadlock the OCPP CALLRESULT). Idempotency flag in the payload prevents duplicate stops. DB-fallback rebuild reads balance via `WalletService.get_balance` so server restarts mid-session still honour the cap. Key deleted on StopTransaction.
+wallet_transaction (id, wallet_id, amount, type, payment_metadata) -- `amount` is always >= 0; direction carried by `type` (TOP_UP credits, CHARGE_DEDUCT debits). Enforced by `WalletTransaction.save()` validator + DB CHECK `wallet_transaction_amount_non_negative` (migration 32 NOT VALID, redeemed to VALID by migration 33). Only TOP_UP rows with `payment_metadata->>status = 'COMPLETED'` contribute to derived balance; PENDING/FAILED rows are filtered out. Migration 33 inserted "BALANCE_ADJUSTMENT" rows (description-tagged) to absorb any pre-existing stored-vs-derived drift.
 
 -- Charging Infrastructure
 charging_station (id, name, latitude, longitude, address)
@@ -598,6 +600,7 @@ gst_invoice (id, invoice_number, series, financial_year, transaction_id, franchi
 -- `energy_consumed_kwh` on the invoice is the BILLABLE kWh after the QR cap fix — not the raw meter reading on transaction.energy_consumed_kwh.
 -- `pdf_url` holds an S3 object key, populated lazily on first download (presigned URL served at /api/.../pdf endpoints).
 -- Invoice generation is blocked at the service layer when VOLTLYNC_GSTIN env var is empty (CGST Rule 46).
+-- Invoice generation is also skipped when `Transaction.user.role` is ADMIN or FRANCHISEE — those sessions are operational (test/courtesy/own-station remote-starts) and do not produce customer-facing sales. Skip increments `Custom/Invoice/InternalRoleSkipped`; no invoice number is consumed.
 -- Cancellation infrastructure was removed: invoices are immutable once issued.
 -- Credit notes are not modelled today; revisit if/when B2B (ITC-claiming customers) is introduced.
 

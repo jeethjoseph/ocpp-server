@@ -191,8 +191,8 @@ async def handle_user_created(data: dict):
             rfid_card_id=rfid_card_id
         )
         
-        # Create wallet for user
-        await Wallet.create(user=user, balance=0.00)
+        # Create wallet for user (balance is derived from the log; default 0)
+        await Wallet.create(user=user)
         
         logger.info(f"Created new user {primary_email} from Clerk webhook")
 

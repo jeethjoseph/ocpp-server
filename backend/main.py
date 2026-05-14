@@ -20,6 +20,7 @@ from crud import (
 )
 from models import OCPPLog, Transaction, TransactionStatusEnum, MeterValue
 from services.wallet_service import WalletService
+from services.wallet_session_service import WalletSessionService
 from redis_manager import redis_manager
 from core.connection_manager import connection_manager
 from utils import safe_create_task, mask_id_tag, mask_email
@@ -804,6 +805,23 @@ class ChargePoint(OcppChargePoint):
             except Exception as qr_err:
                 logger.warning(f"QR payment link check failed (non-fatal): {qr_err}")
 
+            # Wallet session budget cap — mirror of QR's check_budget_and_auto_stop.
+            # Skipped if a QR payment was linked above (QR enforces its own cap).
+            # Cache failure is non-fatal; only the in-session balance cap is forfeited.
+            try:
+                from models import QRPayment, Wallet
+                qr = await QRPayment.filter(transaction_id=transaction.id).first()
+                if not qr:
+                    wallet = await Wallet.filter(user_id=user.id).first()
+                    if wallet:
+                        tariff = await WalletService.get_applicable_tariff(charger.id)
+                        await WalletSessionService.cache_session_on_start(
+                            transaction.id, wallet, tariff,
+                            float(transaction.start_meter_kwh or 0), charger.id,
+                        )
+            except Exception as ws_err:
+                logger.warning(f"Wallet session cache failed (non-fatal): {ws_err}")
+
             # Record transaction started event
             await OCPPMetrics.record_transaction_started(self.id, user.id)
             SentryHelper.set_transaction_context(transaction.id, self.id, user.id)
@@ -829,7 +847,6 @@ class ChargePoint(OcppChargePoint):
         logger.info(f"🛑 StopTransaction from {self.id}: transaction_id={transaction_id}, meter_stop={meter_stop}")
         
         from models import Transaction, TransactionStatusEnum
-        from services.wallet_service import WalletService
         import datetime
         
         try:
@@ -871,6 +888,12 @@ class ChargePoint(OcppChargePoint):
                 await clear_zero_energy_tracking(transaction_id)
             except Exception as e:
                 logger.debug(f"Zero-energy cleanup error (non-fatal): {e}")
+
+            # Clean up wallet session budget cache (no-op if QR session)
+            try:
+                await redis_manager.delete_wallet_session(transaction_id)
+            except Exception as e:
+                logger.debug(f"Wallet session cleanup error (non-fatal): {e}")
 
             safe_create_task(log_audit_event(
                 action="transaction.status_changed",
@@ -1108,6 +1131,16 @@ class ChargePoint(OcppChargePoint):
                     await QRPaymentService.check_budget_and_auto_stop(transaction_id, meter_data['reading_kwh'])
                 except Exception as qr_err:
                     logger.warning(f"QR budget check failed (non-fatal): {qr_err}")
+
+                # Wallet-paid session budget cap — mirror of QR's check above.
+                # check_balance_and_auto_stop short-circuits if this isn't a
+                # wallet session (the Redis key won't exist for QR sessions).
+                try:
+                    await WalletSessionService.check_balance_and_auto_stop(
+                        transaction_id, meter_data['reading_kwh']
+                    )
+                except Exception as ws_err:
+                    logger.warning(f"Wallet budget check failed (non-fatal): {ws_err}")
 
             # Check zero-energy watchdog (stalled charging detection)
             if meter_records_created > 0 and meter_data.get('reading_kwh') is not None:

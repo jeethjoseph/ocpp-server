@@ -814,14 +814,14 @@ export default function ChargerDetailPage() {
                     </div>
                     <div className="text-right ml-4">
                       <p className={`text-lg font-bold ${
-                        walletTx.amount < 0 
-                          ? 'text-red-600' 
+                        walletTx.type === 'CHARGE_DEDUCT'
+                          ? 'text-red-600'
                           : 'text-green-600'
                       }`}>
-                        {walletTx.amount < 0 ? '-' : '+'}₹{Math.abs(walletTx.amount).toFixed(2)}
+                        {walletTx.type === 'CHARGE_DEDUCT' ? '-' : '+'}₹{Math.abs(walletTx.amount).toFixed(2)}
                       </p>
                       <p className="text-xs text-muted-foreground">
-                        {walletTx.amount < 0 ? 'Deducted' : 'Added'}
+                        {walletTx.type === 'CHARGE_DEDUCT' ? 'Deducted' : 'Added'}
                       </p>
                     </div>
                   </div>
@@ -834,10 +834,10 @@ export default function ChargerDetailPage() {
                   <div className="flex justify-between items-center">
                     <p className="font-medium">Total Billed:</p>
                     <p className="text-xl font-bold text-red-600">
-                      ₹{Math.abs(transactionData.wallet_transactions.reduce(
-                        (sum, wt) => sum + (wt.amount < 0 ? Math.abs(wt.amount) : 0), 
+                      ₹{transactionData.wallet_transactions.reduce(
+                        (sum, wt) => sum + (wt.type === 'CHARGE_DEDUCT' ? Math.abs(wt.amount) : 0),
                         0
-                      )).toFixed(2)}
+                      ).toFixed(2)}
                     </p>
                   </div>
                 </div>

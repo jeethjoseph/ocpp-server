@@ -16,6 +16,7 @@ from models import (
     Transaction,
     TransactionStatusEnum,
     User,
+    UserRoleEnum,
 )
 from services import invoice_service as _svc
 from services.invoice_service import InvoiceService
@@ -181,6 +182,21 @@ async def test_missing_gstin_blocks_issuance(client, monkeypatch):
     monkeypatch.setattr(_svc, "VOLTLYNC_GSTIN", "")
 
     _, _, txn, _, _ = await _make_session()
+    invoice = await InvoiceService.generate_invoice(txn.id)
+
+    assert invoice is None
+    assert await GSTInvoice.filter(transaction_id=txn.id).count() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", [UserRoleEnum.ADMIN, UserRoleEnum.FRANCHISEE])
+async def test_internal_role_session_skips_invoice(client, role):
+    """ADMIN and FRANCHISEE-initiated sessions are operational, not sales —
+    no GST invoice is issued and no invoice number is consumed."""
+    _, _, txn, user, _ = await _make_session()
+    user.role = role
+    await user.save()
+
     invoice = await InvoiceService.generate_invoice(txn.id)
 
     assert invoice is None

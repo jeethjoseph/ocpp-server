@@ -29,6 +29,7 @@ class ChargerCreate(BaseModel):
     external_charger_id: Optional[str] = None
     connectors: List[ConnectorInput]
     tariff_per_kwh: Optional[float] = None
+    tariff_per_kwh_incl_tax: Optional[float] = None
 
 class ChargerUpdate(BaseModel):
     name: Optional[str] = None
@@ -37,6 +38,7 @@ class ChargerUpdate(BaseModel):
     latest_status: Optional[str] = None
     external_charger_id: Optional[str] = None
     tariff_per_kwh: Optional[float] = None
+    tariff_per_kwh_incl_tax: Optional[float] = None
 
 class LatestErrorInfo(BaseModel):
     """Summary of latest unresolved error for a charger"""
@@ -62,6 +64,7 @@ class ChargerResponse(BaseModel):
     updated_at: datetime
     tariff_per_kwh: Optional[float] = None
     tariff_gst_percent: Optional[float] = None
+    tariff_per_kwh_incl_tax: Optional[float] = None
     latest_error: Optional[LatestErrorInfo] = None
 
     class Config:
@@ -157,8 +160,19 @@ async def get_bulk_connection_status(chargers: List[Charger]) -> Dict[str, bool]
     
     return status_dict
 
-def charger_to_response(charger: Charger, connection_status: bool, latest_error: Optional[ChargerError] = None) -> ChargerResponse:
-    """Convert a Charger model to ChargerResponse with connection status and latest error"""
+def _compute_incl_tax(rate_per_kwh: Decimal, gst_percent: Decimal) -> Decimal:
+    """Compute tax-inclusive rate from excl-tax rate + GST percent. 4 dp."""
+    multiplier = Decimal('1') + (gst_percent / Decimal('100'))
+    return (rate_per_kwh * multiplier).quantize(Decimal('0.0001'))
+
+
+def charger_to_response(
+    charger: Charger,
+    connection_status: bool,
+    latest_error: Optional[ChargerError] = None,
+    tariff: Optional[Tariff] = None,
+) -> ChargerResponse:
+    """Convert a Charger model to ChargerResponse with connection status, latest error, and tariff"""
     error_info = None
     if latest_error:
         error_info = LatestErrorInfo(
@@ -167,6 +181,13 @@ def charger_to_response(charger: Charger, connection_status: bool, latest_error:
             info=latest_error.info,
             created_at=latest_error.created_at
         )
+
+    tariff_rate = float(tariff.rate_per_kwh) if tariff else None
+    tariff_gst = float(tariff.gst_percent) if tariff else None
+    tariff_incl = (
+        float(_compute_incl_tax(tariff.rate_per_kwh, tariff.gst_percent))
+        if tariff else None
+    )
 
     return ChargerResponse(
         id=charger.id,
@@ -183,8 +204,30 @@ def charger_to_response(charger: Charger, connection_status: bool, latest_error:
         created_at=charger.created_at,
         updated_at=charger.updated_at,
         connection_status=connection_status,
-        latest_error=error_info
+        latest_error=error_info,
+        tariff_per_kwh=tariff_rate,
+        tariff_gst_percent=tariff_gst,
+        tariff_per_kwh_incl_tax=tariff_incl,
     )
+
+
+async def get_applicable_tariffs_for_chargers(charger_ids: List[int]) -> Dict[int, Tariff]:
+    """Bulk-resolve the applicable tariff for each charger.
+    Priority: charger-specific tariff -> global tariff."""
+    if not charger_ids:
+        return {}
+
+    specific = await Tariff.filter(charger_id__in=charger_ids)
+    by_charger = {t.charger_id: t for t in specific}
+
+    missing = [cid for cid in charger_ids if cid not in by_charger]
+    if missing:
+        global_tariff = await Tariff.filter(is_global=True).first()
+        if global_tariff:
+            for cid in missing:
+                by_charger[cid] = global_tariff
+
+    return by_charger
 
 async def get_latest_errors_for_chargers(charger_ids: List[int]) -> Dict[int, ChargerError]:
     """Get the latest unresolved error for multiple chargers efficiently"""
@@ -247,12 +290,18 @@ async def list_chargers(
     charger_ids = [c.id for c in chargers]
     error_dict = await get_latest_errors_for_chargers(charger_ids)
 
-    # Build response with connection status and errors
+    # Bulk-resolve applicable tariff per charger (charger-specific or global fallback)
+    tariff_dict = await get_applicable_tariffs_for_chargers(charger_ids)
+
+    # Build response with connection status, errors, and tariff
     charger_responses = []
     for charger in chargers:
         connection_status = connection_status_dict.get(charger.charge_point_string_id, False)
         latest_error = error_dict.get(charger.id)
-        charger_responses.append(charger_to_response(charger, connection_status, latest_error))
+        tariff = tariff_dict.get(charger.id)
+        charger_responses.append(
+            charger_to_response(charger, connection_status, latest_error, tariff)
+        )
 
     return ChargerListResponse(
         data=charger_responses,
@@ -295,11 +344,32 @@ async def create_charger(charger_data: ChargerCreate, admin_user: User = Depends
                 max_power_kw=connector_input.max_power_kw
             )
 
-        # Create charger-specific tariff if provided
+        # Create charger-specific tariff if provided.
+        # Reject if both excl-tax and incl-tax forms are supplied to avoid ambiguity.
+        if (
+            charger_data.tariff_per_kwh is not None
+            and charger_data.tariff_per_kwh_incl_tax is not None
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Provide either tariff_per_kwh or tariff_per_kwh_incl_tax, not both",
+            )
+
         if charger_data.tariff_per_kwh is not None:
             await Tariff.create(
                 charger=charger,
                 rate_per_kwh=Decimal(str(charger_data.tariff_per_kwh)),
+            )
+        elif charger_data.tariff_per_kwh_incl_tax is not None:
+            # Compute excl-tax rate from incl-tax using the model's default GST percent
+            gst_default = Tariff._meta.fields_map["gst_percent"].default
+            gst = Decimal(str(gst_default))
+            incl = Decimal(str(charger_data.tariff_per_kwh_incl_tax))
+            excl = (incl / (Decimal('1') + gst / Decimal('100'))).quantize(Decimal('0.0001'))
+            await Tariff.create(
+                charger=charger,
+                rate_per_kwh=excl,
+                gst_percent=gst,
             )
 
         await log_audit_event(
@@ -318,8 +388,9 @@ async def create_charger(charger_data: ChargerCreate, admin_user: User = Depends
         # Get connection status for response (new charger won't be connected yet)
         connection_status_dict = await get_bulk_connection_status([charger])
         connection_status = connection_status_dict.get(charger.charge_point_string_id, False)
+        applicable_tariff = (await get_applicable_tariffs_for_chargers([charger.id])).get(charger.id)
         return {
-            "charger": charger_to_response(charger, connection_status),
+            "charger": charger_to_response(charger, connection_status, tariff=applicable_tariff),
             "ocpp_url": ocpp_url,
             "message": "Charger onboarded successfully"
         }
@@ -342,7 +413,6 @@ async def get_charger_details(charger_id: int, user: User = Depends(require_user
     # Get applicable tariff for this charger
     from services.wallet_service import WalletService
     tariff = await WalletService.get_applicable_tariff(charger_id)
-    tariff_rate = tariff.rate_per_kwh if tariff else None
 
     # Get current active transaction if any
     current_transaction = await Transaction.filter(
@@ -372,14 +442,11 @@ async def get_charger_details(charger_id: int, user: User = Depends(require_user
     ).order_by("-created_at").first()
 
     # Build charger response with tariff and error
-    charger_response = charger_to_response(charger, connection_status, latest_error)
-    charger_dict = charger_response.model_dump()
-    charger_dict['tariff_per_kwh'] = float(tariff_rate) if tariff_rate else None
-    charger_dict['tariff_gst_percent'] = float(tariff.gst_percent) if tariff else None
+    charger_response = charger_to_response(charger, connection_status, latest_error, tariff)
 
     # Build response
     response = ChargerDetailResponse(
-        charger=ChargerResponse(**charger_dict),
+        charger=charger_response,
         station=StationBasicInfo.model_validate(station, from_attributes=True),
         connectors=[ConnectorResponse.model_validate(c, from_attributes=True) for c in connectors]
     )
@@ -418,10 +485,31 @@ async def update_charger(charger_id: int, update_data: ChargerUpdate, admin_user
 
     # Handle tariff separately (not a Charger model field)
     tariff_per_kwh = update_dict.pop("tariff_per_kwh", None)
+    tariff_per_kwh_incl_tax = update_dict.pop("tariff_per_kwh_incl_tax", None)
+    if tariff_per_kwh is not None and tariff_per_kwh_incl_tax is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either tariff_per_kwh or tariff_per_kwh_incl_tax, not both",
+        )
+
     if tariff_per_kwh is not None:
         await Tariff.update_or_create(
             defaults={"rate_per_kwh": Decimal(str(tariff_per_kwh))},
             charger_id=charger_id
+        )
+    elif tariff_per_kwh_incl_tax is not None:
+        # Use existing charger-specific tariff's GST if present, else default.
+        existing = await Tariff.filter(charger_id=charger_id).first()
+        if existing:
+            gst = existing.gst_percent
+        else:
+            gst_default = Tariff._meta.fields_map["gst_percent"].default
+            gst = Decimal(str(gst_default))
+        incl = Decimal(str(tariff_per_kwh_incl_tax))
+        excl = (incl / (Decimal('1') + gst / Decimal('100'))).quantize(Decimal('0.0001'))
+        await Tariff.update_or_create(
+            defaults={"rate_per_kwh": excl, "gst_percent": gst},
+            charger_id=charger_id,
         )
 
     for field, value in update_dict.items():
@@ -444,8 +532,9 @@ async def update_charger(charger_id: int, update_data: ChargerUpdate, admin_user
     # Get connection status for response
     connection_status_dict = await get_bulk_connection_status([charger])
     connection_status = connection_status_dict.get(charger.charge_point_string_id, False)
+    applicable_tariff = (await get_applicable_tariffs_for_chargers([charger.id])).get(charger.id)
     return {
-        "charger": charger_to_response(charger, connection_status),
+        "charger": charger_to_response(charger, connection_status, tariff=applicable_tariff),
         "message": "Charger updated successfully"
     }
 
