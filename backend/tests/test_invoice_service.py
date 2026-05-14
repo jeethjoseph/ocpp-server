@@ -246,14 +246,14 @@ async def test_qr_invoice_kwh_is_billable_not_actual(client):
 
     assert invoice is not None
     # billable_kwh = 16.75 / 20 = 0.838 (rounded to 3dp)
-    assert invoice.energy_consumed_kwh == pytest.approx(0.838, abs=0.001)
+    assert float(invoice.energy_consumed_kwh) == pytest.approx(0.838, abs=0.001)
     # Actual meter reading on the transaction is preserved.
     await txn.refresh_from_db()
-    assert txn.energy_consumed_kwh == actual_kwh
+    assert float(txn.energy_consumed_kwh) == pytest.approx(actual_kwh, abs=0.001)
     # Energy line-item math reconciles: billable_kwh × rate_incl_tax should
     # equal the energy taxable + GST (excluding the separate gateway line).
     energy_incl_tax = capped_energy_charge + capped_gst
-    reconciled = Decimal(str(invoice.energy_consumed_kwh)) * invoice.tariff_rate_incl_tax
+    reconciled = invoice.energy_consumed_kwh * invoice.tariff_rate_incl_tax
     assert abs(reconciled - energy_incl_tax) < Decimal("0.05")
 
 

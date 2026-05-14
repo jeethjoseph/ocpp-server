@@ -2,6 +2,7 @@
 import os
 import asyncio
 import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Dict, List
 from fastapi import Depends, FastAPI, HTTPException, Query
 from auth_middleware import require_admin
@@ -780,7 +781,7 @@ class ChargePoint(OcppChargePoint):
                 user=user,
                 charger=charger,
                 vehicle=vehicle,
-                start_meter_kwh=float(meter_start) / 1000,  # Convert Wh to kWh
+                start_meter_kwh=Decimal(str(meter_start)) / Decimal(1000),  # Convert Wh to kWh
                 transaction_status=TransactionStatusEnum.RUNNING  # Changed from STARTED to RUNNING
             )
 
@@ -846,8 +847,8 @@ class ChargePoint(OcppChargePoint):
                 logger.info(f"🛑 Stopping SUSPENDED transaction {transaction_id} — charger chose to end rather than resume")
 
             # Update transaction with end values
-            transaction.end_meter_kwh = float(meter_stop) / 1000  # Convert Wh to kWh
-            transaction.energy_consumed_kwh = transaction.end_meter_kwh - (transaction.start_meter_kwh or 0)
+            transaction.end_meter_kwh = Decimal(str(meter_stop)) / Decimal(1000)  # Convert Wh to kWh
+            transaction.energy_consumed_kwh = transaction.end_meter_kwh - (transaction.start_meter_kwh or Decimal(0))
             transaction.end_time = datetime.datetime.now(datetime.timezone.utc)
             transaction.transaction_status = TransactionStatusEnum.COMPLETED
             transaction.stop_reason = kwargs.get('reason', 'Remote')
@@ -1036,9 +1037,9 @@ class ChargePoint(OcppChargePoint):
                     try:
                         if measurand == 'Energy.Active.Import.Register':
                             # Store energy reading
-                            reading_kwh = float(value)
+                            reading_kwh = Decimal(str(value))
                             if unit == 'Wh':
-                                reading_kwh = reading_kwh / 1000  # Convert Wh to kWh
+                                reading_kwh = reading_kwh / Decimal(1000)  # Convert Wh to kWh
                             meter_data['reading_kwh'] = reading_kwh
                             logger.debug(f"🔋   ✅ Energy: {reading_kwh} kWh")
                             
@@ -1068,7 +1069,7 @@ class ChargePoint(OcppChargePoint):
                         else:
                             logger.debug(f"🔋   ⚠️ Unknown measurand: {measurand} - ignoring")
                             
-                    except (ValueError, TypeError) as e:
+                    except (ValueError, TypeError, InvalidOperation) as e:
                         logger.error(f"🔋   ❌ Error parsing {measurand} value '{value}': {e}", exc_info=True)
                         continue
                 

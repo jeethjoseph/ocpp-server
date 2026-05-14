@@ -117,6 +117,65 @@ async def test_list_franchisees_returns_existing(client_admin, test_franchisee):
     assert test_franchisee.id in ids
 
 
+async def test_list_franchisees_includes_zero_totals(client_admin, test_franchisee):
+    """A franchisee with no invoices and no ledger entries reports both totals
+    as zero rather than null — the UI relies on a numeric string."""
+    resp = await client_admin.get("/api/admin/franchisees")
+    assert resp.status_code == 200
+    row = next(
+        r for r in resp.json()["data"] if r["id"] == test_franchisee.id
+    )
+    assert Decimal(row["total_invoiced"]) == Decimal("0")
+    assert Decimal(row["total_transferred"]) == Decimal("0")
+
+
+async def test_get_franchisee_totals_filter_by_status(
+    client_admin, test_commission_ledger_entry, test_franchisee
+):
+    """`total_transferred` must include only TRANSFER_PROCESSED + SETTLED
+    rows. The PENDING fixture entry contributes zero."""
+    from datetime import datetime, timezone
+    from models import (
+        CommissionLedgerEntry, SettlementStatusEnum, Transaction,
+        TransactionStatusEnum,
+    )
+    # Add one SETTLED entry that SHOULD count.
+    settled_txn = await Transaction.create(
+        charger=test_commission_ledger_entry.transaction.charger,
+        user=test_commission_ledger_entry.transaction.user,
+        transaction_status=TransactionStatusEnum.COMPLETED,
+    )
+    await CommissionLedgerEntry.create(
+        transaction=settled_txn,
+        franchisee=test_franchisee,
+        gross_amount=Decimal("500.00"),
+        payment_method="QR_UPI",
+        razorpay_payment_id=f"pay_settled_{settled_txn.id}",
+        refund_amount=Decimal("0.00"),
+        pg_fee_amount=Decimal("0.00"),
+        net_amount=Decimal("500.00"),
+        gst_collected=Decimal("76.27"),
+        net_excl_gst=Decimal("423.73"),
+        commission_percent=Decimal("20.00"),
+        platform_commission=Decimal("84.75"),
+        tds_rate_percent=Decimal("10.00"),
+        tds_amount=Decimal("33.90"),
+        transfer_fee=Decimal("0.00"),
+        franchisee_payout=Decimal("305.08"),
+        energy_consumed_kwh=5.0,
+        tariff_rate_per_kwh=Decimal("15.00"),
+        settlement_status=SettlementStatusEnum.SETTLED,
+        idempotency_key=f"txn_settled_{settled_txn.id}",
+        transfer_processed_at=datetime.now(timezone.utc),
+    )
+
+    resp = await client_admin.get(f"/api/admin/franchisees/{test_franchisee.id}")
+    assert resp.status_code == 200
+    body = resp.json()
+    # PENDING ledger (610.17) excluded; SETTLED (305.08) counted.
+    assert Decimal(body["total_transferred"]) == Decimal("305.08")
+
+
 async def test_get_franchisee_by_id(client_admin, test_franchisee):
     resp = await client_admin.get(f"/api/admin/franchisees/{test_franchisee.id}")
     assert resp.status_code == 200

@@ -35,6 +35,7 @@ import {
 
 import { FranchiseeCreate } from "@/types/api";
 import { useFranchisees, useCreateFranchisee } from "@/lib/queries/franchisees";
+import { formatINR } from "@/lib/utils";
 
 const STATUS_COLORS: Record<string, string> = {
   DRAFT: "bg-gray-100 text-gray-800",
@@ -152,6 +153,8 @@ export default function AdminFranchiseesPage() {
                       <TableHead>Contact</TableHead>
                       <TableHead>Commission</TableHead>
                       <TableHead>Stations</TableHead>
+                      <TableHead className="text-right">Total Invoiced</TableHead>
+                      <TableHead className="text-right">Total Transferred</TableHead>
                       <TableHead>Status</TableHead>
                       <TableHead>Created</TableHead>
                     </TableRow>
@@ -175,6 +178,12 @@ export default function AdminFranchiseesPage() {
                         </TableCell>
                         <TableCell>{Number(f.commission_percent)}%</TableCell>
                         <TableCell>{f.station_count}</TableCell>
+                        <TableCell className="text-right text-sm">
+                          {formatINR(f.total_invoiced)}
+                        </TableCell>
+                        <TableCell className="text-right text-sm">
+                          {formatINR(f.total_transferred)}
+                        </TableCell>
                         <TableCell>
                           <Badge
                             className={STATUS_COLORS[f.status] || ""}

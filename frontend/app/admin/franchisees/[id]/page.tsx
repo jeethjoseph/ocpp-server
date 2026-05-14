@@ -388,7 +388,7 @@ export default function FranchiseeDetailPage() {
         </div>
 
         {/* Overview Cards */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-5 gap-4">
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm text-muted-foreground">
@@ -421,6 +421,30 @@ export default function FranchiseeDetailPage() {
             </CardHeader>
             <CardContent>
               <p className="text-2xl font-bold">{franchisee.station_count}</p>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm text-muted-foreground">
+                Total Invoiced
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-2xl font-bold">
+                {formatINR(franchisee.total_invoiced)}
+              </p>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm text-muted-foreground">
+                Total Transferred
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-2xl font-bold">
+                {formatINR(franchisee.total_transferred)}
+              </p>
             </CardContent>
           </Card>
         </div>

@@ -1648,11 +1648,17 @@ CREATE TABLE charger (
 CREATE TABLE tariff (
     id SERIAL PRIMARY KEY,
     charger_id INTEGER REFERENCES charger(id),
-    rate_per_kwh DECIMAL(10, 2) NOT NULL,
-    gst_percent DECIMAL(5, 2) DEFAULT 18.00,  -- GST percentage applied on energy cost
+    rate_per_kwh DECIMAL(8, 4) NOT NULL,        -- 4dp precision; tariffs like ₹12.3456/kWh are storable without truncation
+    gst_percent DECIMAL(5, 2) DEFAULT 18.00,    -- GST percentage applied on energy cost
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
+
+-- Decimal precision convention (post migration 31):
+--   Rate-like columns (per-kWh, per-unit prices): DECIMAL(8, 4)
+--   Amount-like columns (line totals, GST amounts, ledger amounts): DECIMAL(*, 2) — paisa-precise to match Razorpay
+--   Energy/kWh columns: DECIMAL(12, 3) — OCPP reports Wh resolution
+--   Percentage rates (GST/commission/TDS): DECIMAL(5, 2) — statutory whole/half percentages
 ```
 
 #### Firmware Management Tables
@@ -1833,9 +1839,9 @@ CREATE TABLE transaction (
     user_id INTEGER REFERENCES user(id),
     charger_id INTEGER REFERENCES charger(id),
     vehicle_id INTEGER REFERENCES vehicle_profile(id),
-    start_meter_kwh DECIMAL(10, 3),
-    end_meter_kwh DECIMAL(10, 3),
-    energy_consumed_kwh DECIMAL(10, 3),
+    start_meter_kwh DECIMAL(12, 3),
+    end_meter_kwh DECIMAL(12, 3),
+    energy_consumed_kwh DECIMAL(12, 3),
     energy_charge DECIMAL(10, 2),       -- energy_kwh × rate_per_kwh
     gst_amount DECIMAL(10, 2),          -- GST on energy_charge
     gst_rate_percent DECIMAL(5, 2) DEFAULT 18.00,  -- rate snapshot at billing
@@ -1856,7 +1862,7 @@ CREATE TABLE transaction (
 CREATE TABLE meter_value (
     id SERIAL PRIMARY KEY,
     transaction_id INTEGER REFERENCES transaction(id),
-    reading_kwh DECIMAL(10, 3) NOT NULL,
+    reading_kwh DECIMAL(12, 3) NOT NULL,
     current DECIMAL(6, 2),      -- Amperes
     voltage DECIMAL(6, 2),      -- Volts
     power_kw DECIMAL(8, 3),     -- Kilowatts
@@ -2476,6 +2482,23 @@ Implementation notes:
    404 / "not found" errors so admins can re-run after a partial
    failure. Frontend confirmation dialog requires typing the exact
    `acc_*` ID before the destructive button is enabled.
+
+8. **Per-franchisee financial rollup on admin reads**:
+   `FranchiseeResponse` carries two derived totals — `total_invoiced`
+   and `total_transferred` — populated by helpers in
+   `routers/franchisees.py`. `total_invoiced` =
+   `SUM(GSTInvoice.total_amount)` for the franchisee (gross,
+   GST-inclusive). `total_transferred` =
+   `SUM(CommissionLedgerEntry.franchisee_payout)` filtered by
+   `settlement_status IN (TRANSFER_PROCESSED, SETTLED)` so
+   pending/failed/on-hold entries are excluded — the value reflects
+   money actually moved to the franchisee. `list_franchisees` batches
+   both aggregations with a single `group_by("franchisee_id")` query
+   per metric to avoid N+1 on the admin list page; `get_franchisee`
+   runs single-id sums. The fields are surfaced as two columns on the
+   `/admin/franchisees` table and two overview cards on the
+   `/admin/franchisees/[id]` detail page (formatted via
+   `frontend/lib/utils.ts::formatINR`).
 
 Complementary transparency surfaces (all read-only, franchisee name
 sourced from the `Charger → Station → Franchisee` FK chain):

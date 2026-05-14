@@ -327,6 +327,19 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
     Razorpay DELETE first, then local cleanup inside `@in_transaction()`:
     deletes `franchisee_stakeholder` rows, clears all `razorpay_*` /
     `kyc_*` / `activated_at` fields, resets `status` to `DRAFT`.
+  - **`FranchiseeResponse` financial rollup fields** — `total_invoiced`
+    and `total_transferred` (Decimal, serialised as string) are added to
+    the response on `GET /api/admin/franchisees` (list) and
+    `GET /api/admin/franchisees/{id}` (detail). `total_invoiced` =
+    `SUM(GSTInvoice.total_amount)` for the franchisee (gross incl. GST,
+    no status filter — invoices are issued on creation).
+    `total_transferred` = `SUM(CommissionLedgerEntry.franchisee_payout)`
+    filtered by `settlement_status IN (TRANSFER_PROCESSED, SETTLED)` —
+    money actually moved, excluding pending/failed/on-hold. List
+    endpoint batches both aggregations via group-by to avoid N+1; detail
+    endpoint runs single-id sums. Surfaced as two table columns on
+    `/admin/franchisees` and two overview cards on
+    `/admin/franchisees/[id]` (formatted with `formatINR`).
 - **`franchisee_settlement_service.py`** - **Post-session franchisee payout**
   - `process_settlement(transaction_id)` runs from `transaction_finalizer`
     right after `process_qr_session_billing` returns (refund already
@@ -550,11 +563,14 @@ charging_station (id, name, latitude, longitude, address)
 charger (id, charge_point_string_id, station_id, vendor, model, latest_status, last_heart_beat_time)
 connector (id, charger_id, connector_id, connector_type, max_power_kw) -- connector_type: Type2, CCS, CHAdeMO, Socket
 tariff (id, station_id, rate_per_kwh, gst_percent) -- gst_percent default 18.00, applied on top of energy charge
+-- `rate_per_kwh` stored as DECIMAL(8,4) — per-kWh rates need 4dp precision to express tariffs like ₹12.3456/kWh; 1-paise truncation would compound across kWh and cause rounding noise on every session. Amount/total columns stay at 2dp (the paisa).
 
 -- OCPP Transactions
 transaction (id, user_id, charger_id, start_meter_kwh, end_meter_kwh, transaction_status, suspended_at, resumed_at, resume_count, energy_charge, gst_amount, gst_rate_percent, total_billed)
 -- `gst_rate_percent` is snapshotted from the tariff at billing time so invoices stay stable if the tariff later changes.
+-- `start_meter_kwh`, `end_meter_kwh`, `energy_consumed_kwh` stored as DECIMAL(12,3) — OCPP reports Wh-resolution readings (3dp kWh). Migrated from FloatField in migration 31 to eliminate binary-float noise on energy × rate multiplications.
 meter_value (id, transaction_id, reading_kwh, current, voltage, power_kw)
+-- `reading_kwh` is DECIMAL(12,3); raw OCPP MeterValues are parsed via `Decimal(str(value))` to preserve exact decimal representation through the Wh→kWh conversion.
 
 -- Firmware Management
 firmware_file (id, version, filename, file_path, file_size, checksum, description, uploaded_by, is_active)

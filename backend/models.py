@@ -318,7 +318,7 @@ class Tariff(Model):
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)
     charger = fields.ForeignKeyField("models.Charger", related_name="tariffs", null=True)
-    rate_per_kwh = fields.DecimalField(max_digits=5, decimal_places=2)
+    rate_per_kwh = fields.DecimalField(max_digits=8, decimal_places=4)
     gst_percent = fields.DecimalField(max_digits=5, decimal_places=2, default=18.00)
     hsn_sac_code = fields.CharField(max_length=10, null=True)
     is_global = fields.BooleanField(default=False)
@@ -333,9 +333,9 @@ class Transaction(Model):
     user = fields.ForeignKeyField("models.User", related_name="transactions")
     charger = fields.ForeignKeyField("models.Charger", related_name="transactions")
     vehicle = fields.ForeignKeyField("models.VehicleProfile", related_name="transactions", null=True)
-    start_meter_kwh = fields.FloatField(null=True)
-    end_meter_kwh = fields.FloatField(null=True)
-    energy_consumed_kwh = fields.FloatField(null=True)
+    start_meter_kwh = fields.DecimalField(max_digits=12, decimal_places=3, null=True)
+    end_meter_kwh = fields.DecimalField(max_digits=12, decimal_places=3, null=True)
+    energy_consumed_kwh = fields.DecimalField(max_digits=12, decimal_places=3, null=True)
     start_time = fields.DatetimeField(auto_now_add=True)
     end_time = fields.DatetimeField(null=True)
     stop_reason = fields.TextField(null=True)
@@ -362,7 +362,7 @@ class MeterValue(Model):
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)
     transaction = fields.ForeignKeyField("models.Transaction", related_name="meter_values")
-    reading_kwh = fields.FloatField()
+    reading_kwh = fields.DecimalField(max_digits=12, decimal_places=3)
     current = fields.FloatField(null=True)
     voltage = fields.FloatField(null=True)
     power_kw = fields.FloatField(null=True)
@@ -761,8 +761,8 @@ class CommissionLedgerEntry(Model):
     franchisee_payout = fields.DecimalField(max_digits=10, decimal_places=2)
 
     # Energy data (denormalized for reporting)
-    energy_consumed_kwh = fields.FloatField()
-    tariff_rate_per_kwh = fields.DecimalField(max_digits=5, decimal_places=2)
+    energy_consumed_kwh = fields.DecimalField(max_digits=12, decimal_places=3)
+    tariff_rate_per_kwh = fields.DecimalField(max_digits=8, decimal_places=4)
 
     # Transfer tracking
     settlement_status = fields.CharEnumField(
@@ -884,7 +884,7 @@ class GSTInvoice(Model):
     connector_type = fields.CharField(max_length=50, null=True)
 
     # Charging details
-    energy_consumed_kwh = fields.FloatField()
+    energy_consumed_kwh = fields.DecimalField(max_digits=12, decimal_places=3)
     tariff_rate_incl_tax = fields.DecimalField(max_digits=10, decimal_places=2)
     charged_on = fields.DatetimeField(null=True)
     duration_seconds = fields.IntField(null=True)

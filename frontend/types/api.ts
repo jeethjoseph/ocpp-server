@@ -547,6 +547,8 @@ export interface Franchisee {
   bank_account_type?: string | null;
   kyc_verifications?: Record<string, unknown> | null;
   station_count: number;
+  total_invoiced: string;
+  total_transferred: string;
   activated_at?: string | null;
   created_at: string;
   updated_at: string;

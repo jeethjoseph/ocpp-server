@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel, EmailStr
 from tortoise.exceptions import IntegrityError
 from tortoise.expressions import Q
+from tortoise.functions import Sum
 from tortoise.transactions import in_transaction
 
 from models import (
@@ -16,6 +17,7 @@ from models import (
     FranchiseeStakeholder,
     CommissionAuditLog, CommissionChangeReasonEnum, CommissionLedgerEntry,
     SettlementStatusEnum,
+    GSTInvoice,
     ChargingStation, User, UserRoleEnum,
 )
 from auth_middleware import require_admin
@@ -106,6 +108,8 @@ class FranchiseeResponse(BaseModel):
     bank_account_number: Optional[str] = None
     bank_ifsc_code: Optional[str] = None
     station_count: int = 0
+    total_invoiced: Decimal = Decimal("0")
+    total_transferred: Decimal = Decimal("0")
     activated_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
@@ -142,8 +146,75 @@ class CommissionAuditResponse(BaseModel):
 
 # ─── Helpers ─────────────────────────────────────────────────────────
 
-async def _franchisee_to_response(f: Franchisee) -> dict:
+# settlement_status values that count as money actually transferred to the
+# franchisee. PENDING / INITIATED / FAILED / ON_HOLD / REVERSED are excluded.
+_TRANSFERRED_STATUSES = [
+    SettlementStatusEnum.TRANSFER_PROCESSED,
+    SettlementStatusEnum.SETTLED,
+]
+
+
+async def _sum_invoiced_for(franchisee_id: int) -> Decimal:
+    rows = await (
+        GSTInvoice.filter(franchisee_id=franchisee_id)
+        .annotate(total=Sum("total_amount"))
+        .values("total")
+    )
+    total = rows[0]["total"] if rows else None
+    return total or Decimal("0")
+
+
+async def _sum_transferred_for(franchisee_id: int) -> Decimal:
+    rows = await (
+        CommissionLedgerEntry.filter(
+            franchisee_id=franchisee_id,
+            settlement_status__in=_TRANSFERRED_STATUSES,
+        )
+        .annotate(total=Sum("franchisee_payout"))
+        .values("total")
+    )
+    total = rows[0]["total"] if rows else None
+    return total or Decimal("0")
+
+
+async def _bulk_invoiced_map(ids: List[int]) -> dict:
+    if not ids:
+        return {}
+    rows = await (
+        GSTInvoice.filter(franchisee_id__in=ids)
+        .annotate(total=Sum("total_amount"))
+        .group_by("franchisee_id")
+        .values("franchisee_id", "total")
+    )
+    return {r["franchisee_id"]: (r["total"] or Decimal("0")) for r in rows}
+
+
+async def _bulk_transferred_map(ids: List[int]) -> dict:
+    if not ids:
+        return {}
+    rows = await (
+        CommissionLedgerEntry.filter(
+            franchisee_id__in=ids,
+            settlement_status__in=_TRANSFERRED_STATUSES,
+        )
+        .annotate(total=Sum("franchisee_payout"))
+        .group_by("franchisee_id")
+        .values("franchisee_id", "total")
+    )
+    return {r["franchisee_id"]: (r["total"] or Decimal("0")) for r in rows}
+
+
+async def _franchisee_to_response(
+    f: Franchisee,
+    *,
+    total_invoiced: Optional[Decimal] = None,
+    total_transferred: Optional[Decimal] = None,
+) -> dict:
     station_count = await ChargingStation.filter(franchisee_id=f.id).count()
+    if total_invoiced is None:
+        total_invoiced = await _sum_invoiced_for(f.id)
+    if total_transferred is None:
+        total_transferred = await _sum_transferred_for(f.id)
     return {
         "id": f.id,
         "business_name": f.business_name,
@@ -173,6 +244,8 @@ async def _franchisee_to_response(f: Franchisee) -> dict:
         "bank_ifsc_code": f.bank_ifsc_code,
         "bank_account_type": f.bank_account_type,
         "station_count": station_count,
+        "total_invoiced": total_invoiced,
+        "total_transferred": total_transferred,
         "activated_at": f.activated_at,
         "created_at": f.created_at,
         "updated_at": f.updated_at,
@@ -352,7 +425,17 @@ async def list_franchisees(
 
     total = await query.count()
     franchisees = await query.offset((page - 1) * limit).limit(limit).order_by("-created_at")
-    data = [await _franchisee_to_response(f) for f in franchisees]
+    ids = [f.id for f in franchisees]
+    invoiced_map = await _bulk_invoiced_map(ids)
+    transferred_map = await _bulk_transferred_map(ids)
+    data = [
+        await _franchisee_to_response(
+            f,
+            total_invoiced=invoiced_map.get(f.id, Decimal("0")),
+            total_transferred=transferred_map.get(f.id, Decimal("0")),
+        )
+        for f in franchisees
+    ]
 
     return {"data": data, "total": total, "page": page, "limit": limit}
 

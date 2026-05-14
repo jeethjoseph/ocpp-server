@@ -1,4 +1,5 @@
 # routers/chargers.py
+from decimal import Decimal
 from typing import List, Optional, Dict
 from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel
@@ -296,7 +297,10 @@ async def create_charger(charger_data: ChargerCreate, admin_user: User = Depends
 
         # Create charger-specific tariff if provided
         if charger_data.tariff_per_kwh is not None:
-            await Tariff.create(charger=charger, rate_per_kwh=charger_data.tariff_per_kwh)
+            await Tariff.create(
+                charger=charger,
+                rate_per_kwh=Decimal(str(charger_data.tariff_per_kwh)),
+            )
 
         await log_audit_event(
             action="charger.created",
@@ -416,7 +420,7 @@ async def update_charger(charger_id: int, update_data: ChargerUpdate, admin_user
     tariff_per_kwh = update_dict.pop("tariff_per_kwh", None)
     if tariff_per_kwh is not None:
         await Tariff.update_or_create(
-            defaults={"rate_per_kwh": tariff_per_kwh},
+            defaults={"rate_per_kwh": Decimal(str(tariff_per_kwh))},
             charger_id=charger_id
         )
 

@@ -182,7 +182,7 @@ class WalletService:
                     description=f"Charging session - {transaction.energy_consumed_kwh:.2f} kWh @ ₹{tariff_rate}/kWh + GST {gst_percent}%",
                     charging_transaction=transaction,
                     payment_metadata={
-                        "energy_consumed_kwh": transaction.energy_consumed_kwh,
+                        "energy_consumed_kwh": float(transaction.energy_consumed_kwh),
                         "rate_per_kwh": float(tariff_rate),
                         "energy_charge": float(energy_charge),
                         "gst_percent": float(gst_percent),

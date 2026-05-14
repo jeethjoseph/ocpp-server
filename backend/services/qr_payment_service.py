@@ -485,7 +485,7 @@ class QRPaymentService:
             "budget_limit_paise": budget_limit_paise,
             "tariff_rate": float(tariff_rate),
             "gst_percent": float(gst_percent),
-            "start_meter_kwh": transaction.start_meter_kwh if transaction else 0,
+            "start_meter_kwh": float(transaction.start_meter_kwh) if transaction and transaction.start_meter_kwh else 0,
             "charger_id": charger_id,
         }
         await redis_manager.set_qr_session(transaction_id, session_data)
@@ -527,7 +527,7 @@ class QRPaymentService:
                 "budget_limit_paise": budget_limit_paise,
                 "tariff_rate": float(tariff_rate),
                 "gst_percent": float(gst_percent),
-                "start_meter_kwh": transaction.start_meter_kwh if transaction else 0,
+                "start_meter_kwh": float(transaction.start_meter_kwh) if transaction and transaction.start_meter_kwh else 0,
                 "charger_id": qr_payment.charger_id,
             }
             await redis_manager.set_qr_session(transaction_id, session)

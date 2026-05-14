@@ -621,7 +621,7 @@ function ChargerModal({ stations, onSubmit, onClose }: ChargerModalProps) {
             </label>
             <input
               type="number"
-              step="0.01"
+              step="0.0001"
               min="0"
               value={formData.tariff_per_kwh}
               onChange={(e) =>
@@ -833,7 +833,7 @@ function EditChargerModal({ charger, onSubmit, onClose }: EditChargerModalProps)
             </label>
             <input
               type="number"
-              step="0.01"
+              step="0.0001"
               min="0"
               value={formData.tariff_per_kwh}
               onChange={(e) =>

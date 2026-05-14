@@ -31,6 +31,7 @@ from models import (
 logger = logging.getLogger("ocpp-server")
 
 TWO_DP = Decimal("0.01")
+FOUR_DP = Decimal("0.0001")
 MIN_TRANSFER_AMOUNT = Decimal(
     os.getenv("MINIMUM_TRANSFER_AMOUNT", "1.00")
 )
@@ -232,7 +233,7 @@ class FranchiseeSettlementService:
             transfer_fee=calc["transfer_fee"],
             franchisee_payout=calc["franchisee_payout"],
             energy_consumed_kwh=energy,
-            tariff_rate_per_kwh=tariff_rate.quantize(TWO_DP, ROUND_HALF_UP),
+            tariff_rate_per_kwh=tariff_rate.quantize(FOUR_DP, ROUND_HALF_UP),
             idempotency_key=idempotency_key,
         )
 

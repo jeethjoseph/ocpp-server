@@ -300,18 +300,16 @@ class InvoiceService:
         # For WAL sessions `energy_charge = actual_kwh × rate`, so this equals
         # the actual reading.
         if tariff and tariff.rate_per_kwh and energy_taxable > 0:
-            billable_kwh = float(
-                (energy_taxable / tariff.rate_per_kwh).quantize(
-                    Decimal("0.001"), rounding=ROUND_HALF_UP
-                )
+            billable_kwh = (energy_taxable / tariff.rate_per_kwh).quantize(
+                Decimal("0.001"), rounding=ROUND_HALF_UP
             )
         else:
-            billable_kwh = energy
+            billable_kwh = energy if isinstance(energy, Decimal) else Decimal(str(energy or 0))
 
         # Tax-inclusive tariff rate for display — derived from billable_kwh so
         # the line-item math reconciles (rate × kWh = total).
         tariff_rate_incl = (
-            ((energy_taxable + energy_tax) / Decimal(str(billable_kwh))).quantize(
+            ((energy_taxable + energy_tax) / billable_kwh).quantize(
                 TWO_DP, ROUND_HALF_UP
             )
             if billable_kwh > 0 else Decimal("0")
