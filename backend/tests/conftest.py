@@ -38,33 +38,28 @@ TEST_DB_URL = os.environ.get(
 _SCHEMA_GENERATED_THIS_SESSION = False
 
 
-@pytest.fixture(autouse=True, scope="session")
+@pytest.fixture(autouse=True)
 def _flush_public_endpoint_rate_limit_keys():
     """Public endpoints (`/api/public/qr-transactions/*`) use a 20-req/min
     per-IP rate limiter backed by Redis (`public_qr_transactions:*`).
-    Across a full test-suite run, accumulated state from earlier tests
-    can trip the limiter on later ones — manifests as 429s in
-    test_invoice_pdf_endpoint. Flush at session start so each run begins
-    with a clean window. Per-test state during a run is fine: the window
-    is 60s and the full suite runs in ~30s.
+    Function-scoped autouse flush so every test starts with a clean
+    window — otherwise the cumulative request count across the suite
+    trips the limiter on the last few tests of `test_invoice_pdf_endpoint`
+    (each test makes 1-2 requests but ~20 tests collectively cross the
+    threshold within 60s). Cost is one Redis DEL per test (~ms).
 
-    Sync fixture using asyncio.run for the Redis I/O so we don't pull in
-    pytest-asyncio's event-loop scoping (which would clash with the
-    function-scoped async runner used by every other async fixture)."""
-    import asyncio
+    Uses the synchronous redis client (not asyncio) — calling
+    `asyncio.run()` from inside a sync pytest fixture that's used
+    alongside pytest-asyncio's async tests clashes with pytest-asyncio's
+    event-loop management."""
+    import redis as _sync_redis
     redis_url = os.environ.get("REDIS_URL", "redis://redis:6379/0")
-
-    async def _flush():
-        client = redis.from_url(redis_url, decode_responses=True)
-        try:
-            keys = await client.keys("public_qr_transactions:*")
-            if keys:
-                await client.delete(*keys)
-        finally:
-            await client.aclose()
-
     try:
-        asyncio.run(_flush())
+        client = _sync_redis.from_url(redis_url, decode_responses=True)
+        keys = client.keys("ratelimit:public_qr_transactions:*")
+        if keys:
+            client.delete(*keys)
+        client.close()
     except Exception:
         pass  # Redis unavailable in some test envs — non-fatal
     yield
