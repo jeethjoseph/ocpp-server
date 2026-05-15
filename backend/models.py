@@ -44,14 +44,10 @@ class MessageDirectionEnum(str, enum.Enum):
     OUTBOUND = "OUT"
 
 class FirmwareUpdateStatusEnum(str, enum.Enum):
-    PENDING = "PENDING"
-    DOWNLOADING = "DOWNLOADING"
-    DOWNLOADED = "DOWNLOADED"
-    INSTALLING = "INSTALLING"
-    INSTALLED = "INSTALLED"
-    DOWNLOAD_FAILED = "DOWNLOAD_FAILED"
-    INSTALLATION_FAILED = "INSTALLATION_FAILED"
-    CANCELLED = "CANCELLED"
+    PENDING = "PENDING"        # active: scheduled, in-flight, or waiting for next retry
+    INSTALLED = "INSTALLED"    # terminal success (confirmed via BootNotification or admin)
+    FAILED = "FAILED"          # terminal failure (retry budget exhausted or admin marked)
+    CANCELLED = "CANCELLED"    # terminal admin cancel before any attempt
 
 # OCPP 1.6 Standard Error Codes
 class OCPPErrorCodeEnum(str, enum.Enum):
@@ -411,7 +407,8 @@ class FirmwareFile(Model):
     updated_at = fields.DatetimeField(auto_now=True)
     version = fields.CharField(max_length=50, unique=True, index=True)
     filename = fields.CharField(max_length=255)
-    file_path = fields.CharField(max_length=500)
+    file_path = fields.CharField(max_length=500)  # legacy local-filesystem path; null for S3-only uploads
+    s3_key = fields.CharField(max_length=500, null=True)  # null on rows uploaded before S3 migration
     file_size = fields.BigIntField()
     checksum = fields.CharField(max_length=64)
     description = fields.TextField(null=True)
@@ -437,7 +434,9 @@ class FirmwareUpdate(Model):
     started_at = fields.DatetimeField(null=True)
     completed_at = fields.DatetimeField(null=True)
     error_message = fields.TextField(null=True)
-    retry_count = fields.IntField(default=0)
+    attempt_count = fields.IntField(default=0)  # number of UpdateFirmware sends so far
+    last_attempt_at = fields.DatetimeField(null=True)  # when the last attempt was sent
+    next_retry_at = fields.DatetimeField(null=True, index=True)  # scheduler wakes up rows whose retry is due
 
     class Meta:
         table = "firmware_update"

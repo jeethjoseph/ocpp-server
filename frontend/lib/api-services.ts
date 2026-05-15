@@ -213,6 +213,19 @@ export const transactionService = {
 };
 
 // Public stations service for user-facing pages
+export interface PublicStationChargerInfo {
+  charge_point_string_id: string;
+  name: string;
+  latest_status: string;
+  connectors: Array<{
+    connector_type: string;
+    max_power_kw: number | null;
+  }>;
+  tariff_per_kwh: number | null;
+  tariff_per_kwh_incl_tax: number | null;
+  tariff_gst_percent: number | null;
+}
+
 export interface PublicStationResponse {
   id: number;
   name: string;
@@ -228,7 +241,10 @@ export interface PublicStationResponse {
     available_count: number;
     total_count: number;
   }>;
+  chargers?: PublicStationChargerInfo[];
   price_per_kwh: number | null;
+  min_price_per_kwh_incl_tax: number | null;
+  max_price_per_kwh_incl_tax: number | null;
   franchisee_name: string | null;
 }
 
@@ -556,10 +572,28 @@ export const firmwareService = {
     ),
 
   /**
-   * Cancel a pending firmware update
+   * Cancel a pending firmware update (only PENDING with no attempts)
    */
   cancelUpdate: (updateId: number) =>
     api.post(`/api/admin/firmware/updates/${updateId}/cancel`, {}),
+
+  /**
+   * Admin: manually close an update as INSTALLED (polling chargers / out-of-band installs)
+   */
+  markInstalled: (updateId: number) =>
+    api.post<import("@/types/api").FirmwareUpdate>(
+      `/api/admin/firmware/updates/${updateId}/mark-installed`,
+      {}
+    ),
+
+  /**
+   * Admin: manually close a stuck update as FAILED
+   */
+  markFailed: (updateId: number) =>
+    api.post<import("@/types/api").FirmwareUpdate>(
+      `/api/admin/firmware/updates/${updateId}/mark-failed`,
+      {}
+    ),
 };
 
 /**

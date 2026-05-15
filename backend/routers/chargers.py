@@ -160,10 +160,7 @@ async def get_bulk_connection_status(chargers: List[Charger]) -> Dict[str, bool]
     
     return status_dict
 
-def _compute_incl_tax(rate_per_kwh: Decimal, gst_percent: Decimal) -> Decimal:
-    """Compute tax-inclusive rate from excl-tax rate + GST percent. 4 dp."""
-    multiplier = Decimal('1') + (gst_percent / Decimal('100'))
-    return (rate_per_kwh * multiplier).quantize(Decimal('0.0001'))
+from services.tariff_utils import compute_incl_tax
 
 
 def charger_to_response(
@@ -185,7 +182,7 @@ def charger_to_response(
     tariff_rate = float(tariff.rate_per_kwh) if tariff else None
     tariff_gst = float(tariff.gst_percent) if tariff else None
     tariff_incl = (
-        float(_compute_incl_tax(tariff.rate_per_kwh, tariff.gst_percent))
+        float(compute_incl_tax(tariff.rate_per_kwh, tariff.gst_percent))
         if tariff else None
     )
 

@@ -109,6 +109,7 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
   - Atomic transaction processing with SELECT FOR UPDATE
   - Tariff-based billing calculation with GST: `energy_charge = energy_kwh * rate_per_kwh`, `gst = energy_charge * gst_percent / 100`, `total = energy_charge + gst` (default 18% GST, configurable per tariff via `gst_percent` field)
   - **Admin tariff edits accept GST-inclusive input.** `POST/PUT /api/admin/chargers` accept either `tariff_per_kwh` (excl-GST, legacy) **or** `tariff_per_kwh_incl_tax` (incl-GST, new). When the incl-tax form is supplied the router computes `rate_per_kwh = incl / (1 + gst_percent/100)` quantized to 4dp and persists that as the excl-GST value, leaving billing math unchanged. Sending both forms together returns 400. `GET /api/admin/chargers` and `GET /api/admin/chargers/{id}` echo back the derived `tariff_per_kwh_incl_tax` alongside the excl-GST rate and `tariff_gst_percent`, so the admin list/edit UI can render the tax-inclusive figure without re-doing math client-side.
+  - **All user-facing tariff displays show tax-inclusive with an "incl. GST" note.** Tariff stays stored tax-exclusive in `Tariff.rate_per_kwh`; the incl-tax math (`rate * (1 + gst%/100)`) is centralised in `backend/services/tariff_utils.py` (`compute_incl_tax`, `compute_station_tariff_range`). Public station endpoints expose per-charger `tariff_per_kwh_incl_tax`/`tariff_gst_percent` on `StationChargerInfo` plus station-level `min/max_price_per_kwh_incl_tax`. The user-facing charger detail endpoint (`GET /api/users/chargers/{id}`) returns `tariff_per_kwh_incl_tax` too. Frontend renders via `formatTariffRangeInclGst` in `frontend/lib/utils.ts` — uniform tariffs collapse to a single value, varied tariffs show a "₹min–₹max/kWh (incl. GST)" range. The stations detail modal lists per-charger tariff rows instead of aggregated connectors.
 - **`charger_type_service.py`** - **NEW**: Socket charger detection helpers
   - `is_socket_charger()` - DB lookup for socket connector type
   - `is_socket_charger_cached()` - In-memory cache with DB fallback
@@ -130,7 +131,12 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
   - `clear_zero_energy_tracking()` - Cleanup hook called from `transaction_finalizer.finalize_stopped_transaction`
   - Config: `ZERO_ENERGY_TIMEOUT_SECONDS=120`, `ZERO_ENERGY_GRACE_PERIOD_SECONDS=60`
 - **`billing_retry_service.py`** - Background service (30-min interval) for failed transaction recovery, QR refund retries, orphaned QR payment cleanup, stale suspended transaction cleanup
-- **`firmware_update_service.py`** - Background service that processes pending firmware updates on startup
+- **`firmware_update_service.py`** - Background service for OCPP firmware updates (v2 state machine, migration 35)
+  - **State machine**: only 4 states — PENDING / INSTALLED / FAILED / CANCELLED. Intermediate states (DOWNLOADING/DOWNLOADED/INSTALLING) and split failures (DOWNLOAD_FAILED/INSTALLATION_FAILED) were collapsed in migration 35.
+  - **Source of truth for completion**: BootNotification with charger-reported `firmware_version` matching the pending target. `FirmwareStatusNotification` is logging-only — Quectel modems suspend WSS during HTTPS firmware download, so FSN messages are not reliable.
+  - **Retry scheduler**: Phase A sends `UpdateFirmware` for due rows (never attempted, or `next_retry_at <= now`). Phase B declares attempts failed when `last_attempt_at` is older than `FIRMWARE_ATTEMPT_TIMEOUT_SECONDS` with no `next_retry_at` (no boot received). Exponential backoff: 5m → 30m → 2h → 4h. Defaults: 5 attempts / 6h wall-clock (`FIRMWARE_MAX_ATTEMPTS`, `FIRMWARE_MAX_ELAPSED_SECONDS`).
+  - **handle_boot_notification(charger, reported_version)**: called from main.py's BootNotification handler. Marks INSTALLED on match. Ignores boots inside `FIRMWARE_BOOT_DEBOUNCE_SECONDS` window (charger may still be mid-download). Applies backoff on mismatch outside debounce.
+  - **WS-drop expectation**: after a successful `UpdateFirmware` send, marks `connected_charge_points[cp_id]["expected_ws_drop_until"] = now + 30min` so disconnect handlers don't alarm.
 - **`razorpay_service.py`** - Razorpay payment gateway integration
   - Order creation and payment verification
   - Webhook signature verification (HMAC SHA256)
@@ -148,18 +154,13 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
   - `@trace_transaction` decorator for OCPP message tracing
   - `MetricsCollector`, `OCPPMetrics`, `SentryHelper` classes
   - **W6 metrics for failure-mode alerting**: `record_disconnect_suspended`, `record_disconnect_stopped`, `record_zero_energy_stopped`, `record_billing_failed`, `record_stale_suspended_swept` — all paired with `Custom/OCPP/...` counters and structured events. Linked from runbooks in `docs/runbooks/`.
-- **`storage_service.py`** - **Firmware file storage and management**
-  - Local filesystem storage in `/backend/firmware_files/`
-  - MD5 checksum calculation for integrity
-  - Download URL generation for OCPP UpdateFirmware
-  - File naming: `{version}_{original_filename}`
-  - Static serving via `/firmware/{filename}` endpoint
-  - Volume is a Docker named volume (`backend_firmware_{env}`). Production
-    image has no `USER` directive — `docker-entrypoint.sh` starts as root,
-    `chown`s `/app/firmware_files` to `app:app`, then `exec gosu app` to
-    drop privileges. Heals pre-existing volumes whose root directory was
-    seeded under a different user (the bug that broke staging firmware
-    uploads). See `backend/Dockerfile` + `backend/docker-entrypoint.sh`.
+- **`storage_service.py`** - **Firmware file storage**
+  - **Primary storage**: S3 with presigned GET URLs. Bucket: `AWS_S3_FIRMWARE_BUCKET`. Region: `AWS_REGION` (default `ap-south-1`). Same boto3 client pattern as `s3_service.py` (invoice PDFs).
+  - **Presigned URL TTL**: `max(FIRMWARE_MAX_ELAPSED_SECONDS, 24h) + 1h` — sized to outlive the 6h retry window so a URL handed out at attempt 1 is still valid at attempt 5.
+  - **Key shape**: `firmware/{sanitized_version}/{sanitized_filename}`. Built via `build_firmware_s3_key()`.
+  - **Helpers**: `upload_firmware_to_s3(s3_key, bytes)`, `generate_firmware_presigned_url(s3_key)`, `get_firmware_download_url_for_file(firmware_file)` (prefers S3, falls back to legacy local-mount URL when `s3_key` is null).
+  - **Legacy fallback**: rows uploaded before migration 35 have `FirmwareFile.s3_key=NULL` and are still served via the local `/firmware/{filename}` StaticFiles mount. A one-time migration script (follow-up) backfills `s3_key` and uploads existing files; once all rows have `s3_key`, the StaticFiles mount can be removed.
+  - **Legacy volume**: `backend_firmware_{env}` named Docker volume retained for fallback. `docker-entrypoint.sh` still chowns `/app/firmware_files` to `app:app` for the legacy path.
 - **`data_retention_service.py`** - **Background data cleanup service**
   - Automated cleanup of old signal quality data (90 days retention)
   - OCPP log cleanup (90 days retention)
@@ -862,7 +863,11 @@ GET /api/admin/firmware/updates/status - Real-time dashboard
 
 # Public Endpoints (NO authentication)
 GET /api/public/stations/map - Charger map data with real-time availability (rate limited: 20 req/60s per IP)
-  Response: { "data": [{ id, name, latitude, longitude, address, available_chargers, total_chargers, connector_types, connector_details, price_per_kwh }], "total" }
+  Response: { "data": [{ id, name, latitude, longitude, address, available_chargers, total_chargers, connector_types, connector_details, price_per_kwh, min_price_per_kwh_incl_tax, max_price_per_kwh_incl_tax, franchisee_name }], "total" }
+  Note: `price_per_kwh` is the min tax-EXCLUSIVE rate across the station's chargers (kept for compat). All user-facing UI renders the incl-tax range — when min==max the UI shows a single value, otherwise "₹min–₹max/kWh (incl. GST)". Map endpoint deliberately omits per-charger detail for privacy.
+
+GET /api/public/stations - Authenticated station list (full per-charger detail)
+  Response data items include `chargers[]: { charge_point_string_id, name, latest_status, connectors, tariff_per_kwh, tariff_per_kwh_incl_tax, tariff_gst_percent }` plus the station-level `min/max_price_per_kwh_incl_tax`. The /stations detail modal renders per-charger tariff rows from this; the list card uses the station range.
 
 GET /api/firmware/latest - Get latest firmware for non-OCPP charge points
   Response: { "version", "filename", "download_url", "checksum", "file_size" }
@@ -923,6 +928,12 @@ GET /api/logs/{charge_point_id} - Logs for specific charger
 ---
 
 ## Current State & Recent Updates
+
+### voltNOW rebrand (2026-05-15)
+- Navbar: `frontend/components/Navbar.tsx` renders the voltNOW logo image instead of the "OCPP Admin/User" text. Two assets are shipped under `frontend/public/`: `voltnow-logo.png` (black, for light theme) and `voltnow-logo-light.png` (grey, for dark theme); swapped at runtime via Tailwind's `dark:` modifier (`block dark:hidden` / `hidden dark:block`). The right-side role chip stays as the source of truth for ADMIN/USER/FRANCHISEE.
+- Page title: `frontend/app/layout.tsx` metadata.title is "voltNOW EV Charging".
+- Invoice PDF (`backend/services/invoice_service.py:generate_pdf`): every page is stamped with the voltNOW A4 header/footer image (`backend/assets/invoice_header_footer.png`) via an `onFirstPage`/`onLaterPages` callback. `SimpleDocTemplate` top/bottom margins are 38 mm / 22 mm so content clears the lime "EV Charging" header band and the lime footer band. The previously green "TAX INVOICE" title is now a small black caption above the meta row. Missing asset is non-fatal — falls back to legacy 15 mm margins and logs a warning.
+- "OCPP" still appears in product copy where it names the protocol (e.g. "OCPP StatusNotification", "OCPP UpdateFirmware", "OCPP 1.6") — those mentions are intentionally kept.
 
 ### Latest Changes (March 2025 - Branch: 57-qr-based-appless-transaction)
 

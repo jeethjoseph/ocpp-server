@@ -257,40 +257,65 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 
 #### Firmware Management (`backend/routers/firmware.py`)
 **Endpoints**: `/api/admin/firmware/*` (admin) and `/api/firmware/*` (public)
-**Purpose**: Complete firmware update lifecycle for OCPP and non-OCPP charge points
+**Purpose**: Firmware update lifecycle for OCPP and polling chargers, with BootNotification-driven completion and CSMS-side exponential backoff retries.
 
 **Admin Endpoints**:
-- `POST /api/admin/firmware/upload` - Upload new firmware files (.bin, .hex, .fw)
-- `GET /api/admin/firmware` - List all firmware with pagination and filtering
-- `DELETE /api/admin/firmware/{id}` - Soft delete firmware (sets is_active=False)
-- `POST /api/admin/firmware/chargers/{id}/update` - Trigger OCPP firmware update for single charger
-- `POST /api/admin/firmware/bulk-update` - Trigger updates for multiple chargers
-- `GET /api/admin/firmware/chargers/{id}/history` - Get firmware update history
-- `GET /api/admin/firmware/updates/status` - Real-time dashboard of all firmware updates
+- `POST /api/admin/firmware/upload` - Upload firmware files (.bin, .hex, .fw); stored on S3 (`AWS_S3_FIRMWARE_BUCKET`).
+- `GET /api/admin/firmware` - List firmware files
+- `DELETE /api/admin/firmware/{id}` - Soft delete (`is_active=False`)
+- `POST /api/admin/firmware/chargers/{id}/update` - Schedule update; resets any existing row for this (charger, firmware) pair regardless of prior status.
+- `POST /api/admin/firmware/bulk-update` - Bulk schedule
+- `GET /api/admin/firmware/chargers/{id}/history` - History per charger
+- `GET /api/admin/firmware/updates/status` - Dashboard (PENDING rows + counts)
+- `POST /api/admin/firmware/updates/{id}/cancel` - Cancel a PENDING row that has not yet been attempted (`attempt_count == 0`)
+- `POST /api/admin/firmware/updates/{id}/mark-installed` - Admin manual close for polling chargers (also updates `Charger.firmware_version`)
+- `POST /api/admin/firmware/updates/{id}/mark-failed` - Admin manual close (does not touch `Charger.firmware_version`)
 
-**Public Endpoints**:
-- `GET /api/firmware/latest` - **NEW** - Public API for non-OCPP charge points to discover latest firmware
+**Public Endpoint**:
+- `GET /api/firmware/latest?external_charger_id=X&current_firmware_version=Y` - Polling chargers fetch their pending update here. When `current_firmware_version` matches the pending target, the server auto-closes the row as INSTALLED.
 
-**Key Features**:
-- OCPP 1.6 UpdateFirmware command integration
-- FirmwareStatusNotification handling with status tracking
-- Pre-update safety validation (online check, no active transactions)
-- MD5 checksum verification for file integrity
-- Real-time progress monitoring with dashboard
-- File storage with static serving via `/firmware/{filename}`
-- Supports OCPP (UpdateFirmware) and non-OCPP (API discovery) devices
+**State machine (v2, migration 35)**:
+4 states only — **PENDING / INSTALLED / FAILED / CANCELLED**. Intermediate states (DOWNLOADING / DOWNLOADED / INSTALLING) and split failures (DOWNLOAD_FAILED / INSTALLATION_FAILED) were collapsed because they encoded signals (`FirmwareStatusNotification`) that aren't reliably delivered.
 
-**OCPP Flow**:
-1. Admin triggers update → Sends OCPP UpdateFirmware command
-2. Charger downloads firmware from provided URL
-3. Charger sends FirmwareStatusNotification updates (Downloading → Downloaded → Installing → Installed)
-4. Server updates FirmwareUpdate status and charger.firmware_version
+**Why BootNotification is the source of truth (CRITICAL — non-obvious)**:
+Chargers using Quectel cellular modems (BG95/BG96, EC25, EG21/25 family) cannot reliably maintain the OCPP WSS connection during firmware download. The modem suspends WSS to free its single TLS context, or WSS keepalive starves under the download throughput. So `FirmwareStatusNotification: Downloading/Downloaded/Installing/Installed/DownloadFailed` may never arrive. **The only reliable completion signal is the BootNotification the charger sends after install + reboot, carrying its new `firmware_version`.** `FirmwareStatusNotification` handler (`main.py:1168+`) is therefore logging-only — it writes to OCPPLog but does not transition state.
 
-**Non-OCPP Flow**:
-1. Device calls `GET /api/firmware/latest`
-2. Receives version, download URL, checksum, file size
-3. Downloads and verifies firmware
-4. Installs and reboots with new version
+**Retry semantics (CSMS-side)**:
+- Each attempt = one `UpdateFirmware` command. Server records `attempt_count`, `last_attempt_at`.
+- `handle_boot_notification(charger, reported_version)` runs from the BootNotification handler:
+  - Match → INSTALLED (terminal)
+  - Mismatch within `FIRMWARE_BOOT_DEBOUNCE_SECONDS` (default 300s) → ignore (charger may still be mid-download)
+  - Mismatch outside debounce → attempt failed; schedule next via backoff
+- Phase B timeout: if no BootNotification arrives within `FIRMWARE_ATTEMPT_TIMEOUT_SECONDS` (default 7200s/2h), the scheduler declares the attempt failed.
+- Backoff schedule: **5min → 30min → 2h → 4h**. Capped by `FIRMWARE_MAX_ATTEMPTS` (default 5) AND `FIRMWARE_MAX_ELAPSED_SECONDS` (default 21600s/6h).
+- Budget exhausted → FAILED. Admin must re-trigger to retry.
+
+**Storage**:
+- S3 with presigned GET URLs. TTL = `max(FIRMWARE_MAX_ELAPSED_SECONDS, 24h) + 1h` so a URL handed out at attempt 1 outlives the retry window.
+- `FirmwareFile.s3_key` is the bucket key. `FirmwareFile.file_path` and the local `/firmware/{filename}` StaticFiles mount remain as legacy fallback for rows with `s3_key=NULL`.
+
+**OCPP flow (post-redesign)**:
+1. Admin triggers update → row = PENDING.
+2. Background scheduler waits for charger online + idle, then sends OCPP `UpdateFirmware` with a presigned S3 URL.
+3. WS drops within seconds (expected — `expected_ws_drop_until` flag suppresses alerts for 30 min).
+4. Charger downloads, installs, reboots.
+5. Post-install BootNotification arrives with new `firmware_version` → row → INSTALLED.
+6. If BootNotification reports the old version (outside the 5-min debounce) OR no boot within 2h → attempt failed; scheduler picks the next backoff bucket.
+7. After 5 attempts or 6h elapsed, row → FAILED.
+
+**Polling flow (out-of-network chargers)**:
+1. Charger polls `GET /api/firmware/latest?external_charger_id=...&current_firmware_version=...` every ~30 min.
+2. Server returns the PENDING row's URL + checksum.
+3. Charger downloads + installs out-of-band.
+4. Next poll carries the new version → server auto-marks INSTALLED. If the charger can't report version, admin uses `mark-installed` to close the row.
+
+**Env vars** (defaults shown; configurable in all three docker-compose files):
+- `FIRMWARE_MAX_ATTEMPTS=5`
+- `FIRMWARE_MAX_ELAPSED_SECONDS=21600` (6h wall-clock)
+- `FIRMWARE_ATTEMPT_TIMEOUT_SECONDS=7200` (2h per-attempt timeout)
+- `FIRMWARE_BOOT_DEBOUNCE_SECONDS=300` (5min)
+- `AWS_S3_FIRMWARE_BUCKET=...`
+- `FIRMWARE_PUBLIC_BASE_URL=...` (legacy fallback URL when `s3_key` is null)
 
 #### QR Code Management (`backend/routers/qr_codes.py`)
 **Endpoints**: `/api/admin/qr-codes/*`
@@ -315,6 +340,7 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 - List stations with charger availability counts (requires USER auth)
 - Get station details by ID (requires USER auth)
 - Shared helper `_fetch_stations_with_availability()` provides Redis+heartbeat filtering, connector aggregation, and tariff lookup for both authenticated and public endpoints
+- **Tariff display**: tariff is per-charger (`Tariff.rate_per_kwh` is tax-exclusive). `StationChargerInfo` carries `tariff_per_kwh`, `tariff_per_kwh_incl_tax`, `tariff_gst_percent` per charger; `PublicStationResponse` carries station-level `min/max_price_per_kwh_incl_tax` (collapse to a single value when uniform). `price_per_kwh` is preserved for compat as the min tax-EXCLUSIVE rate. Helpers live in `backend/services/tariff_utils.py`. Frontend renders incl-tax ranges via `formatTariffRangeInclGst` and uses the per-charger fields in the `/stations` detail modal.
 
 #### Public Station Map (`backend/routers/public_station_map.py`)
 **Endpoints**: `GET /api/public/stations/map`
@@ -323,6 +349,7 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 - In-memory per-IP rate limiting (20 requests per 60-second window)
 - Reuses `_fetch_stations_with_availability()` from `public_stations.py`
 - Frontend: Leaflet map on `/my-charges` page
+- Carries the same station-level `min/max_price_per_kwh_incl_tax` as `/api/public/stations` but deliberately omits per-charger detail (no `charge_point_string_id`). Popup/list/my-charges modal render the range string `₹min–₹max/kWh (incl. GST)`.
 
 #### Public QR Transaction History (`backend/routers/public_qr_transactions.py`)
 **Endpoints**: `GET /api/public/qr-transactions?vpa=xxx&page=1&limit=10&status=COMPLETED`
@@ -2628,6 +2655,8 @@ The counter row is incremented under `SELECT FOR UPDATE` and the full `generate_
 **Refunds.** Credit notes and refund vouchers are not modelled. The invoice's `transaction_amount` is net of refund (`amount_paid − refund_amount` for QR sessions). When B2B customers (with claimable Input Tax Credit) are introduced, a `gst_credit_note` table and IRP integration (IRN/signed QR/cancellation ack) will need to be added — schema today is B2C-only.
 
 **PDF persistence.** PDFs are rendered with ReportLab and uploaded to S3 lazily on first download request. `gst_invoice.pdf_url` stores the S3 key; downloads redirect to a 15-minute presigned URL. Env vars: `AWS_S3_INVOICE_BUCKET`, `AWS_REGION`. Credentials resolve via the EC2 instance role on staging/prod and via `AWS_PROFILE=voltlync` locally.
+
+**Branding overlay.** Every PDF page is stamped with the voltNOW A4 header/footer image (`backend/assets/invoice_header_footer.png`, 1241×1754 px ≈ 150 DPI) via a `_draw_branding` closure passed as both `onFirstPage` and `onLaterPages` to `doc.build`. Top/bottom margins on `SimpleDocTemplate` are 38 mm / 22 mm respectively so flowable content never overlaps the lime "EV Charging" header band or the lime footer band. The asset path is resolved relative to `services/invoice_service.py`; if the file is absent the renderer logs a warning and falls back to the legacy 15 mm margins so production is never broken by a missing asset.
 
 **Cancellation.** Invoices are immutable once issued. Cancellation columns (`status`, `cancelled_at`, `cancellation_reason`) and the orphaned `gst_credit_note` table were removed in migration 27.
 

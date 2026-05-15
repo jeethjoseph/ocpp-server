@@ -377,11 +377,20 @@ export default function ChargerDetailPage() {
               </div>
               <div className="flex justify-between items-center">
                 <span className="text-sm font-medium">Tariff:</span>
-                <Badge variant="outline">
-                  {charger.tariff_per_kwh != null
-                    ? `₹${charger.tariff_per_kwh}/kWh`
-                    : "Global"}
-                </Badge>
+                {charger.tariff_per_kwh_incl_tax != null ? (
+                  <Badge variant="outline" className="flex flex-col items-end gap-0.5 py-1 h-auto">
+                    <span className="font-medium">
+                      ₹{charger.tariff_per_kwh_incl_tax.toFixed(2)}/kWh
+                    </span>
+                    {charger.tariff_per_kwh != null && charger.tariff_gst_percent != null && (
+                      <span className="text-[10px] text-muted-foreground">
+                        (₹{charger.tariff_per_kwh.toFixed(4)} + {charger.tariff_gst_percent}% GST)
+                      </span>
+                    )}
+                  </Badge>
+                ) : (
+                  <Badge variant="outline">Global</Badge>
+                )}
               </div>
               {/* Latest Error */}
               {charger.latest_error && (

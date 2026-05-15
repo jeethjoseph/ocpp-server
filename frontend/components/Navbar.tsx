@@ -69,10 +69,23 @@ export default function Navbar() {
         <div className="flex justify-between h-16">
           <div className="flex">
             <div className="flex-shrink-0 flex items-center">
-              <Link href={isAdmin ? "/admin" : isFranchisee ? "/franchisee" : "/"}>
-                <h1 className="text-xl font-bold text-card-foreground hover:text-primary transition-colors">
-                  OCPP {isAdmin ? 'Admin' : 'User'}
-                </h1>
+              <Link
+                href={isAdmin ? "/admin" : isFranchisee ? "/franchisee" : "/"}
+                className="flex items-center"
+                aria-label="voltNOW home"
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src="/voltnow-logo.png"
+                  alt="voltNOW"
+                  className="block dark:hidden h-7 w-auto"
+                />
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src="/voltnow-logo-light.png"
+                  alt="voltNOW"
+                  className="hidden dark:block h-7 w-auto"
+                />
               </Link>
             </div>
             {/* Desktop Navigation */}

@@ -247,6 +247,18 @@ class ChargePoint(OcppChargePoint):
             connector = await Connector.filter(charger=charger).first()
             if connector and self.id in connected_charge_points:
                 connected_charge_points[self.id]["connector_type"] = connector.connector_type
+
+            # Cross-check any pending firmware updates: a BootNotification with
+            # the target firmware_version is our reliable completion signal
+            # (FirmwareStatusNotification cannot be trusted on Quectel modems).
+            try:
+                from services.firmware_update_service import firmware_update_service
+                await firmware_update_service.handle_boot_notification(charger, firmware_version)
+            except Exception as fw_err:
+                logger.error(
+                    f"📦 Error checking pending firmware updates on boot for {self.id}: {fw_err}",
+                    exc_info=True,
+                )
         except Exception as e:
             logger.error(f"❌ Error updating charger info from BootNotification: {e}", exc_info=True)
 
@@ -1167,73 +1179,17 @@ class ChargePoint(OcppChargePoint):
 
     @on('FirmwareStatusNotification')
     async def on_firmware_status_notification(self, status: str, **kwargs):
+        """OCPP 1.6 FirmwareStatusNotification — informational only.
+
+        Quectel-based chargers drop the OCPP WSS during firmware download to
+        free their single TLS context, so these messages are unreliable. State
+        transitions are driven by BootNotification (see firmware_update_service).
+        We log for audit only.
         """
-        OCPP 1.6 FirmwareStatusNotification handler
-        Charger sends this to report firmware update progress
-        """
-        # Record metric
         await OCPPMetrics.record_message("FirmwareStatusNotification", "IN")
-
-        logger.info(f"📦 FirmwareStatusNotification from {self.id}: status={status}")
-
-        from models import Charger, FirmwareUpdate, FirmwareFile
+        logger.info(f"📦 FirmwareStatusNotification from {self.id}: status={status} (informational)")
 
         try:
-            # Get charger from database
-            charger = await Charger.get(charge_point_string_id=self.id)
-
-            # Find the most recent active update for this charger
-            # Note: With new schema, each charger+firmware combo has one row
-            # Only one should be "active" (in progress) at a time per charger
-            firmware_update = await FirmwareUpdate.filter(
-                charger_id=charger.id,
-                status__in=["PENDING", "DOWNLOADING", "DOWNLOADED", "INSTALLING"]
-            ).order_by('-started_at', '-initiated_at').first()
-
-            if not firmware_update:
-                logger.warning(
-                    f"📦 No active firmware update found for {self.id}, "
-                    f"but received FirmwareStatusNotification: {status}"
-                )
-                return call_result.FirmwareStatusNotification()
-
-            # Map OCPP status to our database status
-            status_mapping = {
-                "Idle": "PENDING",
-                "Downloading": "DOWNLOADING",
-                "Downloaded": "DOWNLOADED",
-                "Installing": "INSTALLING",
-                "Installed": "INSTALLED",
-                "DownloadFailed": "DOWNLOAD_FAILED",
-                "InstallationFailed": "INSTALLATION_FAILED",
-                "InstallVerificationFailed": "INSTALLATION_FAILED"
-            }
-
-            new_status = status_mapping.get(status, status)
-            firmware_update.status = new_status
-
-            # Track timestamps
-            if status == "Downloading" and not firmware_update.started_at:
-                firmware_update.started_at = datetime.datetime.now(datetime.timezone.utc)
-                logger.info(f"📦 ✅ Firmware download started for {self.id}")
-
-            elif status in ["Installed", "DownloadFailed", "InstallationFailed", "InstallVerificationFailed"]:
-                firmware_update.completed_at = datetime.datetime.now(datetime.timezone.utc)
-
-                if status == "Installed":
-                    # Update success - update charger's firmware version
-                    firmware_file = await firmware_update.firmware_file
-                    charger.firmware_version = firmware_file.version
-                    await charger.save()
-                    logger.info(f"📦 ✅ Firmware update completed for {self.id} - new version: {firmware_file.version}")
-                else:
-                    # Update failed
-                    firmware_update.error_message = f"Firmware update failed with status: {status}"
-                    logger.error(f"📦 ❌ Firmware update failed for {self.id} with status: {status}")
-
-            await firmware_update.save()
-
-            # Log to OCPP logs for audit trail
             await OCPPLog.create(
                 charge_point_id=self.id,
                 message_type="FirmwareStatusNotification",
@@ -1242,11 +1198,8 @@ class ChargePoint(OcppChargePoint):
                 status="SUCCESS",
                 timestamp=datetime.datetime.now(datetime.timezone.utc)
             )
-
-            logger.info(f"📦 Updated firmware_update ID={firmware_update.id} to status={new_status}")
-
         except Exception as e:
-            logger.error(f"📦 ❌ Error processing FirmwareStatusNotification from {self.id}: {e}", exc_info=True)
+            logger.error(f"📦 Error logging FirmwareStatusNotification from {self.id}: {e}", exc_info=True)
 
         return call_result.FirmwareStatusNotification()
 

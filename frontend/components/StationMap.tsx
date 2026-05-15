@@ -5,6 +5,7 @@ import { MapContainer, TileLayer, Marker, Popup, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import type { PublicStationResponse } from "@/lib/api-services";
+import { formatTariffRangeInclGst } from "@/lib/utils";
 
 export interface StationWithDistance extends PublicStationResponse {
   distance?: number;
@@ -214,7 +215,12 @@ export default function StationMap({ stations, userLocation, onStationSelect, on
                 <div className="space-y-1 text-sm mb-3">
                   <div className="flex justify-between">
                     <span className="text-gray-600">Price:</span>
-                    <span className="font-medium">₹{station.price_per_kwh || 'N/A'}/kWh</span>
+                    <span className="font-medium text-right">
+                      {formatTariffRangeInclGst(
+                        station.min_price_per_kwh_incl_tax,
+                        station.max_price_per_kwh_incl_tax,
+                      )}
+                    </span>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-gray-600">Connectors:</span>

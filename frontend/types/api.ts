@@ -332,14 +332,14 @@ export interface FirmwareFileListResponse {
   limit: number;
 }
 
+// State machine v2 (post-migration 35): completion is driven by BootNotification,
+// not the unreliable FirmwareStatusNotification channel. Intermediate states
+// (DOWNLOADING/DOWNLOADED/INSTALLING) and split failure states
+// (DOWNLOAD_FAILED/INSTALLATION_FAILED) were collapsed.
 export type FirmwareUpdateStatus =
   | 'PENDING'
-  | 'DOWNLOADING'
-  | 'DOWNLOADED'
-  | 'INSTALLING'
   | 'INSTALLED'
-  | 'DOWNLOAD_FAILED'
-  | 'INSTALLATION_FAILED'
+  | 'FAILED'
   | 'CANCELLED';
 
 export interface FirmwareUpdate {
@@ -352,7 +352,9 @@ export interface FirmwareUpdate {
   started_at?: string;
   completed_at?: string;
   error_message?: string;
-  retry_count?: number;
+  attempt_count: number;
+  last_attempt_at?: string;
+  next_retry_at?: string;
   firmware_version?: string;
 }
 
@@ -387,8 +389,6 @@ export interface BulkUpdateResult {
 
 export interface UpdateStatusSummary {
   pending: number;
-  downloading: number;
-  installing: number;
   completed_today: number;
   failed_today: number;
 }
@@ -401,6 +401,9 @@ export interface UpdateStatusDashboard {
     charge_point_id: string;
     firmware_version: string;
     status: FirmwareUpdateStatus;
+    attempt_count: number;
+    last_attempt_at?: string;
+    next_retry_at?: string;
     started_at?: string;
     initiated_at: string;
   }>;

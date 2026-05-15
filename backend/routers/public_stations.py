@@ -9,6 +9,7 @@ from models import ChargingStation, Charger, Connector, Tariff, ChargerStatusEnu
 from tortoise.functions import Count, Sum
 from tortoise.query_utils import Prefetch
 from auth_middleware import require_user
+from services.tariff_utils import compute_incl_tax, compute_station_tariff_range
 
 # Pydantic schemas for public API
 class ConnectorInfo(BaseModel):
@@ -26,6 +27,9 @@ class StationChargerInfo(BaseModel):
     name: str
     latest_status: str
     connectors: List[ChargerConnectorInfo]
+    tariff_per_kwh: Optional[float] = None
+    tariff_per_kwh_incl_tax: Optional[float] = None
+    tariff_gst_percent: Optional[float] = None
 
 class PublicStationResponse(BaseModel):
     id: int
@@ -39,6 +43,10 @@ class PublicStationResponse(BaseModel):
     connector_details: List[ConnectorInfo]
     chargers: List[StationChargerInfo] = Field(default_factory=list)
     price_per_kwh: Optional[float]
+    # Tax-inclusive min/max across the station's chargers. Equal when uniform.
+    # UI uses these for the "₹X.XX–₹Y.YY/kWh (incl. GST)" summary range.
+    min_price_per_kwh_incl_tax: Optional[float] = None
+    max_price_per_kwh_incl_tax: Optional[float] = None
     # Operator / franchisee business name for payer-payee transparency
     # (RBI Payment Aggregator mandate). None means the platform operates
     # this station directly.
@@ -72,6 +80,7 @@ async def _fetch_stations_with_availability(
 
     connected_charger_ids = set(await redis_manager.get_all_connected_chargers())
     current_time = datetime.now(timezone.utc)
+    global_tariff = await Tariff.filter(is_global=True).first()
     station_responses: List[PublicStationResponse] = []
 
     for station in stations:
@@ -87,11 +96,13 @@ async def _fetch_stations_with_availability(
         )
 
         connector_details, all_connector_types = _aggregate_connectors(real_chargers)
-        price_per_kwh = await _resolve_price(real_chargers)
+        min_excl, _max_excl, min_incl, max_incl = compute_station_tariff_range(
+            real_chargers, global_tariff,
+        )
 
         charger_info_list: List[StationChargerInfo] = []
         if include_charger_details:
-            charger_info_list = _build_charger_info(real_chargers)
+            charger_info_list = _build_charger_info(real_chargers, global_tariff)
 
         station_responses.append(PublicStationResponse(
             id=station.id,
@@ -104,7 +115,9 @@ async def _fetch_stations_with_availability(
             connector_types=sorted(list(all_connector_types)),
             connector_details=sorted(connector_details, key=lambda x: x.connector_type),
             chargers=charger_info_list,
-            price_per_kwh=price_per_kwh,
+            price_per_kwh=min_excl,
+            min_price_per_kwh_incl_tax=min_incl,
+            max_price_per_kwh_incl_tax=max_incl,
             franchisee_name=station.franchisee.business_name if station.franchisee else None,
         ))
 
@@ -162,19 +175,8 @@ def _aggregate_connectors(real_chargers):
     return details, all_connector_types
 
 
-async def _resolve_price(real_chargers) -> Optional[float]:
-    """Get price_per_kwh from charger tariffs or global tariff."""
-    for charger in real_chargers:
-        if charger.tariffs:
-            return float(charger.tariffs[0].rate_per_kwh)
-    global_tariff = await Tariff.filter(is_global=True).first()
-    if global_tariff:
-        return float(global_tariff.rate_per_kwh)
-    return None
-
-
-def _build_charger_info(real_chargers) -> List[StationChargerInfo]:
-    """Build per-charger detail list."""
+def _build_charger_info(real_chargers, global_tariff) -> List[StationChargerInfo]:
+    """Build per-charger detail list including each charger's tariff."""
     result = []
     for charger in real_chargers:
         connectors = [
@@ -183,11 +185,21 @@ def _build_charger_info(real_chargers) -> List[StationChargerInfo]:
             )
             for c in charger.connectors
         ]
+        tariff = charger.tariffs[0] if charger.tariffs else global_tariff
+        if tariff is not None:
+            tariff_excl = float(tariff.rate_per_kwh)
+            tariff_incl = float(compute_incl_tax(tariff.rate_per_kwh, tariff.gst_percent))
+            tariff_gst = float(tariff.gst_percent)
+        else:
+            tariff_excl = tariff_incl = tariff_gst = None
         result.append(StationChargerInfo(
             charge_point_string_id=charger.charge_point_string_id,
             name=charger.name or f"Charger {charger.id}",
             latest_status=charger.latest_status.value,
             connectors=connectors,
+            tariff_per_kwh=tariff_excl,
+            tariff_per_kwh_incl_tax=tariff_incl,
+            tariff_gst_percent=tariff_gst,
         ))
     return result
 

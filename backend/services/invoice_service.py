@@ -14,6 +14,7 @@ import os
 import logging
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
+from pathlib import Path
 from typing import Optional
 
 from num2words import num2words
@@ -42,6 +43,11 @@ TWO_DP = Decimal("0.01")
 # under Razorpay Route). Franchisee operator details are snapshotted onto the
 # invoice separately and rendered as the "Operated by" block on the PDF.
 VOLTLYNC_NAME = os.getenv("VOLTLYNC_BUSINESS_NAME", "VOLTLYNC PRIVATE LIMITED")
+
+# voltNOW-branded A4 header/footer overlay stamped on every PDF page.
+INVOICE_BRANDING_PATH = (
+    Path(__file__).resolve().parent.parent / "assets" / "invoice_header_footer.png"
+)
 VOLTLYNC_GSTIN = os.getenv("VOLTLYNC_GSTIN", "")
 VOLTLYNC_ADDRESS = os.getenv("VOLTLYNC_ADDRESS", "")
 VOLTLYNC_STATE = os.getenv("VOLTLYNC_STATE", "Kerala")
@@ -426,17 +432,34 @@ class InvoiceService:
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
         buf = io.BytesIO()
-        doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=15*mm, bottomMargin=15*mm)
+        # Margins are sized to clear the lime "EV Charging" header band and
+        # the lime footer band of the voltNOW A4 overlay stamped by
+        # `_draw_invoice_branding` on every page.
+        branding_available = INVOICE_BRANDING_PATH.exists()
+        if not branding_available:
+            logger.warning(
+                "Invoice branding asset missing at %s — falling back to "
+                "unbranded layout.", INVOICE_BRANDING_PATH,
+            )
+        doc = SimpleDocTemplate(
+            buf,
+            pagesize=A4,
+            topMargin=38*mm if branding_available else 15*mm,
+            bottomMargin=22*mm if branding_available else 15*mm,
+            leftMargin=15*mm,
+            rightMargin=15*mm,
+        )
         styles = getSampleStyleSheet()
         elements = []
 
-        title_style = ParagraphStyle("InvTitle", parent=styles["Heading1"], fontSize=16, textColor=colors.HexColor("#2E7D32"))
+        title_style = ParagraphStyle("InvTitle", parent=styles["Heading2"], fontSize=12, textColor=colors.black, alignment=1)
         subtitle_style = ParagraphStyle("InvSub", parent=styles["Normal"], fontSize=8, textColor=colors.grey)
         bold_style = ParagraphStyle("Bold", parent=styles["Normal"], fontSize=9, fontName="Helvetica-Bold")
         normal_style = ParagraphStyle("Norm", parent=styles["Normal"], fontSize=9)
         small_style = ParagraphStyle("Small", parent=styles["Normal"], fontSize=7, textColor=colors.grey)
 
-        # Header
+        # Document-type caption. The voltNOW header overlay already brands the
+        # page, so this is a discreet centred label rather than a large title.
         elements.append(Paragraph("TAX INVOICE", title_style))
         elements.append(Spacer(1, 3*mm))
 
@@ -608,5 +631,17 @@ class InvoiceService:
             ParagraphStyle("Footer", parent=small_style, alignment=1),
         ))
 
-        doc.build(elements)
+        def _draw_branding(canvas, _doc):
+            if not branding_available:
+                return
+            canvas.saveState()
+            page_w, page_h = A4
+            canvas.drawImage(
+                str(INVOICE_BRANDING_PATH), 0, 0,
+                width=page_w, height=page_h,
+                preserveAspectRatio=True, mask='auto',
+            )
+            canvas.restoreState()
+
+        doc.build(elements, onFirstPage=_draw_branding, onLaterPages=_draw_branding)
         return buf.getvalue()
