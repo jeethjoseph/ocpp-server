@@ -723,12 +723,10 @@ async def get_charger_by_string_id(
 
         # Get applicable tariff for this charger
         from services.wallet_service import WalletService
-        from services.tariff_utils import compute_incl_tax
         tariff = await WalletService.get_applicable_tariff(charger.id)
         tariff_rate = tariff.rate_per_kwh if tariff else None
-        tariff_rate_incl = (
-            float(compute_incl_tax(tariff.rate_per_kwh, tariff.gst_percent))
-            if tariff else None
+        tariff_all_in = (
+            float(tariff.tariff_per_kwh_all_in) if tariff else None
         )
 
         # Get current transaction if any
@@ -761,7 +759,7 @@ async def get_charger_by_string_id(
                 "updated_at": charger.updated_at.isoformat(),
                 "tariff_per_kwh": float(tariff_rate) if tariff_rate else None,
                 "tariff_gst_percent": float(tariff.gst_percent) if tariff else None,
-                "tariff_per_kwh_incl_tax": tariff_rate_incl,
+                "tariff_per_kwh_all_in": tariff_all_in,
             },
             "station": {
                 "id": charger.station.id,

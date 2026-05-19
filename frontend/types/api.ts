@@ -54,7 +54,7 @@ export interface Charger {
   updated_at: string;
   tariff_per_kwh?: number;
   tariff_gst_percent?: number;
-  tariff_per_kwh_incl_tax?: number;
+  tariff_per_kwh_all_in?: number;
   latest_error?: LatestErrorInfo;
 }
 
@@ -66,8 +66,7 @@ export interface ChargerCreate {
   serial_number?: string;
   external_charger_id?: string;
   connectors: ConnectorInput[];
-  tariff_per_kwh?: number;
-  tariff_per_kwh_incl_tax?: number;
+  tariff_per_kwh_all_in?: number;
 }
 
 export interface ConnectorInput {
@@ -82,8 +81,7 @@ export interface ChargerUpdate {
   vendor?: string;
   latest_status?: string;
   external_charger_id?: string;
-  tariff_per_kwh?: number;
-  tariff_per_kwh_incl_tax?: number;
+  tariff_per_kwh_all_in?: number;
 }
 
 export interface ChargerListResponse {

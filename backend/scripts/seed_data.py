@@ -352,22 +352,37 @@ class DatabaseSeeder:
         """Create tariff structures"""
         print("💵 Creating tariffs...")
         
-        # Global default tariff
+        # Global default tariff. Seed data mirrors production semantics
+        # (post-ADR 0003): pick an all-in customer-facing rate first, then
+        # back-derive rate_per_kwh so the runtime identity check passes.
+        from core.config import RAZORPAY_PLATFORM_FEE_PERCENT
+        from services.tariff_utils import back_derive_rate_per_kwh
+
+        gst = Decimal("18.00")
+        all_in_global = Decimal("0.41")  # ≈ ₹0.35/kWh excl, post-fee + GST
+        rate_global = back_derive_rate_per_kwh(all_in_global, gst, RAZORPAY_PLATFORM_FEE_PERCENT)
         await Tariff.create(
-            rate_per_kwh=Decimal("0.35"),
-            is_global=True
+            rate_per_kwh=rate_global,
+            tariff_per_kwh_all_in=all_in_global,
+            gst_percent=gst,
+            is_global=True,
         )
-        print("  ✅ Created global tariff: ₹0.35/kWh")
-        
-        # Specific tariffs for some chargers
+        print(f"  ✅ Created global tariff: ₹{all_in_global}/kWh all-in (rate_per_kwh={rate_global})")
+
+        # Specific tariffs for some chargers — pick all_in in a plausible
+        # range, then back-derive.
         premium_chargers = random.sample(self.chargers, min(3, len(self.chargers)))
         for charger in premium_chargers:
+            all_in = Decimal(random.uniform(0.30, 0.60)).quantize(Decimal('0.01'))
+            rate = back_derive_rate_per_kwh(all_in, gst, RAZORPAY_PLATFORM_FEE_PERCENT)
             await Tariff.create(
                 charger=charger,
-                rate_per_kwh=Decimal(random.uniform(0.25, 0.50)).quantize(Decimal('0.01')),
-                is_global=False
+                rate_per_kwh=rate,
+                tariff_per_kwh_all_in=all_in,
+                gst_percent=gst,
+                is_global=False,
             )
-            print(f"  ✅ Created specific tariff for {charger.charge_point_string_id}")
+            print(f"  ✅ Created specific tariff for {charger.charge_point_string_id}: ₹{all_in}/kWh all-in")
 
     async def create_charging_transactions(self):
         """Create realistic charging transactions with history"""

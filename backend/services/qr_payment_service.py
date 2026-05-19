@@ -9,12 +9,14 @@ from typing import Optional, Tuple, Dict
 
 from tortoise.transactions import in_transaction
 
+from core.config import RAZORPAY_PLATFORM_FEE_PERCENT  # noqa: F401  (re-exported for backwards compat)
 from models import (
     User, Wallet, Charger, Transaction, QRPayment, ChargerQRCode,
     QRPaymentStatusEnum, AuthProviderEnum, ChargerStatusEnum,
     TransactionStatusEnum, UserRoleEnum
 )
 from services.razorpay_service import razorpay_service, RazorpayAlreadyRefundedError, extract_fee_from_payment
+from services.tariff_utils import synthetic_platform_fee, synthetic_fee_split
 from services.wallet_service import WalletService
 from services.monitoring_service import MetricsCollector
 from redis_manager import redis_manager
@@ -24,21 +26,24 @@ from utils import safe_create_task, mask_vpa, mask_phone, mask_payment_id, mask_
 
 logger = logging.getLogger(__name__)
 
-# Configuration from environment
-RAZORPAY_PLATFORM_FEE_PERCENT = Decimal(os.getenv("RAZORPAY_PLATFORM_FEE_PERCENT", "2.0"))
+# QR-specific configuration. The project-level RAZORPAY_PLATFORM_FEE_PERCENT
+# lives in core.config; see the import above.
 QR_PAYMENT_PENDING_TIMEOUT = int(os.getenv("QR_PAYMENT_PENDING_TIMEOUT", "300"))
 
 SYSTEM_GUEST_EMAIL = "guest@system.powerlync.com"
 
 
-async def _resolve_platform_fee(qr_payment: QRPayment) -> Decimal:
-    """Get the best available platform fee for a QR payment.
+async def _ensure_actual_fee_captured(qr_payment: QRPayment) -> None:
+    """Side-effect writer: ensure the actual Razorpay fee lives on the row.
 
-    Priority: stored actual fee > Razorpay API fetch > 2% estimate.
-    Side effect: updates fee fields on qr_payment (caller must save).
+    Priority for sourcing the actual fee: existing stored value (webhook/api) >
+    Razorpay API fetch > 2% estimate fallback. Updates `qr_payment.platform_fee`,
+    `razorpay_commission`, `razorpay_gst`, and `fee_source` in place; caller must
+    save. Used only for ops/reconciliation. NEVER drives customer-facing math —
+    see ADR 0001.
     """
     if qr_payment.fee_source in ("webhook", "api") and qr_payment.platform_fee is not None:
-        return qr_payment.platform_fee
+        return
 
     fee_data = razorpay_service.fetch_payment_fees(qr_payment.razorpay_payment_id)
     if fee_data:
@@ -47,20 +52,17 @@ async def _resolve_platform_fee(qr_payment: QRPayment) -> Decimal:
         qr_payment.razorpay_commission = total_fee - tax
         qr_payment.razorpay_gst = tax
         qr_payment.fee_source = "api"
-        return total_fee
+        return
 
-    estimated = (qr_payment.amount_paid * RAZORPAY_PLATFORM_FEE_PERCENT / 100).quantize(
-        Decimal('0.01'), rounding=ROUND_HALF_UP
-    )
-    # Estimate breakdown: Razorpay charges 18% GST on their commission
-    gst_on_fee = (estimated * Decimal('18') / Decimal('118')).quantize(
-        Decimal('0.01'), rounding=ROUND_HALF_UP
-    )
+    # Fallback when Razorpay neither delivered the fee in the webhook nor
+    # exposes it via the payment-fetch API — estimate using the same synthetic
+    # split so the row stays internally consistent.
+    estimated = synthetic_platform_fee(qr_payment.amount_paid)
+    commission, gst_on_fee = synthetic_fee_split(qr_payment.amount_paid)
     qr_payment.platform_fee = estimated
-    qr_payment.razorpay_commission = estimated - gst_on_fee
+    qr_payment.razorpay_commission = commission
     qr_payment.razorpay_gst = gst_on_fee
     qr_payment.fee_source = "estimated"
-    return estimated
 
 
 async def ensure_guest_user():
@@ -466,7 +468,11 @@ class QRPaymentService:
         tariff = await WalletService.get_applicable_tariff(charger_id)
         tariff_rate = tariff.rate_per_kwh if tariff else Decimal('0')
         gst_percent = tariff.gst_percent if tariff else Decimal('18')
-        platform_fee = await _resolve_platform_fee(qr_payment)
+        # Budget cap uses the synthetic platform fee, not the actual Razorpay
+        # fee — see ADR 0001. Customers get a predictable contract regardless
+        # of Razorpay's pricing of the moment.
+        platform_fee = synthetic_platform_fee(qr_payment.amount_paid)
+        await _ensure_actual_fee_captured(qr_payment)
         # Store budget as an integer paise value — Decimal money should
         # never round-trip through float in Redis. Consumers read this
         # back as Decimal via ``Decimal(...) / Decimal("100")``.
@@ -508,11 +514,13 @@ class QRPaymentService:
             if not qr_payment:
                 return  # Not a QR session
 
-            # Rebuild cache
+            # Rebuild cache (post-restart / cache miss). Synthetic fee for
+            # budget, actual fee still captured to the row — see ADR 0001.
             tariff = await WalletService.get_applicable_tariff(qr_payment.charger_id)
             tariff_rate = tariff.rate_per_kwh if tariff else Decimal('0')
             gst_percent = tariff.gst_percent if tariff else Decimal('18')
-            platform_fee = await _resolve_platform_fee(qr_payment)
+            platform_fee = synthetic_platform_fee(qr_payment.amount_paid)
+            await _ensure_actual_fee_captured(qr_payment)
             await qr_payment.save()
             budget_limit_paise = int(
                 ((qr_payment.amount_paid - platform_fee) * Decimal("100"))
@@ -612,7 +620,11 @@ class QRPaymentService:
         tariff = await WalletService.get_applicable_tariff(qr_payment.charger_id)
         tariff_rate = tariff.rate_per_kwh if tariff else Decimal('0')
         gst_percent = tariff.gst_percent if tariff else Decimal('18')
-        platform_fee = await _resolve_platform_fee(qr_payment)
+        # Final billing uses the synthetic platform fee for budget cap AND
+        # over-payment refund — same rule as the budget side, so the customer
+        # never feels the variance with Razorpay's actual fee. See ADR 0001.
+        platform_fee = synthetic_platform_fee(qr_payment.amount_paid)
+        await _ensure_actual_fee_captured(qr_payment)
 
         if tariff_rate:
             uncapped_energy_cost = (Decimal(str(energy_kwh)) * tariff_rate).quantize(
@@ -661,7 +673,9 @@ class QRPaymentService:
 
         qr_payment.energy_cost = energy_cost
         qr_payment.gst_amount = gst_amount
-        qr_payment.platform_fee = platform_fee
+        # NB: qr_payment.platform_fee already holds the actual Razorpay fee
+        # (populated above by _ensure_actual_fee_captured) — do not overwrite
+        # with the synthetic value. ADR 0001.
         qr_payment.status = QRPaymentStatusEnum.COMPLETED
 
         # Store billing breakdown on transaction
@@ -753,9 +767,12 @@ class QRPaymentService:
                 )
                 return
 
-            platform_fee = await _resolve_platform_fee(locked)
-            locked.platform_fee = platform_fee
-            refund_amount = locked.amount_paid - platform_fee
+            # Capture the actual Razorpay fee onto the row for ops/reconciliation,
+            # but don't subtract it from the refund — zero-energy = no service
+            # rendered, customer is made whole, VoltLync absorbs the fee as P&L.
+            # See ADR 0002.
+            await _ensure_actual_fee_captured(locked)
+            refund_amount = locked.amount_paid
 
             if refund_amount <= 0:
                 await locked.save()  # Persist fee data even if refund is skipped

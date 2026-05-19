@@ -56,3 +56,17 @@ Checklist when adding a new env var:
 5. `docker-compose.prod.yml` — add to `backend.environment:`
 6. `backend/main.py` startup event — log a warning/error if the var is critical and empty (so a misconfigured deploy fails loud)
 7. Run `docker compose build backend && docker exec <container> env | grep NEW_VAR` to verify locally before claiming done
+
+## Agent skills
+
+### Issue tracker
+
+Issues live as local markdown files under `.scratch/<feature>/`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Five canonical triage roles using default label strings (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.

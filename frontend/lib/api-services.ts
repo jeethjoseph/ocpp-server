@@ -222,7 +222,7 @@ export interface PublicStationChargerInfo {
     max_power_kw: number | null;
   }>;
   tariff_per_kwh: number | null;
-  tariff_per_kwh_incl_tax: number | null;
+  tariff_per_kwh_all_in: number | null;
   tariff_gst_percent: number | null;
 }
 
@@ -243,8 +243,8 @@ export interface PublicStationResponse {
   }>;
   chargers?: PublicStationChargerInfo[];
   price_per_kwh: number | null;
-  min_price_per_kwh_incl_tax: number | null;
-  max_price_per_kwh_incl_tax: number | null;
+  min_price_per_kwh_all_in: number | null;
+  max_price_per_kwh_all_in: number | null;
   franchisee_name: string | null;
 }
 

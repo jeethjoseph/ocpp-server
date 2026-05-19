@@ -73,6 +73,7 @@ async def test_full_path_topup_charge_invoice_balance(client):
     await Tariff.create(
         charger=charger,
         rate_per_kwh=Decimal("15.00"),
+        tariff_per_kwh_all_in=Decimal("17.7000"),  # 15 × 1.18
         gst_percent=Decimal("18.00"),
         hsn_sac_code="996749",
     )

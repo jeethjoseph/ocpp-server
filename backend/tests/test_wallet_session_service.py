@@ -58,6 +58,7 @@ async def _make_wallet_session_fixture(initial_balance: Decimal = Decimal("50.00
     tariff = await Tariff.create(
         charger=charger,
         rate_per_kwh=Decimal("15.0000"),
+        tariff_per_kwh_all_in=Decimal("17.7000"),  # 15 × 1.18
         gst_percent=Decimal("18.00"),
     )
     user = await User.create(

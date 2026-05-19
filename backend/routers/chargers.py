@@ -2,15 +2,18 @@
 from decimal import Decimal
 from typing import List, Optional, Dict
 from fastapi import APIRouter, HTTPException, Query, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime, timedelta, timezone
 import uuid
 import logging
 
+from core.config import RAZORPAY_PLATFORM_FEE_PERCENT
 from models import Charger, ChargingStation, Connector, Transaction, OCPPLog, User, ChargerError, Tariff
 from tortoise.exceptions import IntegrityError
+from tortoise.transactions import in_transaction
 from auth_middleware import require_admin, require_user_or_admin
 from crud import log_audit_event
+from services.tariff_utils import back_derive_rate_per_kwh
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +24,11 @@ class ConnectorInput(BaseModel):
     max_power_kw: Optional[float] = None
 
 class ChargerCreate(BaseModel):
+    """ADR 0003: tariff is operator-typed as the all-inclusive per-kWh rate
+    (`tariff_per_kwh_all_in`). The legacy `tariff_per_kwh` / `tariff_per_kwh_incl_tax`
+    request fields are rejected via `extra='forbid'`."""
+    model_config = {"extra": "forbid"}
+
     station_id: int
     name: str
     model: Optional[str] = None
@@ -28,17 +36,25 @@ class ChargerCreate(BaseModel):
     serial_number: Optional[str] = None
     external_charger_id: Optional[str] = None
     connectors: List[ConnectorInput]
-    tariff_per_kwh: Optional[float] = None
-    tariff_per_kwh_incl_tax: Optional[float] = None
+    tariff_per_kwh_all_in: Optional[float] = Field(
+        None, ge=1.0, le=100.0,
+        description="All-inclusive per-kWh tariff (incl. GST + 2% gateway fee). 1.0–100.0.",
+    )
+
 
 class ChargerUpdate(BaseModel):
+    """ADR 0003: see ChargerCreate."""
+    model_config = {"extra": "forbid"}
+
     name: Optional[str] = None
     model: Optional[str] = None
     vendor: Optional[str] = None
     latest_status: Optional[str] = None
     external_charger_id: Optional[str] = None
-    tariff_per_kwh: Optional[float] = None
-    tariff_per_kwh_incl_tax: Optional[float] = None
+    tariff_per_kwh_all_in: Optional[float] = Field(
+        None, ge=1.0, le=100.0,
+        description="All-inclusive per-kWh tariff (incl. GST + 2% gateway fee). 1.0–100.0.",
+    )
 
 class LatestErrorInfo(BaseModel):
     """Summary of latest unresolved error for a charger"""
@@ -62,9 +78,9 @@ class ChargerResponse(BaseModel):
     connection_status: bool
     created_at: datetime
     updated_at: datetime
-    tariff_per_kwh: Optional[float] = None
+    tariff_per_kwh: Optional[float] = None  # back-derived; internal billing math
     tariff_gst_percent: Optional[float] = None
-    tariff_per_kwh_incl_tax: Optional[float] = None
+    tariff_per_kwh_all_in: Optional[float] = None  # operator-set, customer-displayed
     latest_error: Optional[LatestErrorInfo] = None
 
     class Config:
@@ -160,9 +176,6 @@ async def get_bulk_connection_status(chargers: List[Charger]) -> Dict[str, bool]
     
     return status_dict
 
-from services.tariff_utils import compute_incl_tax
-
-
 def charger_to_response(
     charger: Charger,
     connection_status: bool,
@@ -181,10 +194,7 @@ def charger_to_response(
 
     tariff_rate = float(tariff.rate_per_kwh) if tariff else None
     tariff_gst = float(tariff.gst_percent) if tariff else None
-    tariff_incl = (
-        float(compute_incl_tax(tariff.rate_per_kwh, tariff.gst_percent))
-        if tariff else None
-    )
+    tariff_all_in = float(tariff.tariff_per_kwh_all_in) if tariff else None
 
     return ChargerResponse(
         id=charger.id,
@@ -204,7 +214,7 @@ def charger_to_response(
         latest_error=error_info,
         tariff_per_kwh=tariff_rate,
         tariff_gst_percent=tariff_gst,
-        tariff_per_kwh_incl_tax=tariff_incl,
+        tariff_per_kwh_all_in=tariff_all_in,
     )
 
 
@@ -320,54 +330,45 @@ async def create_charger(charger_data: ChargerCreate, admin_user: User = Depends
     charge_point_id = str(uuid.uuid4())
     
     try:
-        # Create charger
-        charger = await Charger.create(
-            charge_point_string_id=charge_point_id,
-            external_charger_id=charger_data.external_charger_id,
-            station_id=charger_data.station_id,
-            name=charger_data.name,
-            model=charger_data.model,
-            vendor=charger_data.vendor,
-            serial_number=charger_data.serial_number,
-            latest_status="Unavailable"
-        )
-        
-        # Create connectors
-        for connector_input in charger_data.connectors:
-            await Connector.create(
-                charger_id=charger.id,
-                connector_id=connector_input.connector_id,
-                connector_type=connector_input.connector_type,
-                max_power_kw=connector_input.max_power_kw
+        # All three writes (Charger + Connectors + Tariff) must succeed or fail
+        # together — otherwise a partial-failure scenario leaves an orphan
+        # charger row with no connectors or no tariff. Issue 05 / M6.
+        # Audit log stays OUTSIDE the transaction so the "we attempted this"
+        # trail is preserved even on rollback.
+        async with in_transaction():
+            charger = await Charger.create(
+                charge_point_string_id=charge_point_id,
+                external_charger_id=charger_data.external_charger_id,
+                station_id=charger_data.station_id,
+                name=charger_data.name,
+                model=charger_data.model,
+                vendor=charger_data.vendor,
+                serial_number=charger_data.serial_number,
+                latest_status="Unavailable"
             )
 
-        # Create charger-specific tariff if provided.
-        # Reject if both excl-tax and incl-tax forms are supplied to avoid ambiguity.
-        if (
-            charger_data.tariff_per_kwh is not None
-            and charger_data.tariff_per_kwh_incl_tax is not None
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="Provide either tariff_per_kwh or tariff_per_kwh_incl_tax, not both",
-            )
+            for connector_input in charger_data.connectors:
+                await Connector.create(
+                    charger_id=charger.id,
+                    connector_id=connector_input.connector_id,
+                    connector_type=connector_input.connector_type,
+                    max_power_kw=connector_input.max_power_kw
+                )
 
-        if charger_data.tariff_per_kwh is not None:
-            await Tariff.create(
-                charger=charger,
-                rate_per_kwh=Decimal(str(charger_data.tariff_per_kwh)),
-            )
-        elif charger_data.tariff_per_kwh_incl_tax is not None:
-            # Compute excl-tax rate from incl-tax using the model's default GST percent
-            gst_default = Tariff._meta.fields_map["gst_percent"].default
-            gst = Decimal(str(gst_default))
-            incl = Decimal(str(charger_data.tariff_per_kwh_incl_tax))
-            excl = (incl / (Decimal('1') + gst / Decimal('100'))).quantize(Decimal('0.0001'))
-            await Tariff.create(
-                charger=charger,
-                rate_per_kwh=excl,
-                gst_percent=gst,
-            )
+            # Create charger-specific tariff if provided.
+            # The operator types the all-inclusive per-kWh rate; we back-derive
+            # rate_per_kwh server-side and persist both. ADR 0003.
+            if charger_data.tariff_per_kwh_all_in is not None:
+                gst_default = Tariff._meta.fields_map["gst_percent"].default
+                gst = Decimal(str(gst_default))
+                all_in = Decimal(str(charger_data.tariff_per_kwh_all_in))
+                rate = back_derive_rate_per_kwh(all_in, gst, RAZORPAY_PLATFORM_FEE_PERCENT)
+                await Tariff.create(
+                    charger=charger,
+                    rate_per_kwh=rate,
+                    tariff_per_kwh_all_in=all_in,
+                    gst_percent=gst,
+                )
 
         await log_audit_event(
             action="charger.created",
@@ -392,6 +393,30 @@ async def create_charger(charger_data: ChargerCreate, admin_user: User = Depends
             "message": "Charger onboarded successfully"
         }
     except IntegrityError as e:
+        # The transaction has already rolled back at this point — no Charger /
+        # Connector / Tariff row persists. Record the attempt anyway so the
+        # audit trail captures "operator tried, system refused" with enough
+        # context to debug. Best-effort: a secondary audit failure shouldn't
+        # mask the original 400 response.
+        try:
+            await log_audit_event(
+                action="charger.create_failed",
+                entity_type="charger",
+                entity_id=charge_point_id,
+                actor_type="admin",
+                actor=admin_user,
+                changes={
+                    "charge_point_string_id": charge_point_id,
+                    "station_id": charger_data.station_id,
+                    "name": charger_data.name,
+                    "failure_reason": str(e),
+                },
+            )
+        except Exception as audit_err:
+            logger.warning(
+                "Failed to write rollback audit for charger create attempt %s: %s",
+                charge_point_id, audit_err,
+            )
         raise HTTPException(status_code=400, detail="Charger creation failed - check serial number or external charger ID uniqueness")
 
 @router.get("/{charger_id}", response_model=ChargerDetailResponse)
@@ -480,32 +505,24 @@ async def update_charger(charger_id: int, update_data: ChargerUpdate, admin_user
     # Update only provided fields
     update_dict = update_data.model_dump(exclude_unset=True)
 
-    # Handle tariff separately (not a Charger model field)
-    tariff_per_kwh = update_dict.pop("tariff_per_kwh", None)
-    tariff_per_kwh_incl_tax = update_dict.pop("tariff_per_kwh_incl_tax", None)
-    if tariff_per_kwh is not None and tariff_per_kwh_incl_tax is not None:
-        raise HTTPException(
-            status_code=400,
-            detail="Provide either tariff_per_kwh or tariff_per_kwh_incl_tax, not both",
-        )
-
-    if tariff_per_kwh is not None:
-        await Tariff.update_or_create(
-            defaults={"rate_per_kwh": Decimal(str(tariff_per_kwh))},
-            charger_id=charger_id
-        )
-    elif tariff_per_kwh_incl_tax is not None:
-        # Use existing charger-specific tariff's GST if present, else default.
+    # Tariff is handled out-of-band — back-derive rate_per_kwh from the
+    # operator-typed all-in value and persist both columns. ADR 0003.
+    tariff_per_kwh_all_in = update_dict.pop("tariff_per_kwh_all_in", None)
+    if tariff_per_kwh_all_in is not None:
         existing = await Tariff.filter(charger_id=charger_id).first()
         if existing:
             gst = existing.gst_percent
         else:
             gst_default = Tariff._meta.fields_map["gst_percent"].default
             gst = Decimal(str(gst_default))
-        incl = Decimal(str(tariff_per_kwh_incl_tax))
-        excl = (incl / (Decimal('1') + gst / Decimal('100'))).quantize(Decimal('0.0001'))
+        all_in = Decimal(str(tariff_per_kwh_all_in))
+        rate = back_derive_rate_per_kwh(all_in, gst, RAZORPAY_PLATFORM_FEE_PERCENT)
         await Tariff.update_or_create(
-            defaults={"rate_per_kwh": excl, "gst_percent": gst},
+            defaults={
+                "rate_per_kwh": rate,
+                "tariff_per_kwh_all_in": all_in,
+                "gst_percent": gst,
+            },
             charger_id=charger_id,
         )
 

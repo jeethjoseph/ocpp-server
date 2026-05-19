@@ -34,6 +34,7 @@ from models import (
 )
 from services.wallet_service import WalletService
 from services.monitoring_service import MetricsCollector
+from services.tariff_utils import synthetic_fee_split
 
 logger = logging.getLogger("ocpp-server")
 
@@ -282,8 +283,10 @@ class InvoiceService:
             # two separate lines on the PDF.
             transaction_amount = qr_payment.amount_paid or Decimal("0")
             refund_amount = qr_payment.refund_amount or Decimal("0")
-            gateway_taxable = qr_payment.razorpay_commission or Decimal("0")
-            gateway_tax = qr_payment.razorpay_gst or Decimal("0")
+            # Gateway charges on the invoice use the SYNTHETIC 2% split,
+            # not Razorpay's actual fee — see ADR 0001. The QRPayment row's
+            # razorpay_commission/razorpay_gst keep the actual values for ops.
+            gateway_taxable, gateway_tax = synthetic_fee_split(transaction_amount)
             series = "QR"
         else:
             payment_method = "WALLET"
@@ -393,7 +396,7 @@ class InvoiceService:
             gst_rate_percent=gst_rate,
             energy_taxable_value=energy_taxable,
             gateway_charges=gateway_taxable,
-            gateway_gst=(qr_payment.razorpay_gst if qr_payment else None),
+            gateway_gst=(gateway_tax if qr_payment else None),
             total_taxable_value=total_taxable,
             is_inter_state=gst_split["is_inter_state"],
             cgst_rate=gst_split["cgst_rate"],

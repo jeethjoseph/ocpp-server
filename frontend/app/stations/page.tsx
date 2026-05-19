@@ -7,7 +7,7 @@ import dynamic from "next/dynamic";
 import { Button } from "@/components/ui/button";
 import { usePublicStations } from "@/lib/queries/public-stations";
 import type { StationWithDistance } from "@/components/StationMap";
-import { formatTariffRangeInclGst } from "@/lib/utils";
+import { formatTariffRangeAllIn } from "@/lib/utils";
 
 // Dynamic import for Leaflet to avoid SSR issues
 const Map = dynamic(() => import("@/components/StationMap"), {
@@ -163,9 +163,9 @@ export default function StationsPage() {
                           </div>
                           
                           <div className="text-sm font-medium text-gray-900">
-                            {formatTariffRangeInclGst(
-                              station.min_price_per_kwh_incl_tax,
-                              station.max_price_per_kwh_incl_tax,
+                            {formatTariffRangeAllIn(
+                              station.min_price_per_kwh_all_in,
+                              station.max_price_per_kwh_all_in,
                             )}
                           </div>
                         </div>
@@ -252,8 +252,8 @@ export default function StationsPage() {
                               </span>
                             </div>
                             <div className="mt-1 text-xs text-gray-700 text-right">
-                              {charger.tariff_per_kwh_incl_tax != null
-                                ? `₹${charger.tariff_per_kwh_incl_tax.toFixed(2)}/kWh (incl. GST)`
+                              {charger.tariff_per_kwh_all_in != null
+                                ? `₹${charger.tariff_per_kwh_all_in.toFixed(2)}/kWh (all-inclusive)`
                                 : 'Tariff: N/A'}
                             </div>
                           </div>

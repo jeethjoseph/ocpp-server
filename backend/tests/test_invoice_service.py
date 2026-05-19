@@ -59,6 +59,7 @@ async def _make_session(
     await Tariff.create(
         charger=charger,
         rate_per_kwh=rate,
+        tariff_per_kwh_all_in=(rate * (Decimal("1") + gst_percent / Decimal("100"))).quantize(Decimal("0.0001")),
         gst_percent=gst_percent,
         is_global=False,
         hsn_sac_code="996749",
@@ -91,6 +92,11 @@ async def _make_session(
             image_url=f"https://r/{_uuid.uuid4().hex[:6]}.png",
             is_active=True,
         )
+        # platform_fee / razorpay_commission / razorpay_gst on the row are the
+        # ACTUAL Razorpay fee (₹0.24 = 1.2% here) per ADR 0001. refund_amount
+        # is computed against the SYNTHETIC fee (₹0.40 = 2%) so the prepaid
+        # invariant total_amount + refund_amount == amount_paid holds against
+        # the invoice (which uses synthetic gateway charges).
         qr_payment = await QRPayment.create(
             razorpay_payment_id=f"pay_{_uuid.uuid4().hex[:10]}",
             razorpay_qr_code_id=qr_code.razorpay_qr_code_id,
@@ -106,7 +112,7 @@ async def _make_session(
             razorpay_commission=Decimal("0.20"),
             razorpay_gst=Decimal("0.04"),
             refund_amount=(
-                Decimal("20.00") - energy_charge - gst_amount - Decimal("0.24")
+                Decimal("20.00") - energy_charge - gst_amount - Decimal("0.40")
             ),
             status=QRPaymentStatusEnum.REFUNDED,
         )
@@ -162,18 +168,28 @@ async def test_qr_invoice_shows_gross_payment_and_refund_separately(client):
 
 
 @pytest.mark.asyncio
-async def test_qr_invoice_includes_gateway_charges(client):
-    """Gateway line = razorpay_commission (taxable) + razorpay_gst (tax)."""
+async def test_qr_invoice_gateway_line_uses_synthetic_2_percent(client):
+    """Gateway line on the invoice is the SYNTHETIC 2% of amount_paid, NOT
+    the actual Razorpay fee on the QRPayment row. See ADR 0001.
+
+    For amount_paid=₹20, synthetic total=₹0.40 → commission=₹0.34, GST=₹0.06.
+    The qr_payment row still carries the actual fee (₹0.24 in this fixture)
+    for ops/reconciliation — only the invoice surface uses the synthetic split.
+    """
     _, _, txn, _, qr_payment = await _make_session(with_qr=True)
 
     invoice = await InvoiceService.generate_invoice(txn.id)
 
-    assert invoice.gateway_charges == qr_payment.razorpay_commission
+    # Synthetic split of amount_paid=₹20: total=₹0.40, commission=₹0.34, GST=₹0.06
+    assert invoice.gateway_charges == Decimal("0.34")
     assert (
         invoice.total_taxable_value
-        == txn.energy_charge + qr_payment.razorpay_commission
+        == txn.energy_charge + Decimal("0.34")
     )
-    assert invoice.total_tax == txn.gst_amount + qr_payment.razorpay_gst
+    assert invoice.total_tax == txn.gst_amount + Decimal("0.06")
+    # Actual Razorpay fee on the QRPayment row is untouched
+    assert qr_payment.razorpay_commission == Decimal("0.20")
+    assert qr_payment.razorpay_gst == Decimal("0.04")
 
 
 @pytest.mark.asyncio
@@ -380,15 +396,18 @@ async def test_invoice_total_plus_refund_equals_amount_paid(client):
 
 
 @pytest.mark.asyncio
-async def test_invoice_gateway_gst_snapshotted_from_qr_payment(client):
-    """generate_invoice snapshots qr_payment.razorpay_gst onto gateway_gst.
-    For wallet sessions (no qr_payment), gateway_gst is None."""
+async def test_invoice_gateway_gst_uses_synthetic_split(client):
+    """generate_invoice writes gateway_gst from the synthetic 2% split,
+    NOT from qr_payment.razorpay_gst. Wallet sessions (no qr_payment) leave
+    gateway_gst NULL. See ADR 0001."""
     _, _, qr_txn, _, qr_payment = await _make_session(with_qr=True)
     qr_invoice = await InvoiceService.generate_invoice(qr_txn.id)
 
     assert qr_invoice is not None
-    assert qr_invoice.gateway_gst == qr_payment.razorpay_gst
-    assert qr_invoice.gateway_gst == Decimal("0.04")
+    # Synthetic GST on amount_paid=₹20 → ₹0.06, not the row's ₹0.04
+    assert qr_invoice.gateway_gst == Decimal("0.06")
+    # Row's actual fee is unchanged
+    assert qr_payment.razorpay_gst == Decimal("0.04")
 
     _, _, wallet_txn, _, _ = await _make_session()
     wallet_invoice = await InvoiceService.generate_invoice(wallet_txn.id)

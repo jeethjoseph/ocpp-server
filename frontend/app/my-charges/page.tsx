@@ -29,7 +29,7 @@ import { usePublicQRTransactions, viewPublicInvoicePDF } from "@/lib/queries/pub
 import { usePublicStationMap } from "@/lib/queries/public-station-map";
 import { QRTransactionItem } from "@/lib/api-services";
 import type { StationWithDistance } from "@/components/StationMap";
-import { formatTariffRangeInclGst } from "@/lib/utils";
+import { formatTariffRangeAllIn } from "@/lib/utils";
 
 const Map = dynamic(() => import("@/components/StationMap"), {
   ssr: false,
@@ -411,9 +411,9 @@ export default function MyChargesPage() {
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">Price per kWh:</span>
                   <span className="font-medium text-foreground text-right">
-                    {formatTariffRangeInclGst(
-                      selectedStation.min_price_per_kwh_incl_tax,
-                      selectedStation.max_price_per_kwh_incl_tax,
+                    {formatTariffRangeAllIn(
+                      selectedStation.min_price_per_kwh_all_in,
+                      selectedStation.max_price_per_kwh_all_in,
                     )}
                   </span>
                 </div>

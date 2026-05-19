@@ -22,8 +22,12 @@ env/
 test.html
 dump.rdb
 
-# Claude Code plans (local development artifacts)
-.claude/plans/
+# Claude Code + agent tooling — local development artifacts only.
+# Project-level agent docs (docs/agents/, CLAUDE.md) and issue specs
+# (.scratch/) stay tracked; only personal/per-machine state is ignored.
+.claude/
+.agents/
+skills-lock.json
 
 # Database (PostgreSQL dumps and backups)
 *.sql

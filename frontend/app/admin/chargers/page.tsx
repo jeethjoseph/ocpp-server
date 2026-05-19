@@ -19,6 +19,8 @@ import {
   useCreateCharger,
   useUpdateCharger,
 } from "@/lib/queries/chargers";
+import { PLATFORM_FEE_PERCENT, DEFAULT_GST_PERCENT } from "@/lib/constants";
+import { TariffBreakdownPreview } from "@/components/TariffBreakdownPreview";
 
 export default function AdminChargersPage() {
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -336,16 +338,12 @@ export default function AdminChargersPage() {
                           {station?.name || "Unknown"}
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm">
-                          {charger.tariff_per_kwh_incl_tax != null ? (
+                          {charger.tariff_per_kwh_all_in != null ? (
                             <div className="flex flex-col">
                               <span className="text-card-foreground font-medium">
-                                ₹{charger.tariff_per_kwh_incl_tax.toFixed(2)}/kWh
+                                ₹{charger.tariff_per_kwh_all_in.toFixed(2)}/kWh
                               </span>
-                              {charger.tariff_per_kwh != null && charger.tariff_gst_percent != null && (
-                                <span className="text-xs text-muted-foreground">
-                                  (₹{charger.tariff_per_kwh.toFixed(4)} + {charger.tariff_gst_percent}% GST)
-                                </span>
-                              )}
+                              <span className="text-xs text-muted-foreground">(all-inclusive)</span>
                             </div>
                           ) : (
                             <span className="text-xs text-muted-foreground">—</span>
@@ -482,7 +480,7 @@ function ChargerModal({ stations, onSubmit, onClose }: ChargerModalProps) {
     vendor: "",
     serial_number: "",
     external_charger_id: "",
-    tariff_per_kwh_incl_tax: "",
+    tariff_per_kwh_all_in: "",
     connectors: [
       { connector_id: 1, connector_type: "Type2", max_power_kw: 22 },
     ],
@@ -497,8 +495,8 @@ function ChargerModal({ stations, onSubmit, onClose }: ChargerModalProps) {
       vendor: formData.vendor || undefined,
       serial_number: formData.serial_number || undefined,
       external_charger_id: formData.external_charger_id || undefined,
-      tariff_per_kwh_incl_tax: formData.tariff_per_kwh_incl_tax
-        ? parseFloat(formData.tariff_per_kwh_incl_tax)
+      tariff_per_kwh_all_in: formData.tariff_per_kwh_all_in
+        ? parseFloat(formData.tariff_per_kwh_all_in)
         : undefined,
     });
   };
@@ -638,22 +636,24 @@ function ChargerModal({ stations, onSubmit, onClose }: ChargerModalProps) {
 
           <div>
             <label className="block text-sm font-medium text-card-foreground mb-1">
-              Tariff (₹/kWh, incl. GST)
+              Tariff (₹/kWh, all-inclusive)
             </label>
             <input
               type="number"
               step="0.01"
-              min="0"
-              value={formData.tariff_per_kwh_incl_tax}
+              min="1"
+              max="100"
+              value={formData.tariff_per_kwh_all_in}
               onChange={(e) =>
-                setFormData({ ...formData, tariff_per_kwh_incl_tax: e.target.value })
+                setFormData({ ...formData, tariff_per_kwh_all_in: e.target.value })
               }
-              placeholder="Leave empty to use global tariff"
+              placeholder="Leave empty to use global tariff (1.0–100.0)"
               className="w-full px-3 py-2 border border-border bg-input text-foreground rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 transition-colors"
             />
             <p className="text-xs text-muted-foreground mt-1">
-              Tax-exclusive rate is computed using the default GST and stored automatically.
+              The customer sees this number. Includes GST and the 2% gateway fee.
             </p>
+            <TariffBreakdownPreview value={formData.tariff_per_kwh_all_in} feePercent={PLATFORM_FEE_PERCENT} gstPercent={DEFAULT_GST_PERCENT} />
           </div>
 
           <div>
@@ -772,9 +772,9 @@ function EditChargerModal({ charger, onSubmit, onClose }: EditChargerModalProps)
     model: charger.model || "",
     vendor: charger.vendor || "",
     external_charger_id: charger.external_charger_id || "",
-    tariff_per_kwh_incl_tax:
-      charger.tariff_per_kwh_incl_tax != null
-        ? charger.tariff_per_kwh_incl_tax.toFixed(2)
+    tariff_per_kwh_all_in:
+      charger.tariff_per_kwh_all_in != null
+        ? charger.tariff_per_kwh_all_in.toFixed(2)
         : "",
   });
 
@@ -785,8 +785,8 @@ function EditChargerModal({ charger, onSubmit, onClose }: EditChargerModalProps)
       model: formData.model || undefined,
       vendor: formData.vendor || undefined,
       external_charger_id: formData.external_charger_id || undefined,
-      tariff_per_kwh_incl_tax: formData.tariff_per_kwh_incl_tax
-        ? parseFloat(formData.tariff_per_kwh_incl_tax)
+      tariff_per_kwh_all_in: formData.tariff_per_kwh_all_in
+        ? parseFloat(formData.tariff_per_kwh_all_in)
         : undefined,
     });
   };
@@ -858,24 +858,24 @@ function EditChargerModal({ charger, onSubmit, onClose }: EditChargerModalProps)
 
           <div>
             <label className="block text-sm font-medium text-card-foreground mb-1">
-              Tariff (₹/kWh, incl. GST)
+              Tariff (₹/kWh, all-inclusive)
             </label>
             <input
               type="number"
               step="0.01"
-              min="0"
-              value={formData.tariff_per_kwh_incl_tax}
+              min="1"
+              max="100"
+              value={formData.tariff_per_kwh_all_in}
               onChange={(e) =>
-                setFormData({ ...formData, tariff_per_kwh_incl_tax: e.target.value })
+                setFormData({ ...formData, tariff_per_kwh_all_in: e.target.value })
               }
-              placeholder="Leave empty to use global tariff"
+              placeholder="Leave empty to use global tariff (1.0–100.0)"
               className="w-full px-3 py-2 border border-border bg-input text-foreground rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 transition-colors"
             />
-            {charger.tariff_per_kwh != null && charger.tariff_gst_percent != null && (
-              <p className="text-xs text-muted-foreground mt-1">
-                Current excl-GST rate: ₹{charger.tariff_per_kwh.toFixed(4)} + {charger.tariff_gst_percent}% GST. Updated value is stored as excl-GST automatically.
-              </p>
-            )}
+            <p className="text-xs text-muted-foreground mt-1">
+              The customer sees this number. Includes GST and the 2% gateway fee.
+            </p>
+            <TariffBreakdownPreview value={formData.tariff_per_kwh_all_in} feePercent={PLATFORM_FEE_PERCENT} gstPercent={DEFAULT_GST_PERCENT} />
           </div>
 
           <div className="flex justify-end space-x-3 pt-4">
@@ -896,3 +896,4 @@ function EditChargerModal({ charger, onSubmit, onClose }: EditChargerModalProps)
     </div>
   );
 }
+

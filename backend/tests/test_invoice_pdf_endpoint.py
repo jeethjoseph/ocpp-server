@@ -55,6 +55,7 @@ async def _make_invoice_for_admin_test() -> tuple[GSTInvoice, Transaction]:
     await Tariff.create(
         charger=charger,
         rate_per_kwh=Decimal("20.00"),
+        tariff_per_kwh_all_in=Decimal("23.6000"),  # 20 × 1.18
         gst_percent=Decimal("18.00"),
         is_global=False,
         hsn_sac_code="996749",
@@ -213,6 +214,7 @@ async def _make_qr_session_with_invoice(vpa: str):
     await Connector.create(charger=charger, connector_id=1, connector_type="Type2")
     await Tariff.create(
         charger=charger, rate_per_kwh=Decimal("20.00"),
+        tariff_per_kwh_all_in=Decimal("23.6000"),  # 20 × 1.18
         gst_percent=Decimal("18.00"), is_global=False, hsn_sac_code="996749",
     )
     user = await User.create(

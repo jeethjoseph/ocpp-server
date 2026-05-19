@@ -334,7 +334,14 @@ class Tariff(Model):
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)
     charger = fields.ForeignKeyField("models.Charger", related_name="tariffs", null=True)
+    # Internal back-derived rate, used by line-item billing math only.
+    # Equals `tariff_per_kwh_all_in × (1 - fee_pct/100) / (1 + gst_pct/100)`.
+    # Never customer-facing — see ADR 0003.
     rate_per_kwh = fields.DecimalField(max_digits=8, decimal_places=4)
+    # Operator-typed, customer-displayed all-inclusive rate (incl. GST and
+    # the synthetic 2% gateway fee). Source of truth for the customer-facing
+    # tariff display. See ADR 0003.
+    tariff_per_kwh_all_in = fields.DecimalField(max_digits=10, decimal_places=4)
     gst_percent = fields.DecimalField(max_digits=5, decimal_places=2, default=18.00)
     hsn_sac_code = fields.CharField(max_length=10, null=True)
     is_global = fields.BooleanField(default=False)

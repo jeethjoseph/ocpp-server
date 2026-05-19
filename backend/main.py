@@ -1635,6 +1635,23 @@ async def startup_event():
             "All charging sessions will complete and be billed, but no "
             "gst_invoice row will be created."
         )
+
+    # ADR 0001 + issue 03: synthetic platform fee drives all customer-facing
+    # math. Validate at startup across four bands (≤0 fail / 0–5 ok / 5–10 warn
+    # / >10 fail) so a misconfigured deploy never reaches a real user.
+    from core.config import RAZORPAY_PLATFORM_FEE_PERCENT, validate_platform_fee_percent
+    validate_platform_fee_percent(RAZORPAY_PLATFORM_FEE_PERCENT, logger)
+
+    # Tariff back-calc identity check (issue 02): catch the scenario where
+    # RAZORPAY_PLATFORM_FEE_PERCENT was changed AFTER migration 36 ran, leaving
+    # legacy-backfilled rows violating the identity until operators re-save them.
+    # Non-fatal — startup proceeds and operators are nudged via the warning.
+    from services.tariff_drift_check import warn_on_tariff_identity_drift
+    try:
+        await warn_on_tariff_identity_drift(RAZORPAY_PLATFORM_FEE_PERCENT, logger)
+    except Exception as e:
+        logger.warning("Tariff identity check failed (non-fatal): %s", e)
+
     if not os.getenv("AWS_S3_INVOICE_BUCKET"):
         logger.warning(
             "STARTUP WARNING: AWS_S3_INVOICE_BUCKET is not configured. "

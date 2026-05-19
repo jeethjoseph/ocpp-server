@@ -296,62 +296,183 @@ class TestChargerEndpoints:
     async def test_list_chargers_includes_tariff(
         self, client_admin: AsyncClient, test_charger, test_tariff
     ):
-        """List endpoint should populate tariff_per_kwh, tariff_gst_percent, and the derived incl-tax rate."""
+        """List endpoint populates tariff_per_kwh, tariff_gst_percent, and the
+        operator-set tariff_per_kwh_all_in (post-ADR 0003)."""
         response = await client_admin.get("/api/admin/chargers")
         assert response.status_code == status.HTTP_200_OK
         data = response.json()
         row = next(c for c in data["data"] if c["id"] == test_charger.id)
         assert row["tariff_per_kwh"] == pytest.approx(15.0, rel=1e-6)
         assert row["tariff_gst_percent"] == pytest.approx(18.0, rel=1e-6)
-        # 15.00 * 1.18 = 17.70
-        assert row["tariff_per_kwh_incl_tax"] == pytest.approx(17.70, rel=1e-6)
+        # Fixture sets tariff_per_kwh_all_in to 17.70 (= 15 × 1.18, migration-equivalent)
+        assert row["tariff_per_kwh_all_in"] == pytest.approx(17.70, rel=1e-6)
+        # Legacy field is gone from responses.
+        assert "tariff_per_kwh_incl_tax" not in row
 
     @pytest.mark.asyncio
-    async def test_update_charger_with_incl_tax_tariff(
+    async def test_update_charger_with_all_in_tariff_back_derives_rate(
         self, client_admin: AsyncClient, test_charger, test_tariff
     ):
-        """Updating with tariff_per_kwh_incl_tax should compute and store excl-tax rate using current GST %."""
+        """Updating with tariff_per_kwh_all_in back-derives rate_per_kwh
+        server-side. ADR 0003 acceptance criterion."""
         response = await client_admin.put(
             f"/api/admin/chargers/{test_charger.id}",
-            json={"tariff_per_kwh_incl_tax": 11.80},
+            json={"tariff_per_kwh_all_in": 30.00},
         )
         assert response.status_code == status.HTTP_200_OK
-        # 11.80 / 1.18 = 10.0000 (4dp)
+        # 30 × 0.98 / 1.18 = 24.9152542... → 24.9153 (4dp, ROUND_HALF_UP)
         tariff = await Tariff.filter(charger_id=test_charger.id).first()
         assert tariff is not None
-        assert tariff.rate_per_kwh == Decimal("10.0000")
+        assert tariff.tariff_per_kwh_all_in == Decimal("30.0000")
+        assert tariff.rate_per_kwh == Decimal("24.9153")
         assert tariff.gst_percent == Decimal("18.00")
-        assert response.json()["charger"]["tariff_per_kwh_incl_tax"] == pytest.approx(11.80, rel=1e-6)
+        assert response.json()["charger"]["tariff_per_kwh_all_in"] == pytest.approx(30.0, rel=1e-6)
 
     @pytest.mark.asyncio
-    async def test_update_charger_rejects_both_tariff_forms(
+    async def test_update_charger_validates_all_in_lower_bound(
         self, client_admin: AsyncClient, test_charger
     ):
-        """Sending both excl- and incl-tax tariff in one update should 400."""
+        """tariff_per_kwh_all_in below ₹1.0 returns 422."""
         response = await client_admin.put(
             f"/api/admin/chargers/{test_charger.id}",
-            json={"tariff_per_kwh": 8.5, "tariff_per_kwh_incl_tax": 10.0},
+            json={"tariff_per_kwh_all_in": 0.5},
         )
-        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
 
     @pytest.mark.asyncio
-    async def test_create_charger_with_incl_tax_tariff(
+    async def test_update_charger_validates_all_in_upper_bound(
+        self, client_admin: AsyncClient, test_charger
+    ):
+        """tariff_per_kwh_all_in above ₹100.0 returns 422."""
+        response = await client_admin.put(
+            f"/api/admin/chargers/{test_charger.id}",
+            json={"tariff_per_kwh_all_in": 150.0},
+        )
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+    @pytest.mark.asyncio
+    async def test_update_charger_rejects_legacy_tariff_fields(
+        self, client_admin: AsyncClient, test_charger
+    ):
+        """The pre-ADR-0003 fields tariff_per_kwh and tariff_per_kwh_incl_tax
+        are no longer accepted — `extra='forbid'` returns 422."""
+        for legacy_field in ("tariff_per_kwh", "tariff_per_kwh_incl_tax"):
+            response = await client_admin.put(
+                f"/api/admin/chargers/{test_charger.id}",
+                json={legacy_field: 12.0},
+            )
+            assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY, (
+                f"Legacy field {legacy_field} should be rejected"
+            )
+
+    @pytest.mark.asyncio
+    async def test_create_charger_with_all_in_tariff(
         self, client_admin: AsyncClient, test_station
     ):
-        """Creating a charger with tariff_per_kwh_incl_tax should store the computed excl-tax rate."""
+        """Creating a charger with tariff_per_kwh_all_in back-derives rate_per_kwh."""
         payload = {
             "station_id": test_station.id,
-            "name": "Incl-tax Charger",
+            "name": "All-in Charger",
             "connectors": [{"connector_id": 1, "connector_type": "Type2", "max_power_kw": 22.0}],
-            "tariff_per_kwh_incl_tax": 23.60,
+            "tariff_per_kwh_all_in": 25.0,
         }
         response = await client_admin.post("/api/admin/chargers", json=payload)
         assert response.status_code == status.HTTP_201_CREATED
         charger_id = response.json()["charger"]["id"]
         tariff = await Tariff.filter(charger_id=charger_id).first()
         assert tariff is not None
-        # 23.60 / 1.18 = 20.0000
-        assert tariff.rate_per_kwh == Decimal("20.0000")
-        assert tariff.gst_percent == Decimal("18.00")
+        # 25 × 0.98 / 1.18 = 20.7627 (4dp)
+        assert tariff.rate_per_kwh == Decimal("20.7627")
+        assert tariff.tariff_per_kwh_all_in == Decimal("25.0000")
+
+    # ========================================================================
+    # Transactional atomicity (issue 05 / M6)
+    # ========================================================================
+
+    @pytest.mark.asyncio
+    async def test_create_charger_rolls_back_on_tariff_failure(
+        self, client_admin: AsyncClient, test_station
+    ):
+        """If Tariff.create raises mid-request, neither the Charger nor the
+        Connector rows persist — all three writes are wrapped in a transaction.
+        The audit row IS written (rollback-audit, issue 05) so the attempted
+        creation is captured even though the data was rolled back."""
+        from unittest.mock import patch
+        from tortoise.exceptions import IntegrityError
+        from models import Connector, AuditLog
+
+        charger_count_before = await Charger.filter(station_id=test_station.id).count()
+        connector_count_before = await Connector.all().count()
+        failed_audit_count_before = await AuditLog.filter(
+            action="charger.create_failed"
+        ).count()
+
+        payload = {
+            "station_id": test_station.id,
+            "name": "Rollback Test Charger",
+            "serial_number": "ROLLBACK-001",
+            "connectors": [
+                {"connector_id": 1, "connector_type": "Type2", "max_power_kw": 22.0}
+            ],
+            "tariff_per_kwh_all_in": 25.0,
+        }
+
+        # Patch Tariff.create to raise — simulates a DB constraint blowing up
+        # the third step of the create sequence.
+        with patch(
+            "routers.chargers.Tariff.create",
+            side_effect=IntegrityError("simulated tariff insert failure"),
+        ):
+            response = await client_admin.post("/api/admin/chargers", json=payload)
+
+        # Backend should surface a 400 (the existing except branch catches it).
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+        # Critical assertion: NO charger or connector row was created. The
+        # transaction rolled back atomically.
+        charger_count_after = await Charger.filter(station_id=test_station.id).count()
+        connector_count_after = await Connector.all().count()
+        assert charger_count_after == charger_count_before, (
+            "Charger persisted despite tariff insert failure — transaction rollback broken"
+        )
+        assert connector_count_after == connector_count_before, (
+            "Connector persisted despite tariff insert failure — transaction rollback broken"
+        )
+
+        # The audit row is written OUTSIDE the transaction so it survives
+        # rollback. Ops needs this signal to investigate failed onboardings.
+        failed_audit_count_after = await AuditLog.filter(
+            action="charger.create_failed"
+        ).count()
+        assert failed_audit_count_after == failed_audit_count_before + 1, (
+            "Rollback-audit not written — operators can't see failed create attempts"
+        )
+
+    @pytest.mark.asyncio
+    async def test_create_charger_happy_path_persists_all_three_rows(
+        self, client_admin: AsyncClient, test_station
+    ):
+        """Regression guard for the transaction wrapper: happy path still
+        creates Charger + Connector + Tariff."""
+        from models import Connector
+
+        payload = {
+            "station_id": test_station.id,
+            "name": "Happy Path Charger",
+            "serial_number": "HAPPY-001",
+            "connectors": [
+                {"connector_id": 1, "connector_type": "Type2", "max_power_kw": 22.0},
+                {"connector_id": 2, "connector_type": "CCS", "max_power_kw": 50.0},
+            ],
+            "tariff_per_kwh_all_in": 18.0,
+        }
+        response = await client_admin.post("/api/admin/chargers", json=payload)
+        assert response.status_code == status.HTTP_201_CREATED
+
+        charger_id = response.json()["charger"]["id"]
+        charger = await Charger.filter(id=charger_id).first()
+        assert charger is not None
+        assert await Connector.filter(charger_id=charger_id).count() == 2
+        assert await Tariff.filter(charger_id=charger_id).count() == 1
 
 # Run with: pytest tests/test_chargers.py -v

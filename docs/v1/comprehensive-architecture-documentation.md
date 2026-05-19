@@ -340,7 +340,9 @@ Chargers using Quectel cellular modems (BG95/BG96, EC25, EG21/25 family) cannot 
 - List stations with charger availability counts (requires USER auth)
 - Get station details by ID (requires USER auth)
 - Shared helper `_fetch_stations_with_availability()` provides Redis+heartbeat filtering, connector aggregation, and tariff lookup for both authenticated and public endpoints
-- **Tariff display**: tariff is per-charger (`Tariff.rate_per_kwh` is tax-exclusive). `StationChargerInfo` carries `tariff_per_kwh`, `tariff_per_kwh_incl_tax`, `tariff_gst_percent` per charger; `PublicStationResponse` carries station-level `min/max_price_per_kwh_incl_tax` (collapse to a single value when uniform). `price_per_kwh` is preserved for compat as the min tax-EXCLUSIVE rate. Helpers live in `backend/services/tariff_utils.py`. Frontend renders incl-tax ranges via `formatTariffRangeInclGst` and uses the per-charger fields in the `/stations` detail modal.
+- **Tariff display (post-ADR 0003, 2026-05-18)**: tariff is per-charger. `Tariff.tariff_per_kwh_all_in` is the operator-typed, customer-displayed source of truth; `Tariff.rate_per_kwh` is back-derived. `StationChargerInfo` carries `tariff_per_kwh` (back-derived), `tariff_per_kwh_all_in`, `tariff_gst_percent`; `PublicStationResponse` carries station-level `min/max_price_per_kwh_all_in` (collapse to a single value when uniform). `price_per_kwh` is preserved for compat as the min back-derived rate. Backend helpers live in `backend/services/tariff_utils.py` (`back_derive_rate_per_kwh`, `compute_station_tariff_range`). Frontend renders the all-in figure with an `(all-inclusive)` label via `formatTariffRangeAllIn` in `frontend/lib/utils.ts`. The admin chargers form (`frontend/app/admin/chargers/page.tsx`) takes a single `tariff_per_kwh_all_in` input bounded to ₹1.0–100.0 and renders a live `TariffBreakdownPreview` (computed client-side via `breakdownAllInTariff`) showing the back-derived `rate_per_kwh`, the gateway-fee per kWh, and the GST per kWh — mirroring the backend back-derivation so the operator sees exactly what will be stored.
+
+- **Migration cutover note**: migration 36 shrinks every `Tariff.rate_per_kwh` by 2% so customer-facing displayed prices stay constant; the franchisee absorbs the 2% on legacy tariffs until they re-save via the new API. The originally-planned `operator_set_all_in_at` audit column + `/api/admin/tariffs/legacy` banner endpoint were dropped at the time of cutover (two live chargers — ops handles re-entry manually). See ADR 0003 for the conditions to add the banner back.
 
 #### Public Station Map (`backend/routers/public_station_map.py`)
 **Endpoints**: `GET /api/public/stations/map`
@@ -455,14 +457,40 @@ class QRPaymentService:
         """Handles failures: sets status=FAILED, issues full refund"""
 ```
 
+**Charger creation atomicity (issue 05, post-2026-05-18)**: `routers/chargers.py:create_charger` wraps the three writes (`Charger.create`, `Connector.create` per connector input, `Tariff.create`) in `async with in_transaction()`. If any step raises, the whole creation rolls back — no orphan chargers with partial connector sets or no tariff. Two audit-log paths:
+- **Happy path**: `action="charger.created"` written after the transaction commits.
+- **Rollback path**: `action="charger.create_failed"` written inside the `except IntegrityError` branch with the input data + `failure_reason`. Operators can query `WHERE action IN ('charger.created', 'charger.create_failed')` to see every attempted onboarding. The audit write itself is best-effort — wrapped in its own try/except so a secondary audit failure doesn't mask the original 400.
+
 **Configuration**:
-- `RAZORPAY_PLATFORM_FEE_PERCENT`: 2.0% fallback (actual fee extracted from Razorpay webhook/API)
+- `RAZORPAY_PLATFORM_FEE_PERCENT`: 2.0% — **authoritative synthetic rate** used for every customer-facing calculation (post-ADR 0001). Validated at startup (issue 03) in four bands via `core.config.validate_platform_fee_percent`: `≤0` and `>10` refuse startup with `RuntimeError`; `>5` logs `ERROR` and proceeds (legitimately high — ops should confirm intent); `0–5` is the normal range with an info log. Configurable ceilings live in `core/config.py` as `PLATFORM_FEE_HARD_CEILING` (10) and `PLATFORM_FEE_SOFT_CEILING` (5). The actual Razorpay fee is still captured on the `QRPayment` row for ops/reconciliation but is no longer used for budget, refund, or invoice math.
 - `QR_PAYMENT_PENDING_TIMEOUT`: 300 seconds (env var)
+
+**Tariff back-calc identity drift check (issue 02, post-2026-05-18)**:
+- `services/tariff_drift_check.py` exposes `find_drifting_tariffs(fee_percent, sample_size)` and `warn_on_tariff_identity_drift(fee_percent, logger)`. Invoked from `main.py` startup after DB init.
+- Samples up to 10 `Tariff` rows. For each, verifies `back_derive_rate_per_kwh(all_in, gst, current_fee) ≈ stored_rate_per_kwh` within ±0.0002. Catches the H3 scenario: migration 36 baked in the 2% fee assumption, but `RAZORPAY_PLATFORM_FEE_PERCENT` was changed afterwards — legacy-backfilled rows now violate the identity until operators re-save them via the admin form.
+- One `WARNING` log per drifting row (named by `tariff_id` / `charger_id` / drift magnitude). `Custom/Tariff/IdentityDrift` counter increments once per startup if any drift detected — not once per row, to avoid alert storms on fleet-wide env changes.
+- Non-fatal: startup proceeds either way. Operators clear drift by re-entering the affected tariff via the admin form, which recomputes `rate_per_kwh` under the current env-var value.
+
+**Synthetic platform fee policy (effective 2026-05-18, ADR 0001)**:
+- Three helpers replace the old `_resolve_platform_fee`. Public helpers live in `services/tariff_utils.py` (the single home for synthetic-fee policy math + the back-derivation formula); the side-effect writer stays in `qr_payment_service.py` because it talks to the Razorpay SDK.
+  - `synthetic_platform_fee(amount_paid)` (in `tariff_utils`) — pure function, returns `amount_paid × RAZORPAY_PLATFORM_FEE_PERCENT/100`. Drives budget cap, over-payment refund, and invoice gateway-charges line.
+  - `synthetic_fee_split(amount_paid)` (in `tariff_utils`) — returns the (commission, GST) breakdown, treating the 2% as all-in: commission = `× 2/118`, GST = `total − commission` (residual, not independently rounded).
+  - `_ensure_actual_fee_captured(qr_payment)` (in `qr_payment_service`) — side-effect writer: ensures the actual Razorpay fee lives on the `QRPayment` row (`platform_fee` / `razorpay_commission` / `razorpay_gst`). Priority: webhook > API fetch > 2% estimate fallback.
+- `RAZORPAY_PLATFORM_FEE_PERCENT` itself lives in `backend/core/config.py` (project-level config). Read by `main.py` (startup validation), `routers/chargers.py` (back-derivation on POST/PATCH), and `tariff_utils.py` (synthetic-fee math). Re-exported from `qr_payment_service.py` for backwards compatibility.
+- `GSTInvoice.gateway_charges` / `gateway_gst` snapshot the synthetic 2% split at issuance, NOT the QRPayment row's actual fee. Customers see a deterministic gateway-charges line regardless of what Razorpay actually charged.
+- Variance between actual and synthetic is absorbed by VoltLync as P&L — queryable via `SUM(qr_payment.platform_fee - 0.02 × amount_paid)`.
 
 **Refund / over-consumption policy (effective 2026-05-13)**:
 - **Positive balance** (customer paid more than they used) → **always refunded** via Razorpay, regardless of amount. The historical `MINIMUM_REFUND_AMOUNT` threshold has been removed.
 - **Negative balance** (customer used more energy than they paid for, due to stop-signal latency) → **operator absorbs**. Existing budget cap on `energy_charge` stays; `Custom/QR/OverConsumptionCapped` / `Custom/QR/OverDeliveryKwh` metrics continue tracking magnitude.
 - **Invariant**: `transaction_amount = total_amount + refund_amount` holds on every new QR invoice.
+
+**Zero-energy refund policy (effective 2026-05-18, ADR 0002)**:
+- When a QR session finalises with `energy_consumed_kwh ≤ 0`, `handle_charging_failure` → `_full_refund` issues a refund equal to the entire `amount_paid` (NOT `amount_paid - platform_fee` as in the pre-ADR behaviour).
+- The actual Razorpay fee is still captured on the `QRPayment` row (`platform_fee` / `razorpay_commission` / `razorpay_gst`) for reconciliation, but the refund formula ignores it. VoltLync absorbs the Razorpay gateway fee and refund-processing fee as P&L loss — no service rendered, customer is made whole.
+- No `GSTInvoice` is issued for zero-energy sessions (the invoice service short-circuits at `energy <= 0` in `generate_invoice`).
+- Idempotency preserved: `razorpay_refund_id` guard prevents duplicate refunds on webhook retries.
+- See `docs/adr/0002-zero-energy-full-refund.md` for the policy rationale and rejected alternatives.
 
 **Error Handling**:
 - **Idempotency**: Checks `razorpay_payment_id` uniqueness before processing
@@ -1610,8 +1638,8 @@ aws ssm send-command \
 - Calls `process_qr_session_billing(transaction_id)`
 - Calculates: `energy_cost = energy_consumed × tariff_rate`
 - Calculates: `gst_amount = energy_cost × gst_percent / 100` (GST on energy cost only)
-- Resolves `platform_fee` via `_resolve_platform_fee()`: actual Razorpay fee from webhook/API, fallback to 2% estimate
-- Calculates: `refund = amount_paid - energy_cost - gst_amount - platform_fee`
+- Computes `platform_fee = _synthetic_platform_fee(amount_paid)` (fixed 2%, ADR 0001). Also calls `_ensure_actual_fee_captured(qr_payment)` so the actual Razorpay fee lands on the row for ops/reconciliation.
+- Calculates: `refund = amount_paid - energy_cost - gst_amount - synthetic_platform_fee`
 - **If refund >= ₹1.0**: Issues partial refund via Razorpay, sets status=REFUNDED
 - **If refund < ₹1.0**: Absorbed as operator credit, sets status=COMPLETED
 - Deletes Redis session cache
@@ -1642,7 +1670,7 @@ REFUND_FAILED
 ### Configuration
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `RAZORPAY_PLATFORM_FEE_PERCENT` | 2.0 | Fallback fee estimate (%) when actual Razorpay fee unavailable |
+| `RAZORPAY_PLATFORM_FEE_PERCENT` | 2.0 | Authoritative synthetic platform-fee rate (%) used for budget cap, over-payment refund, and invoice gateway-charges line. ADR 0001. Startup fails loud if missing/zero. |
 | `QR_PAYMENT_PENDING_TIMEOUT` | 300 | Seconds before a payment is considered stale |
 
 ### Test Script
@@ -1756,19 +1784,30 @@ CREATE TABLE charger (
 );
 
 -- Tariff configuration per charger
--- Defined in: backend/models.py (Tariff)
+-- Defined in: backend/models.py (Tariff). ADR 0003 added the all-in column.
 CREATE TABLE tariff (
     id SERIAL PRIMARY KEY,
     charger_id INTEGER REFERENCES charger(id),
-    rate_per_kwh DECIMAL(8, 4) NOT NULL,        -- 4dp precision, stored EXCLUSIVE of GST; tariffs like ₹12.3456/kWh are storable without truncation
-    gst_percent DECIMAL(5, 2) DEFAULT 18.00,    -- GST percentage applied on top of rate_per_kwh during billing
+    rate_per_kwh DECIMAL(8, 4) NOT NULL,                   -- INTERNAL back-derived rate (= all_in × 0.98 / 1.18); used by line-item billing math only, never customer-facing
+    tariff_per_kwh_all_in DECIMAL(10, 4) NOT NULL,         -- OPERATOR-TYPED, CUSTOMER-DISPLAYED all-inclusive rate (incl. GST + synthetic 2% gateway fee). Authoritative for display
+    gst_percent DECIMAL(5, 2) DEFAULT 18.00,               -- GST percentage; used in the back-derivation formula and at billing time
+    hsn_sac_code VARCHAR(10),
+    is_global BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
--- Admin-facing UX note: the chargers admin UI takes the *GST-inclusive* per-kWh price as input
--- and the API (POST/PUT /api/admin/chargers) accepts `tariff_per_kwh_incl_tax`; the router
--- divides by (1 + gst_percent/100) and stores the excl-GST result in `rate_per_kwh`. GET responses
--- include the derived `tariff_per_kwh_incl_tax` alongside the stored excl-GST rate.
+-- Admin-facing UX (post issue 04): the chargers admin UI takes the
+-- *all-inclusive* per-kWh price (operator's intended customer-visible rate).
+-- The API accepts ONLY `tariff_per_kwh_all_in` (validated 1.0–100.0); the
+-- router back-derives `rate_per_kwh = all_in × (1 - fee_pct/100) / (1 + gst_percent/100)`
+-- and persists both. The legacy `tariff_per_kwh` / `tariff_per_kwh_incl_tax`
+-- request fields are rejected with 422 (`extra='forbid'`).
+--
+-- Migration 36 (2026-05-18) backfilled `tariff_per_kwh_all_in = rate × (1 + gst/100)`
+-- and shrunk `rate_per_kwh *= 0.98` so the back-calc identity holds going
+-- forward. Franchisees absorb a 2% margin on legacy tariffs until they
+-- re-save via the new API; with two live chargers at cutover, ops handles
+-- re-entry manually instead of via a banner endpoint. See ADR 0003.
 
 -- Decimal precision convention (post migration 31):
 --   Rate-like columns (per-kWh, per-unit prices): DECIMAL(8, 4)
@@ -4725,7 +4764,7 @@ CLERK_WEBHOOK_SECRET=whsec_...
 # Razorpay Payment Gateway
 RAZORPAY_KEY_ID=rzp_live_...
 RAZORPAY_KEY_SECRET=...
-RAZORPAY_PLATFORM_FEE_PERCENT=2.0  # Fallback only; actual fee from Razorpay webhook/API
+RAZORPAY_PLATFORM_FEE_PERCENT=2.0  # Authoritative synthetic rate for customer-facing math (ADR 0001)
 
 # Transaction Suspend/Resume
 DISCONNECT_SUSPEND_TIMEOUT_SECONDS=180  # Timeout after charger disconnect (before marking STOPPED)
