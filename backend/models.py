@@ -437,7 +437,7 @@ class FirmwareUpdate(Model):
     status = fields.CharEnumField(FirmwareUpdateStatusEnum, default=FirmwareUpdateStatusEnum.PENDING, index=True)
     initiated_by = fields.ForeignKeyField("models.User", related_name="initiated_updates")
     initiated_at = fields.DatetimeField(auto_now_add=True)
-    download_url = fields.CharField(max_length=500)
+    download_url = fields.TextField()
     started_at = fields.DatetimeField(null=True)
     completed_at = fields.DatetimeField(null=True)
     error_message = fields.TextField(null=True)

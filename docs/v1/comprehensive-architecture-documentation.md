@@ -1860,7 +1860,7 @@ CREATE TABLE firmware_update (
     status VARCHAR(19) NOT NULL DEFAULT 'PENDING',  -- FirmwareUpdateStatusEnum
     initiated_by_id INTEGER REFERENCES app_user(id) ON DELETE CASCADE,
     initiated_at TIMESTAMP DEFAULT NOW(),
-    download_url VARCHAR(500) NOT NULL,  -- URL for charger to download from
+    download_url TEXT NOT NULL,  -- Presigned S3 URL; TEXT because role-assumed STS tokens push URLs past 500 chars
     started_at TIMESTAMP,                -- When download began
     completed_at TIMESTAMP,              -- When update completed/failed
     error_message TEXT,                  -- Failure details

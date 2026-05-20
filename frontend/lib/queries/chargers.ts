@@ -6,7 +6,6 @@ import {
   chargerErrorService,
   type ChangeAvailabilityResponse,
 } from "@/lib/api-services";
-import { ChargerListResponse } from "@/types/api";
 import { toast } from "sonner";
 import { transactionKeys } from "./transactions";
 import { useAuth } from "@/contexts/AuthContext";
@@ -165,14 +164,15 @@ export function useRemoteStartByStringId() {
 
 // Change Availability Mutation Hook
 //
-// Honours all three OCPP 1.6 response states. Per issue 01 (availability-toggle
-// review fixes):
-//   - Accepted  → toast success, keep optimistic update
-//   - Scheduled → toast info ("will apply when current session ends"), revert
-//                 the optimistic update (the StatusNotification fired when the
-//                 transaction ends will reconcile the real state).
-//   - Rejected  → toast error, revert.
-//   - other     → defensive neutral toast, revert.
+// No optimistic update: OCPP 1.6 ChangeAvailability has three valid replies
+// (Accepted / Scheduled / Rejected) and chargers can also silently drop the
+// request, so flipping the row before the ack would lie to the operator.
+// We wait for the backend's response and reconcile against the server's
+// view of the world.
+//   - Accepted  → invalidate the list so it refetches the now-true state
+//   - Scheduled → toast info ("will apply when the current session ends")
+//   - Rejected  → toast error
+//   - other     → defensive neutral toast
 
 type ChangeAvailabilityVariables = {
   id: number;
@@ -180,69 +180,15 @@ type ChangeAvailabilityVariables = {
   connectorId?: number;
 };
 
-type ChangeAvailabilityContext = {
-  previousChargers: Array<[readonly unknown[], unknown]>;
-};
-
 export function useChangeAvailability() {
   const queryClient = useQueryClient();
 
-  // Single rollback helper so both onError and the non-Accepted onSuccess
-  // branches can revert the optimistic update without duplicating the loop.
-  const rollback = (context: ChangeAvailabilityContext | undefined) => {
-    if (!context?.previousChargers) return;
-    context.previousChargers.forEach(([queryKey, data]) => {
-      queryClient.setQueryData(queryKey, data);
-    });
-  };
-
-  return useMutation<
-    ChangeAvailabilityResponse,
-    Error,
-    ChangeAvailabilityVariables,
-    ChangeAvailabilityContext
-  >({
+  return useMutation<ChangeAvailabilityResponse, Error, ChangeAvailabilityVariables>({
     mutationFn: async ({ id, type, connectorId = 0 }) => {
-      // chargerService.changeAvailability is typed Promise<ChangeAvailabilityResponse>
-      // — no cast needed.
       return chargerService.changeAvailability(id, type, connectorId);
     },
-    onMutate: async ({ id, type }) => {
-      // Cancel outgoing refetches so they don't overwrite optimistic update
-      await queryClient.cancelQueries({ queryKey: chargerKeys.all });
-
-      // Snapshot previous value for rollback
-      const previousChargers = queryClient.getQueriesData({
-        queryKey: chargerKeys.lists(),
-      });
-
-      // Optimistically update charger status. Reverted below for any non-Accepted
-      // OCPP response so the UI never lies about a Scheduled or Rejected outcome.
-      queryClient.setQueriesData<ChargerListResponse>(
-        { queryKey: chargerKeys.lists() },
-        (old) => {
-          if (!old) return old;
-
-          const optimisticStatus = type === "Inoperative" ? "Unavailable" : "Available";
-
-          return {
-            ...old,
-            data: old.data.map((charger) =>
-              charger.id === id
-                ? { ...charger, latest_status: optimisticStatus }
-                : charger
-            ),
-          };
-        }
-      );
-
-      return { previousChargers };
-    },
-    onSuccess: (data, variables, context) => {
-      // Defensive: a future contract change where the backend returns
-      // success=false with a 200 must not silently process as Accepted.
+    onSuccess: (data, variables) => {
       if (!data?.success) {
-        rollback(context);
         toast.error("Charger refused the change");
         return;
       }
@@ -252,33 +198,22 @@ export function useChangeAvailability() {
 
       switch (ocppResponse) {
         case "Accepted":
-          // Optimistic update is correct; just notify.
+          queryClient.invalidateQueries({ queryKey: chargerKeys.all });
           toast.success(`Charger marked as ${displayStatus}`);
           break;
         case "Scheduled":
-          // Change deferred until the current session ends. Revert the
-          // optimistic flip so the table reflects the real (still-current)
-          // state; the StatusNotification on session-end will refresh it.
-          rollback(context);
-          toast.info(
-            `Change scheduled — will apply when the current session ends`
-          );
+          toast.info(`Change scheduled — will apply when the current session ends`);
           break;
         case "Rejected":
-          rollback(context);
           toast.error("Charger refused the change");
           break;
         default:
-          // Defensive: unknown OCPP status. Revert so the UI doesn't fib.
-          rollback(context);
           toast(
             `Unexpected charger response${ocppResponse ? `: ${ocppResponse}` : ""}`,
           );
       }
     },
-    onError: (err, _variables, context) => {
-      rollback(context);
-
+    onError: (err) => {
       const errorMessage = err instanceof Error ? err.message : String(err);
       if (errorMessage.includes("409") || errorMessage.includes("not connected")) {
         toast.error("Charger not connected");
