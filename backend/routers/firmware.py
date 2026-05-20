@@ -147,20 +147,31 @@ async def upload_firmware(
         )
 
     try:
-        # Read file bytes once (we need both checksum and S3 upload)
         file_content = await file.read()
         safe_filename = f"{version}_{file.filename}"
-        s3_key = storage_service.build_firmware_s3_key(version, safe_filename)
 
-        # Upload to S3 (primary storage)
-        storage_service.upload_firmware_to_s3(s3_key, file_content)
+        # Storage backend selection: presence of AWS_S3_FIRMWARE_BUCKET picks S3;
+        # empty/unset falls back to local-disk storage. The legacy local path is
+        # a stopgap so charger firmware with a short URL-buffer can ingest the
+        # download location until the device-side parser is patched.
+        if os.getenv("AWS_S3_FIRMWARE_BUCKET"):
+            s3_key = storage_service.build_firmware_s3_key(version, safe_filename)
+            storage_service.upload_firmware_to_s3(s3_key, file_content)
+            file_path = ""
+            storage_backend = "s3"
+        else:
+            s3_key = None
+            file_path = os.path.join(storage_service.FIRMWARE_DIR, safe_filename)
+            with open(file_path, "wb") as f:
+                f.write(file_content)
+            storage_backend = "local"
 
         checksum = storage_service.calculate_checksum_from_bytes(file_content)
 
         firmware_file = await FirmwareFile.create(
             version=version,
             filename=safe_filename,
-            file_path="",  # legacy column kept for schema compatibility; S3 is primary
+            file_path=file_path,
             s3_key=s3_key,
             file_size=len(file_content),
             checksum=checksum,
@@ -169,7 +180,10 @@ async def upload_firmware(
             is_active=True,
         )
 
-        logger.info(f"📦 ✅ Firmware uploaded to S3: ID={firmware_file.id}, version={version}, s3_key={s3_key}")
+        if storage_backend == "s3":
+            logger.info(f"📦 ✅ Firmware uploaded to S3: ID={firmware_file.id}, version={version}, s3_key={s3_key}")
+        else:
+            logger.info(f"📦 ✅ Firmware uploaded to local disk: ID={firmware_file.id}, version={version}, file_path={file_path}")
 
         await log_audit_event(
             action="firmware.uploaded",
@@ -177,7 +191,13 @@ async def upload_firmware(
             entity_id=firmware_file.id,
             actor_type="admin",
             actor=user,
-            changes={"version": version, "filename": safe_filename, "s3_key": s3_key},
+            changes={
+                "version": version,
+                "filename": safe_filename,
+                "storage_backend": storage_backend,
+                "s3_key": s3_key,
+                "file_path": file_path or None,
+            },
         )
 
         return FirmwareFileResponse.from_orm(firmware_file)

@@ -608,14 +608,22 @@ User → Frontend Modal → Create Order → Razorpay Checkout → Payment
 - Runs as background task started during app startup
 
 #### Firmware Storage Service (`backend/services/storage_service.py`)
-**Purpose**: Local filesystem storage for firmware files
+**Purpose**: Dual-mode storage for firmware files — S3 (primary) with a local-disk fallback for short-URL stopgap.
+
+**Storage backend selection (effective 2026-05-20)**:
+- `POST /api/admin/firmware/upload` reads `AWS_S3_FIRMWARE_BUCKET` at request time:
+  - **Bucket set** (production-default behavior): bytes uploaded to S3, `FirmwareFile.s3_key` populated, `file_path=""`. `_try_trigger_update` dispatches `UpdateFirmware` with the ~1700-byte presigned URL.
+  - **Bucket empty/unset** (stopgap for charger URL-parser limits): bytes written to `/app/firmware_files/{version}_{filename}` on the backend container, `s3_key=NULL`, `file_path` populated. `get_firmware_download_url_for_file` returns the legacy ~62-byte URL `{FIRMWARE_PUBLIC_BASE_URL}/firmware/{filename}` served by FastAPI's static-files mount (`main.py:158`) and proxied by nginx `location /firmware/`.
+- Audit log records `storage_backend: "s3" | "local"` on every upload.
+- Why: an EC2 instance-role-signed S3 presigned URL is ~1700 bytes due to the `X-Amz-Security-Token` (~1100 bytes of base64). Firmware on some chargers (Quectel modems) has a smaller URL-parse buffer. The stopgap lets ops flip to local-disk mode for staging without a code change — set `AWS_S3_FIRMWARE_BUCKET=""` and redeploy env. The proper long-term replacement is a backend proxy endpoint with a short opaque token (see follow-up issue).
+- Security caveat: the legacy `/firmware/{filename}` URL has no signature/TTL — anyone who reaches the host with the right path can download the blob. Acceptable for staging; **must not be enabled on prod** without first landing the token-based proxy.
 
 **Key Features**:
-- Firmware file upload and storage in `/backend/firmware_files/`
+- Firmware file upload and storage — S3 in normal mode, `/app/firmware_files/` in stopgap mode
 - MD5 checksum calculation for integrity verification
-- Download URL generation for OCPP UpdateFirmware commands
+- Download URL generation for OCPP UpdateFirmware commands — automatically picks per-row based on `s3_key`
 - File naming convention: `{version}_{original_filename}`
-- Static file serving via `/firmware/{filename}` endpoint
+- Static file serving via `/firmware/{filename}` endpoint (always live; serves whatever is on disk regardless of S3 mode)
 
 **Methods**:
 ```python
