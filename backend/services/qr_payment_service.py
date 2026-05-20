@@ -18,7 +18,7 @@ from models import (
 from services.razorpay_service import razorpay_service, RazorpayAlreadyRefundedError, extract_fee_from_payment
 from services.tariff_utils import synthetic_platform_fee, synthetic_fee_split
 from services.wallet_service import WalletService
-from services.monitoring_service import MetricsCollector
+from services.monitoring_service import MetricsCollector, OCPPMetrics
 from redis_manager import redis_manager
 from core.connection_manager import connection_manager
 from crud import log_audit_event
@@ -781,14 +781,28 @@ class QRPaymentService:
 
             locked.refund_amount = refund_amount
 
+            # ADR 0002: request instant refund (speed=optimum) on full-refund
+            # flows so customers see the money back in minutes, not days.
+            # Razorpay falls back to normal speed server-side when rails or
+            # payment method don't support instant. VoltLync absorbs the
+            # per-refund instant fee. Kill-switch:
+            # RAZORPAY_INSTANT_REFUND_ENABLED (default true).
+            instant_enabled = os.getenv(
+                "RAZORPAY_INSTANT_REFUND_ENABLED", "true"
+            ).lower() == "true"
+            refund_speed = "optimum" if instant_enabled else None
+
             try:
                 refund_result = razorpay_service.refund_payment(
                     locked.razorpay_payment_id,
                     amount=refund_amount,
                     notes={"reason": reason, "qr_payment_id": str(locked.id)},
                     idempotency_key=f"qr_payment_{locked.id}",
+                    speed=refund_speed,
                 )
                 locked.razorpay_refund_id = refund_result.get("id")
+                speed_processed = refund_result.get("speed_processed")
+                locked.razorpay_refund_speed_processed = speed_processed
                 if locked.status != QRPaymentStatusEnum.EXPIRED:
                     locked.status = QRPaymentStatusEnum.REFUNDED
                 await locked.save()
@@ -796,10 +810,16 @@ class QRPaymentService:
                     "Full refund ₹%s issued for QR payment %s: %s",
                     refund_amount, locked.id, reason,
                 )
+                if refund_speed == "optimum":
+                    await OCPPMetrics.record_refund_speed(
+                        locked.charger_id, locked.id, speed_processed,
+                    )
             except RazorpayAlreadyRefundedError as e:
                 existing = razorpay_service.find_refund_for_payment(locked.razorpay_payment_id)
                 if existing and existing.get("id"):
                     locked.razorpay_refund_id = existing["id"]
+                    existing_speed = existing.get("speed_processed")
+                    locked.razorpay_refund_speed_processed = existing_speed
                     if locked.status != QRPaymentStatusEnum.EXPIRED:
                         locked.status = QRPaymentStatusEnum.REFUNDED
                     await locked.save()
@@ -807,6 +827,10 @@ class QRPaymentService:
                         "refund_reconciled=true qr_payment=%s existing_refund=%s reason=%s",
                         locked.id, existing["id"], reason,
                     )
+                    if refund_speed == "optimum" and existing_speed:
+                        await OCPPMetrics.record_refund_speed(
+                            locked.charger_id, locked.id, existing_speed,
+                        )
                 else:
                     locked.status = QRPaymentStatusEnum.REFUND_FAILED
                     locked.failure_reason = f"Razorpay reports already refunded but no refund record found: {e}"

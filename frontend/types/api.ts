@@ -505,6 +505,7 @@ export interface QRPayment {
   razorpay_gst?: string;
   fee_source?: string;
   refund_amount?: string;
+  razorpay_refund_speed_processed?: string | null;
   status: QRPaymentStatus;
   failure_reason?: string;
   transaction_id?: number;

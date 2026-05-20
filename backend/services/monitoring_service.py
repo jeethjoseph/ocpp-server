@@ -543,3 +543,23 @@ class OCPPMetrics:
         MetricsCollector.record_event("OCPPStaleSuspendedSwept", {
             "count": count,
         })
+
+    @staticmethod
+    async def record_refund_speed(charger_id, qr_payment_id: int, speed_processed):
+        """Record Razorpay refund speed outcome on full-refund flows.
+
+        Only call this when `speed=optimum` was requested — a normal-speed
+        refund (kill-switch off) is not a fallback. Increments one of two
+        New Relic counters so ops can alert on a sudden fallback spike
+        (rail outage, account-level rate limit, payment-method shift).
+        ADR 0002 amendment (2026-05-20).
+        """
+        if speed_processed == "instant":
+            MetricsCollector.increment_counter("Custom/QR/RefundInstantSucceeded")
+        else:
+            MetricsCollector.increment_counter("Custom/QR/RefundInstantFallback")
+        MetricsCollector.record_event("QRRefundSpeed", {
+            "charger_id": charger_id,
+            "qr_payment_id": qr_payment_id,
+            "speed_processed": speed_processed or "unknown",
+        })

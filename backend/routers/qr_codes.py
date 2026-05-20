@@ -316,6 +316,7 @@ async def get_qr_payments(
             "razorpay_gst": str(p.razorpay_gst) if p.razorpay_gst is not None else None,
             "fee_source": p.fee_source,
             "refund_amount": str(p.refund_amount) if p.refund_amount else None,
+            "razorpay_refund_speed_processed": p.razorpay_refund_speed_processed,
             "status": p.status.value,
             "failure_reason": p.failure_reason,
             "transaction_id": p.transaction_id,

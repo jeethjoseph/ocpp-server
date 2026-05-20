@@ -425,6 +425,7 @@ class RazorpayService:
         amount: Optional[Decimal] = None,
         notes: Optional[Dict] = None,
         idempotency_key: Optional[str] = None,
+        speed: Optional[str] = None,
     ) -> Optional[Dict]:
         """
         Create a refund for a payment
@@ -436,6 +437,12 @@ class RazorpayService:
             idempotency_key: Stable key for safe retries. Sent as
                 ``X-Refund-Idempotency`` header. Same key + same body replays
                 the original refund; same key + different body returns 400.
+            speed: Razorpay refund speed. ``"optimum"`` requests instant
+                payout when the rails/payment method support it, falling
+                back to ``"normal"`` server-side (Razorpay returns the
+                actual speed in ``speed_processed``). ``None`` (default)
+                lets Razorpay use ``normal`` (5–7 working days, no fee).
+                See ADR 0002 for the policy.
 
         Returns:
             Refund details or None if failed
@@ -454,14 +461,19 @@ class RazorpayService:
             if notes:
                 refund_data["notes"] = notes
 
+            if speed:
+                refund_data["speed"] = speed
+
             options = {}
             if idempotency_key:
                 options["headers"] = {"X-Refund-Idempotency": idempotency_key}
 
             refund = self.client.payment.refund(payment_id, refund_data, **options)
             logger.info(
-                "Refund created: %s for payment %s idempotency_key=%s",
+                "Refund created: %s for payment %s idempotency_key=%s "
+                "speed_requested=%s speed_processed=%s",
                 refund.get("id"), payment_id, idempotency_key or "none",
+                speed or "default", refund.get("speed_processed") or "unknown",
             )
             return refund
 

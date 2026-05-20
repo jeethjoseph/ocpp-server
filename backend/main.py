@@ -1727,6 +1727,12 @@ async def startup_event():
     else:
         logger.info("ℹ️ Sentry Error Tracking: DISABLED")
 
+    # ADR 0002 kill-switch for Razorpay instant refunds on _full_refund flows.
+    if os.getenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true").lower() == "true":
+        logger.info("✅ Razorpay Instant Refunds: ENABLED (speed=optimum on _full_refund)")
+    else:
+        logger.info("ℹ️ Razorpay Instant Refunds: DISABLED (normal speed, 5–7 working days)")
+
 @app.on_event("shutdown")
 async def shutdown_event():
     """Close database and Redis connections on shutdown"""

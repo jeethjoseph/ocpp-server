@@ -508,6 +508,19 @@ The frontend's `useChangeAvailability` hook (admin) branches on the OCPP respons
 - Idempotency preserved: `razorpay_refund_id` guard prevents duplicate refunds on webhook retries.
 - See `docs/adr/0002-zero-energy-full-refund.md` for the policy rationale and rejected alternatives.
 
+**Razorpay instant refunds for full-refund flows (effective 2026-05-20, ADR 0002 amendment)**:
+- All six `_full_refund` call sites — zero-energy at StopTransaction, stale payment, concurrent rejection on busy charger, charger not connected at start, RemoteStart failure, plug-in timeout — request Razorpay's `speed=optimum` mode. Customers see refunds in minutes instead of the default 5–7 working days.
+- VoltLync absorbs Razorpay's per-refund instant fee (~₹5–₹6 + 18% GST per UPI refund) **in addition to** the original gateway fee. Same philosophy as the gateway-fee absorption: the customer experiencing a failure should not feel the cost of the failure.
+- Partial unused-credit refunds in `process_qr_session_billing` remain on Razorpay's default `normal` speed. The partial-refund case = "here's your change" after service was rendered; not the same urgency as "we failed you."
+- `speed=optimum` is best-effort. Razorpay falls back to `normal` server-side when rails or payment method don't support instant. The actual outcome is exposed in `speed_processed`, which `RazorpayService.refund_payment` logs on every refund.
+- **Kill-switch env var**: `RAZORPAY_INSTANT_REFUND_ENABLED` (default `true`). Wired into `docker-compose.yml`, `docker-compose.staging.yml`, `docker-compose.prod.yml`, and the three `.env.*.example` files. Logged at startup in `backend/main.py`. Set to `false` and redeploy to revert all full refunds to normal speed without a code change.
+- **Outcome persisted on the QRPayment row**: column `razorpay_refund_speed_processed` (VARCHAR(20), nullable; migration 40) holds Razorpay's reported `speed_processed` value (`"instant"` or `"normal"`) for every full-refund call — including the `RazorpayAlreadyRefundedError` reconciliation path when the existing-refund dict carries the field. NULL on partial refunds and on all pre-feature rows. The admin QR detail page (`/admin/qr-codes/[id]`) renders an `Instant` (green) or `Normal (5-7 days)` (gray) badge next to the refund amount when the column is non-null; customer-facing `/my-charges` is unchanged.
+- **Monitoring counters** (emitted from `OCPPMetrics.record_refund_speed`, gated on `speed=optimum` actually being requested):
+  - `Custom/QR/RefundInstantSucceeded` — `speed_processed == "instant"`.
+  - `Custom/QR/RefundInstantFallback` — `speed_processed` came back as anything other than `"instant"` (typically `"normal"`).
+  - Neither counter fires when `RAZORPAY_INSTANT_REFUND_ENABLED=false` (a normal-speed refund under the kill-switch is intentional, not a Razorpay-side fallback). A sudden spike in `RefundInstantFallback` is the operational alert for rail outages, account-level rate limits, or payment-method shifts.
+  - A `QRRefundSpeed` New Relic event is also emitted with `charger_id`, `qr_payment_id`, and `speed_processed` for ad-hoc querying.
+
 **Error Handling**:
 - **Idempotency**: Checks `razorpay_payment_id` uniqueness before processing
 - **Stale payments**: Refunds payments older than 5 minutes (customer likely left)

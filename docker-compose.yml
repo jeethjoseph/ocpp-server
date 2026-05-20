@@ -69,6 +69,11 @@ services:
       - STUCK_PAYOUT_CHECK_INTERVAL_SECONDS=${STUCK_PAYOUT_CHECK_INTERVAL_SECONDS:-3600}
       - STUCK_PAYOUT_THRESHOLD_HOURS=${STUCK_PAYOUT_THRESHOLD_HOURS:-24}
       - RAZORPAY_PLATFORM_FEE_PERCENT=${RAZORPAY_PLATFORM_FEE_PERCENT:-2.0}
+      # Razorpay instant refund kill-switch (ADR 0002). When true,
+      # _full_refund requests speed=optimum so customers see refunds in
+      # minutes; VoltLync absorbs Razorpay's per-refund instant fee.
+      # Flip to false to revert to normal speed (5–7 working days, free).
+      - RAZORPAY_INSTANT_REFUND_ENABLED=${RAZORPAY_INSTANT_REFUND_ENABLED:-true}
       # VoltLync GST supplier identity (printed on every invoice)
       - VOLTLYNC_BUSINESS_NAME=${VOLTLYNC_BUSINESS_NAME:-VOLTLYNC PRIVATE LIMITED}
       - VOLTLYNC_GSTIN=${VOLTLYNC_GSTIN:-}

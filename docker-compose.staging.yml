@@ -107,6 +107,9 @@ services:
       - RAZORPAY_PLATFORM_FEE_PERCENT=${RAZORPAY_PLATFORM_FEE_PERCENT:-2.0}
       - MINIMUM_REFUND_AMOUNT=${MINIMUM_REFUND_AMOUNT:-1.0}
       - QR_PAYMENT_PENDING_TIMEOUT=${QR_PAYMENT_PENDING_TIMEOUT:-300}
+      # Razorpay instant refund kill-switch (ADR 0002). Default true.
+      # Flip to false to revert to normal speed in an incident.
+      - RAZORPAY_INSTANT_REFUND_ENABLED=${RAZORPAY_INSTANT_REFUND_ENABLED:-true}
       # OCPP & Server Tuning
       - SUSPEND_TIMEOUT_SECONDS=${SUSPEND_TIMEOUT_SECONDS:-300}
       - OCPP_TIMEOUT=${OCPP_TIMEOUT:-120}

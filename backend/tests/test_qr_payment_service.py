@@ -13,6 +13,7 @@ These mirror the style of test_wallet_billing_gst.py (static-method calls,
 mocked external services) with DB fixtures from conftest.py when needed.
 """
 import pytest
+from datetime import datetime, timezone
 from decimal import Decimal
 from unittest.mock import patch, AsyncMock, MagicMock
 
@@ -332,8 +333,14 @@ async def test_full_refund_returns_amount_paid_in_full(client, qr_charger, qr_co
 
 
 @pytest.mark.asyncio
-async def test_handle_charging_failure_issues_full_refund(client, qr_charger, qr_code):
-    """End-to-end: zero-energy finalize → handle_charging_failure → full refund."""
+async def test_handle_charging_failure_issues_full_refund(client, qr_charger, qr_code, monkeypatch):
+    """End-to-end: zero-energy finalize → handle_charging_failure → full refund.
+
+    Trigger 1 of 6 for ADR 0002 instant-refund coverage: zero-energy at
+    StopTransaction. Asserts speed=optimum reaches Razorpay so a refactor
+    that bypasses `_full_refund` on this path is caught.
+    """
+    monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
     import uuid
     user = await User.create(
         email=f"chg_fail_{uuid.uuid4().hex[:6]}@voltlync.test",
@@ -373,6 +380,7 @@ async def test_handle_charging_failure_issues_full_refund(client, qr_charger, qr
 
     call_kwargs = mock_razorpay.refund_payment.call_args.kwargs
     assert call_kwargs["amount"] == Decimal("250.00")
+    assert call_kwargs["speed"] == "optimum"
 
     await qr_payment.refresh_from_db()
     assert qr_payment.refund_amount == Decimal("250.00")
@@ -383,12 +391,310 @@ async def test_handle_charging_failure_issues_full_refund(client, qr_charger, qr
 
 
 # ============================================================================
+# Razorpay instant refund speed wiring (ADR 0002)
+# ============================================================================
+
+@pytest.fixture
+async def _refund_qr_payment(qr_charger, qr_code):
+    """Minimal PAID QR payment ready for a full-refund call."""
+    import uuid
+    user = await User.create(
+        email=f"speed_{uuid.uuid4().hex[:6]}@voltlync.test",
+        phone_number=f"9{uuid.uuid4().int % 1000000000:09d}",
+    )
+    return await QRPayment.create(
+        charger=qr_charger,
+        charger_qr_code=qr_code,
+        user=user,
+        razorpay_payment_id=f"pay_{uuid.uuid4().hex[:12]}",
+        razorpay_qr_code_id="qr_TEST123",
+        amount_paid=Decimal("300.00"),
+        status=QRPaymentStatusEnum.PAID,
+        platform_fee=Decimal("5.40"),
+        razorpay_commission=Decimal("4.58"),
+        razorpay_gst=Decimal("0.82"),
+        fee_source="webhook",
+    )
+
+
+@pytest.mark.asyncio
+async def test_full_refund_passes_speed_optimum_when_flag_enabled(
+    client, _refund_qr_payment, monkeypatch
+):
+    """ADR 0002: full refunds request instant payout via speed=optimum.
+
+    All six triggers flow through `_full_refund`. Per-trigger tests assert
+    the speed param at each integration site so a refactor that bypasses
+    `_full_refund` for one trigger is caught. Triggers covered:
+      1. Zero-energy at StopTransaction → test_handle_charging_failure_issues_full_refund
+      2. Stale payment → test_stale_payment_full_refund_passes_speed_optimum
+      3. Concurrent rejection → test_concurrent_payment_rejected_when_active_txn
+      4. Charger not connected → test_charger_not_connected_full_refund_passes_speed_optimum
+      5. RemoteStart failed / 6. Plug-in timeout → covered only by this direct
+         test; integration setup for those paths would require >30 lines of
+         OCPP/asyncio mocking and the funnel is identical (see issue 02
+         Comments section for the rationale).
+    """
+    monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment.return_value = {
+        "id": "rfnd_INSTANT", "speed_processed": "instant",
+    }
+
+    with patch("services.qr_payment_service.razorpay_service", mock_razorpay):
+        await QRPaymentService._full_refund(_refund_qr_payment, "Zero energy")
+
+    mock_razorpay.refund_payment.assert_called_once()
+    assert mock_razorpay.refund_payment.call_args.kwargs["speed"] == "optimum"
+
+    await _refund_qr_payment.refresh_from_db()
+    assert _refund_qr_payment.razorpay_refund_speed_processed == "instant"
+
+
+@pytest.mark.asyncio
+async def test_full_refund_persists_speed_processed_normal_on_fallback(
+    client, _refund_qr_payment, monkeypatch
+):
+    """When Razorpay falls back to normal speed server-side, persist 'normal'
+    on the QRPayment row so ops can see the fallback in the admin UI without
+    grepping logs."""
+    monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment.return_value = {
+        "id": "rfnd_FB", "speed_processed": "normal",
+    }
+
+    with patch("services.qr_payment_service.razorpay_service", mock_razorpay):
+        await QRPaymentService._full_refund(_refund_qr_payment, "Zero energy")
+
+    await _refund_qr_payment.refresh_from_db()
+    assert _refund_qr_payment.razorpay_refund_speed_processed == "normal"
+
+
+@pytest.mark.asyncio
+async def test_admin_qr_payments_endpoint_returns_refund_speed_processed(
+    client_admin, qr_charger, qr_code
+):
+    """Admin QR payment list response includes razorpay_refund_speed_processed
+    so the frontend can render the instant-vs-normal badge."""
+    import uuid
+    user = await User.create(
+        email=f"endpoint_{uuid.uuid4().hex[:6]}@voltlync.test",
+        phone_number=f"9{uuid.uuid4().int % 1000000000:09d}",
+    )
+    await QRPayment.create(
+        charger=qr_charger,
+        charger_qr_code=qr_code,
+        user=user,
+        razorpay_payment_id=f"pay_{uuid.uuid4().hex[:12]}",
+        razorpay_qr_code_id="qr_TEST123",
+        amount_paid=Decimal("100.00"),
+        refund_amount=Decimal("100.00"),
+        razorpay_refund_id="rfnd_API",
+        razorpay_refund_speed_processed="instant",
+        status=QRPaymentStatusEnum.REFUNDED,
+    )
+
+    resp = await client_admin.get(f"/api/admin/qr-codes/{qr_code.id}/payments")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["data"][0]["razorpay_refund_speed_processed"] == "instant"
+
+
+@pytest.mark.asyncio
+async def test_full_refund_persists_speed_processed_from_reconciliation(
+    client, _refund_qr_payment, monkeypatch
+):
+    """`RazorpayAlreadyRefundedError` reconciliation persists speed_processed
+    from the existing-refund dict when present."""
+    monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment.side_effect = RazorpayAlreadyRefundedError(
+        _refund_qr_payment.razorpay_payment_id, Exception("dup")
+    )
+    mock_razorpay.find_refund_for_payment.return_value = {
+        "id": "rfnd_RECON", "speed_processed": "instant",
+    }
+
+    with patch("services.qr_payment_service.razorpay_service", mock_razorpay):
+        await QRPaymentService._full_refund(_refund_qr_payment, "Zero energy")
+
+    await _refund_qr_payment.refresh_from_db()
+    assert _refund_qr_payment.razorpay_refund_id == "rfnd_RECON"
+    assert _refund_qr_payment.razorpay_refund_speed_processed == "instant"
+
+
+@pytest.mark.asyncio
+async def test_full_refund_emits_instant_succeeded_metric(
+    client, _refund_qr_payment, monkeypatch
+):
+    """Razorpay returns speed_processed=instant → RefundInstantSucceeded
+    counter increments, RefundInstantFallback does not."""
+    monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment.return_value = {
+        "id": "rfnd_M_OK", "speed_processed": "instant",
+    }
+
+    with patch("services.qr_payment_service.razorpay_service", mock_razorpay), \
+         patch("services.qr_payment_service.OCPPMetrics.record_refund_speed",
+               new_callable=AsyncMock) as mock_record:
+        await QRPaymentService._full_refund(_refund_qr_payment, "Zero energy")
+
+    mock_record.assert_awaited_once()
+    assert mock_record.await_args.args[2] == "instant"
+
+
+@pytest.mark.asyncio
+async def test_full_refund_emits_fallback_metric_when_response_is_normal(
+    client, _refund_qr_payment, monkeypatch
+):
+    """`speed=optimum` requested but Razorpay fell back to normal →
+    RefundInstantFallback counter increments via record_refund_speed.
+    """
+    monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment.return_value = {
+        "id": "rfnd_M_FB", "speed_processed": "normal",
+    }
+
+    with patch("services.qr_payment_service.razorpay_service", mock_razorpay), \
+         patch("services.qr_payment_service.OCPPMetrics.record_refund_speed",
+               new_callable=AsyncMock) as mock_record:
+        await QRPaymentService._full_refund(_refund_qr_payment, "Zero energy")
+
+    mock_record.assert_awaited_once()
+    assert mock_record.await_args.args[2] == "normal"
+
+
+@pytest.mark.asyncio
+async def test_full_refund_emits_no_metric_when_flag_disabled(
+    client, _refund_qr_payment, monkeypatch
+):
+    """Kill-switch off → speed wasn't requested as optimum → neither counter
+    fires. A normal-speed refund is intentional, not a fallback."""
+    monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "false")
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment.return_value = {
+        "id": "rfnd_M_OFF", "speed_processed": "normal",
+    }
+
+    with patch("services.qr_payment_service.razorpay_service", mock_razorpay), \
+         patch("services.qr_payment_service.OCPPMetrics.record_refund_speed",
+               new_callable=AsyncMock) as mock_record:
+        await QRPaymentService._full_refund(_refund_qr_payment, "Zero energy")
+
+    mock_record.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_full_refund_reconciliation_emits_metric_when_speed_present(
+    client, _refund_qr_payment, monkeypatch
+):
+    """Reconciliation path also emits the metric when the existing-refund
+    dict carries `speed_processed` (only when optimum was requested)."""
+    monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment.side_effect = RazorpayAlreadyRefundedError(
+        _refund_qr_payment.razorpay_payment_id, Exception("dup")
+    )
+    mock_razorpay.find_refund_for_payment.return_value = {
+        "id": "rfnd_M_RECON", "speed_processed": "instant",
+    }
+
+    with patch("services.qr_payment_service.razorpay_service", mock_razorpay), \
+         patch("services.qr_payment_service.OCPPMetrics.record_refund_speed",
+               new_callable=AsyncMock) as mock_record:
+        await QRPaymentService._full_refund(_refund_qr_payment, "Zero energy")
+
+    mock_record.assert_awaited_once()
+    assert mock_record.await_args.args[2] == "instant"
+
+
+@pytest.mark.asyncio
+async def test_partial_refund_does_not_emit_speed_metric(
+    client, qr_charger, qr_code, qr_tariff, monkeypatch
+):
+    """Partial refunds in process_qr_session_billing never touch the speed
+    metric — they stay on normal speed and are not 'fallbacks'."""
+    monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
+
+    _, txn, _qr_payment = await _make_qr_billing_fixture(
+        qr_charger, qr_code, qr_tariff, energy_consumed_kwh=0.5,
+    )
+
+    with patch("services.qr_payment_service.redis_manager") as mock_redis:
+        mock_redis.delete_qr_session = AsyncMock()
+        with patch("services.qr_payment_service.razorpay_service") as mock_rzp, \
+             patch("services.qr_payment_service.OCPPMetrics.record_refund_speed",
+                   new_callable=AsyncMock) as mock_record:
+            mock_rzp.refund_payment.return_value = {"id": "rfnd_partial_M"}
+            await QRPaymentService.process_qr_session_billing(txn.id)
+
+    mock_record.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_full_refund_passes_speed_none_when_flag_disabled(
+    client, _refund_qr_payment, monkeypatch
+):
+    """Kill-switch: with RAZORPAY_INSTANT_REFUND_ENABLED=false, no speed is set."""
+    monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "false")
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment.return_value = {
+        "id": "rfnd_NORMAL", "speed_processed": "normal",
+    }
+
+    with patch("services.qr_payment_service.razorpay_service", mock_razorpay):
+        await QRPaymentService._full_refund(_refund_qr_payment, "Zero energy")
+
+    mock_razorpay.refund_payment.assert_called_once()
+    assert mock_razorpay.refund_payment.call_args.kwargs["speed"] is None
+
+
+@pytest.mark.asyncio
+async def test_partial_refund_does_not_request_instant_speed(
+    client, qr_charger, qr_code, qr_tariff, monkeypatch
+):
+    """Partial unused-credit refunds stay on normal speed even with the flag on
+    (ADR 0002 — instant is scoped to full refunds where service was not rendered)."""
+    monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
+
+    _, txn, qr_payment = await _make_qr_billing_fixture(
+        qr_charger, qr_code, qr_tariff, energy_consumed_kwh=0.5,
+    )
+
+    with patch("services.qr_payment_service.redis_manager") as mock_redis:
+        mock_redis.delete_qr_session = AsyncMock()
+        with patch("services.qr_payment_service.razorpay_service") as mock_rzp:
+            mock_rzp.refund_payment.return_value = {"id": "rfnd_partial"}
+            await QRPaymentService.process_qr_session_billing(txn.id)
+
+    mock_rzp.refund_payment.assert_called_once()
+    # speed kwarg either absent entirely or None — both mean "normal".
+    assert mock_rzp.refund_payment.call_args.kwargs.get("speed") is None
+
+
+# ============================================================================
 # Concurrent-payment rejection on same charger
 # ============================================================================
 
 @pytest.mark.asyncio
-async def test_concurrent_payment_rejected_when_active_txn(client, qr_charger, qr_code, qr_tariff):
-    """If charger has an active transaction, new QR payment is rejected + refunded."""
+async def test_concurrent_payment_rejected_when_active_txn(client, qr_charger, qr_code, qr_tariff, monkeypatch):
+    """If charger has an active transaction, new QR payment is rejected + refunded.
+
+    Trigger 3 of 6 for ADR 0002 instant-refund coverage: concurrent payment
+    rejected on busy charger. Asserts speed=optimum reaches Razorpay.
+    """
+    monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
     import uuid
     user = await User.create(
         email=f"conc_{uuid.uuid4().hex[:6]}@voltlync.test",
@@ -417,11 +723,60 @@ async def test_concurrent_payment_rejected_when_active_txn(client, qr_charger, q
     assert result["status"] == "failed"
     assert result["reason"] == "active_transaction"
     mock_razorpay.refund_payment.assert_called_once()
+    assert mock_razorpay.refund_payment.call_args.kwargs["speed"] == "optimum"
 
     rejected = await QRPayment.filter(razorpay_payment_id="pay_CONC001").first()
     assert rejected is not None
     assert rejected.status == QRPaymentStatusEnum.REFUNDED
     assert rejected.razorpay_refund_id == "rfnd_REJECTED"
+
+
+@pytest.mark.asyncio
+async def test_stale_payment_full_refund_passes_speed_optimum(
+    client, qr_charger, qr_code, monkeypatch
+):
+    """Trigger 2 of 6: stale payment (webhook delayed past pending timeout)
+    issues a full refund via `_full_refund` with speed=optimum.
+    """
+    monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
+    # Make the payment older than QR_PAYMENT_PENDING_TIMEOUT (300s default).
+    stale_ts = int(datetime.now(timezone.utc).timestamp()) - 900
+    payload = _webhook_payload("pay_STALE001", "qr_TEST123", 10000)
+    payload["payment"]["entity"]["created_at"] = stale_ts
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment.return_value = {"id": "rfnd_STALE"}
+    mock_razorpay.fetch_payment_fees.return_value = None
+
+    with patch("services.qr_payment_service.razorpay_service", mock_razorpay):
+        result = await QRPaymentService.handle_qr_payment(payload)
+
+    assert result["status"] == "refunded_stale"
+    mock_razorpay.refund_payment.assert_called_once()
+    assert mock_razorpay.refund_payment.call_args.kwargs["speed"] == "optimum"
+
+
+@pytest.mark.asyncio
+async def test_charger_not_connected_full_refund_passes_speed_optimum(
+    client, qr_charger, qr_code, monkeypatch
+):
+    """Trigger 4 of 6: charger not connected at payment time → full refund
+    via `_full_refund` with speed=optimum.
+    """
+    monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
+    payload = _webhook_payload("pay_NOCONN001", "qr_TEST123", 10000)
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment.return_value = {"id": "rfnd_NOCONN"}
+    mock_razorpay.fetch_payment_fees.return_value = None
+
+    with patch("services.qr_payment_service.razorpay_service", mock_razorpay), \
+         patch("services.qr_payment_service.redis_manager") as mock_redis:
+        mock_redis.is_charger_connected = AsyncMock(return_value=False)
+        await QRPaymentService.handle_qr_payment(payload)
+
+    mock_razorpay.refund_payment.assert_called_once()
+    assert mock_razorpay.refund_payment.call_args.kwargs["speed"] == "optimum"
 
 
 # ============================================================================

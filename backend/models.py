@@ -593,6 +593,7 @@ class QRPayment(Model):
     fee_source = fields.CharField(max_length=20, null=True)                                 # 'webhook', 'api', or 'estimated'
     refund_amount = fields.DecimalField(max_digits=10, decimal_places=2, null=True)
     razorpay_refund_id = fields.CharField(max_length=255, null=True, index=True)
+    razorpay_refund_speed_processed = fields.CharField(max_length=20, null=True)
     refund_processed_at = fields.DatetimeField(null=True)
     refund_failure_reason = fields.TextField(null=True)
     status = fields.CharEnumField(QRPaymentStatusEnum)
