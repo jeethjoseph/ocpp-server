@@ -911,7 +911,15 @@ class GSTInvoice(Model):
 
     # Charging details
     energy_consumed_kwh = fields.DecimalField(max_digits=12, decimal_places=3)
+    # GST-only-effective per-kWh rate, derived from (energy_taxable + energy_tax) / billable_kwh.
+    # Used by line-item reconciliation on the PDF for legacy invoices.
     tariff_rate_incl_tax = fields.DecimalField(max_digits=10, decimal_places=2)
+    # Snapshot of the operator-set, customer-displayed all-inclusive per-kWh
+    # rate (Tariff.tariff_per_kwh_all_in) at the moment of issuance. Mirrors
+    # what the customer saw on the QR / stations screen when they paid.
+    # Nullable for backwards compat with pre-2026-05-19 invoices; the PDF
+    # falls back to `tariff_rate_incl_tax` when this is NULL. See ADR 0003.
+    tariff_per_kwh_all_in = fields.DecimalField(max_digits=10, decimal_places=4, null=True)
     charged_on = fields.DatetimeField(null=True)
     duration_seconds = fields.IntField(null=True)
     hsn_sac_code = fields.CharField(max_length=10, default="996749")

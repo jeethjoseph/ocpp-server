@@ -30,8 +30,8 @@ from models import (
     GSTInvoiceCounter,
     QRPayment,
     User,
-    UserRoleEnum,
 )
+from core.roles import INTERNAL_ROLES
 from services.wallet_service import WalletService
 from services.monitoring_service import MetricsCollector
 from services.tariff_utils import synthetic_fee_split
@@ -53,13 +53,6 @@ VOLTLYNC_GSTIN = os.getenv("VOLTLYNC_GSTIN", "")
 VOLTLYNC_ADDRESS = os.getenv("VOLTLYNC_ADDRESS", "")
 VOLTLYNC_STATE = os.getenv("VOLTLYNC_STATE", "Kerala")
 VOLTLYNC_STATE_CODE = os.getenv("VOLTLYNC_STATE_CODE", "32")
-
-# Roles whose charging sessions are internal/operational (admin test-charges,
-# franchisee remote-starts on their own stations) and not customer sales —
-# generate_invoice skips these so they don't pollute the GST liability or
-# the per-franchisee invoice sequence.
-INTERNAL_ROLES = {UserRoleEnum.ADMIN, UserRoleEnum.FRANCHISEE}
-
 
 def _get_financial_year(dt: datetime) -> str:
     """Return FY string like '2026-27'. Indian FY runs Apr-Mar."""
@@ -207,10 +200,11 @@ class InvoiceService:
             return None
 
         # Skip invoicing for internal-role sessions (admin test-charges or
-        # franchisee remote-starts on their own stations). These deduct from
-        # the initiator's wallet but are operational, not customer sales —
-        # issuing a customer-facing GST invoice would inflate liability and
-        # consume an invoice number for an internal event.
+        # franchisee remote-starts on their own stations). These are purely
+        # operational — no wallet deduction (skipped in WalletService per
+        # ADR 0004), no budget cap, no GST invoice. Issuing a customer-facing
+        # GST invoice would inflate liability and consume an invoice number
+        # for an internal event. See CONTEXT.md "Internal-role Session."
         user = await User.filter(id=txn.user_id).first()
         if user and user.role in INTERNAL_ROLES:
             logger.info(
@@ -390,6 +384,14 @@ class InvoiceService:
             connector_type=connector_type,
             energy_consumed_kwh=billable_kwh,
             tariff_rate_incl_tax=tariff_rate_incl,
+            # Snapshot the operator-set all-in rate at issuance time so the
+            # PDF can show the same number the customer saw on the QR /
+            # stations screen when they paid. NULL for legacy invoices and
+            # for wallet/admin sessions where no Tariff row resolves; the
+            # PDF falls back to `tariff_rate_incl_tax` in that case.
+            tariff_per_kwh_all_in=(
+                tariff.tariff_per_kwh_all_in if tariff else None
+            ),
             charged_on=txn.start_time,
             duration_seconds=duration_seconds,
             hsn_sac_code=hsn_sac_code,
@@ -538,12 +540,24 @@ class InvoiceService:
         charged_on_str = invoice.charged_on.strftime("%d/%m/%Y, %I:%M %p") if invoice.charged_on else ""
         duration_str = _format_duration(invoice.duration_seconds)
 
-        header = ["HSN CODE", "ENERGY BILLED\n(kWh)", "TARIFF / kWh\n(Including Taxes)", "CHARGED ON", "DURATION", "AMOUNT (INR)"]
+        # Tariff column shows the operator-set, customer-displayed all-in
+        # rate when we snapshotted it at issuance (post-2026-05-19 invoices);
+        # legacy invoices fall back to the GST-only-effective rate captured
+        # in `tariff_rate_incl_tax`. The column header reflects which one
+        # we're displaying so the customer / auditor isn't misled.
+        if invoice.tariff_per_kwh_all_in is not None:
+            tariff_header = "TARIFF / kWh\n(Including Taxes and\nGateway Charges)"
+            tariff_cell = f"{invoice.tariff_per_kwh_all_in:.2f}"
+        else:
+            tariff_header = "TARIFF / kWh\n(Including Taxes)"
+            tariff_cell = str(invoice.tariff_rate_incl_tax)
+
+        header = ["HSN CODE", "ENERGY BILLED\n(kWh)", tariff_header, "CHARGED ON", "DURATION", "AMOUNT (INR)"]
         rows = [header]
         rows.append([
             str(invoice.hsn_sac_code),
             f"{invoice.energy_consumed_kwh:.1f}",
-            str(invoice.tariff_rate_incl_tax),
+            tariff_cell,
             charged_on_str,
             duration_str,
             f"{invoice.energy_taxable_value:.2f}",

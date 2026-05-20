@@ -190,6 +190,41 @@ class WalletService:
             if not transaction:
                 return False, f"Transaction {transaction_id} not found", None, None
 
+            # Internal-role skip — ADR 0004. Sessions initiated by ADMIN or
+            # FRANCHISEE users are purely operational; no wallet deduction,
+            # no GST invoice, no budget cap. Mark the session COMPLETED so
+            # it doesn't sit in the anomaly STOPPED-with-energy bucket and so
+            # the billing retry service never picks it up. Audit log carries
+            # the policy reason. See CONTEXT.md "Internal-role Session."
+            from core.roles import INTERNAL_ROLES
+            user = await User.filter(id=transaction.user_id).first()
+            if user and user.role in INTERNAL_ROLES:
+                await Transaction.filter(id=transaction_id).update(
+                    transaction_status=TransactionStatusEnum.COMPLETED
+                )
+                # Audit awaited (not fire-and-forget) so the row is part of
+                # the same @atomic — a failed Transaction.update rolls the
+                # audit back too, and a spawned task wouldn't inherit a usable
+                # connection after the atomic exits.
+                await log_audit_event(
+                    action="transaction.status_changed",
+                    entity_type="transaction",
+                    entity_id=transaction_id,
+                    actor_type="system",
+                    changes={
+                        "new_status": "COMPLETED",
+                        "trigger": "InternalRoleSkip",
+                        "reason": "Wallet billing skipped — internal-role session per policy (ADR 0004)",
+                        "role": user.role.value,
+                    },
+                )
+                MetricsCollector.increment_counter("Custom/Wallet/InternalRoleSkipped")
+                logger.info(
+                    f"Transaction {transaction_id}: internal-role ({user.role.value}) session, "
+                    f"wallet billing skipped per policy"
+                )
+                return True, "Internal-role session — wallet billing skipped per policy", Decimal('0.00'), None
+
             # Skip wallet billing for QR payment sessions
             from models import QRPayment
             qr_payment = await QRPayment.filter(transaction_id=transaction_id).first()

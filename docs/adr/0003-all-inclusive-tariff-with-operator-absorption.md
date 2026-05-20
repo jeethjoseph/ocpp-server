@@ -22,6 +22,12 @@ Per the cutover plan, the migration runs in a coordinated maintenance window wit
 - **Repurpose `rate_per_kwh` to mean all-in; drop the back-derivation.** Rejected: huge blast radius across billing, invoicing, settlement, simulators, and tests, all of which currently treat `rate_per_kwh` as excl-everything.
 - **Track `operator_set_all_in_at` + ship a legacy-tariff banner endpoint.** Rejected at the size we're at — two live chargers is well within manual coordination range. Reconsider when the operator-set audit trail or self-serve "what changed" tooling becomes useful in its own right.
 
+## Invoice display (post-2026-05-19)
+
+The GST invoice PDF surfaces the operator's promised all-in rate, not the GST-only-effective rate computed from line-item amounts. To achieve historical stability — re-printing an old invoice after a tariff change must still show the rate the customer saw when they paid — we snapshot `Tariff.tariff_per_kwh_all_in` onto each `GSTInvoice` row at issuance time via a nullable `GSTInvoice.tariff_per_kwh_all_in` column (migration 38). The PDF renders that snapshot when present and falls back to the legacy `tariff_rate_incl_tax` (with the legacy column header) for pre-cutover invoices, so old PDFs stay accurate too.
+
+The column header on the PDF is conditional: `Tariff/kWh (Including Taxes and Gateway Charges)` when the snapshot is present; `Tariff/kWh (Including Taxes)` for legacy. Trade-off accepted: at partial consumption the displayed rate doesn't reconcile exactly against `tariff × kWh = total` (the gateway fee is a fixed rupee on `amount_paid`, not per-kWh on consumption — see "Consequences" below). The chosen design prioritises matching the operator's promise on the QR / stations screen over per-line arithmetic reconciliation.
+
 ## Consequences
 
 - The displayed all-in rate is **exact only at full budget consumption**. Partial consumption inflates the customer's effective per-kWh slightly (the synthetic fee is a fixed rupee amount on `amount_paid`, not per-kWh). This is intentional and not disclosed in-line — see grilling notes 2026-05-18.

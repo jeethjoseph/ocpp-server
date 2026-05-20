@@ -29,9 +29,19 @@ ZERO_ENERGY_GRACE_PERIOD_SECONDS = int(
 
 
 async def check_zero_energy(
-    transaction_id: int, reading_kwh: float, transaction_start_time: datetime
+    transaction_id: int, reading_kwh, transaction_start_time: datetime
 ):
-    """Check if energy has stalled and trigger auto-stop if needed."""
+    """Check if energy has stalled and trigger auto-stop if needed.
+
+    `reading_kwh` is annotated as float in older call sites but the
+    MeterValues parser actually passes a `Decimal` (see main.py where it
+    is parsed via `Decimal(str(value))`). The watchdog only uses it for
+    monotonic advancement comparisons + Redis serialisation, so float()
+    is the right boundary cast: it makes the dict JSON-serialisable
+    without needing a custom encoder and the precision is far above
+    what the minute-scale stall check needs.
+    """
+    reading_kwh = float(reading_kwh)
     now = datetime.now(timezone.utc)
 
     # Grace period: skip check during initial charging negotiation

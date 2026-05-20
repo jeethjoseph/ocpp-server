@@ -106,7 +106,10 @@ class RedisConnectionManager:
             return False
         try:
             key = f"{self.QR_SESSION_PREFIX}{transaction_id}"
-            await self.redis_client.set(key, json.dumps(data), ex=ttl)
+            # default=str lets any Decimal (or datetime) in the payload
+            # serialise as its string form rather than crashing the writer.
+            # Readers must cast back if they need numeric arithmetic.
+            await self.redis_client.set(key, json.dumps(data, default=str), ex=ttl)
             logger.info(f"Cached QR session for transaction {transaction_id}")
             return True
         except Exception as e:
@@ -154,7 +157,7 @@ class RedisConnectionManager:
             return False
         try:
             key = f"{self.WALLET_SESSION_PREFIX}{transaction_id}"
-            await self.redis_client.set(key, json.dumps(data), ex=ttl)
+            await self.redis_client.set(key, json.dumps(data, default=str), ex=ttl)
             logger.info(f"Cached wallet session for transaction {transaction_id}")
             return True
         except Exception as e:
@@ -246,7 +249,7 @@ class RedisConnectionManager:
             return False
         try:
             key = f"{self.ZERO_ENERGY_PREFIX}{transaction_id}"
-            await self.redis_client.set(key, json.dumps(data), ex=ttl)
+            await self.redis_client.set(key, json.dumps(data, default=str), ex=ttl)
             return True
         except Exception as e:
             logger.error(f"Failed to set zero-energy state for transaction {transaction_id}: {e}")
@@ -293,7 +296,7 @@ class RedisConnectionManager:
                 "transaction_ids": transaction_ids,
                 "started_at": datetime.now(timezone.utc).isoformat(),
             }
-            await self.redis_client.set(key, json.dumps(data), ex=ttl)
+            await self.redis_client.set(key, json.dumps(data, default=str), ex=ttl)
             logger.info(f"Set socket grace period for {charge_point_id}, txns={transaction_ids}")
             return True
         except Exception as e:

@@ -24,7 +24,8 @@ dispatches are harmless. The Redis key is deleted on StopTransaction.
 import logging
 from decimal import Decimal, ROUND_HALF_UP
 
-from models import Transaction, Wallet
+from core.roles import INTERNAL_ROLES
+from models import Transaction, User, Wallet
 from services.wallet_service import WalletService
 from services.monitoring_service import MetricsCollector
 from redis_manager import redis_manager
@@ -55,6 +56,20 @@ class WalletSessionService:
         if not tariff or not tariff.rate_per_kwh:
             logger.warning(
                 f"Wallet session cache skipped for txn {transaction_id}: no tariff"
+            )
+            return False
+
+        # Internal-role skip — ADR 0004. Sessions initiated by ADMIN or
+        # FRANCHISEE users are purely operational, no budget cap. The
+        # MeterValues budget check naturally short-circuits because no
+        # `wallet_session:{txn_id}` cache row exists. See CONTEXT.md
+        # "Internal-role Session."
+        user = await User.filter(id=wallet.user_id).first()
+        if user and user.role in INTERNAL_ROLES:
+            MetricsCollector.increment_counter("Custom/WalletSession/InternalRoleSkipped")
+            logger.info(
+                f"Wallet session cache skipped for txn {transaction_id}: "
+                f"internal-role ({user.role.value}) session per policy"
             )
             return False
 

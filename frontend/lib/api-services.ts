@@ -73,6 +73,17 @@ export const stationService = {
   delete: (id: number) => api.delete<ApiResponse>(`/api/admin/stations/${id}`),
 };
 
+// Success payload from POST /api/admin/chargers/{id}/change-availability.
+// Backend captures the charger's OCPP ChangeAvailability response. The hook
+// (lib/queries/chargers.ts:useChangeAvailability) branches on ocpp_response.
+export interface ChangeAvailabilityResponse {
+  success: boolean;
+  message: string;
+  ocpp_response: "Accepted" | "Scheduled" | "Rejected" | string;
+  type: "Operative" | "Inoperative";
+  previous_status?: string;
+}
+
 export const chargerService = {
   getAll: (params?: {
     page?: number;
@@ -122,7 +133,7 @@ export const chargerService = {
     type: "Inoperative" | "Operative",
     connectorId: number
   ) =>
-    api.post<ApiResponse>(
+    api.post<ChangeAvailabilityResponse>(
       `/api/admin/chargers/${id}/change-availability?type=${type}&connector_id=${connectorId}`
     ),
 

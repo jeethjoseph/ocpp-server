@@ -191,9 +191,21 @@ async def handle_user_created(data: dict):
             rfid_card_id=rfid_card_id
         )
         
-        # Create wallet for user (balance is derived from the log; default 0)
-        await Wallet.create(user=user)
-        
+        # Internal-role users (ADMIN, FRANCHISEE) don't get a wallet — their
+        # sessions are operational, not customer-facing. See ADR 0004 and
+        # `services/wallet_service.py` for the runtime skip that handles any
+        # legacy backfilled wallets defensively. Promotion USER → ADMIN keeps
+        # the existing wallet (orphaned, never touched); demotion ADMIN → USER
+        # is handled lazily at `routers/wallet_payments.py` on first top-up.
+        from core.roles import INTERNAL_ROLES
+        if user_role not in INTERNAL_ROLES:
+            await Wallet.create(user=user)
+        else:
+            logger.info(
+                f"Skipping wallet creation for internal-role ({user_role.value}) "
+                f"user {primary_email} per ADR 0004"
+            )
+
         logger.info(f"Created new user {primary_email} from Clerk webhook")
 
         await log_webhook_event(

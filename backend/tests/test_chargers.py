@@ -235,20 +235,21 @@ class TestChargerEndpoints:
         mock_send_ocpp.return_value = (True, {"status": "Accepted"})
         
         response = await client_admin.post(
-            f"/api/admin/chargers/{test_charger.id}/change-availability?type=Inoperative&connector_id=1"
+            f"/api/admin/chargers/{test_charger.id}/change-availability?type=Inoperative&connector_id=0"
         )
-        
+
         assert response.status_code == status.HTTP_200_OK
         data = response.json()
         assert data["success"] is True
         # Endpoint message text was simplified — was "Availability changed to ... successfully"
         assert "ChangeAvailability" in data["message"]
 
-        # Verify OCPP command — payload key changed from connectorId to connector_id
+        # Verify OCPP command — connector_id pinned to 0 (whole-charger) per
+        # the admin contract; per-connector toggle isn't a product feature.
         mock_send_ocpp.assert_called_once_with(
             test_charger.charge_point_string_id,
             "ChangeAvailability",
-            {"connector_id": 1, "type": "Inoperative"}
+            {"connector_id": 0, "type": "Inoperative"}
         )
     
     @pytest.mark.asyncio

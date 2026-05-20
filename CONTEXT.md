@@ -22,6 +22,16 @@ _Avoid_: guest session, anonymous session.
 A session that ended with `energy_consumed_kwh ≤ 0`. For **QR Sessions** this triggers a full refund and no GST invoice; for **Wallet Sessions** no debit occurs.
 _Avoid_: failed session (charger faults are a separate category).
 
+**Internal-role Session**:
+A **Charging Session** initiated by an ADMIN or FRANCHISEE user, regardless of funding source. Purely operational — VoltLync staff testing a charger or a franchisee charging their own car at their own station. No **GST Invoice** is issued, no **Wallet** is debited, no **Budget cap** is enforced. The OCPP audit trail and meter values are still recorded so ops can see "this admin burned X kWh testing." If a FRANCHISEE wants to be billed for charging, they register a separate USER account.
+
+Working assumption (2026-05-19): internal users do not in practice scan QR codes or initiate UPI payments — those flows are customer-only. If that ever changes, the scope of this term needs to narrow to "wallet-funded + admin-triggered only" so external-money QR sessions still issue a GST invoice.
+_Avoid_: test session, ops session (both are used informally in code comments but neither is the canonical term).
+
+**Internal-role User**:
+A `User` row whose `role` is `ADMIN` or `FRANCHISEE`. The canonical set is `INTERNAL_ROLES = {ADMIN, FRANCHISEE}` in `services/invoice_service.py`. These users do not require a `Wallet` and any **Charging Session** they initiate is an **Internal-role Session**.
+_Avoid_: staff user, operator user.
+
 ### Tariffs and pricing
 
 **All-in tariff** / **All-inclusive tariff**:

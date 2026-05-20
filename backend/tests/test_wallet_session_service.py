@@ -18,6 +18,7 @@ from models import (
     TransactionStatusEnum,
     TransactionTypeEnum,
     User,
+    UserRoleEnum,
     Wallet,
     WalletTransaction,
 )
@@ -245,3 +246,41 @@ async def test_qr_session_skipped_by_rebuild(client):
 
     mock_task.assert_not_called()
     mock_redis.set_wallet_session.assert_not_awaited()
+
+
+# ============================================================================
+# Internal-role skip (ADR 0004) — admin/franchisee sessions skip budget cap
+# ============================================================================
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", [UserRoleEnum.ADMIN, UserRoleEnum.FRANCHISEE])
+async def test_cache_session_on_start_skips_internal_role(client, role):
+    """ADMIN/FRANCHISEE sessions must not snapshot a budget into Redis.
+
+    The MeterValues budget check naturally short-circuits because no
+    `wallet_session:{txn_id}` row exists — but we assert the skip explicitly
+    at the entry point so an accidentally-cached row can't sneak past us
+    if a future refactor changes the order of checks. See ADR 0004.
+    """
+    wallet, charger, tariff, txn = await _make_wallet_session_fixture()
+    # Promote the wallet's owner to an internal role.
+    user = await User.get(id=wallet.user_id)
+    user.role = role
+    await user.save()
+
+    with patch("services.wallet_session_service.redis_manager") as mock_redis, \
+         patch(
+             "services.wallet_session_service.MetricsCollector.increment_counter"
+         ) as mock_metric:
+        mock_redis.set_wallet_session = AsyncMock(return_value=True)
+
+        result = await WalletSessionService.cache_session_on_start(
+            txn.id, wallet, tariff, start_meter_kwh=0.0, charger_id=charger.id
+        )
+
+    assert result is False, "Internal-role session must return False (no snapshot)"
+    mock_redis.set_wallet_session.assert_not_awaited(), (
+        "Internal-role session must not write a Redis snapshot"
+    )
+    metric_calls = [c.args[0] for c in mock_metric.call_args_list]
+    assert "Custom/WalletSession/InternalRoleSkipped" in metric_calls

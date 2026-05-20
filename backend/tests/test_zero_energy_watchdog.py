@@ -1,4 +1,7 @@
 """Unit tests for zero_energy_watchdog state machine."""
+import json
+from decimal import Decimal
+
 import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch, AsyncMock
@@ -140,3 +143,92 @@ class TestTimezoneHandling:
         naive_start = datetime.utcnow() - timedelta(seconds=300)
         # Should not raise
         await check_zero_energy(transaction_id=7, reading_kwh=5.0, transaction_start_time=naive_start)
+
+
+class TestDecimalReadingKwh:
+    """Regression guard for the 'Decimal is not JSON serializable' staging
+    storm (223 occurrences in the recent log window before this fix).
+
+    The MeterValues parser at main.py constructs `reading_kwh` as a Decimal,
+    then hands it to `check_zero_energy`. Before the fix, the resulting
+    state dict failed `json.dumps`, the Redis write was never persisted,
+    and the watchdog couldn't detect stalled sessions for any transaction
+    hitting this path."""
+
+    @pytest.mark.asyncio
+    async def test_decimal_reading_kwh_serialises_without_crash(self, mock_redis):
+        """A Decimal reading_kwh must flow through to the Redis write."""
+        mock_rm, store = mock_redis
+        start_time = datetime.now(timezone.utc) - timedelta(
+            seconds=ZERO_ENERGY_GRACE_PERIOD_SECONDS + 30
+        )
+
+        # Pre-fix behaviour: this raised TypeError inside json.dumps.
+        await check_zero_energy(
+            transaction_id=42,
+            reading_kwh=Decimal("5.123"),
+            transaction_start_time=start_time,
+        )
+
+        # State was written; the values are JSON-safe floats.
+        assert 42 in store
+        # Round-trip through json.dumps to prove the payload is serialisable
+        # with the stdlib defaults (no `default=` kwarg). If a future change
+        # re-introduces a Decimal here this test fails loudly.
+        json.dumps(store[42])
+        assert isinstance(store[42]["last_advancing_kwh"], float)
+        assert isinstance(store[42]["previous_kwh"], float)
+        assert store[42]["last_advancing_kwh"] == pytest.approx(5.123)
+
+    @pytest.mark.asyncio
+    async def test_decimal_advancing_path_also_safe(self, mock_redis):
+        """The 'energy advancing' branch overwrites state — also Decimal-safe."""
+        mock_rm, store = mock_redis
+        start_time = datetime.now(timezone.utc) - timedelta(
+            seconds=ZERO_ENERGY_GRACE_PERIOD_SECONDS + 30
+        )
+
+        await check_zero_energy(
+            transaction_id=43,
+            reading_kwh=Decimal("1.000"),
+            transaction_start_time=start_time,
+        )
+        await check_zero_energy(
+            transaction_id=43,
+            reading_kwh=Decimal("1.500"),
+            transaction_start_time=start_time,
+        )
+
+        assert store[43]["last_advancing_kwh"] == pytest.approx(1.5)
+        json.dumps(store[43])
+
+
+class TestRedisManagerDefaultStrDefense:
+    """Defensive guard at the redis_manager layer. The primary fix is the
+    float() cast at the watchdog entry point; this proves the secondary
+    `default=str` belt would catch a regression that bypassed the cast."""
+
+    @pytest.mark.asyncio
+    async def test_set_zero_energy_state_accepts_decimal_payload(self):
+        from redis_manager import RedisConnectionManager
+
+        rm = RedisConnectionManager()
+        captured = {}
+
+        class _FakeClient:
+            async def set(self, key, value, ex=None):
+                captured["key"] = key
+                captured["value"] = value
+                captured["ex"] = ex
+                return True
+
+        rm.redis_client = _FakeClient()
+        ok = await rm.set_zero_energy_state(
+            99,
+            {"last_advancing_kwh": Decimal("3.142"), "previous_kwh": Decimal("3.000")},
+        )
+        assert ok is True
+        # default=str routes Decimals to their str form rather than crashing.
+        round_tripped = json.loads(captured["value"])
+        assert round_tripped["last_advancing_kwh"] == "3.142"
+        assert round_tripped["previous_kwh"] == "3.000"

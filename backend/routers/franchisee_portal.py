@@ -242,7 +242,18 @@ async def change_availability(
     available: bool = Query(...),
     auth=Depends(require_franchisee()),
 ):
-    """Change charger availability."""
+    """Change charger availability — franchisee-facing surface.
+
+    Takes a boolean (`?available=true|false`) for operator-intuitive UX.
+    Internally fixed to `connector_id=0` (whole-charger) and maps the boolean
+    to OCPP Operative/Inoperative.
+
+    The parallel admin endpoint at `routers/chargers.change_charger_availability`
+    instead takes OCPP-aligned vocabulary (`?type=Operative|Inoperative&connector_id=0`)
+    so admins debugging at the OCPP layer have explicit terminology. This
+    divergence is intentional; see docs/v1/comprehensive-architecture-documentation.md
+    "Charger control surface" for the rationale. Do not unify them blindly.
+    """
     _, franchisee = auth
     charger = await _verify_charger_ownership(charger_id, franchisee.id)
 

@@ -1,12 +1,16 @@
 """Unit tests for WalletService GST billing logic + W1 atomicity fix."""
 import pytest
 from decimal import Decimal
+from unittest.mock import patch
 
 from services.wallet_service import WalletService
 from models import (
+    AuditLog,
     Transaction,
     TransactionStatusEnum,
     TransactionTypeEnum,
+    User,
+    UserRoleEnum,
     Wallet,
     WalletTransaction,
 )
@@ -202,6 +206,155 @@ class TestProcessTransactionBillingAtomicity:
         assert refreshed.energy_charge is None
         assert refreshed.gst_amount is None
         assert refreshed.total_billed is None
+
+
+# ============================================================================
+# Internal-role skip (ADR 0004) — admin/franchisee sessions skip billing
+# ============================================================================
+
+class TestInternalRoleBillingSkip:
+    """An ADMIN- or FRANCHISEE-initiated session must NOT enter BILLING_FAILED
+    even when no wallet exists, and must NOT create a WalletTransaction even
+    when a wallet does exist. Sessions complete COMPLETED with an audit log
+    row carrying the InternalRoleSkip trigger. See ADR 0004."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("role", [UserRoleEnum.ADMIN, UserRoleEnum.FRANCHISEE])
+    async def test_internal_role_session_skips_billing_with_no_wallet(
+        self, client, test_charger, test_tariff, role
+    ):
+        """Internal-role user with NO wallet — must reach COMPLETED, not BILLING_FAILED."""
+        import random
+        suffix = random.randint(100000000, 999999999)
+        user = await User.create(
+            email=f"internal_{suffix}@voltlync.test",
+            phone_number=f"9{suffix}",
+            role=role,
+        )
+        # NB: no Wallet.create — emulates the post-ADR-0004 onboarding gate
+
+        txn = await Transaction.create(
+            charger=test_charger,
+            user=user,
+            transaction_status=TransactionStatusEnum.STOPPED,
+            start_meter_kwh=0.0,
+            end_meter_kwh=5.0,
+            energy_consumed_kwh=5.0,
+        )
+
+        with patch(
+            "services.wallet_service.MetricsCollector.increment_counter"
+        ) as mock_metric:
+            success, message, amount = await WalletService.process_transaction_billing(txn.id)
+
+        assert success is True
+        assert "Internal-role" in message
+        assert amount == Decimal("0.00")
+
+        refreshed = await Transaction.get(id=txn.id)
+        # CRITICAL: status must be COMPLETED, not BILLING_FAILED.
+        assert refreshed.transaction_status == TransactionStatusEnum.COMPLETED, (
+            "Internal-role session must NOT enter BILLING_FAILED — that's the "
+            "user-12 retry-storm pattern we're explicitly preventing."
+        )
+        # Breakdown fields stay None — no billing happened.
+        assert refreshed.energy_charge is None
+        assert refreshed.gst_amount is None
+        assert refreshed.total_billed is None
+
+        # No WalletTransaction was written for this session.
+        deduct = await WalletTransaction.filter(
+            charging_transaction_id=txn.id,
+        ).first()
+        assert deduct is None
+
+        # Audit log carries the policy reason.
+        audit = await AuditLog.filter(
+            action="transaction.status_changed",
+            entity_id=str(txn.id),
+        ).order_by("-id").first()
+        assert audit is not None
+        assert audit.changes["trigger"] == "InternalRoleSkip"
+        assert audit.changes["new_status"] == "COMPLETED"
+        assert audit.changes["role"] == role.value
+        assert "policy" in audit.changes["reason"].lower()
+
+        # Metric was incremented.
+        metric_calls = [c.args[0] for c in mock_metric.call_args_list]
+        assert "Custom/Wallet/InternalRoleSkipped" in metric_calls
+
+    @pytest.mark.asyncio
+    async def test_internal_role_session_skips_billing_even_with_legacy_wallet(
+        self, client, test_charger, test_tariff
+    ):
+        """Legacy data path: an internal-role user that still has a wallet
+        (e.g. from a backfill that pre-dates the creation gate) must STILL
+        skip billing. Defensive — the skip lives in the wallet service, not
+        gated on wallet absence."""
+        import random
+        suffix = random.randint(100000000, 999999999)
+        user = await User.create(
+            email=f"legacy_admin_{suffix}@voltlync.test",
+            phone_number=f"9{suffix}",
+            role=UserRoleEnum.ADMIN,
+        )
+        wallet = await Wallet.create(user=user)  # legacy backfilled wallet
+
+        txn = await Transaction.create(
+            charger=test_charger,
+            user=user,
+            transaction_status=TransactionStatusEnum.STOPPED,
+            start_meter_kwh=0.0,
+            end_meter_kwh=5.0,
+            energy_consumed_kwh=5.0,
+        )
+
+        success, message, amount = await WalletService.process_transaction_billing(txn.id)
+
+        assert success is True
+        assert amount == Decimal("0.00")
+
+        refreshed = await Transaction.get(id=txn.id)
+        assert refreshed.transaction_status == TransactionStatusEnum.COMPLETED
+
+        # Critically: no WalletTransaction even though the wallet exists.
+        deduct = await WalletTransaction.filter(wallet_id=wallet.id).first()
+        assert deduct is None, (
+            "Internal-role skip must not touch the wallet even when one exists."
+        )
+
+    @pytest.mark.asyncio
+    async def test_user_role_session_unchanged(
+        self, client, test_charger, test_user, test_tariff, test_wallet
+    ):
+        """Regression guard: USER-role sessions continue to bill normally."""
+        txn = await Transaction.create(
+            charger=test_charger,
+            user=test_user,
+            transaction_status=TransactionStatusEnum.STOPPED,
+            start_meter_kwh=0.0,
+            end_meter_kwh=10.0,
+            energy_consumed_kwh=10.0,
+        )
+
+        success, _, amount = await WalletService.process_transaction_billing(txn.id)
+        assert success is True
+        assert amount == Decimal("177.00")  # 10 kWh × ₹15 × 1.18
+
+        # Regression guard: USER-role billing writes the breakdown fields and
+        # deducts from the wallet. (Status transition to COMPLETED happens in
+        # the StopTransaction handler, not in this service — so we don't assert
+        # on status here.)
+        refreshed = await Transaction.get(id=txn.id)
+        assert refreshed.energy_charge == Decimal("150.00")
+        assert refreshed.total_billed == Decimal("177.00")
+
+        deduct = await WalletTransaction.filter(
+            charging_transaction_id=txn.id,
+            type=TransactionTypeEnum.CHARGE_DEDUCT,
+        ).first()
+        assert deduct is not None
+        assert deduct.amount == Decimal("177.00")
 
 
 # ============================================================================

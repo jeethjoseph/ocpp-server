@@ -710,23 +710,56 @@ async def remote_stop_charging(charger_id: int, reason: Optional[str] = "Request
 async def change_charger_availability(
     charger_id: int,
     type: str = Query(..., regex="^(Inoperative|Operative)$"),
-    connector_id: int = Query(..., ge=0),
+    connector_id: int = Query(..., ge=0,
+        description="Must be 0 — admin operates at whole-charger granularity. See docstring."),
     admin_user: User = Depends(require_admin())
 ):
     """
-    Change charger availability (Operative/Inoperative) - OCPP 1.6 compliant
+    Change charger availability (Operative/Inoperative) — OCPP 1.6 compliant.
 
-    Per OCPP 1.6 spec, ChangeAvailability can be sent at any time.
-    The charger responds with:
+    Per OCPP 1.6 spec, ChangeAvailability can be sent at any time. The charger
+    responds with:
     - Accepted: Change applied immediately
     - Scheduled: Will change after current transaction ends
     - Rejected: Cannot comply (e.g., hardware fault)
+
+    Contract notes:
+    - `connector_id` must be 0 (whole-charger semantic per OCPP 1.6). The
+      admin UI doesn't expose per-connector control; the validator rejects
+      anything else with 422 so a curl/ops typo doesn't send a doomed
+      OCPP message. If per-connector toggle becomes a product feature later,
+      relax the ceiling and add the UI affordance together.
+    - `type` uses OCPP vocabulary (Operative/Inoperative). The parallel
+      franchisee endpoint at `routers/franchisee_portal.change_availability`
+      uses a `?available=bool` query param instead — this divergence is
+      intentional (admins are debugging an OCPP layer; franchisees want a
+      self-serve boolean). See docs/v1/comprehensive-architecture-documentation.md
+      "Charger control surface" for the rationale; do not unify them blindly.
     """
+
+    # Whole-charger semantics only — see contract notes in docstring. Explicit
+    # check (not a Pydantic le=0) so the 422 message names the constraint
+    # instead of "Input should be less than or equal to 0".
+    if connector_id != 0:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "connector_id must be 0 — admin availability toggle operates "
+                "at whole-charger granularity. Per-connector control is not "
+                "exposed via the admin API."
+            ),
+        )
 
     charger = await Charger.filter(id=charger_id).first()
     if not charger:
         raise HTTPException(status_code=404, detail="Charger not found")
 
+    # Snapshot the charger's state at the moment the operator clicked. This is
+    # captured BEFORE the OCPP exchange so `previous_status` reflects "what
+    # was the charger doing when the operator pressed the button" — the right
+    # audit semantic. (An earlier revision read it AFTER the exchange; that
+    # broke the field's meaning whenever the charger Accepted and immediately
+    # fired a StatusNotification reflecting the new state.)
     current_status = charger.latest_status
 
     # Check if charger is connected (via Redis - works across all workers)
@@ -765,7 +798,6 @@ async def change_charger_availability(
             "ocpp_response": ocpp_status,
             "type": type,
             "previous_status": current_status,
-            "note": "Scheduled" if ocpp_status == "Scheduled" else None
         }
     else:
         raise HTTPException(status_code=500, detail=f"Failed to change availability: {response}")

@@ -168,6 +168,26 @@ async def test_qr_invoice_shows_gross_payment_and_refund_separately(client):
 
 
 @pytest.mark.asyncio
+async def test_invoice_snapshots_operator_set_all_in_tariff(client):
+    """generate_invoice snapshots the operator's `tariff_per_kwh_all_in` onto
+    the GSTInvoice row at issuance so the PDF can show the customer the same
+    rate they saw on the QR / stations screen when they paid — even if the
+    operator later changes the tariff. Migration 38 added the column. See
+    ADR 0003 and the 2026-05-19 invoice-display fix."""
+    # _make_session sets the Tariff with rate=20 and gst=18, so all_in is
+    # auto-computed by the helper as rate × 1.18 = 23.6000.
+    _, _, txn, _, _ = await _make_session(with_qr=True)
+
+    invoice = await InvoiceService.generate_invoice(txn.id)
+
+    assert invoice is not None
+    assert invoice.tariff_per_kwh_all_in == Decimal("23.6000"), (
+        "Invoice should snapshot Tariff.tariff_per_kwh_all_in verbatim "
+        "(not derived from amounts)."
+    )
+
+
+@pytest.mark.asyncio
 async def test_qr_invoice_gateway_line_uses_synthetic_2_percent(client):
     """Gateway line on the invoice is the SYNTHETIC 2% of amount_paid, NOT
     the actual Razorpay fee on the QRPayment row. See ADR 0001.

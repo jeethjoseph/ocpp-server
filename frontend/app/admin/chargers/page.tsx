@@ -102,18 +102,22 @@ export default function AdminChargersPage() {
   };
 
   const getAvailabilityToggleState = (status: string) => {
-    // Green/ON for operational states, Gray/OFF for Unavailable/Faulted
-    return status !== "Unavailable" && status !== "Faulted";
+    // Toggle reflects OCPP availability only. Per OCPP 1.6, `Faulted` is a
+    // hardware/error state ORTHOGONAL to availability — a Faulted charger
+    // can still be Operative. Only `Unavailable` flips the toggle off.
+    // (Faulted is communicated separately in the status pill.)
+    return status !== "Unavailable";
   };
 
   const handleChangeAvailability = async (
     chargerId: number,
     currentStatus: string
   ) => {
-    // OCPP 1.6: ChangeAvailability can be sent at any time
-    // Toggle logic: if currently operational -> Inoperative, otherwise -> Operative
-    // The charger may respond with Accepted, Scheduled, or Rejected
-    const isCurrentlyOperational = currentStatus !== "Unavailable" && currentStatus !== "Faulted";
+    // OCPP 1.6: ChangeAvailability can be sent at any time. Use the same
+    // operational-state check the UI uses, so the two never drift. The
+    // charger surfaces the real outcome via the OCPP response (Accepted /
+    // Scheduled / Rejected), which the hook branches on.
+    const isCurrentlyOperational = getAvailabilityToggleState(currentStatus);
     const newType: "Inoperative" | "Operative" = isCurrentlyOperational ? "Inoperative" : "Operative";
 
     // Add charger to loading set
