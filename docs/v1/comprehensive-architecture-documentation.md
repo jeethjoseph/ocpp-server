@@ -818,12 +818,14 @@ A txn with no signals at all returns `(False, None)` — the helper defers to th
 - Hooked into `MeterValues` handler
 - Tracks per-transaction state in Redis (`zero_energy:{txn_id}`)
 - Skips check during initial grace period (`ZERO_ENERGY_GRACE_PERIOD_SECONDS`, default 60s)
-- If energy hasn't advanced for `ZERO_ENERGY_TIMEOUT_SECONDS` (default 120s), schedules `RemoteStopTransaction`
+- If energy hasn't advanced for `ZERO_ENERGY_TIMEOUT_SECONDS` (default 7200s / 2h, bumped 2026-05-21 from 120s), schedules `RemoteStopTransaction`
 - **W5 hook**: when energy advances, also pops `disconnect_handler._disconnect_reset_count` for the transaction (zeros the flap counter)
+
+**Rationale for 2-hour window** (2026-05-21): the previous 120s timeout was killing sessions whose EV had taper-completed (SOC cap reached, BMS pause) only a couple of minutes earlier. Operators wanted EVs to be able to sit idle on the connector for up to 2 hours before being auto-stopped — covers natural taper-end without leaving infinitely-stuck sessions. Customers paying via QR see their refund window extend from ~3 min after taper-end to ~2 hr after taper-end; flag this in customer-comms if relevant.
 
 **Cleanup**: `clear_zero_energy_tracking(transaction_id)` is called from `transaction_finalizer.finalize_stopped_transaction`, ensuring state is removed on every stop path.
 
-**Redis TTL**: 7200 seconds (2h) — well above the longest plausible session, bounded leak in case of missed cleanup.
+**Redis TTL invariant**: `set_zero_energy_state` uses `ttl=14400` (4h). This MUST remain strictly greater than `ZERO_ENERGY_TIMEOUT_SECONDS`, otherwise a charger that goes silent mid-stall lets the Redis state expire and resets the stall clock on reconnect — the watchdog would never trip. If you raise the timeout, raise the TTL too.
 
 #### Operational Runbooks (`docs/runbooks/`)
 **Purpose**: Single source of truth for on-call triage. Each runbook is linked from a New Relic alert condition via `runbook_url`, so the on-call engineer gets a one-click path from page → triage steps.

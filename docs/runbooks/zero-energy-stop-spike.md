@@ -25,9 +25,15 @@ TIMESERIES 5 minutes
 
 The `zero_energy_watchdog` service monitors active transactions for stalled
 energy consumption. If the energy register hasn't advanced for
-`ZERO_ENERGY_TIMEOUT_SECONDS` (default 120s) after the grace period
-(`ZERO_ENERGY_GRACE_PERIOD_SECONDS`, default 60s), it auto-stops the session by
-sending `RemoteStopTransaction` to the charger.
+`ZERO_ENERGY_TIMEOUT_SECONDS` (default 7200s / 2h since 2026-05-21; was 120s
+prior) after the grace period (`ZERO_ENERGY_GRACE_PERIOD_SECONDS`, default
+60s), it auto-stops the session by sending `RemoteStopTransaction` to the
+charger.
+
+**Note on alert thresholds**: with the 2h timeout, a single spike is unusual —
+each stop now represents either a real taper-completed EV that idled for 2h+
+or a chronically stuck charger. The historical 120s baseline meant frequent
+benign stops on taper-end; do not transfer those volume assumptions forward.
 
 A *spike* means many sessions are failing to deliver energy, which points to
 **one of three patterns**:
@@ -120,13 +126,18 @@ new firmware mis-reports the energy register.
    - **If firmware was just pushed**: roll back via the admin firmware
      management panel
    - **If rollback not possible**: temporarily increase
-     `ZERO_ENERGY_TIMEOUT_SECONDS` to 300 to reduce false positives while you
-     wait for a vendor fix:
+     `ZERO_ENERGY_TIMEOUT_SECONDS` (default 7200 / 2h) to suppress further
+     auto-stops while you wait for a vendor fix. Pick a value larger than the
+     longest plausible firmware-induced stall:
      ```bash
-     # Edit /home/ec2-user/ocpp-server/.env
-     ZERO_ENERGY_TIMEOUT_SECONDS=300   # was 120
+     # Edit /home/ec2-user/ocpp-server/.env.prod
+     ZERO_ENERGY_TIMEOUT_SECONDS=14400   # was 7200 — also bump Redis TTL in code if you go above 14400
      docker compose -f docker-compose.prod.yml up -d backend
      ```
+     **Invariant**: keep the value strictly less than the Redis state TTL in
+     `redis_manager.set_zero_energy_state` (currently 14400). If you need a
+     value ≥ 14400, raise the TTL in code first or stall detection breaks
+     silently across charger reconnects.
    - **Long-term**: flag the vendor and capture an OCPP log sample for the
      firmware ticket
 
@@ -158,7 +169,7 @@ of EV that's struggling to handshake with the charger.
 If neither A nor B explains it, suspect:
 
 1. **Watchdog config drift**: was `ZERO_ENERGY_TIMEOUT_SECONDS` recently
-   lowered? Check `.env` against git history.
+   lowered (default is 7200)? Check `.env` against git history.
 
    ```bash
    cd /home/ec2-user/ocpp-server
@@ -177,12 +188,13 @@ If neither A nor B explains it, suspect:
    ```
 
 4. **Mitigation**: if no clear cause, raise the timeout temporarily and page
-   backend lead:
+   backend lead. Default is 7200 (2h); double it if a real bug needs cover:
 
    ```bash
-   ZERO_ENERGY_TIMEOUT_SECONDS=300
+   ZERO_ENERGY_TIMEOUT_SECONDS=14400
    docker compose -f docker-compose.prod.yml up -d backend
    ```
+   See the invariant note in Step A about Redis TTL before going higher.
 
 ## Customer impact
 
@@ -222,8 +234,11 @@ admin or admin panel.
 
 - **Do not** disable the watchdog. A genuine stall = wasted charging slot =
   lost revenue + frustrated customer at the next session.
-- **Do not** raise `ZERO_ENERGY_TIMEOUT_SECONDS` above 600 seconds. A real stall
-  consumes a charger indefinitely.
+- **Do not** raise `ZERO_ENERGY_TIMEOUT_SECONDS` to or beyond the Redis state
+  TTL (`set_zero_energy_state` in `redis_manager.py`, currently 14400s) without
+  also raising the TTL. If timeout ≥ TTL, the Redis state can expire mid-stall
+  on a silent charger and the watchdog will never trip — stall detection
+  silently disabled.
 - **Do not** mark affected transactions as COMPLETED — they had no energy
   delivered, COMPLETED would imply billable.
 - **Do not** roll back firmware without checking which other deployments might

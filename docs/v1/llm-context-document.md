@@ -134,10 +134,11 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
   - Replaces duplicated stop-and-bill logic that previously lived in both `main.py:_suspend_timeout` and `disconnect_handler._stop_and_bill_transaction`
   - Used by: `main.py` BootNotification suspend timeout, `disconnect_handler` disconnect timeout, `disconnect_handler` startup sweep, all three resume points (MeterValues auto-resume, BootNotification per-txn handler, GetLastMeterValue DataTransfer)
 - **`zero_energy_watchdog.py`** - Auto-stop for stalled charging sessions
-  - `check_zero_energy()` - Called from MeterValues handler. Tracks energy progress in Redis, schedules `RemoteStopTransaction` if energy hasn't advanced for `ZERO_ENERGY_TIMEOUT_SECONDS` (120s) after `ZERO_ENERGY_GRACE_PERIOD_SECONDS` (60s) grace
+  - `check_zero_energy()` - Called from MeterValues handler. Tracks energy progress in Redis, schedules `RemoteStopTransaction` if energy hasn't advanced for `ZERO_ENERGY_TIMEOUT_SECONDS` (7200s / 2h since 2026-05-21) after `ZERO_ENERGY_GRACE_PERIOD_SECONDS` (60s) grace. The 2h window was chosen so EVs that taper-complete (SOC limit / BMS pause) aren't killed mid-taper — operators can manually stop or the watchdog will eventually finalize.
+  - **Invariant**: Redis state TTL (`set_zero_energy_state` in `redis_manager.py`, currently 14400s) MUST remain strictly greater than `ZERO_ENERGY_TIMEOUT_SECONDS`, otherwise a charger that goes silent mid-stall lets the state expire and resets the stall clock on reconnect
   - **W5 hook**: when energy advances, pops `disconnect_handler._disconnect_reset_count` for the transaction, allowing long sessions with intermittent disconnects to never trip the flap detector
   - `clear_zero_energy_tracking()` - Cleanup hook called from `transaction_finalizer.finalize_stopped_transaction`
-  - Config: `ZERO_ENERGY_TIMEOUT_SECONDS=120`, `ZERO_ENERGY_GRACE_PERIOD_SECONDS=60`
+  - Config: `ZERO_ENERGY_TIMEOUT_SECONDS=7200`, `ZERO_ENERGY_GRACE_PERIOD_SECONDS=60`
 - **`billing_retry_service.py`** - Background service (30-min interval) for failed transaction recovery, QR refund retries, orphaned QR payment cleanup, stale suspended transaction cleanup
 - **`firmware_update_service.py`** - Background service for OCPP firmware updates (v2 state machine, migration 35)
   - **State machine**: only 4 states — PENDING / INSTALLED / FAILED / CANCELLED. Intermediate states (DOWNLOADING/DOWNLOADED/INSTALLING) and split failures (DOWNLOAD_FAILED/INSTALLATION_FAILED) were collapsed in migration 35.

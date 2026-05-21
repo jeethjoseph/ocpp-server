@@ -239,11 +239,13 @@ class RedisConnectionManager:
     # Zero-energy watchdog methods
     ZERO_ENERGY_PREFIX = "zero_energy:"
 
-    async def set_zero_energy_state(self, transaction_id: int, data: Dict, ttl: int = 7200) -> bool:
+    async def set_zero_energy_state(self, transaction_id: int, data: Dict, ttl: int = 14400) -> bool:
         """Cache zero-energy tracking state for a transaction.
 
-        TTL of 2h is well above the longest plausible charging session and
-        bounds any leak from missed cleanup paths."""
+        TTL must be strictly greater than ZERO_ENERGY_TIMEOUT_SECONDS so a
+        charger that goes silent mid-stall doesn't let the state expire and
+        reset the stall clock on reconnect. Current values: timeout=7200s,
+        TTL=14400s (2x headroom)."""
         if not self.redis_client:
             logger.error("Redis client not initialized")
             return False
