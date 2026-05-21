@@ -158,6 +158,7 @@ export default function AdminStationsPage() {
               <Table>
                 <TableHeader>
                   <TableRow>
+                    <TableHead>ID</TableHead>
                     <TableHead>Name</TableHead>
                     <TableHead>Address</TableHead>
                     <TableHead>Location</TableHead>
@@ -168,6 +169,9 @@ export default function AdminStationsPage() {
                 <TableBody>
                   {stations.map((station) => (
                     <TableRow key={station.id}>
+                      <TableCell className="font-mono text-xs text-muted-foreground">
+                        #{station.id}
+                      </TableCell>
                       <TableCell className="font-medium">{station.name}</TableCell>
                       <TableCell>{station.address}</TableCell>
                       <TableCell>

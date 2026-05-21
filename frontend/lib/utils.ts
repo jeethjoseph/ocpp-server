@@ -28,6 +28,16 @@ export function formatINR(value: string | number | null | undefined): string {
   return INR_FORMATTER.format(n);
 }
 
+/** Plain numeric formatter that returns `"—"` for null/invalid input.
+ * Caller is responsible for prefixing `₹` or other symbols. Useful when the
+ * call site already provides the currency symbol and just wants the digits. */
+export function formatAmount(value: string | number | null | undefined): string {
+  if (value === null || value === undefined || value === "") return "—";
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(n)) return "—";
+  return n.toFixed(2);
+}
+
 export function formatTariffRangeAllIn(
   minAllIn: number | null | undefined,
   maxAllIn: number | null | undefined,
@@ -37,6 +47,17 @@ export function formatTariffRangeAllIn(
   const hi = (maxAllIn ?? minAllIn) as number;
   if (Math.abs(lo - hi) < 0.005) return `₹${lo.toFixed(2)}/kWh (all-inclusive)`;
   return `₹${lo.toFixed(2)}–₹${hi.toFixed(2)}/kWh (all-inclusive)`;
+}
+
+export function formatTariffBare(
+  minAllIn: number | null | undefined,
+  maxAllIn: number | null | undefined,
+): string | null {
+  if (minAllIn == null && maxAllIn == null) return null;
+  const lo = (minAllIn ?? maxAllIn) as number;
+  const hi = (maxAllIn ?? minAllIn) as number;
+  if (Math.abs(lo - hi) < 0.005) return `₹${lo.toFixed(2)}/kWh`;
+  return `₹${lo.toFixed(2)}–₹${hi.toFixed(2)}/kWh`;
 }
 
 /**

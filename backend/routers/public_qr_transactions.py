@@ -1,18 +1,15 @@
 """Public endpoint for QR payment users to look up transaction history by UPI ID"""
-import re
 import logging
 from fastapi import APIRouter, HTTPException, Query, Request
 from typing import Optional
 
+from core.validators import VPA_PATTERN
 from models import GSTInvoice, QRPayment, QRPaymentStatusEnum
 from redis_manager import redis_manager
 from routers.invoices import serve_invoice_pdf
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/public/qr-transactions", tags=["Public QR Transactions"])
-
-# UPI VPA: alphanumeric start, optional dots/hyphens/underscores, @ followed by bank code (2+ alpha chars)
-VPA_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9.\-_]{0,253}@[a-zA-Z][a-zA-Z0-9]{1,}$")
 
 RATE_LIMIT_MAX = 20  # requests per window
 RATE_LIMIT_WINDOW = 60  # seconds
@@ -87,6 +84,10 @@ async def get_transactions_by_vpa(
             "razorpay_gst": str(p.razorpay_gst) if p.razorpay_gst is not None else None,
             "fee_source": p.fee_source,
             "refund_amount": str(p.refund_amount) if p.refund_amount else None,
+            "razorpay_refund_id": p.razorpay_refund_id,
+            "razorpay_refund_speed_processed": p.razorpay_refund_speed_processed,
+            "refund_processed_at": p.refund_processed_at.isoformat() if p.refund_processed_at else None,
+            "refund_failure_reason": p.refund_failure_reason,
             "charger_name": charger.name if charger else None,
             "station_name": station.name if station else None,
             "franchisee_name": franchisee.business_name if franchisee else None,

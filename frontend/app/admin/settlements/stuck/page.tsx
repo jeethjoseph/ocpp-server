@@ -151,6 +151,7 @@ export default function AdminStuckSettlementsPage() {
               <Table>
                 <TableHeader>
                   <TableRow>
+                    <TableHead>ID</TableHead>
                     <TableHead>Franchisee</TableHead>
                     <TableHead>Status</TableHead>
                     <TableHead className="text-right">Payout</TableHead>
@@ -163,12 +164,15 @@ export default function AdminStuckSettlementsPage() {
                 <TableBody>
                   {data.data.map((e) => (
                     <TableRow key={e.id}>
+                      <TableCell className="font-mono text-xs text-muted-foreground">
+                        #{e.id}
+                      </TableCell>
                       <TableCell className="text-sm">
                         <div className="font-medium">
                           {e.franchisee_business_name || `#${e.franchisee_id}`}
                         </div>
                         <div className="text-xs text-muted-foreground">
-                          entry #{e.id} · txn #{e.transaction_id ?? "—"}
+                          txn #{e.transaction_id ?? "—"}
                         </div>
                       </TableCell>
                       <TableCell>

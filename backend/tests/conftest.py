@@ -57,6 +57,7 @@ def _flush_public_endpoint_rate_limit_keys():
     try:
         client = _sync_redis.from_url(redis_url, decode_responses=True)
         keys = client.keys("ratelimit:public_qr_transactions:*")
+        keys += client.keys("ratelimit:public_qr_active_sessions:*")
         if keys:
             client.delete(*keys)
         client.close()

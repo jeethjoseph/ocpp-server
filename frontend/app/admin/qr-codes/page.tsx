@@ -128,6 +128,7 @@ export default function QRCodesPage() {
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b">
+                      <th className="text-left py-3 px-2 font-medium">ID</th>
                       <th className="text-left py-3 px-2 font-medium">Charger</th>
                       <th className="text-left py-3 px-2 font-medium">
                         Charge Point ID
@@ -143,6 +144,9 @@ export default function QRCodesPage() {
                   <tbody>
                     {data.data.map((qr) => (
                       <tr key={qr.id} className="border-b hover:bg-accent/50">
+                        <td className="py-3 px-2 font-mono text-xs text-muted-foreground">
+                          #{qr.id}
+                        </td>
                         <td className="py-3 px-2 font-medium">
                           {qr.charger_name}
                         </td>

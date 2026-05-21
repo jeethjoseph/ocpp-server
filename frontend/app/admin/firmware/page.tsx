@@ -177,6 +177,7 @@ export default function AdminFirmwarePage() {
               <Table>
                 <TableHeader>
                   <TableRow>
+                    <TableHead>ID</TableHead>
                     <TableHead>Charger</TableHead>
                     <TableHead>Version</TableHead>
                     <TableHead>Status</TableHead>
@@ -190,6 +191,9 @@ export default function AdminFirmwarePage() {
                 <TableBody>
                   {inProgressUpdates.map((update) => (
                     <TableRow key={update.update_id}>
+                      <TableCell className="font-mono text-xs text-muted-foreground">
+                        #{update.update_id}
+                      </TableCell>
                       <TableCell>
                         <div>
                           <div className="font-medium">{update.charger_name}</div>
@@ -273,6 +277,7 @@ export default function AdminFirmwarePage() {
               <Table>
                 <TableHeader>
                   <TableRow>
+                    <TableHead>ID</TableHead>
                     <TableHead>Version</TableHead>
                     <TableHead>Filename</TableHead>
                     <TableHead>Size</TableHead>
@@ -284,6 +289,9 @@ export default function AdminFirmwarePage() {
                 <TableBody>
                   {firmwareFiles.map((firmware) => (
                     <TableRow key={firmware.id}>
+                      <TableCell className="font-mono text-xs text-muted-foreground">
+                        #{firmware.id}
+                      </TableCell>
                       <TableCell className="font-medium">{firmware.version}</TableCell>
                       <TableCell>{firmware.filename}</TableCell>
                       <TableCell>{(firmware.file_size / 1024 / 1024).toFixed(2)} MB</TableCell>

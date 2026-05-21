@@ -252,6 +252,9 @@ export default function AdminChargersPage() {
                 <thead className="bg-muted">
                   <tr>
                     <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap">
+                      ID
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap">
                       Name
                     </th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap">
@@ -292,6 +295,9 @@ export default function AdminChargersPage() {
                       <tr
                         key={charger.id}
                         className="hover:bg-accent/50 transition-colors">
+                        <td className="px-6 py-4 whitespace-nowrap text-xs text-muted-foreground font-mono">
+                          #{charger.id}
+                        </td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-card-foreground">
                           {charger.name}
                         </td>

@@ -246,6 +246,7 @@ export default function QRCodeDetailPage() {
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b">
+                      <th className="text-left py-3 px-2 font-medium">ID</th>
                       <th className="text-left py-3 px-2 font-medium">Date</th>
                       <th className="text-right py-3 px-2 font-medium">
                         Amount
@@ -276,6 +277,9 @@ export default function QRCodeDetailPage() {
                         key={payment.id}
                         className="border-b hover:bg-accent/50"
                       >
+                        <td className="py-3 px-2 font-mono text-xs text-muted-foreground">
+                          #{payment.id}
+                        </td>
                         <td className="py-3 px-2 text-muted-foreground">
                           {new Date(payment.created_at).toLocaleString()}
                         </td>

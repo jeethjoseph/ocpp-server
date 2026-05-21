@@ -484,14 +484,18 @@ class QRPaymentService:
 
         transaction = await Transaction.filter(id=transaction_id).first()
 
+        # Decimal fields are serialized as strings (not float) so reads round-trip
+        # without precision loss. Readers parse via `Decimal(value)`. Legacy
+        # in-flight cache rows (pre-2026-05-21) wrote floats — readers continue
+        # to accept those via `Decimal(str(value))` for one TTL window.
         session_data = {
             "qr_payment_id": qr_payment.id,
-            "amount_paid": float(qr_payment.amount_paid),
-            "platform_fee": float(platform_fee),
+            "amount_paid": str(qr_payment.amount_paid),
+            "platform_fee": str(platform_fee),
             "budget_limit_paise": budget_limit_paise,
-            "tariff_rate": float(tariff_rate),
-            "gst_percent": float(gst_percent),
-            "start_meter_kwh": float(transaction.start_meter_kwh) if transaction and transaction.start_meter_kwh else 0,
+            "tariff_rate": str(tariff_rate),
+            "gst_percent": str(gst_percent),
+            "start_meter_kwh": str(transaction.start_meter_kwh) if transaction and transaction.start_meter_kwh else "0",
             "charger_id": charger_id,
         }
         await redis_manager.set_qr_session(transaction_id, session_data)
@@ -506,7 +510,16 @@ class QRPaymentService:
         session = await redis_manager.get_qr_session(transaction_id)
 
         if not session:
-            # DB fallback for cache miss (e.g., server restart)
+            # DB fallback for cache miss (e.g., server restart). Log the miss so
+            # ops can detect Redis blips / TTL exhaustion / operator-edits-mid-
+            # session in production. Counter feeds the dashboard from issue 04.
+            logger.warning(
+                "qr_session cache miss for txn %s — rebuilding from DB. "
+                "If frequent, indicates Redis instability or TTL exhaustion.",
+                transaction_id,
+            )
+            MetricsCollector.increment_counter("Custom/QrSession/BudgetCheckCacheMiss")
+
             qr_payment = await QRPayment.filter(
                 transaction_id=transaction_id,
                 status=QRPaymentStatusEnum.CHARGING
@@ -530,12 +543,12 @@ class QRPaymentService:
             transaction = await Transaction.filter(id=transaction_id).first()
             session = {
                 "qr_payment_id": qr_payment.id,
-                "amount_paid": float(qr_payment.amount_paid),
-                "platform_fee": float(platform_fee),
+                "amount_paid": str(qr_payment.amount_paid),
+                "platform_fee": str(platform_fee),
                 "budget_limit_paise": budget_limit_paise,
-                "tariff_rate": float(tariff_rate),
-                "gst_percent": float(gst_percent),
-                "start_meter_kwh": float(transaction.start_meter_kwh) if transaction and transaction.start_meter_kwh else 0,
+                "tariff_rate": str(tariff_rate),
+                "gst_percent": str(gst_percent),
+                "start_meter_kwh": str(transaction.start_meter_kwh) if transaction and transaction.start_meter_kwh else "0",
                 "charger_id": qr_payment.charger_id,
             }
             await redis_manager.set_qr_session(transaction_id, session)

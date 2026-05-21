@@ -251,6 +251,11 @@ export interface PublicStationResponse {
     max_power_kw: number | null;
     available_count: number;
     total_count: number;
+    ready_count: number;
+    in_use_count: number;
+    out_of_service_count: number;
+    min_tariff_all_in: number | null;
+    max_tariff_all_in: number | null;
   }>;
   chargers?: PublicStationChargerInfo[];
   price_per_kwh: number | null;
@@ -292,6 +297,10 @@ export interface QRTransactionItem {
   razorpay_gst: string | null;
   fee_source: string | null;
   refund_amount: string | null;
+  razorpay_refund_id: string | null;
+  razorpay_refund_speed_processed: string | null;
+  refund_processed_at: string | null;
+  refund_failure_reason: string | null;
   charger_name: string | null;
   station_name: string | null;
   franchisee_name: string | null;
@@ -307,6 +316,38 @@ export interface QRTransactionListResponse {
   page: number;
   limit: number;
 }
+
+export type QRActiveSessionSubState = "waiting" | "charging" | "paused" | "stopping";
+
+export interface QRActiveSessionItem {
+  qr_payment_id: number;
+  transaction_id: number | null;
+  amount_paid: string;
+  started_at: string;
+  charger_name: string | null;
+  station_name: string | null;
+  franchisee_name: string | null;
+  sub_state: QRActiveSessionSubState;
+  energy_kwh: string | null;
+  spent_so_far: string | null;
+  refund_if_stopped_now: string | null;
+  power_kw: number | null;
+  /** Set only on `waiting` sub-state — remaining seconds until the stale-payment
+   * watchdog will auto-refund. Frontend renders this as e.g. "auto-refund in N min". */
+  stale_threshold_seconds?: number;
+}
+
+export interface QRActiveSessionListResponse {
+  data: QRActiveSessionItem[];
+  total: number;
+}
+
+export const publicQRActiveSessionService = {
+  getByVpa: (vpa: string) =>
+    api.get<QRActiveSessionListResponse>(
+      `/api/public/qr-active-sessions?vpa=${encodeURIComponent(vpa)}`,
+    ),
+};
 
 export const publicQRTransactionService = {
   getByVpa: (params: { vpa: string; page?: number; limit?: number; status?: string }) => {

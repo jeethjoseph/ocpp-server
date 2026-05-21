@@ -149,6 +149,7 @@ export default function AdminFranchiseesPage() {
                 <Table>
                   <TableHeader>
                     <TableRow>
+                      <TableHead>ID</TableHead>
                       <TableHead>Business</TableHead>
                       <TableHead>Contact</TableHead>
                       <TableHead>Commission</TableHead>
@@ -162,6 +163,9 @@ export default function AdminFranchiseesPage() {
                   <TableBody>
                     {franchisees.map((f) => (
                       <TableRow key={f.id}>
+                        <TableCell className="font-mono text-xs text-muted-foreground">
+                          #{f.id}
+                        </TableCell>
                         <TableCell>
                           <Link
                             href={`/admin/franchisees/${f.id}`}

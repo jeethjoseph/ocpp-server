@@ -807,10 +807,13 @@ async def handle_refund_event(event_type: str, event_data: dict):
         if event_type == "refund.processed":
             qr_payment.refund_processed_at = time_now_utc()
             qr_payment.refund_failure_reason = None
+            speed = refund.get("speed_processed")
+            if speed:
+                qr_payment.razorpay_refund_speed_processed = speed
             await qr_payment.save()
             logger.info(
-                "Refund processed for QR payment %s (refund=%s)",
-                qr_payment.id, refund_id,
+                "Refund processed for QR payment %s (refund=%s, speed=%s)",
+                qr_payment.id, refund_id, speed or "unchanged",
             )
         elif event_type == "refund.failed":
             reason = (
@@ -824,6 +827,23 @@ async def handle_refund_event(event_type: str, event_data: dict):
                 "Refund failed for QR payment %s (refund=%s): %s",
                 qr_payment.id, refund_id, reason,
             )
+        elif event_type == "refund.speed_changed":
+            # Razorpay can silently downgrade instant→normal (or upgrade) when
+            # the bank rails change their mind mid-flight. Capture the new
+            # `speed_processed` so the customer-facing ETA stays honest;
+            # see ADR 0005.
+            new_speed = refund.get("speed_processed")
+            if new_speed:
+                qr_payment.razorpay_refund_speed_processed = new_speed
+                await qr_payment.save()
+                logger.info(
+                    "Refund speed changed for QR payment %s (refund=%s): %s",
+                    qr_payment.id, refund_id, new_speed,
+                )
+            else:
+                logger.warning(
+                    "refund.speed_changed for %s missing speed_processed", refund_id,
+                )
 
         await log_webhook_event(
             source=WebhookSourceEnum.RAZORPAY,

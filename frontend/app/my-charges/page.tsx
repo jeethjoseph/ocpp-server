@@ -2,9 +2,7 @@
 
 import { useState, useEffect } from "react";
 import dynamic from "next/dynamic";
-import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -16,20 +14,22 @@ import {
 import {
   Search,
   Zap,
-  Clock,
-  IndianRupee,
   ChevronLeft,
   ChevronRight,
   AlertCircle,
-  RefreshCw,
   Navigation,
-  Download,
 } from "lucide-react";
-import { usePublicQRTransactions, viewPublicInvoicePDF } from "@/lib/queries/public-qr-transactions";
+import { usePublicQRTransactions } from "@/lib/queries/public-qr-transactions";
+import { usePublicQRActiveSessions } from "@/lib/queries/public-qr-active-sessions";
 import { usePublicStationMap } from "@/lib/queries/public-station-map";
-import { QRTransactionItem } from "@/lib/api-services";
 import type { StationWithDistance } from "@/components/StationMap";
-import { formatTariffRangeAllIn } from "@/lib/utils";
+import { ChargerRow } from "./_components/ChargerRow";
+import { TransactionCard } from "./_components/TransactionCard";
+import {
+  ActiveSessionCard,
+  ActiveSessionSkeleton,
+} from "./_components/ActiveSessionCard";
+import { ActiveSessionsError } from "./_components/ActiveSessionsError";
 
 const Map = dynamic(() => import("@/components/StationMap"), {
   ssr: false,
@@ -54,54 +54,6 @@ const STATUS_OPTIONS = [
   { value: "EXPIRED", label: "Expired" },
 ];
 
-function getStatusBadgeClass(status: string) {
-  switch (status) {
-    case "COMPLETED":
-      return "bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400";
-    case "CHARGING":
-      return "bg-blue-100 text-blue-800 dark:bg-blue-900/20 dark:text-blue-400";
-    case "PAID":
-      return "bg-amber-100 text-amber-800 dark:bg-amber-900/20 dark:text-amber-400";
-    case "REFUNDED":
-      return "bg-purple-100 text-purple-800 dark:bg-purple-900/20 dark:text-purple-400";
-    case "FAILED":
-    case "REFUND_FAILED":
-      return "bg-red-100 text-red-800 dark:bg-red-900/20 dark:text-red-400";
-    case "EXPIRED":
-      return "bg-gray-100 text-gray-800 dark:bg-gray-900/20 dark:text-gray-400";
-    default:
-      return "bg-muted text-muted-foreground";
-  }
-}
-
-function formatDuration(minutes: number): string {
-  if (minutes < 60) return `${Math.round(minutes)} min`;
-  const hours = Math.floor(minutes / 60);
-  const mins = Math.round(minutes % 60);
-  return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
-}
-
-function formatDate(isoString: string): string {
-  return new Date(isoString).toLocaleDateString("en-IN", {
-    day: "numeric",
-    month: "short",
-    year: "numeric",
-  });
-}
-
-function formatTime(isoString: string): string {
-  return new Date(isoString).toLocaleTimeString("en-IN", {
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-function formatINR(val: string | null): string | null {
-  if (!val) return null;
-  const num = parseFloat(val);
-  return isNaN(num) ? val : num.toFixed(2);
-}
-
 function getErrorMessage(error: Error): string {
   const msg = error.message;
   if (msg.includes("429")) return "Too many requests. Please wait a moment and try again.";
@@ -111,130 +63,50 @@ function getErrorMessage(error: Error): string {
   return "Something went wrong. Please try again.";
 }
 
-function TransactionCard({ txn, vpa }: { txn: QRTransactionItem; vpa: string }) {
-  return (
-    <Card className="border-0 shadow-md bg-card">
-      <CardContent className="p-4 space-y-3">
-        <div className="flex justify-between items-start">
-          <div>
-            <p className="text-sm font-medium text-card-foreground">
-              {formatDate(txn.created_at)}
-            </p>
-            <p className="text-xs text-muted-foreground">
-              {formatTime(txn.created_at)}
-            </p>
-          </div>
-          <Badge className={`border-0 ${getStatusBadgeClass(txn.status)}`}>
-            {txn.status.replace("_", " ")}
-          </Badge>
-        </div>
+// localStorage key namespacing — page-scoped so future surfaces don't collide.
+// Old unnamespaced key is migrated on first read.
+const VPA_STORAGE_KEY = "voltlync.myCharges.lastVpa";
+const VPA_LEGACY_KEY = "voltlync.lastVpa";
+const VPA_INPUT_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9.\-_]{0,253}@[a-zA-Z][a-zA-Z0-9]{1,}$/;
+// MUST stay in sync with VPA_PATTERN in backend/core/validators.py.
 
-        <div className="grid grid-cols-2 gap-3">
-          <div className="flex items-center gap-2 p-2 bg-muted/50 rounded-lg">
-            <IndianRupee className="h-4 w-4 text-muted-foreground" />
-            <div>
-              <p className="text-xs text-muted-foreground">Paid</p>
-              <p className="font-semibold text-card-foreground">
-                {formatINR(txn.amount_paid)}
-              </p>
-            </div>
-          </div>
-          <div className="flex items-center gap-2 p-2 bg-muted/50 rounded-lg">
-            <Zap className="h-4 w-4 text-muted-foreground" />
-            <div>
-              <p className="text-xs text-muted-foreground">Energy</p>
-              <p className="font-semibold text-card-foreground">
-                {txn.energy_consumed_kwh != null
-                  ? `${txn.energy_consumed_kwh.toFixed(2)} kWh`
-                  : "N/A"}
-              </p>
-            </div>
-          </div>
-        </div>
+function readStoredVpa(): string {
+  if (typeof window === "undefined") return "";
+  try {
+    let v = window.localStorage.getItem(VPA_STORAGE_KEY);
+    if (!v) {
+      // One-time migration from the pre-namespacing key.
+      const legacy = window.localStorage.getItem(VPA_LEGACY_KEY);
+      if (legacy && VPA_INPUT_PATTERN.test(legacy)) {
+        window.localStorage.setItem(VPA_STORAGE_KEY, legacy);
+        window.localStorage.removeItem(VPA_LEGACY_KEY);
+        v = legacy;
+      }
+    }
+    if (v && VPA_INPUT_PATTERN.test(v)) return v;
+  } catch {
+    // localStorage can throw in private mode / quota cases — ignore.
+  }
+  return "";
+}
 
-        <div className="grid grid-cols-2 gap-3">
-          {txn.duration_minutes != null && (
-            <div className="flex items-center gap-2 text-sm text-muted-foreground">
-              <Clock className="h-3.5 w-3.5" />
-              <span>{formatDuration(txn.duration_minutes)}</span>
-            </div>
-          )}
-          {txn.charger_name && (
-            <div className="flex items-center gap-2 text-sm text-muted-foreground truncate">
-              <Zap className="h-3.5 w-3.5 flex-shrink-0" />
-              <span className="truncate">
-                {txn.charger_name}
-                {txn.station_name ? ` · ${txn.station_name}` : ""}
-              </span>
-            </div>
-          )}
-          {txn.franchisee_name && (
-            <div className="text-xs text-muted-foreground truncate pl-5">
-              Operator: <span className="font-medium">{txn.franchisee_name}</span>
-            </div>
-          )}
-        </div>
+function persistVpa(v: string) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(VPA_STORAGE_KEY, v);
+  } catch {
+    // ignore
+  }
+}
 
-        {txn.energy_cost && (
-          <div className="border-t border-border pt-2 space-y-1 text-sm">
-            <div className="flex justify-between text-muted-foreground">
-              <span>Energy cost</span>
-              <span>{formatINR(txn.energy_cost)}</span>
-            </div>
-            {txn.gst_amount && (
-              <div className="flex justify-between text-muted-foreground">
-                <span>GST</span>
-                <span>{formatINR(txn.gst_amount)}</span>
-              </div>
-            )}
-            {txn.platform_fee && (
-              <div className="flex justify-between text-muted-foreground">
-                <span>Platform fee{txn.fee_source === 'estimated' ? ' (est.)' : ''}</span>
-                <span>{formatINR(txn.platform_fee)}</span>
-              </div>
-            )}
-          </div>
-        )}
-
-        {txn.refund_amount && (
-          <div className="flex items-center gap-2 p-2 bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-700 rounded-lg">
-            <RefreshCw className="h-4 w-4 text-purple-600 dark:text-purple-400" />
-            <span className="text-sm font-medium text-purple-800 dark:text-purple-300">
-              Refunded: {formatINR(txn.refund_amount)}
-            </span>
-          </div>
-        )}
-
-        {txn.failure_reason &&
-          (txn.status === "FAILED" || txn.status === "REFUND_FAILED") && (
-            <div className="flex items-start gap-2 p-2 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-700 rounded-lg">
-              <AlertCircle className="h-4 w-4 text-red-600 dark:text-red-400 mt-0.5 flex-shrink-0" />
-              <span className="text-sm text-red-800 dark:text-red-300">
-                {txn.failure_reason}
-              </span>
-            </div>
-          )}
-
-        {(txn.status === "COMPLETED" || txn.status === "REFUNDED") && (
-          <Button
-            variant="outline"
-            size="sm"
-            className="w-full mt-2"
-            onClick={async () => {
-              try {
-                await viewPublicInvoicePDF(txn.id, vpa);
-              } catch (e) {
-                alert(`PDF download failed: ${(e as Error).message}`);
-              }
-            }}
-          >
-            <Download className="h-4 w-4 mr-2" />
-            Download GST Invoice
-          </Button>
-        )}
-      </CardContent>
-    </Card>
-  );
+function clearStoredVpa() {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.removeItem(VPA_STORAGE_KEY);
+    window.localStorage.removeItem(VPA_LEGACY_KEY);
+  } catch {
+    // ignore
+  }
 }
 
 function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number) {
@@ -273,7 +145,16 @@ export default function MyChargesPage() {
     status: statusFilter !== "ALL" ? statusFilter : undefined,
   });
 
+  const activeSessionsQuery = usePublicQRActiveSessions(searchedVpa);
+  const activeSessions = activeSessionsQuery.data?.data ?? [];
+
   const totalPages = data ? Math.ceil(data.total / limit) : 1;
+
+  // Pre-fill VPA from localStorage (but don't auto-search; the user taps to commit)
+  useEffect(() => {
+    const stored = readStoredVpa();
+    if (stored) setVpaInput(stored);
+  }, []);
 
   // Get user location
   useEffect(() => {
@@ -314,6 +195,7 @@ export default function MyChargesPage() {
     setSearchedVpa(trimmed);
     setCurrentPage(1);
     setStatusFilter("ALL");
+    if (VPA_INPUT_PATTERN.test(trimmed)) persistVpa(trimmed);
   };
 
   const handleReset = () => {
@@ -321,7 +203,23 @@ export default function MyChargesPage() {
     setSearchedVpa("");
     setStatusFilter("ALL");
     setCurrentPage(1);
+    clearStoredVpa();
   };
+
+  // First-load skeleton: only when we have a VPA, no prior data, and the query
+  // is fetching. Subsequent polls update silently.
+  const showActiveSkeleton =
+    !!searchedVpa &&
+    activeSessionsQuery.isLoading &&
+    !activeSessionsQuery.data;
+
+  // Error banner: shown when the query failed at least once and we have no
+  // last-good response to display. If a poll fails but a prior poll succeeded,
+  // we keep showing the stale data silently rather than flashing red.
+  const showActiveError =
+    !!searchedVpa &&
+    !!activeSessionsQuery.error &&
+    !activeSessionsQuery.data;
 
   return (
     <div className="min-h-screen bg-background">
@@ -369,63 +267,28 @@ export default function MyChargesPage() {
               </div>
             </div>
             <div className="p-4 space-y-4">
-              <div className="flex justify-center">
-                <div className="text-center p-3 bg-green-50 dark:bg-green-900/20 rounded-lg w-48">
-                  <Zap className="h-6 w-6 text-green-600 dark:text-green-400 mx-auto mb-1" />
-                  <div className="text-sm font-medium text-foreground">
-                    {selectedStation.available_chargers}/{selectedStation.total_chargers}
-                  </div>
-                  <div className="text-xs text-muted-foreground">Available Chargers</div>
-                </div>
-              </div>
-
               {selectedStation.connector_details.length > 0 && (
                 <div>
-                  <h4 className="text-sm font-medium text-foreground mb-2">Connectors</h4>
+                  <h4 className="text-sm font-medium text-foreground mb-2">Chargers</h4>
                   <div className="space-y-2">
                     {selectedStation.connector_details.map((detail, index) => (
-                      <div key={index} className="flex items-center justify-between p-2 bg-muted/50 rounded">
-                        <div className="flex items-center space-x-2">
-                          <div className={`w-2 h-2 rounded-full ${
-                            detail.available_count > 0 ? "bg-green-500" : "bg-red-500"
-                          }`}></div>
-                          <span className="text-sm font-medium text-foreground">
-                            {detail.connector_type}
-                          </span>
-                          {detail.max_power_kw && (
-                            <span className="text-xs text-muted-foreground">
-                              ({detail.max_power_kw}kW)
-                            </span>
-                          )}
-                        </div>
-                        <span className="text-xs text-muted-foreground">
-                          {detail.available_count}/{detail.total_count} available
-                        </span>
-                      </div>
+                      <ChargerRow key={index} detail={detail} />
                     ))}
                   </div>
+                  <p className="text-[11px] text-muted-foreground mt-2">
+                    * all prices include GST &amp; fees
+                  </p>
                 </div>
               )}
 
-              <div className="space-y-2">
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">Price per kWh:</span>
-                  <span className="font-medium text-foreground text-right">
-                    {formatTariffRangeAllIn(
-                      selectedStation.min_price_per_kwh_all_in,
-                      selectedStation.max_price_per_kwh_all_in,
-                    )}
+              {selectedStation.distance != null && (
+                <div className="flex justify-between text-sm">
+                  <span className="text-muted-foreground">Distance:</span>
+                  <span className="font-medium text-foreground">
+                    {selectedStation.distance.toFixed(1)} km
                   </span>
                 </div>
-                {selectedStation.distance != null && (
-                  <div className="flex justify-between">
-                    <span className="text-muted-foreground">Distance:</span>
-                    <span className="font-medium text-foreground">
-                      {selectedStation.distance.toFixed(1)} km
-                    </span>
-                  </div>
-                )}
-              </div>
+              )}
 
               <Button
                 className="w-full"
@@ -491,6 +354,19 @@ export default function MyChargesPage() {
                 Change
               </Button>
             </div>
+
+            {/* Active sessions (live) */}
+            {showActiveSkeleton && <ActiveSessionSkeleton />}
+            {showActiveError && (
+              <ActiveSessionsError onRetry={() => activeSessionsQuery.refetch()} />
+            )}
+            {activeSessions.length > 0 && (
+              <div className="space-y-3">
+                {activeSessions.map((s) => (
+                  <ActiveSessionCard key={s.qr_payment_id} session={s} />
+                ))}
+              </div>
+            )}
 
             {/* Status filter */}
             <Select value={statusFilter} onValueChange={(val) => {

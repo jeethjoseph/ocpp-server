@@ -32,6 +32,18 @@ _Avoid_: test session, ops session (both are used informally in code comments bu
 A `User` row whose `role` is `ADMIN` or `FRANCHISEE`. The canonical set is `INTERNAL_ROLES = {ADMIN, FRANCHISEE}` in `services/invoice_service.py`. These users do not require a `Wallet` and any **Charging Session** they initiate is an **Internal-role Session**.
 _Avoid_: staff user, operator user.
 
+### Hardware
+
+**Charger** / **EVSE**:
+A single charging unit identified by its OCPP `charge_point_string_id`. State is tracked via `ChargerStatusEnum` (`AVAILABLE`, `CHARGING`, `FAULTED`, …) and the OCPP heartbeat. The unit of "availability" customers see and the unit our budget cap / RemoteStop dispatch operate on.
+
+**Connector**:
+A physical plug on a `Charger` (e.g. Type2, Socket, CCS), modelled as a `Connector` row with `connector_type` and `max_power_kw`. **Working invariant (2026-05-21):** every `Charger` in our fleet has exactly one `Connector`. The data model permits N:1 but no current deployment uses it, and no per-connector OCPP state is tracked.
+
+**Plug type**:
+A `Connector.connector_type` value (Type2, Socket, CCS, …). Customer-facing groupings on the station map and modal are by **plug type**, but the underlying counts are charger-level — see [[ui-station-modal-chargers]] for the rendering rule.
+_Avoid_: "connector" as a customer-facing label when you mean "charger of plug type X". Renamed in the public station modal 2026-05-21 to avoid the conflation.
+
 ### Tariffs and pricing
 
 **All-in tariff** / **All-inclusive tariff**:

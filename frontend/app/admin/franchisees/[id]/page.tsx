@@ -821,6 +821,7 @@ export default function FranchiseeDetailPage() {
                 <Table>
                   <TableHeader>
                     <TableRow>
+                      <TableHead className="w-16">ID</TableHead>
                       <TableHead className="w-32">When</TableHead>
                       <TableHead className="w-20">Method</TableHead>
                       <TableHead className="w-24 text-right">Gross</TableHead>
@@ -834,6 +835,9 @@ export default function FranchiseeDetailPage() {
                   <TableBody>
                     {settlementsData.data.map((entry) => (
                       <TableRow key={entry.id}>
+                        <TableCell className="font-mono text-xs text-muted-foreground">
+                          #{entry.id}
+                        </TableCell>
                         <TableCell className="text-xs">
                           {new Date(entry.created_at).toLocaleString()}
                         </TableCell>

@@ -11,12 +11,45 @@ from tortoise.query_utils import Prefetch
 from auth_middleware import require_user
 from services.tariff_utils import compute_station_tariff_range
 
+
+# Customer-facing 3-bucket mapping over the OCPP ChargerStatusEnum.
+# AVAILABLE                                  → "ready"
+# PREPARING/CHARGING/SUSPENDED_*/FINISHING   → "in_use"
+# FAULTED/UNAVAILABLE/RESERVED + anything else → "out_of_service"
+_IN_USE_STATES = {
+    ChargerStatusEnum.PREPARING,
+    ChargerStatusEnum.CHARGING,
+    ChargerStatusEnum.SUSPENDED_EVSE,
+    ChargerStatusEnum.SUSPENDED_EV,
+    ChargerStatusEnum.FINISHING,
+}
+
+
+def _status_bucket(status: ChargerStatusEnum) -> str:
+    if status == ChargerStatusEnum.AVAILABLE:
+        return "ready"
+    if status in _IN_USE_STATES:
+        return "in_use"
+    return "out_of_service"
+
 # Pydantic schemas for public API
 class ConnectorInfo(BaseModel):
     connector_type: str
     max_power_kw: Optional[float]
+    # Legacy fields — preserved for /stations and the map popup, which still
+    # render the simple "X/Y available" string. Equals ready_count / total_count.
     available_count: int
     total_count: int
+    # Customer-facing 3-bucket breakdown (ADR 0005 area).
+    # AVAILABLE → ready; PREPARING/CHARGING/SUSPENDED_*/FINISHING → in_use;
+    # FAULTED/UNAVAILABLE/RESERVED → out_of_service.
+    ready_count: int = 0
+    in_use_count: int = 0
+    out_of_service_count: int = 0
+    # Per-plug-type all-inclusive tariff range (₹/kWh, GST + gateway fee
+    # included). Equal when uniform across chargers of this plug type.
+    min_tariff_all_in: Optional[float] = None
+    max_tariff_all_in: Optional[float] = None
 
 class ChargerConnectorInfo(BaseModel):
     connector_type: str
@@ -96,7 +129,9 @@ async def _fetch_stations_with_availability(
             1 for c in real_chargers if c.latest_status == ChargerStatusEnum.AVAILABLE
         )
 
-        connector_details, all_connector_types = _aggregate_connectors(real_chargers)
+        connector_details, all_connector_types = _aggregate_connectors(
+            real_chargers, global_tariff,
+        )
         min_excl, _max_excl, min_all_in, max_all_in = compute_station_tariff_range(
             real_chargers, global_tariff,
         )
@@ -142,37 +177,63 @@ def _filter_real_chargers(chargers, connected_ids: set, now) -> list:
     return real
 
 
-def _aggregate_connectors(real_chargers):
-    """Aggregate connector type counts and availability across chargers."""
+def _aggregate_connectors(real_chargers, global_tariff):
+    """Aggregate per-plug-type charger counts, status buckets, and tariff range.
+
+    Counts are charger-level (1 charger ↔ 1 connector is the working fleet
+    invariant — see CONTEXT.md). If a charger ever carries multiple connectors
+    of distinct types, it contributes to each plug-type group it exposes.
+
+    Returns (list[ConnectorInfo], set[connector_type]).
+    """
+    from decimal import Decimal
+
     connector_type_counts: Dict[str, dict] = {}
     all_connector_types: set = set()
 
     for charger in real_chargers:
-        charger_available = charger.latest_status == ChargerStatusEnum.AVAILABLE
+        bucket = _status_bucket(charger.latest_status)
+        tariff = charger.tariffs[0] if getattr(charger, "tariffs", None) else global_tariff
+        tariff_all_in = (
+            Decimal(tariff.tariff_per_kwh_all_in) if tariff is not None else None
+        )
         for conn in charger.connectors:
             ct = conn.connector_type
             all_connector_types.add(ct)
             if ct not in connector_type_counts:
                 connector_type_counts[ct] = {
-                    'available_count': 0, 'total_count': 0,
+                    'total_count': 0,
+                    'ready_count': 0,
+                    'in_use_count': 0,
+                    'out_of_service_count': 0,
                     'max_power_kw': conn.max_power_kw,
+                    'tariffs': [],
                 }
-            connector_type_counts[ct]['total_count'] += 1
-            if charger_available:
-                connector_type_counts[ct]['available_count'] += 1
-            if (conn.max_power_kw and connector_type_counts[ct]['max_power_kw']
-                    and conn.max_power_kw > connector_type_counts[ct]['max_power_kw']):
-                connector_type_counts[ct]['max_power_kw'] = conn.max_power_kw
+            d = connector_type_counts[ct]
+            d['total_count'] += 1
+            d[f'{bucket}_count'] += 1
+            if (conn.max_power_kw and d['max_power_kw']
+                    and conn.max_power_kw > d['max_power_kw']):
+                d['max_power_kw'] = conn.max_power_kw
+            if tariff_all_in is not None:
+                d['tariffs'].append(tariff_all_in)
 
-    details = [
-        ConnectorInfo(
+    details = []
+    for ct, d in connector_type_counts.items():
+        tariffs = d['tariffs']
+        min_t = float(min(tariffs)) if tariffs else None
+        max_t = float(max(tariffs)) if tariffs else None
+        details.append(ConnectorInfo(
             connector_type=ct,
             max_power_kw=d['max_power_kw'],
-            available_count=d['available_count'],
+            available_count=d['ready_count'],
             total_count=d['total_count'],
-        )
-        for ct, d in connector_type_counts.items()
-    ]
+            ready_count=d['ready_count'],
+            in_use_count=d['in_use_count'],
+            out_of_service_count=d['out_of_service_count'],
+            min_tariff_all_in=min_t,
+            max_tariff_all_in=max_t,
+        ))
     return details, all_connector_types
 
 
