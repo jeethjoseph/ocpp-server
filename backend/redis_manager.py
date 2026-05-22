@@ -106,7 +106,10 @@ class RedisConnectionManager:
             return False
         try:
             key = f"{self.QR_SESSION_PREFIX}{transaction_id}"
-            await self.redis_client.set(key, json.dumps(data), ex=ttl)
+            # default=str lets any Decimal (or datetime) in the payload
+            # serialise as its string form rather than crashing the writer.
+            # Readers must cast back if they need numeric arithmetic.
+            await self.redis_client.set(key, json.dumps(data, default=str), ex=ttl)
             logger.info(f"Cached QR session for transaction {transaction_id}")
             return True
         except Exception as e:
@@ -139,20 +142,116 @@ class RedisConnectionManager:
             logger.error(f"Failed to delete QR session for transaction {transaction_id}: {e}")
             return False
 
+    # Wallet session cache methods — mirror of QR_SESSION_PREFIX
+    # Snapshots the wallet's available balance at StartTransaction so the
+    # MeterValues handler can compare accumulated cost and schedule a
+    # RemoteStopTransaction before the balance goes negative.
+    WALLET_SESSION_PREFIX = "wallet_session:"
+
+    async def set_wallet_session(
+        self, transaction_id: int, data: Dict, ttl: int = 86400
+    ) -> bool:
+        """Cache wallet session data for budget checking during MeterValues."""
+        if not self.redis_client:
+            logger.error("Redis client not initialized")
+            return False
+        try:
+            key = f"{self.WALLET_SESSION_PREFIX}{transaction_id}"
+            await self.redis_client.set(key, json.dumps(data, default=str), ex=ttl)
+            logger.info(f"Cached wallet session for transaction {transaction_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to cache wallet session for transaction {transaction_id}: {e}")
+            return False
+
+    async def get_wallet_session(self, transaction_id: int) -> Optional[Dict]:
+        """Get cached wallet session data."""
+        if not self.redis_client:
+            return None
+        try:
+            key = f"{self.WALLET_SESSION_PREFIX}{transaction_id}"
+            data = await self.redis_client.get(key)
+            if data:
+                return json.loads(data)
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get wallet session for transaction {transaction_id}: {e}")
+            return None
+
+    async def delete_wallet_session(self, transaction_id: int) -> bool:
+        """Delete wallet session cache (called on StopTransaction)."""
+        if not self.redis_client:
+            return False
+        try:
+            key = f"{self.WALLET_SESSION_PREFIX}{transaction_id}"
+            await self.redis_client.delete(key)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete wallet session for transaction {transaction_id}: {e}")
+            return False
+
+    # Wallet balance cache methods
+    # Wallet balance is derived from a SUM over wallet_transaction;
+    # there's no stored column. This cache shields /users/me and other
+    # hot reads from the SUM cost. Invalidated on every WalletTransaction
+    # write inside WalletService.
+    WALLET_BALANCE_PREFIX = "wallet_balance:"
+
+    async def set_wallet_balance(
+        self, wallet_id: int, balance_paise: int, ttl: int = 3600
+    ) -> bool:
+        """Cache a wallet's derived balance (stored as integer paise to avoid
+        float round-trip on Decimal money)."""
+        if not self.redis_client:
+            return False
+        try:
+            key = f"{self.WALLET_BALANCE_PREFIX}{wallet_id}"
+            await self.redis_client.set(key, str(balance_paise), ex=ttl)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to cache wallet balance for {wallet_id}: {e}")
+            return False
+
+    async def get_wallet_balance(self, wallet_id: int) -> Optional[int]:
+        """Return cached balance in paise, or None on miss."""
+        if not self.redis_client:
+            return None
+        try:
+            key = f"{self.WALLET_BALANCE_PREFIX}{wallet_id}"
+            data = await self.redis_client.get(key)
+            return int(data) if data is not None else None
+        except Exception as e:
+            logger.error(f"Failed to read wallet balance cache for {wallet_id}: {e}")
+            return None
+
+    async def invalidate_wallet_balance(self, wallet_id: int) -> bool:
+        """Invalidate the cache after any WalletTransaction write."""
+        if not self.redis_client:
+            return False
+        try:
+            key = f"{self.WALLET_BALANCE_PREFIX}{wallet_id}"
+            await self.redis_client.delete(key)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to invalidate wallet balance cache for {wallet_id}: {e}")
+            return False
+
     # Zero-energy watchdog methods
     ZERO_ENERGY_PREFIX = "zero_energy:"
 
-    async def set_zero_energy_state(self, transaction_id: int, data: Dict, ttl: int = 7200) -> bool:
+    async def set_zero_energy_state(self, transaction_id: int, data: Dict, ttl: int = 14400) -> bool:
         """Cache zero-energy tracking state for a transaction.
 
-        TTL of 2h is well above the longest plausible charging session and
-        bounds any leak from missed cleanup paths."""
+        TTL must be strictly greater than ZERO_ENERGY_TIMEOUT_SECONDS so a
+        charger that goes silent mid-stall doesn't let the state expire and
+        reset the stall clock on reconnect. Current values: timeout=7200s,
+        TTL=14400s (2x headroom)."""
         if not self.redis_client:
             logger.error("Redis client not initialized")
             return False
         try:
             key = f"{self.ZERO_ENERGY_PREFIX}{transaction_id}"
-            await self.redis_client.set(key, json.dumps(data), ex=ttl)
+            await self.redis_client.set(key, json.dumps(data, default=str), ex=ttl)
             return True
         except Exception as e:
             logger.error(f"Failed to set zero-energy state for transaction {transaction_id}: {e}")
@@ -199,7 +298,7 @@ class RedisConnectionManager:
                 "transaction_ids": transaction_ids,
                 "started_at": datetime.now(timezone.utc).isoformat(),
             }
-            await self.redis_client.set(key, json.dumps(data), ex=ttl)
+            await self.redis_client.set(key, json.dumps(data, default=str), ex=ttl)
             logger.info(f"Set socket grace period for {charge_point_id}, txns={transaction_ids}")
             return True
         except Exception as e:

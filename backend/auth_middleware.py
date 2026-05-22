@@ -1,7 +1,7 @@
 import jwt
 import os
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 from fastapi import HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
@@ -156,3 +156,87 @@ def require_user_or_admin():
         return user
 
     return user_or_admin_dependency
+
+
+def require_franchisee():
+    """Dependency for franchisee-only endpoints. Returns (User, Franchisee) tuple.
+
+    Rejects SUSPENDED / DEACTIVATED franchisees: a valid Clerk JWT alone is
+    not enough — admin status changes must take effect within one request,
+    not at the next JWT refresh. DRAFT and KYC_* statuses remain allowed so
+    franchisees can complete onboarding from the portal.
+    """
+    async def franchisee_dependency(
+        user: "User" = Depends(get_current_user_with_db),
+    ):
+        from models import UserRoleEnum, Franchisee, FranchiseeStatusEnum
+
+        if user.role != UserRoleEnum.FRANCHISEE:
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied. Franchisee role required.",
+            )
+        franchisee = await Franchisee.filter(user=user).first()
+        if not franchisee:
+            raise HTTPException(
+                status_code=404,
+                detail="No franchisee profile linked to this user.",
+            )
+        if franchisee.status in (
+            FranchiseeStatusEnum.SUSPENDED,
+            FranchiseeStatusEnum.DEACTIVATED,
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Franchisee account is suspended."
+                    if franchisee.status == FranchiseeStatusEnum.SUSPENDED
+                    else "Franchisee account is deactivated."
+                ),
+            )
+        return user, franchisee
+
+    return franchisee_dependency
+
+
+def require_admin_or_franchisee():
+    """Dependency for endpoints accessible by admin or franchisee.
+    Returns (User, Optional[Franchisee]) -- Franchisee is None for admins.
+
+    Admins bypass the franchisee status check (they may need to view a
+    suspended/deactivated franchisee for audit). For franchisee callers,
+    rejects SUSPENDED / DEACTIVATED — same rule as ``require_franchisee``.
+    """
+    async def admin_or_franchisee_dependency(
+        user: "User" = Depends(get_current_user_with_db),
+    ):
+        from models import UserRoleEnum, Franchisee, FranchiseeStatusEnum
+
+        if user.role == UserRoleEnum.ADMIN:
+            return user, None
+        if user.role == UserRoleEnum.FRANCHISEE:
+            franchisee = await Franchisee.filter(user=user).first()
+            if not franchisee:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No franchisee profile linked to this user.",
+                )
+            if franchisee.status in (
+                FranchiseeStatusEnum.SUSPENDED,
+                FranchiseeStatusEnum.DEACTIVATED,
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        "Franchisee account is suspended."
+                        if franchisee.status == FranchiseeStatusEnum.SUSPENDED
+                        else "Franchisee account is deactivated."
+                    ),
+                )
+            return user, franchisee
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied. Admin or Franchisee role required.",
+        )
+
+    return admin_or_franchisee_dependency

@@ -20,14 +20,25 @@ const adminNavigation = [
   { name: 'Stations', href: '/admin/stations' },
   { name: 'Chargers', href: '/admin/chargers' },
   { name: 'QR Codes', href: '/admin/qr-codes' },
+  { name: 'Franchisees', href: '/admin/franchisees' },
+  { name: 'GST Filings', href: '/admin/gst-filings' },
   { name: 'Firmware', href: '/admin/firmware' },
   { name: 'Users', href: '/admin/users' },
+];
+
+const franchiseeNavigation = [
+  { name: 'Dashboard', href: '/franchisee' },
+  { name: 'Stations', href: '/franchisee/stations' },
+  { name: 'Transactions', href: '/franchisee/transactions' },
+  { name: 'Settlements', href: '/franchisee/settlements' },
+  { name: 'QR Codes', href: '/franchisee/qr-codes' },
+  { name: 'Profile', href: '/franchisee/profile' },
 ];
 
 export default function Navbar() {
   const pathname = usePathname();
   const { theme, setTheme } = useTheme();
-  const { role, isAdmin, isLoaded } = useUserRole();
+  const { role, isAdmin, isFranchisee, isLoaded } = useUserRole();
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
 
   const themeIcons = {
@@ -46,7 +57,11 @@ export default function Navbar() {
   const currentIcon = themeIcons[theme];
 
   // Determine which navigation to show
-  const navigation = isAdmin ? adminNavigation : userNavigation;
+  const navigation = isAdmin
+    ? adminNavigation
+    : isFranchisee
+      ? franchiseeNavigation
+      : userNavigation;
 
   return (
     <nav className="bg-card shadow border-b border-border transition-colors duration-300">
@@ -54,10 +69,23 @@ export default function Navbar() {
         <div className="flex justify-between h-16">
           <div className="flex">
             <div className="flex-shrink-0 flex items-center">
-              <Link href={isAdmin ? "/admin" : "/"}>
-                <h1 className="text-xl font-bold text-card-foreground hover:text-primary transition-colors">
-                  OCPP {isAdmin ? 'Admin' : 'User'}
-                </h1>
+              <Link
+                href={isAdmin ? "/admin" : isFranchisee ? "/franchisee" : "/"}
+                className="flex items-center"
+                aria-label="voltNOW home"
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src="/voltnow-logo.png"
+                  alt="voltNOW"
+                  className="block dark:hidden h-7 w-auto"
+                />
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src="/voltnow-logo-light.png"
+                  alt="voltNOW"
+                  className="hidden dark:block h-7 w-auto"
+                />
               </Link>
             </div>
             {/* Desktop Navigation */}

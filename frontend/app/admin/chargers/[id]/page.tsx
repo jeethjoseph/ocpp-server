@@ -377,11 +377,16 @@ export default function ChargerDetailPage() {
               </div>
               <div className="flex justify-between items-center">
                 <span className="text-sm font-medium">Tariff:</span>
-                <Badge variant="outline">
-                  {charger.tariff_per_kwh != null
-                    ? `₹${charger.tariff_per_kwh}/kWh`
-                    : "Global"}
-                </Badge>
+                {charger.tariff_per_kwh_all_in != null ? (
+                  <Badge variant="outline" className="flex flex-col items-end gap-0.5 py-1 h-auto">
+                    <span className="font-medium">
+                      ₹{charger.tariff_per_kwh_all_in.toFixed(2)}/kWh
+                    </span>
+                    <span className="text-[10px] text-muted-foreground">(all-inclusive)</span>
+                  </Badge>
+                ) : (
+                  <Badge variant="outline">Global</Badge>
+                )}
               </div>
               {/* Latest Error */}
               {charger.latest_error && (
@@ -814,14 +819,14 @@ export default function ChargerDetailPage() {
                     </div>
                     <div className="text-right ml-4">
                       <p className={`text-lg font-bold ${
-                        walletTx.amount < 0 
-                          ? 'text-red-600' 
+                        walletTx.type === 'CHARGE_DEDUCT'
+                          ? 'text-red-600'
                           : 'text-green-600'
                       }`}>
-                        {walletTx.amount < 0 ? '-' : '+'}₹{Math.abs(walletTx.amount).toFixed(2)}
+                        {walletTx.type === 'CHARGE_DEDUCT' ? '-' : '+'}₹{Math.abs(walletTx.amount).toFixed(2)}
                       </p>
                       <p className="text-xs text-muted-foreground">
-                        {walletTx.amount < 0 ? 'Deducted' : 'Added'}
+                        {walletTx.type === 'CHARGE_DEDUCT' ? 'Deducted' : 'Added'}
                       </p>
                     </div>
                   </div>
@@ -834,10 +839,10 @@ export default function ChargerDetailPage() {
                   <div className="flex justify-between items-center">
                     <p className="font-medium">Total Billed:</p>
                     <p className="text-xl font-bold text-red-600">
-                      ₹{Math.abs(transactionData.wallet_transactions.reduce(
-                        (sum, wt) => sum + (wt.amount < 0 ? Math.abs(wt.amount) : 0), 
+                      ₹{transactionData.wallet_transactions.reduce(
+                        (sum, wt) => sum + (wt.type === 'CHARGE_DEDUCT' ? Math.abs(wt.amount) : 0),
                         0
-                      )).toFixed(2)}
+                      ).toFixed(2)}
                     </p>
                   </div>
                 </div>

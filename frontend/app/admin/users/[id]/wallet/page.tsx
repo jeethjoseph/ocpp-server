@@ -75,6 +75,7 @@ function WalletTransactionsTable({ userId }: { userId: number }) {
         <Table>
           <TableHeader>
             <TableRow>
+              <TableHead>ID</TableHead>
               <TableHead>Date & Time</TableHead>
               <TableHead>Type</TableHead>
               <TableHead>Amount</TableHead>
@@ -87,9 +88,12 @@ function WalletTransactionsTable({ userId }: { userId: number }) {
             {transactionsWithBalance.map((transaction) => {
               const transactionDate = new Date(transaction.created_at);
               const isCredit = transaction.amount > 0;
-              
+
               return (
                 <TableRow key={transaction.id}>
+                  <TableCell className="font-mono text-xs text-muted-foreground">
+                    #{transaction.id}
+                  </TableCell>
                   <TableCell>
                     <div>
                       <div className="font-medium">{transactionDate.toLocaleDateString()}</div>

@@ -66,13 +66,14 @@ class FranchiseeBusinessTypeEnum(str, enum.Enum):
     LLP = "LLP"
 
 class SettlementStatusEnum(str, enum.Enum):
-    PENDING = "PENDING"                          # Calculated, not yet transferred
+    PENDING = "PENDING"                          # Calculated, awaiting transfer attempt
     TRANSFER_INITIATED = "TRANSFER_INITIATED"    # Razorpay transfer API called
     TRANSFER_PROCESSED = "TRANSFER_PROCESSED"    # Razorpay webhook confirmed transfer
     SETTLED = "SETTLED"                          # Funds in franchisee bank
     FAILED = "FAILED"                            # Transfer failed
     REVERSED = "REVERSED"                        # Transfer reversed (post-settlement refund)
     ON_HOLD = "ON_HOLD"                          # Manually held (dispute, audit)
+    BELOW_THRESHOLD = "BELOW_THRESHOLD"          # Terminal: payout < MINIMUM_TRANSFER_AMOUNT, no transfer attempted
 
 class CommissionChangeReasonEnum(str, enum.Enum):
     INITIAL_SETUP = "INITIAL_SETUP"
@@ -189,11 +190,11 @@ class CommissionLedgerEntry(Model):
     gst_collected = fields.DecimalField(max_digits=10, decimal_places=2)      # 18% of energy_charge
     net_excl_gst = fields.DecimalField(max_digits=10, decimal_places=2)       # net_amount - gst_collected
 
-    # Commission split (calculated on net_excl_gst)
+    # Commission on net_excl_gst; TDS on franchisee earning (net_excl_gst − platform_commission)
     commission_percent = fields.DecimalField(max_digits=5, decimal_places=2)  # Frozen rate
     platform_commission = fields.DecimalField(max_digits=10, decimal_places=2)
     tds_amount = fields.DecimalField(max_digits=10, decimal_places=2, default=0.00)
-    transfer_fee = fields.DecimalField(max_digits=10, decimal_places=2, default=0.00)
+    transfer_fee = fields.DecimalField(max_digits=10, decimal_places=2, default=0.00)  # Filled post-settlement from webhook; not deducted from payout
 
     # Franchisee payout
     franchisee_payout = fields.DecimalField(max_digits=10, decimal_places=2)
@@ -610,10 +611,9 @@ INPUTS:
     tariff_rate         = Per-kWh rate (pre-GST)
     gst_rate            = 18% (on energy charge)
     refund_amount       = Refund issued (QR unused balance, or 0 for wallet)
-    pg_fee_pct          = Razorpay PG fee % (~2% cards, ~0.5% UPI)
+    pg_fee              = Razorpay PG fee (commission + GST from webhook; ~2%)
     commission_pct      = Franchisee's commission rate (frozen at transaction time)
     tds_pct             = Configurable per franchisee (default 10%)
-    transfer_fee_pct    = 0.25% (Razorpay Route transfer fee)
 
 STEP 1: Customer billing
     energy_charge       = energy_consumed_kwh * tariff_rate
@@ -622,7 +622,6 @@ STEP 1: Customer billing
     (For QR: gross_amount = amount_paid by customer; refund is the overpayment)
 
 STEP 2: Net after PG fees and refunds
-    pg_fee              = gross_amount * pg_fee_pct / 100
     net_amount          = gross_amount - refund_amount - pg_fee
 
 STEP 3: Separate GST component from net
@@ -630,22 +629,36 @@ STEP 3: Separate GST component from net
     net_excl_gst        = net_amount - gst_collected
     (GST collected is remitted to government by the service provider)
 
-STEP 4: Commission and TDS on pre-GST net
+STEP 4: Platform commission on pre-GST net
     platform_commission = net_excl_gst * commission_pct / 100
-    tds_amount          = net_excl_gst * tds_pct / 100
 
-STEP 5: Franchisee payout
-    pre_transfer_amount = net_excl_gst - platform_commission - tds_amount
-    transfer_fee        = pre_transfer_amount * transfer_fee_pct / 100
-    franchisee_payout   = pre_transfer_amount - transfer_fee
+STEP 5: TDS on franchisee earning (post-commission)
+    franchisee_earning  = net_excl_gst - platform_commission
+    tds_amount          = franchisee_earning * tds_pct / 100
+
+    (TDS is withheld from the payment to the franchisee, not from a
+    pre-commission base. Withholding on net_excl_gst would over-deduct
+    by `platform_commission * tds_pct / 100` on every settlement.)
+
+STEP 6: Franchisee payout
+    franchisee_payout   = franchisee_earning - tds_amount
 
 DISTRIBUTION:
     Government (GST):    gst_collected
+    Government (TDS):    tds_amount (VoltLync deposits, franchisee claims credit)
     Razorpay (PG fee):   pg_fee
-    VoltLync retains:    platform_commission + tds_amount
-    Razorpay (transfer): transfer_fee
+    VoltLync retains:    platform_commission
     Franchisee receives: franchisee_payout
     Customer refunded:   refund_amount
+
+TRANSFER GATING:
+    If franchisee_payout < MINIMUM_TRANSFER_AMOUNT (default ₹1.00):
+        settlement_status = BELOW_THRESHOLD (terminal, no transfer attempted)
+    Else if franchisee is ACTIVE with a razorpay_account_id:
+        Initiate Razorpay Route transfer; status = TRANSFER_INITIATED
+
+    transfer_fee is recorded post-settlement from the transfer.processed
+    webhook for reconciliation only — NOT deducted from franchisee_payout.
 ```
 
 All amounts rounded to 2 decimal places with `ROUND_HALF_UP`.
@@ -654,7 +667,7 @@ All amounts rounded to 2 decimal places with `ROUND_HALF_UP`.
 
 ### 6.2 Worked Example: QR Payment Session
 
-**Scenario:** Customer pays Rs.500 via UPI QR, consumes 25 kWh at Rs.14/kWh (pre-GST tariff). Franchisee commission: 20%. TDS: 10%.
+**Scenario:** Customer pays Rs.500 via UPI QR, consumes 25 kWh at Rs.14/kWh (pre-GST tariff). Franchisee commission: 20%. TDS: 10%. Razorpay PG fee = Rs.10 (~2%, same fee used in Stage 1 refund calc and Stage 2 settlement).
 
 ```
 Step 1: Energy billing (GST added on top)
@@ -662,38 +675,40 @@ Step 1: Energy billing (GST added on top)
     gst_on_energy (18%) = Rs.350.00 * 18% = Rs.63.00
     total_energy_bill   = Rs.350.00 + Rs.63.00 = Rs.413.00
 
-Step 2: QR payment handling (existing flow)
+Step 2: QR refund calc (existing flow, before settlement)
     customer_paid       = Rs.500.00
-    existing_platform_fee = Rs.500 * 2% = Rs.10.00
+    pg_fee              = Rs.10.00  (from Razorpay webhook)
     refund_amount       = Rs.500.00 - Rs.413.00 - Rs.10.00 = Rs.77.00
 
 Step 3: Settlement -- net after PG fees and refunds
     gross_amount        = Rs.500.00
-    pg_fee (0.5% UPI)  = Rs.500.00 * 0.5% = Rs.2.50
-    net_amount          = Rs.500.00 - Rs.77.00 - Rs.2.50 = Rs.420.50
+    net_amount          = Rs.500.00 - Rs.77.00 - Rs.10.00 = Rs.413.00
 
 Step 4: Separate GST from net
-    gst_collected       = Rs.63.00 (18% of energy_charge)
-    net_excl_gst        = Rs.420.50 - Rs.63.00 = Rs.357.50
+    gst_collected       = Rs.63.00
+    net_excl_gst        = Rs.413.00 - Rs.63.00 = Rs.350.00
 
-Step 5: Commission and TDS (on pre-GST net)
-    commission (20%)    = Rs.357.50 * 20% = Rs.71.50
-    tds (10%)           = Rs.357.50 * 10% = Rs.35.75
+Step 5: Platform commission
+    commission (20%)    = Rs.350.00 * 20% = Rs.70.00
 
-Step 6: Franchisee payout
-    pre_transfer        = Rs.357.50 - Rs.71.50 - Rs.35.75 = Rs.250.25
-    transfer_fee (0.25%)= Rs.250.25 * 0.25% = Rs.0.63
-    franchisee_payout   = Rs.250.25 - Rs.0.63 = Rs.249.62
+Step 6: TDS on franchisee earning (post-commission)
+    franchisee_earning  = Rs.350.00 - Rs.70.00 = Rs.280.00
+    tds (10%)           = Rs.280.00 * 10% = Rs.28.00
+
+Step 7: Franchisee payout
+    franchisee_payout   = Rs.280.00 - Rs.28.00 = Rs.252.00
+
+    (transfer_fee is recorded later from Razorpay's transfer.processed
+    webhook; it is NOT deducted from the payout.)
 
 SUMMARY:
     Customer paid:           Rs.500.00
     Customer refunded:       Rs.77.00
-    Razorpay PG fee:         Rs.2.50
+    Razorpay PG fee:         Rs.10.00
     GST collected (govt):    Rs.63.00
-    VoltLync commission:     Rs.71.50
-    TDS deducted:            Rs.35.75
-    Transfer fee:            Rs.0.63
-    Franchisee receives:     Rs.249.62
+    VoltLync commission:     Rs.70.00
+    TDS deducted (govt):     Rs.28.00
+    Franchisee receives:     Rs.252.00
     ──────────────────────────────────
     Total:                   Rs.500.00 ✓
 ```
@@ -718,22 +733,22 @@ Step 3: Separate GST
     gst_collected       = Rs.21.60
     net_excl_gst        = Rs.141.60 - Rs.21.60 = Rs.120.00
 
-Step 4: Commission and TDS
+Step 4: Platform commission
     commission (20%)    = Rs.120.00 * 20% = Rs.24.00
-    tds (10%)           = Rs.120.00 * 10% = Rs.12.00
 
-Step 5: Franchisee payout
-    pre_transfer        = Rs.120.00 - Rs.24.00 - Rs.12.00 = Rs.84.00
-    transfer_fee (0.25%)= Rs.84.00 * 0.25% = Rs.0.21
-    franchisee_payout   = Rs.84.00 - Rs.0.21 = Rs.83.79
+Step 5: TDS on franchisee earning (post-commission)
+    franchisee_earning  = Rs.120.00 - Rs.24.00 = Rs.96.00
+    tds (10%)           = Rs.96.00 * 10% = Rs.9.60
+
+Step 6: Franchisee payout
+    franchisee_payout   = Rs.96.00 - Rs.9.60 = Rs.86.40
 
 SUMMARY:
     Wallet deducted:         Rs.141.60
     GST collected (govt):    Rs.21.60
     VoltLync commission:     Rs.24.00
-    TDS deducted:            Rs.12.00
-    Transfer fee:            Rs.0.21
-    Franchisee receives:     Rs.83.79
+    TDS deducted (govt):     Rs.9.60
+    Franchisee receives:     Rs.86.40
     ──────────────────────────────────
     Total:                   Rs.141.60 ✓
 ```
@@ -883,7 +898,8 @@ _process_failed_franchisee_transfers():
 - **Rate**: 18% added on top of tariff rate (not inclusive)
 - **Customer bill**: energy_charge + 18% GST = total billed amount
 - **GST collected**: Tracked per transaction in `CommissionLedgerEntry.gst_collected`
-- **Commission and TDS**: Calculated on `net_excl_gst` (pre-GST net), NOT on the GST-inclusive amount
+- **Commission**: Calculated on `net_excl_gst` (pre-GST net), NOT on the GST-inclusive amount
+- **TDS**: Calculated on franchisee earning (`net_excl_gst − platform_commission`), so the withholding base is the payment actually flowing to the franchisee
 - **GST liability**: Needs CA confirmation -- either franchisee remits (pass through in payout) or VoltLync remits as aggregator
 - **VoltLync claims ITC**: On Razorpay PG fees (18% GST on Razorpay fees)
 - **Monthly invoice**: Includes GST breakdown for both parties' filing

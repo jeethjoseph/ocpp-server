@@ -68,9 +68,10 @@ async def get_my_wallet(
     path-matching conflicts that could incorrectly enforce ADMIN access.
     """
     try:
-        # Get wallet balance
+        # Get wallet balance from the ledger (derived from wallet_transaction)
+        from services.wallet_service import WalletService
         wallet = await Wallet.filter(user=current_user).first()
-        wallet_balance = float(wallet.balance) if wallet and wallet.balance else 0.0
+        wallet_balance = float(await WalletService.get_balance(wallet.id)) if wallet else 0.0
 
         return {
             "wallet_balance": wallet_balance
@@ -253,11 +254,13 @@ async def list_users(
         users = await query.offset(offset).limit(limit).order_by('-created_at')
         
         # Prepare response data with computed fields
+        from services.wallet_service import WalletService
         user_data = []
         for user in users:
-            # Get wallet balance
+            # Get wallet balance from the ledger (derived from wallet_transaction)
             wallet = await Wallet.filter(user=user).first()
-            wallet_balance = float(wallet.balance) if wallet and wallet.balance else 0.0
+            wallet_balance = float(await WalletService.get_balance(wallet.id)) if wallet else 0.0
+
             
             # Get transaction counts
             total_transactions = await Transaction.filter(user=user).count()
@@ -302,10 +305,11 @@ async def get_user(
     """Get detailed user information (admin only) - only USER role users"""
     try:
         user = await User.get(id=user_id, role=UserRoleEnum.USER)
-        
-        # Get wallet balance
+
+        # Get wallet balance from the ledger (derived from wallet_transaction)
+        from services.wallet_service import WalletService
         wallet = await Wallet.filter(user=user).first()
-        wallet_balance = float(wallet.balance) if wallet and wallet.balance else 0.0
+        wallet_balance = float(await WalletService.get_balance(wallet.id)) if wallet else 0.0
         
         # Get transaction counts
         total_transactions = await Transaction.filter(user=user).count()
@@ -689,14 +693,20 @@ async def get_charger_by_string_id(
 
     This endpoint accepts alphanumeric charge point IDs like 'AIRPORT_EXPRESS_CHARGING_01'
     and returns the same data structure as the admin endpoint but uses string IDs.
+
+    The response carries ``station.wallet_payment_disabled``: true when the
+    charger sits on a franchisee-owned station and the wallet-settlement
+    feature flag is off. Frontends hide the "Pay from Wallet" affordance in
+    that case so wallet draws don't accrue indefinitely-held settlements.
     """
     from models import Charger, ChargingStation, Connector
     from redis_manager import redis_manager
     from datetime import datetime, timezone
+    from services.franchisee_settlement_service import WALLET_SETTLEMENT_ENABLED
 
     try:
         # Look up charger by charge_point_string_id
-        charger = await Charger.filter(charge_point_string_id=charge_point_id).prefetch_related('station', 'connectors').first()
+        charger = await Charger.filter(charge_point_string_id=charge_point_id).prefetch_related('station__franchisee', 'connectors').first()
 
         if not charger:
             raise HTTPException(status_code=404, detail="Charger not found")
@@ -715,6 +725,9 @@ async def get_charger_by_string_id(
         from services.wallet_service import WalletService
         tariff = await WalletService.get_applicable_tariff(charger.id)
         tariff_rate = tariff.rate_per_kwh if tariff else None
+        tariff_all_in = (
+            float(tariff.tariff_per_kwh_all_in) if tariff else None
+        )
 
         # Get current transaction if any
         from models import Transaction
@@ -746,11 +759,24 @@ async def get_charger_by_string_id(
                 "updated_at": charger.updated_at.isoformat(),
                 "tariff_per_kwh": float(tariff_rate) if tariff_rate else None,
                 "tariff_gst_percent": float(tariff.gst_percent) if tariff else None,
+                "tariff_per_kwh_all_in": tariff_all_in,
             },
             "station": {
                 "id": charger.station.id,
                 "name": charger.station.name,
                 "address": charger.station.address,
+                "franchisee_name": (
+                    charger.station.franchisee.business_name
+                    if charger.station.franchisee else None
+                ),
+                # Frontend hides the wallet-pay button when this is true.
+                # The settlement service can't currently push franchisee
+                # payouts for wallet sessions until Razorpay activates the
+                # direct-transfer feature; until then, allowing wallet at a
+                # franchisee charger would accrue ON_HOLD ledger entries.
+                "wallet_payment_disabled": bool(
+                    charger.station.franchisee_id
+                ) and not WALLET_SETTLEMENT_ENABLED,
             },
             "connectors": [
                 {

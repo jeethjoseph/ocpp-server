@@ -44,6 +44,7 @@ export function useUserRole() {
     role: user?.publicMetadata?.role as string | undefined,
     isAdmin: user?.publicMetadata?.role === "ADMIN",
     isUser: user?.publicMetadata?.role === "USER",
+    isFranchisee: user?.publicMetadata?.role === "FRANCHISEE",
     isLoaded,
     user
   };
@@ -73,9 +74,21 @@ export function UserOnly({ children, fallback = null }: {
   );
 }
 
+// Component for franchisee-only content
+export function FranchiseeOnly({ children, fallback = null }: {
+  children: React.ReactNode;
+  fallback?: React.ReactNode;
+}) {
+  return (
+    <RoleWrapper allowedRoles={["FRANCHISEE"]} fallback={fallback}>
+      {children}
+    </RoleWrapper>
+  );
+}
+
 // Component for authenticated users (both USER and ADMIN)
-export function AuthenticatedOnly({ children, fallback = null }: { 
-  children: React.ReactNode; 
+export function AuthenticatedOnly({ children, fallback = null }: {
+  children: React.ReactNode;
   fallback?: React.ReactNode;
 }) {
   return (

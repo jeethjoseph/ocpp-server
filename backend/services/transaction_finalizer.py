@@ -230,3 +230,31 @@ async def _process_billing(transaction: Transaction) -> None:
             f"QR billing error for finalized transaction {transaction.id}: {qr_err}",
             exc_info=True,
         )
+
+    # Franchisee settlement (fire-and-forget, non-blocking)
+    try:
+        from services.franchisee_settlement_service import FranchiseeSettlementService
+        from utils import safe_create_task
+        safe_create_task(
+            FranchiseeSettlementService.process_settlement(transaction.id),
+            name=f"settlement-txn-{transaction.id}",
+        )
+    except Exception as settle_err:
+        logger.error(
+            "Settlement trigger error for transaction %s: %s",
+            transaction.id, settle_err,
+        )
+
+    # GST invoice generation (fire-and-forget)
+    try:
+        from services.invoice_service import InvoiceService
+        from utils import safe_create_task
+        safe_create_task(
+            InvoiceService.generate_invoice(transaction.id),
+            name=f"invoice-txn-{transaction.id}",
+        )
+    except Exception as inv_err:
+        logger.error(
+            "Invoice trigger error for transaction %s: %s",
+            transaction.id, inv_err,
+        )

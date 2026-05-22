@@ -1,6 +1,11 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { chargerService, stationService, signalQualityService, chargerErrorService } from "@/lib/api-services";
-import { ChargerListResponse } from "@/types/api";
+import {
+  chargerService,
+  stationService,
+  signalQualityService,
+  chargerErrorService,
+  type ChangeAvailabilityResponse,
+} from "@/lib/api-services";
 import { toast } from "sonner";
 import { transactionKeys } from "./transactions";
 import { useAuth } from "@/contexts/AuthContext";
@@ -158,63 +163,57 @@ export function useRemoteStartByStringId() {
 }
 
 // Change Availability Mutation Hook
+//
+// No optimistic update: OCPP 1.6 ChangeAvailability has three valid replies
+// (Accepted / Scheduled / Rejected) and chargers can also silently drop the
+// request, so flipping the row before the ack would lie to the operator.
+// We wait for the backend's response and reconcile against the server's
+// view of the world.
+//   - Accepted  → invalidate the list so it refetches the now-true state
+//   - Scheduled → toast info ("will apply when the current session ends")
+//   - Rejected  → toast error
+//   - other     → defensive neutral toast
+
+type ChangeAvailabilityVariables = {
+  id: number;
+  type: "Inoperative" | "Operative";
+  connectorId?: number;
+};
+
 export function useChangeAvailability() {
   const queryClient = useQueryClient();
 
-  return useMutation({
-    mutationFn: async ({
-      id,
-      type,
-      connectorId = 0,
-    }: {
-      id: number;
-      type: "Inoperative" | "Operative";
-      connectorId?: number;
-    }) => {
+  return useMutation<ChangeAvailabilityResponse, Error, ChangeAvailabilityVariables>({
+    mutationFn: async ({ id, type, connectorId = 0 }) => {
       return chargerService.changeAvailability(id, type, connectorId);
     },
-    onMutate: async ({ id, type }) => {
-      // Cancel outgoing refetches so they don't overwrite optimistic update
-      await queryClient.cancelQueries({ queryKey: chargerKeys.all });
-
-      // Snapshot previous value for rollback
-      const previousChargers = queryClient.getQueriesData({
-        queryKey: chargerKeys.lists(),
-      });
-
-      // Optimistically update charger status
-      queryClient.setQueriesData<ChargerListResponse>(
-        { queryKey: chargerKeys.lists() },
-        (old) => {
-          if (!old) return old;
-
-          const optimisticStatus = type === "Inoperative" ? "Unavailable" : "Available";
-          
-          return {
-            ...old,
-            data: old.data.map((charger) =>
-              charger.id === id
-                ? { ...charger, latest_status: optimisticStatus }
-                : charger
-            ),
-          };
-        }
-      );
-
-      return { previousChargers };
-    },
     onSuccess: (data, variables) => {
-      const status = variables.type === "Inoperative" ? "unavailable" : "available";
-      toast.success(`Charger marked as ${status}`);
-    },
-    onError: (err, variables, context) => {
-      // Rollback optimistic update on error
-      if (context?.previousChargers) {
-        context.previousChargers.forEach(([queryKey, data]) => {
-          queryClient.setQueryData(queryKey, data);
-        });
+      if (!data?.success) {
+        toast.error("Charger refused the change");
+        return;
       }
-      
+
+      const displayStatus = variables.type === "Inoperative" ? "unavailable" : "available";
+      const ocppResponse = data.ocpp_response;
+
+      switch (ocppResponse) {
+        case "Accepted":
+          queryClient.invalidateQueries({ queryKey: chargerKeys.all });
+          toast.success(`Charger marked as ${displayStatus}`);
+          break;
+        case "Scheduled":
+          toast.info(`Change scheduled — will apply when the current session ends`);
+          break;
+        case "Rejected":
+          toast.error("Charger refused the change");
+          break;
+        default:
+          toast(
+            `Unexpected charger response${ocppResponse ? `: ${ocppResponse}` : ""}`,
+          );
+      }
+    },
+    onError: (err) => {
       const errorMessage = err instanceof Error ? err.message : String(err);
       if (errorMessage.includes("409") || errorMessage.includes("not connected")) {
         toast.error("Charger not connected");

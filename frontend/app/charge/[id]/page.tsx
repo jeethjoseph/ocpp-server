@@ -166,10 +166,18 @@ export default function UserChargePage() {
     }
   };
 
+  const walletDisabled = !!station?.wallet_payment_disabled;
+
   const canStartCharging = () => {
     const statusReady = charger?.latest_status === "Preparing" ||
       (isSocketCharger && charger?.latest_status === "Available");
-    return charger && statusReady && charger.connection_status && !currentTransactionId;
+    return (
+      charger &&
+      statusReady &&
+      charger.connection_status &&
+      !currentTransactionId &&
+      !walletDisabled
+    );
   };
 
   const canStopCharging = () => {
@@ -233,6 +241,11 @@ export default function UserChargePage() {
                 <span className="text-sm truncate">{station.name}</span>
               </div>
             )}
+            {station?.franchisee_name && (
+              <div className="text-xs text-muted-foreground truncate mt-0.5">
+                Operator: <span className="font-medium">{station.franchisee_name}</span>
+              </div>
+            )}
           </div>
         </div>
 
@@ -282,7 +295,9 @@ export default function UserChargePage() {
           {!canStartCharging() && !currentTransactionId && (
             <div className="bg-yellow-50 dark:bg-yellow-900/30 border border-yellow-200 dark:border-yellow-700 p-4 rounded-lg">
               <p className="text-sm text-center text-yellow-800 dark:text-yellow-200 font-medium">
-                {!charger.connection_status
+                {walletDisabled
+                  ? "Wallet charging is not available at this station. Please scan the QR code on the charger to pay via UPI."
+                  : !charger.connection_status
                   ? "⚠️ Charger is offline"
                   : charger.latest_status !== "Preparing" &&
                     !(isSocketCharger && charger.latest_status === "Available")
@@ -402,6 +417,11 @@ export default function UserChargePage() {
                 <Receipt className="h-5 w-5" />
                 Billing Summary
               </CardTitle>
+              {station?.franchisee_name && (
+                <p className="text-xs text-muted-foreground pt-1">
+                  Paid to <span className="font-medium">{station.franchisee_name}</span>
+                </p>
+              )}
             </CardHeader>
             <CardContent>
               {transactionData?.wallet_transactions && transactionData.wallet_transactions.length > 0 ? (

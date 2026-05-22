@@ -9,6 +9,7 @@ from services.disconnect_handler import (
     _disconnect_reset_count,
 )
 from services.transaction_finalizer import finalize_stopped_transaction
+from services.wallet_service import WalletService
 from models import Transaction, TransactionStatusEnum, MeterValue, Wallet
 
 
@@ -92,9 +93,9 @@ class TestDisconnectResumeFlow:
         assert final.gst_amount == Decimal("21.60")
         assert final.total_billed == Decimal("141.60")
 
-        # Wallet debited
+        # Wallet debited (Module C: derived balance)
         wallet = await Wallet.get(user_id=test_user.id)
-        assert wallet.balance == Decimal("500.00") - Decimal("141.60")
+        assert await WalletService.get_balance(wallet.id) == Decimal("500.00") - Decimal("141.60")
 
         # Counter cleaned up after finalization
         assert txn.id not in _disconnect_reset_count
@@ -131,4 +132,4 @@ class TestDisconnectResumeFlow:
         assert final.energy_charge is None
         # Wallet untouched
         wallet = await Wallet.get(user_id=test_user.id)
-        assert wallet.balance == Decimal("500.00")
+        assert await WalletService.get_balance(wallet.id) == Decimal("500.00")

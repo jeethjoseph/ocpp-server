@@ -399,6 +399,34 @@ class SentryHelper:
         except Exception as e:
             logger.debug(f"Failed to capture exception to Sentry: {e}")
 
+    @staticmethod
+    def capture_message(
+        message: str,
+        level: str = "warning",
+        extra: Optional[Dict] = None,
+        tags: Optional[Dict[str, Any]] = None,
+    ):
+        """Manually capture a non-exception event to Sentry.
+
+        Use for things like "we noticed N stuck settlements" — not an
+        error, but an operational signal worth paging on at threshold.
+        """
+        if not _sentry_enabled:
+            return
+
+        try:
+            import sentry_sdk
+            with sentry_sdk.push_scope() as scope:
+                if extra:
+                    for key, value in extra.items():
+                        scope.set_extra(key, value)
+                if tags:
+                    for key, value in tags.items():
+                        scope.set_tag(key, str(value))
+                sentry_sdk.capture_message(message, level=level)
+        except Exception as e:
+            logger.debug(f"Failed to capture message to Sentry: {e}")
+
 
 # ==================== OCPP-SPECIFIC METRICS ====================
 
@@ -514,4 +542,24 @@ class OCPPMetrics:
         MetricsCollector.increment_counter("Custom/OCPP/Suspended/StaleSwept", value=count)
         MetricsCollector.record_event("OCPPStaleSuspendedSwept", {
             "count": count,
+        })
+
+    @staticmethod
+    async def record_refund_speed(charger_id, qr_payment_id: int, speed_processed):
+        """Record Razorpay refund speed outcome on full-refund flows.
+
+        Only call this when `speed=optimum` was requested — a normal-speed
+        refund (kill-switch off) is not a fallback. Increments one of two
+        New Relic counters so ops can alert on a sudden fallback spike
+        (rail outage, account-level rate limit, payment-method shift).
+        ADR 0002 amendment (2026-05-20).
+        """
+        if speed_processed == "instant":
+            MetricsCollector.increment_counter("Custom/QR/RefundInstantSucceeded")
+        else:
+            MetricsCollector.increment_counter("Custom/QR/RefundInstantFallback")
+        MetricsCollector.record_event("QRRefundSpeed", {
+            "charger_id": charger_id,
+            "qr_payment_id": qr_payment_id,
+            "speed_processed": speed_processed or "unknown",
         })

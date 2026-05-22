@@ -4,6 +4,22 @@
 
 set -e
 
+# ---------------------------------------------------------------------------
+# Privilege drop: if we start as root (production image has no USER
+# directive), fix ownership on the firmware volume and re-exec as the app
+# user via gosu. Named volumes mounted at /app/firmware_files may have been
+# seeded with root ownership from an older image, which would otherwise
+# block firmware uploads with EACCES.
+#
+# DO NOT add logic above this block without thinking about the security
+# implication — anything here runs as root.
+# ---------------------------------------------------------------------------
+if [ "$(id -u)" = "0" ]; then
+    mkdir -p /app/firmware_files
+    chown -R app:app /app/firmware_files
+    exec gosu app "$0" "$@"
+fi
+
 echo "=========================================="
 echo "OCPP Backend - Docker Entrypoint"
 echo "=========================================="

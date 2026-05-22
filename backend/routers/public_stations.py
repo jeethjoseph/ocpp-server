@@ -9,13 +9,47 @@ from models import ChargingStation, Charger, Connector, Tariff, ChargerStatusEnu
 from tortoise.functions import Count, Sum
 from tortoise.query_utils import Prefetch
 from auth_middleware import require_user
+from services.tariff_utils import compute_station_tariff_range
+
+
+# Customer-facing 3-bucket mapping over the OCPP ChargerStatusEnum.
+# AVAILABLE                                  → "ready"
+# PREPARING/CHARGING/SUSPENDED_*/FINISHING   → "in_use"
+# FAULTED/UNAVAILABLE/RESERVED + anything else → "out_of_service"
+_IN_USE_STATES = {
+    ChargerStatusEnum.PREPARING,
+    ChargerStatusEnum.CHARGING,
+    ChargerStatusEnum.SUSPENDED_EVSE,
+    ChargerStatusEnum.SUSPENDED_EV,
+    ChargerStatusEnum.FINISHING,
+}
+
+
+def _status_bucket(status: ChargerStatusEnum) -> str:
+    if status == ChargerStatusEnum.AVAILABLE:
+        return "ready"
+    if status in _IN_USE_STATES:
+        return "in_use"
+    return "out_of_service"
 
 # Pydantic schemas for public API
 class ConnectorInfo(BaseModel):
     connector_type: str
     max_power_kw: Optional[float]
+    # Legacy fields — preserved for /stations and the map popup, which still
+    # render the simple "X/Y available" string. Equals ready_count / total_count.
     available_count: int
     total_count: int
+    # Customer-facing 3-bucket breakdown (ADR 0005 area).
+    # AVAILABLE → ready; PREPARING/CHARGING/SUSPENDED_*/FINISHING → in_use;
+    # FAULTED/UNAVAILABLE/RESERVED → out_of_service.
+    ready_count: int = 0
+    in_use_count: int = 0
+    out_of_service_count: int = 0
+    # Per-plug-type all-inclusive tariff range (₹/kWh, GST + gateway fee
+    # included). Equal when uniform across chargers of this plug type.
+    min_tariff_all_in: Optional[float] = None
+    max_tariff_all_in: Optional[float] = None
 
 class ChargerConnectorInfo(BaseModel):
     connector_type: str
@@ -26,6 +60,9 @@ class StationChargerInfo(BaseModel):
     name: str
     latest_status: str
     connectors: List[ChargerConnectorInfo]
+    tariff_per_kwh: Optional[float] = None
+    tariff_per_kwh_all_in: Optional[float] = None
+    tariff_gst_percent: Optional[float] = None
 
 class PublicStationResponse(BaseModel):
     id: int
@@ -39,6 +76,15 @@ class PublicStationResponse(BaseModel):
     connector_details: List[ConnectorInfo]
     chargers: List[StationChargerInfo] = Field(default_factory=list)
     price_per_kwh: Optional[float]
+    # All-inclusive min/max across the station's chargers (incl. GST and the
+    # 2% gateway fee). Equal when uniform. UI renders the
+    # "₹X.XX–₹Y.YY/kWh (all-inclusive)" summary range from these. ADR 0003.
+    min_price_per_kwh_all_in: Optional[float] = None
+    max_price_per_kwh_all_in: Optional[float] = None
+    # Operator / franchisee business name for payer-payee transparency
+    # (RBI Payment Aggregator mandate). None means the platform operates
+    # this station directly.
+    franchisee_name: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -64,10 +110,11 @@ async def _fetch_stations_with_availability(
     qs = station_filter if station_filter is not None else ChargingStation.all()
     stations = await qs.prefetch_related(
         Prefetch('chargers', queryset=Charger.all().prefetch_related('connectors', 'tariffs'))
-    )
+    ).select_related('franchisee')
 
     connected_charger_ids = set(await redis_manager.get_all_connected_chargers())
     current_time = datetime.now(timezone.utc)
+    global_tariff = await Tariff.filter(is_global=True).first()
     station_responses: List[PublicStationResponse] = []
 
     for station in stations:
@@ -82,12 +129,16 @@ async def _fetch_stations_with_availability(
             1 for c in real_chargers if c.latest_status == ChargerStatusEnum.AVAILABLE
         )
 
-        connector_details, all_connector_types = _aggregate_connectors(real_chargers)
-        price_per_kwh = await _resolve_price(real_chargers)
+        connector_details, all_connector_types = _aggregate_connectors(
+            real_chargers, global_tariff,
+        )
+        min_excl, _max_excl, min_all_in, max_all_in = compute_station_tariff_range(
+            real_chargers, global_tariff,
+        )
 
         charger_info_list: List[StationChargerInfo] = []
         if include_charger_details:
-            charger_info_list = _build_charger_info(real_chargers)
+            charger_info_list = _build_charger_info(real_chargers, global_tariff)
 
         station_responses.append(PublicStationResponse(
             id=station.id,
@@ -100,7 +151,10 @@ async def _fetch_stations_with_availability(
             connector_types=sorted(list(all_connector_types)),
             connector_details=sorted(connector_details, key=lambda x: x.connector_type),
             chargers=charger_info_list,
-            price_per_kwh=price_per_kwh,
+            price_per_kwh=min_excl,
+            min_price_per_kwh_all_in=min_all_in,
+            max_price_per_kwh_all_in=max_all_in,
+            franchisee_name=station.franchisee.business_name if station.franchisee else None,
         ))
 
     return station_responses
@@ -123,53 +177,68 @@ def _filter_real_chargers(chargers, connected_ids: set, now) -> list:
     return real
 
 
-def _aggregate_connectors(real_chargers):
-    """Aggregate connector type counts and availability across chargers."""
+def _aggregate_connectors(real_chargers, global_tariff):
+    """Aggregate per-plug-type charger counts, status buckets, and tariff range.
+
+    Counts are charger-level (1 charger ↔ 1 connector is the working fleet
+    invariant — see CONTEXT.md). If a charger ever carries multiple connectors
+    of distinct types, it contributes to each plug-type group it exposes.
+
+    Returns (list[ConnectorInfo], set[connector_type]).
+    """
+    from decimal import Decimal
+
     connector_type_counts: Dict[str, dict] = {}
     all_connector_types: set = set()
 
     for charger in real_chargers:
-        charger_available = charger.latest_status == ChargerStatusEnum.AVAILABLE
+        bucket = _status_bucket(charger.latest_status)
+        tariff = charger.tariffs[0] if getattr(charger, "tariffs", None) else global_tariff
+        tariff_all_in = (
+            Decimal(tariff.tariff_per_kwh_all_in) if tariff is not None else None
+        )
         for conn in charger.connectors:
             ct = conn.connector_type
             all_connector_types.add(ct)
             if ct not in connector_type_counts:
                 connector_type_counts[ct] = {
-                    'available_count': 0, 'total_count': 0,
+                    'total_count': 0,
+                    'ready_count': 0,
+                    'in_use_count': 0,
+                    'out_of_service_count': 0,
                     'max_power_kw': conn.max_power_kw,
+                    'tariffs': [],
                 }
-            connector_type_counts[ct]['total_count'] += 1
-            if charger_available:
-                connector_type_counts[ct]['available_count'] += 1
-            if (conn.max_power_kw and connector_type_counts[ct]['max_power_kw']
-                    and conn.max_power_kw > connector_type_counts[ct]['max_power_kw']):
-                connector_type_counts[ct]['max_power_kw'] = conn.max_power_kw
+            d = connector_type_counts[ct]
+            d['total_count'] += 1
+            d[f'{bucket}_count'] += 1
+            if (conn.max_power_kw and d['max_power_kw']
+                    and conn.max_power_kw > d['max_power_kw']):
+                d['max_power_kw'] = conn.max_power_kw
+            if tariff_all_in is not None:
+                d['tariffs'].append(tariff_all_in)
 
-    details = [
-        ConnectorInfo(
+    details = []
+    for ct, d in connector_type_counts.items():
+        tariffs = d['tariffs']
+        min_t = float(min(tariffs)) if tariffs else None
+        max_t = float(max(tariffs)) if tariffs else None
+        details.append(ConnectorInfo(
             connector_type=ct,
             max_power_kw=d['max_power_kw'],
-            available_count=d['available_count'],
+            available_count=d['ready_count'],
             total_count=d['total_count'],
-        )
-        for ct, d in connector_type_counts.items()
-    ]
+            ready_count=d['ready_count'],
+            in_use_count=d['in_use_count'],
+            out_of_service_count=d['out_of_service_count'],
+            min_tariff_all_in=min_t,
+            max_tariff_all_in=max_t,
+        ))
     return details, all_connector_types
 
 
-async def _resolve_price(real_chargers) -> Optional[float]:
-    """Get price_per_kwh from charger tariffs or global tariff."""
-    for charger in real_chargers:
-        if charger.tariffs:
-            return float(charger.tariffs[0].rate_per_kwh)
-    global_tariff = await Tariff.filter(is_global=True).first()
-    if global_tariff:
-        return float(global_tariff.rate_per_kwh)
-    return None
-
-
-def _build_charger_info(real_chargers) -> List[StationChargerInfo]:
-    """Build per-charger detail list."""
+def _build_charger_info(real_chargers, global_tariff) -> List[StationChargerInfo]:
+    """Build per-charger detail list including each charger's tariff."""
     result = []
     for charger in real_chargers:
         connectors = [
@@ -178,11 +247,21 @@ def _build_charger_info(real_chargers) -> List[StationChargerInfo]:
             )
             for c in charger.connectors
         ]
+        tariff = charger.tariffs[0] if charger.tariffs else global_tariff
+        if tariff is not None:
+            tariff_excl = float(tariff.rate_per_kwh)
+            tariff_all_in = float(tariff.tariff_per_kwh_all_in)
+            tariff_gst = float(tariff.gst_percent)
+        else:
+            tariff_excl = tariff_all_in = tariff_gst = None
         result.append(StationChargerInfo(
             charge_point_string_id=charger.charge_point_string_id,
             name=charger.name or f"Charger {charger.id}",
             latest_status=charger.latest_status.value,
             connectors=connectors,
+            tariff_per_kwh=tariff_excl,
+            tariff_per_kwh_all_in=tariff_all_in,
+            tariff_gst_percent=tariff_gst,
         ))
     return result
 

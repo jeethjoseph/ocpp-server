@@ -79,18 +79,22 @@ When a socket-type charger (no cable lock) reports `Available` status while a tr
 
 ## ZERO_ENERGY_TIMEOUT_SECONDS
 
-**Default:** `120` seconds (2 minutes)
+**Default:** `7200` seconds (2 hours) — raised from `120s` on 2026-05-21
 **File:** `backend/services/zero_energy_watchdog.py`
 
 If a running transaction receives meter values where the energy register (`Energy.Active.Import.Register`) hasn't increased for this duration, the server sends `RemoteStopTransaction` to the charger.
 
-**When it triggers:** Charger is connected and sending meter values, but no energy is being delivered. Common causes: EV battery full and not communicating stop, faulty connector contact, EVSE relay stuck open, EV-side charging error.
+**When it triggers:** Charger is connected and sending meter values, but no energy is being delivered. Common causes: EV battery hit SOC limit and taper-completed, faulty connector contact, EVSE relay stuck open, EV-side charging error.
 **What happens:** Server sends `RemoteStopTransaction`. Charger responds with `StopTransaction`. Normal billing follows.
 
+**Why 2 hours:** Many EVs taper-complete naturally — they hit SOC limit, the BMS stops drawing current, but the connector stays plugged in. The previous 120s timeout was killing those sessions ~3 minutes after taper-end, which surprised users who weren't standing at the charger. 2h covers the natural "leave the car plugged in while it sits" window while still bounding stuck sessions.
+
 **Tuning:**
-- Chargers typically send meter values every 10-30s. Set to at least 4x the meter interval to avoid false positives.
-- Too low: false stops during brief charging pauses (EV battery balancing, thermal throttling).
-- Too high: wasted station time on genuinely stalled sessions.
+- Lower (≥600s): operators who want connectors freed quickly and customers refunded sooner. Accept more taper-end stops.
+- Default 7200s: tolerates idle-while-plugged-in, refund delayed up to ~2h.
+- Higher (≤14400s): only if a known firmware bug is causing false stops and you want temporary suppression.
+
+**Invariant — Redis state TTL:** The watchdog stores per-transaction state in Redis with TTL set by `redis_manager.set_zero_energy_state` (currently `14400`). This TTL **must be strictly greater** than `ZERO_ENERGY_TIMEOUT_SECONDS`, otherwise a charger that goes silent mid-stall lets the state expire and the stall clock resets on reconnect — stall detection silently disabled. If you raise the timeout to or beyond 14400, raise the TTL in code too.
 
 **Relationship:** Works together with `ZERO_ENERGY_GRACE_PERIOD_SECONDS` — the grace period must elapse before this check activates.
 
@@ -112,7 +116,7 @@ After a transaction starts, EVs negotiate charging parameters (EVSE handshake, c
 - Too low: false stops on slow-negotiating vehicles.
 - Too high: genuinely stalled sessions take longer to detect (total detection time = grace + timeout).
 
-**Total detection time:** `ZERO_ENERGY_GRACE_PERIOD_SECONDS` + `ZERO_ENERGY_TIMEOUT_SECONDS` (default: 60 + 120 = 180s / 3 min from transaction start).
+**Total detection time:** `ZERO_ENERGY_GRACE_PERIOD_SECONDS` + `ZERO_ENERGY_TIMEOUT_SECONDS` (default: 60 + 7200 = 7260s / ~2h 1min from transaction start).
 
 ---
 
@@ -150,7 +154,7 @@ How often the data retention background task runs to delete old records.
 | `SUSPEND_TIMEOUT_SECONDS` | 300 | seconds | Reboot resume window |
 | `DISCONNECT_SUSPEND_TIMEOUT_SECONDS` | 180 | seconds | Reconnect window after disconnect |
 | `SOCKET_GRACE_PERIOD_SECONDS` | 300 | seconds | Unplug grace for socket chargers |
-| `ZERO_ENERGY_TIMEOUT_SECONDS` | 120 | seconds | Stalled energy → auto-stop |
+| `ZERO_ENERGY_TIMEOUT_SECONDS` | 7200 | seconds | Stalled energy → auto-stop (2h since 2026-05-21) |
 | `ZERO_ENERGY_GRACE_PERIOD_SECONDS` | 60 | seconds | Startup negotiation grace |
 | `RETENTION_DAYS` | 90 | days | Data retention period |
 | `CLEANUP_INTERVAL_HOURS` | 24 | hours | Retention cleanup frequency |
@@ -170,11 +174,11 @@ T+300s   DISCONNECT_SUSPEND_TIMEOUT expires
 ## Timeline: What Happens During a Stalled Charge
 
 ```
-T+0s     Transaction starts (StartTransaction)
-T+0-60s  ZERO_ENERGY_GRACE_PERIOD — checks skipped
-T+60s    Grace period ends, zero-energy monitoring begins
-T+60s+   Meter values arrive but energy register unchanged
-T+180s   ZERO_ENERGY_TIMEOUT fires (60s grace + 120s stall)
-           → RemoteStopTransaction sent
-           → Charger stops, normal billing follows
+T+0s      Transaction starts (StartTransaction)
+T+0-60s   ZERO_ENERGY_GRACE_PERIOD — checks skipped
+T+60s     Grace period ends, zero-energy monitoring begins
+T+60s+    Meter values arrive but energy register unchanged
+T+7260s   ZERO_ENERGY_TIMEOUT fires (60s grace + 7200s stall = ~2h 1min)
+            → RemoteStopTransaction sent
+            → Charger stops, normal billing follows
 ```

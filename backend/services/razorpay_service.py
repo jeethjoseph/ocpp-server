@@ -1,11 +1,15 @@
 # Razorpay service for payment integration
+import asyncio
 import os
 import razorpay
+import httpx
 import hmac
 import hashlib
 import logging
 from typing import Dict, Optional, Tuple
 from decimal import Decimal
+
+from utils import mask_vpa
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +46,68 @@ def _is_already_refunded_error(err: Exception) -> bool:
     """Detect Razorpay 'already refunded' / 'fully refunded' responses."""
     msg = str(err).lower()
     return any(token in msg for token in ("already refund", "fully refund", "refunded fully"))
+
+
+# Sensitive field names that get masked before being persisted to
+# `razorpay_api_log`. Keys are matched case-insensitively against the
+# JSON payload's keys (top-level and nested). Email/phone are NOT in
+# this set — they're already stored cleartext on the franchisee row.
+_SENSITIVE_KEYS = {
+    "pan", "account_number", "ifsc_code", "ifsc",
+    "aadhaar", "aadhar", "gst", "gstin", "tan",
+    "card_number", "card_id",
+}
+
+
+def _mask_sensitive(value):
+    """Recursively mask known sensitive fields in a JSON-serialisable
+    structure. Returns a NEW structure — never mutates input.
+
+    Masking rule: for any dict key in ``_SENSITIVE_KEYS`` (case-insensitive),
+    replace the value with ``f"***{last4}"`` (preserving last-4 chars for
+    diagnostic value) when the stringified value is at least 4 chars long,
+    or with ``"***"`` for shorter values. Recurses into nested dicts and
+    lists; leaves other scalars untouched.
+    """
+    if isinstance(value, dict):
+        masked = {}
+        for k, v in value.items():
+            if isinstance(k, str) and k.lower() in _SENSITIVE_KEYS and v is not None:
+                sval = str(v)
+                masked[k] = f"***{sval[-4:]}" if len(sval) >= 4 else "***"
+            else:
+                masked[k] = _mask_sensitive(v)
+        return masked
+    if isinstance(value, list):
+        return [_mask_sensitive(v) for v in value]
+    return value
+
+
+# Razorpay caps the QR `name` field at ~50 chars; truncate business + charger
+# so the whole string fits even when the business name is long.
+_QR_NAME_MAX = 50
+_QR_BUSINESS_MAX = 30
+_QR_CHARGER_MAX = 17
+
+
+def build_qr_payee_name(business_name: Optional[str], charger_name: str) -> str:
+    """Compose the Razorpay QR ``name`` metadata field.
+
+    Format: ``"{business_name} - {charger_name}"``. When no franchisee is
+    linked, falls back to ``"VoltLync"`` as the business_name. The result
+    is truncated to fit Razorpay's 50-char cap on the QR name.
+    """
+    business = (business_name or "VoltLync").strip()[:_QR_BUSINESS_MAX]
+    charger = (charger_name or "").strip()[:_QR_CHARGER_MAX]
+    combined = f"{business} - {charger}" if charger else business
+    return combined[:_QR_NAME_MAX]
+
+
+def build_qr_description(business_name: Optional[str], charger_name: str) -> str:
+    """Compose the rendered descriptor line on the Razorpay QR image."""
+    business = (business_name or "VoltLync").strip()
+    charger = (charger_name or "").strip()
+    return f"{business} - Pay for EV charging at {charger}" if charger else f"{business} - Pay for EV charging"
 
 
 class RazorpayService:
@@ -250,43 +316,82 @@ class RazorpayService:
             logger.error(f"Failed to fetch order {order_id}: {e}")
             return None
 
-    def create_qr_code(self, name: str) -> Optional[Dict]:
-        """Create a Razorpay QR code for a charger (static, variable amount)"""
+    def create_qr_code(
+        self,
+        payee_name: str,
+        description: str,
+        account_id: Optional[str] = None,
+    ) -> Optional[Dict]:
+        """Create a Razorpay QR code for a charger (static, variable amount).
+
+        Args:
+            payee_name: metadata label stored on the QR object in Razorpay's
+                dashboard. Does not rewrite the rendered big-label on the
+                returned image — that comes from the owning merchant's KYC.
+            description: shorter descriptor rendered on the returned QR image.
+            account_id: when provided, scopes the QR to a linked account via
+                the ``X-Razorpay-Account`` header. The rendered image will
+                then show the linked account's registered business name
+                instead of the platform's. Required for RBI Route
+                payer-payee transparency when the charger belongs to a
+                franchisee whose linked account is ACTIVE.
+        """
         if not self.is_configured():
             raise Exception("Razorpay is not configured")
         try:
             qr_data = {
                 "type": "upi_qr",
-                "name": f"EV Charging - {name}",
+                "name": payee_name,
                 "usage": "multiple_use",
                 "fixed_amount": False,
-                "description": f"Pay for EV charging at {name}",
+                "description": description,
             }
-            qr_code = self.client.qrcode.create(data=qr_data)
-            logger.info(f"Razorpay QR code created: {qr_code.get('id')} for {name}")
+            options = {}
+            if account_id:
+                options["headers"] = {"X-Razorpay-Account": account_id}
+            qr_code = self.client.qrcode.create(data=qr_data, **options)
+            logger.info(
+                "Razorpay QR code created: %s payee=%s account=%s",
+                qr_code.get("id"), payee_name, account_id or "platform",
+            )
             return qr_code
         except Exception as e:
             logger.error(f"Failed to create Razorpay QR code: {e}", exc_info=True)
             raise Exception(f"Failed to create QR code: {str(e)}")
 
-    def close_qr_code(self, qr_code_id: str) -> Optional[Dict]:
-        """Close a Razorpay QR code"""
+    def close_qr_code(
+        self, qr_code_id: str, account_id: Optional[str] = None
+    ) -> Optional[Dict]:
+        """Close a Razorpay QR code. Pass ``account_id`` if the QR was
+        created under a linked account so the close call is authorised
+        against the same context."""
         if not self.is_configured():
             raise Exception("Razorpay is not configured")
         try:
-            result = self.client.qrcode.close(qr_code_id)
-            logger.info(f"Razorpay QR code closed: {qr_code_id}")
+            options = {}
+            if account_id:
+                options["headers"] = {"X-Razorpay-Account": account_id}
+            result = self.client.qrcode.close(qr_code_id, **options)
+            logger.info(
+                "Razorpay QR code closed: %s account=%s",
+                qr_code_id, account_id or "platform",
+            )
             return result
         except Exception as e:
             logger.error(f"Failed to close Razorpay QR code {qr_code_id}: {e}")
             return None
 
-    def fetch_qr_code(self, qr_code_id: str) -> Optional[Dict]:
-        """Fetch QR code details from Razorpay"""
+    def fetch_qr_code(
+        self, qr_code_id: str, account_id: Optional[str] = None
+    ) -> Optional[Dict]:
+        """Fetch QR code details from Razorpay."""
         if not self.is_configured():
             return None
         try:
-            return self.client.qrcode.fetch(qr_code_id)
+            options = {}
+            if account_id:
+                options["headers"] = {"X-Razorpay-Account": account_id}
+            return self.client.qrcode.fetch(qr_code_id, **options)
         except Exception as e:
             logger.error(f"Failed to fetch QR code {qr_code_id}: {e}")
             return None
@@ -308,17 +413,19 @@ class RazorpayService:
             return None
         try:
             result = self.client.payment.validateVpa({"vpa": vpa})
-            logger.info(f"VPA validation for {vpa}: success={result.get('success')}")
+            logger.info(f"VPA validation for {mask_vpa(vpa)}: success={result.get('success')}")
             return result
         except Exception as e:
-            logger.error(f"Failed to validate VPA {vpa}: {e}")
+            logger.error(f"Failed to validate VPA {mask_vpa(vpa)}: {e}")
             return None
 
     def refund_payment(
         self,
         payment_id: str,
         amount: Optional[Decimal] = None,
-        notes: Optional[Dict] = None
+        notes: Optional[Dict] = None,
+        idempotency_key: Optional[str] = None,
+        speed: Optional[str] = None,
     ) -> Optional[Dict]:
         """
         Create a refund for a payment
@@ -327,6 +434,15 @@ class RazorpayService:
             payment_id: Razorpay payment ID
             amount: Amount to refund in rupees (None for full refund)
             notes: Additional metadata
+            idempotency_key: Stable key for safe retries. Sent as
+                ``X-Refund-Idempotency`` header. Same key + same body replays
+                the original refund; same key + different body returns 400.
+            speed: Razorpay refund speed. ``"optimum"`` requests instant
+                payout when the rails/payment method support it, falling
+                back to ``"normal"`` server-side (Razorpay returns the
+                actual speed in ``speed_processed``). ``None`` (default)
+                lets Razorpay use ``normal`` (5–7 working days, no fee).
+                See ADR 0002 for the policy.
 
         Returns:
             Refund details or None if failed
@@ -345,8 +461,20 @@ class RazorpayService:
             if notes:
                 refund_data["notes"] = notes
 
-            refund = self.client.payment.refund(payment_id, refund_data)
-            logger.info(f"Refund created: {refund['id']} for payment {payment_id}")
+            if speed:
+                refund_data["speed"] = speed
+
+            options = {}
+            if idempotency_key:
+                options["headers"] = {"X-Refund-Idempotency": idempotency_key}
+
+            refund = self.client.payment.refund(payment_id, refund_data, **options)
+            logger.info(
+                "Refund created: %s for payment %s idempotency_key=%s "
+                "speed_requested=%s speed_processed=%s",
+                refund.get("id"), payment_id, idempotency_key or "none",
+                speed or "default", refund.get("speed_processed") or "unknown",
+            )
             return refund
 
         except Exception as e:
@@ -374,6 +502,476 @@ class RazorpayService:
         except Exception as e:
             logger.error(f"Failed to fetch refunds for payment {payment_id}: {e}")
         return None
+
+
+    # ─── Razorpay Route (Linked Accounts & Transfers) ──────────────
+
+    def is_route_enabled(self) -> bool:
+        return self.is_configured() and os.getenv(
+            "RAZORPAY_ROUTE_ENABLED", "false"
+        ).lower() in ("true", "1", "yes")
+
+    async def _audit_call(
+        self,
+        *,
+        method: str,
+        endpoint: str,
+        request_body: Optional[Dict],
+        sdk_call,
+        franchisee_id: Optional[int] = None,
+        account_id: Optional[str] = None,
+        critical: bool = False,
+    ) -> Dict:
+        """Run a sync Razorpay SDK call and persist a single
+        ``RazorpayApiLog`` row capturing request + response (PII masked).
+
+        - SDK exceptions are re-raised AFTER the log row is written.
+        - Audit-write failures are normally swallowed (logged at ERROR
+          level for ops visibility) so SDK behaviour is preserved.
+          When ``critical=True`` (money-moving calls), audit-write
+          failures are re-raised AFTER the SDK result is captured —
+          callers need to know that a real side effect happened without
+          a trace so they can compensate / page on-call.
+        - Used by onboarding-chain wrappers and ``create_payment_transfer``
+          (Route payment-based transfers). Refunds, payment captures, and
+          QR webhook ingestion remain unaudited here.
+        """
+        masked_request = _mask_sensitive(request_body) if request_body else None
+        response_body = None
+        response_status: Optional[int] = None
+        error_message: Optional[str] = None
+        success = False
+        sdk_exc: Optional[BaseException] = None
+        try:
+            # Support both sync SDK calls (return value) and async callers
+            # (coroutine). httpx-based callers need the async branch so the
+            # event loop isn't blocked on the HTTP round-trip.
+            response_body = sdk_call()
+            if asyncio.iscoroutine(response_body):
+                response_body = await response_body
+            success = True
+        except razorpay.errors.BadRequestError as e:
+            response_status = 400
+            error_message = str(e)
+            sdk_exc = e
+        except razorpay.errors.GatewayError as e:
+            response_status = 502
+            error_message = str(e)
+            sdk_exc = e
+        except Exception as e:
+            error_message = str(e)
+            sdk_exc = e
+
+        # Always attempt to write the audit row, regardless of SDK outcome.
+        try:
+            from models import RazorpayApiLog
+            await RazorpayApiLog.create(
+                method=method,
+                endpoint=endpoint,
+                request_body=masked_request,
+                response_status=response_status,
+                response_body=(
+                    _mask_sensitive(response_body)
+                    if isinstance(response_body, (dict, list))
+                    else None
+                ),
+                success=success,
+                error_message=error_message,
+                franchisee_id=franchisee_id,
+                razorpay_account_id=account_id,
+            )
+        except Exception as audit_err:
+            logger.error(
+                "Failed to write razorpay_api_log row for %s %s: %s — "
+                "audit write %s; SDK call %s.",
+                method, endpoint, audit_err,
+                "re-raised (critical=True)" if critical else "swallowed",
+                "succeeded" if success else "failed",
+            )
+            if critical and sdk_exc is None:
+                # SDK side-effect happened; caller MUST know we couldn't
+                # record it. Don't mask SDK exceptions if the call also
+                # failed — those take precedence below.
+                raise
+
+        if sdk_exc is not None:
+            raise sdk_exc
+        return response_body
+
+    async def create_linked_account(
+        self, payload: Dict, franchisee_id: Optional[int] = None
+    ) -> Dict:
+        """Create a Razorpay Route linked account (POST /v2/accounts)."""
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        result = await self._audit_call(
+            method="POST",
+            endpoint="/v2/accounts",
+            request_body=payload,
+            sdk_call=lambda: self.client.account.create(data=payload),
+            franchisee_id=franchisee_id,
+            account_id=None,
+        )
+        logger.info("Linked account created: %s", result.get("id"))
+        return result
+
+    def fetch_linked_account(self, account_id: str) -> Dict:
+        """Fetch linked account details (GET /v2/accounts/{id})."""
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        try:
+            return self.client.account.fetch(account_id)
+        except Exception as e:
+            logger.error("Failed to fetch account %s: %s", account_id, e)
+            raise
+
+    async def update_linked_account(
+        self,
+        account_id: str,
+        data: Dict,
+        franchisee_id: Optional[int] = None,
+    ) -> Dict:
+        """PATCH /v2/accounts/{id} — amend account fields post-create.
+        Some fields (notably ``business_type``) are locked by Razorpay
+        once set; the SDK surfaces those as BadRequestError."""
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        result = await self._audit_call(
+            method="PATCH",
+            endpoint=f"/v2/accounts/{account_id}",
+            request_body=data,
+            sdk_call=lambda: self.client.account.edit(account_id, data),
+            franchisee_id=franchisee_id,
+            account_id=account_id,
+        )
+        logger.info("Linked account updated: %s", account_id)
+        return result
+
+    async def delete_linked_account(
+        self, account_id: str, franchisee_id: Optional[int] = None
+    ) -> Dict:
+        """DELETE /v2/accounts/{id} — hard-delete a linked account.
+
+        Irreversible on Razorpay's side. Used by the admin
+        "Delete Razorpay Account" flow when the account is stuck or
+        misconfigured and we'd rather start over.
+        """
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        result = await self._audit_call(
+            method="DELETE",
+            endpoint=f"/v2/accounts/{account_id}",
+            request_body=None,
+            sdk_call=lambda: self.client.account.delete(account_id),
+            franchisee_id=franchisee_id,
+            account_id=account_id,
+        )
+        logger.info("Linked account deleted: %s", account_id)
+        return result if isinstance(result, dict) else {"deleted": True}
+
+    # ─── Route product configuration + stakeholders (KYC submission) ───
+
+    async def request_product_configuration(
+        self,
+        account_id: str,
+        data: Dict,
+        franchisee_id: Optional[int] = None,
+    ) -> Dict:
+        """POST /v2/accounts/{id}/products — create a product config.
+        Minimal body is ``{product_name, tnc_accepted, ip?}``; other config
+        (settlements, payment_methods, refund, etc.) is PATCH-only."""
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        return await self._audit_call(
+            method="POST",
+            endpoint=f"/v2/accounts/{account_id}/products",
+            request_body=data,
+            sdk_call=lambda: self.client.product.requestProductConfiguration(
+                account_id, data
+            ),
+            franchisee_id=franchisee_id,
+            account_id=account_id,
+        )
+
+    async def edit_product_configuration(
+        self,
+        account_id: str,
+        product_id: str,
+        data: Dict,
+        franchisee_id: Optional[int] = None,
+    ) -> Dict:
+        """PATCH /v2/accounts/{id}/products/{product_id} — update bank,
+        payment_methods, refund, notifications, checkout, etc."""
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        return await self._audit_call(
+            method="PATCH",
+            endpoint=f"/v2/accounts/{account_id}/products/{product_id}",
+            request_body=data,
+            sdk_call=lambda: self.client.product.edit(
+                account_id, product_id, data
+            ),
+            franchisee_id=franchisee_id,
+            account_id=account_id,
+        )
+
+    def fetch_product_configuration(
+        self, account_id: str, product_id: str
+    ) -> Dict:
+        """GET /v2/accounts/{id}/products/{product_id} — read
+        ``activation_status`` and outstanding ``requirements[]``."""
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        try:
+            return self.client.product.fetch(account_id, product_id)
+        except Exception as e:
+            logger.error(
+                "Failed to fetch product %s for %s: %s",
+                product_id, account_id, e,
+            )
+            raise
+
+    async def create_stakeholder(
+        self,
+        account_id: str,
+        data: Dict,
+        franchisee_id: Optional[int] = None,
+    ) -> Dict:
+        """POST /v2/accounts/{id}/stakeholders — add a
+        director/proprietor. Razorpay requires at least one stakeholder
+        to clear the ``name`` requirement on product config."""
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        return await self._audit_call(
+            method="POST",
+            endpoint=f"/v2/accounts/{account_id}/stakeholders",
+            request_body=data,
+            sdk_call=lambda: self.client.stakeholder.create(account_id, data),
+            franchisee_id=franchisee_id,
+            account_id=account_id,
+        )
+
+    def list_stakeholders(self, account_id: str) -> Dict:
+        """GET /v2/accounts/{id}/stakeholders — list all."""
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        try:
+            return self.client.stakeholder.all(account_id)
+        except Exception as e:
+            logger.error(
+                "Failed to list stakeholders on %s: %s", account_id, e
+            )
+            raise
+
+    def fetch_stakeholder(self, account_id: str, stakeholder_id: str) -> Dict:
+        """GET /v2/accounts/{id}/stakeholders/{sid} — read single stakeholder."""
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        try:
+            return self.client.stakeholder.fetch(account_id, stakeholder_id)
+        except Exception as e:
+            logger.error(
+                "Failed to fetch stakeholder %s on %s: %s",
+                stakeholder_id, account_id, e,
+            )
+            raise
+
+    async def update_stakeholder(
+        self,
+        account_id: str,
+        stakeholder_id: str,
+        data: Dict,
+        franchisee_id: Optional[int] = None,
+    ) -> Dict:
+        """PATCH /v2/accounts/{id}/stakeholders/{sid} — amend stakeholder
+        fields. Used to add ``kyc.pan`` / ``addresses.residential`` to a
+        stakeholder created earlier without them."""
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        result = await self._audit_call(
+            method="PATCH",
+            endpoint=f"/v2/accounts/{account_id}/stakeholders/{stakeholder_id}",
+            request_body=data,
+            sdk_call=lambda: self.client.stakeholder.edit(
+                account_id, stakeholder_id, data
+            ),
+            franchisee_id=franchisee_id,
+            account_id=account_id,
+        )
+        logger.info(
+            "Stakeholder updated: %s on %s", stakeholder_id, account_id
+        )
+        return result
+
+    def create_transfer(
+        self,
+        account_id: str,
+        amount_paise: int,
+        notes: Optional[Dict] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Dict:
+        """Create a Route transfer to a linked account.
+
+        When ``idempotency_key`` is set, Razorpay deduplicates retries via the
+        ``X-Transfer-Idempotency`` header: same key + same body returns the
+        original response; same key + different body returns 400.
+        """
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        try:
+            data = {
+                "account": account_id,
+                "amount": amount_paise,
+                "currency": "INR",
+            }
+            if notes:
+                data["notes"] = notes
+
+            options = {}
+            if idempotency_key:
+                options["headers"] = {"X-Transfer-Idempotency": idempotency_key}
+
+            result = self.client.transfer.create(data=data, **options)
+            logger.info(
+                "Transfer created: %s -> %s (%d paise) idempotency_key=%s",
+                result.get("id"), account_id, amount_paise,
+                idempotency_key or "none",
+            )
+            return result
+        except Exception as e:
+            logger.error(
+                "Transfer failed to %s (%d paise): %s",
+                account_id, amount_paise, e,
+            )
+            raise
+
+    async def create_payment_transfer(
+        self,
+        payment_id: str,
+        account_id: str,
+        amount_paise: int,
+        notes: Optional[Dict] = None,
+        franchisee_id: Optional[int] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Dict:
+        """Create a Route transfer from a captured payment to a linked account.
+
+        Calls ``POST /v1/payments/{payment_id}/transfers``. Unlike the
+        standalone ``POST /v1/transfers`` (see ``create_transfer``), this
+        endpoint requires no separate Razorpay-side feature activation —
+        Route account + active linked account is sufficient.
+
+        The only documented constraint is
+        ``sum(transfers on payment) <= captured_amount`` (refunds reduce
+        the effective transferable amount). Two layers of idempotency:
+
+        1. App-level: ``_validate_ledger_for_transfer`` rejects duplicate
+           transfers on the same ``razorpay_payment_id`` once the prior
+           transfer has been recorded on the ledger entry.
+        2. Network-level: ``idempotency_key`` (sent as ``X-Transfer-Idempotency``
+           header) lets Razorpay deduplicate retries when the original POST
+           timed out before we recorded the transfer id. Same key + same body
+           returns the original response; same key + different body returns
+           400. Callers should pass the ledger entry's stable ``idempotency_key``.
+
+        Razorpay returns ``{"entity":"collection","items":[<transfer>]}``;
+        this method unwraps and returns ``items[0]`` so callers can use
+        ``result.get("id")`` interchangeably with ``create_transfer``.
+        """
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+
+        url = f"https://api.razorpay.com/v1/payments/{payment_id}/transfers"
+        transfer_obj: Dict = {
+            "account": account_id,
+            "amount": amount_paise,
+            "currency": "INR",
+        }
+        if notes:
+            transfer_obj["notes"] = notes
+        body = {"transfers": [transfer_obj]}
+
+        headers: Dict[str, str] = {}
+        if idempotency_key:
+            headers["X-Transfer-Idempotency"] = idempotency_key
+
+        async def _do_call():
+            # httpx.AsyncClient — non-blocking; the previous sync ``requests``
+            # call stalled the event loop for the full Razorpay round-trip
+            # (up to 30s), serialising every other concurrent task.
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    url,
+                    json=body,
+                    headers=headers or None,
+                    auth=(self.api_key, self.api_secret),
+                )
+            try:
+                parsed = resp.json()
+            except Exception:
+                parsed = {"raw": resp.text}
+            if resp.is_error:
+                description = ""
+                if isinstance(parsed, dict):
+                    description = (
+                        parsed.get("error", {}).get("description") or ""
+                    )
+                description = description or f"HTTP {resp.status_code}"
+                if resp.status_code == 400:
+                    raise razorpay.errors.BadRequestError(description)
+                if resp.status_code in (502, 503, 504):
+                    raise razorpay.errors.GatewayError(description)
+                raise Exception(f"HTTP {resp.status_code}: {description}")
+            return parsed
+
+        response = await self._audit_call(
+            method="POST",
+            endpoint=f"POST /v1/payments/{payment_id}/transfers",
+            request_body=body,
+            sdk_call=_do_call,
+            franchisee_id=franchisee_id,
+            account_id=account_id,
+            critical=True,
+        )
+
+        items = response.get("items") if isinstance(response, dict) else None
+        if not items:
+            raise Exception(
+                f"Unexpected payment-transfer response shape: {response}"
+            )
+        transfer = items[0]
+        logger.info(
+            "Payment transfer created: %s on %s -> %s (%d paise)",
+            transfer.get("id"), payment_id, account_id, amount_paise,
+        )
+        return transfer
+
+    def fetch_transfer(self, transfer_id: str) -> Dict:
+        """Fetch transfer status."""
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        try:
+            return self.client.transfer.fetch(transfer_id)
+        except Exception as e:
+            logger.error("Failed to fetch transfer %s: %s", transfer_id, e)
+            raise
+
+    def reverse_transfer(
+        self, transfer_id: str, amount_paise: Optional[int] = None
+    ) -> Dict:
+        """Reverse a transfer (full or partial)."""
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        try:
+            data = {}
+            if amount_paise is not None:
+                data["amount"] = amount_paise
+            result = self.client.transfer.reverse(transfer_id, data=data)
+            logger.info("Transfer %s reversed", transfer_id)
+            return result
+        except Exception as e:
+            logger.error("Failed to reverse transfer %s: %s", transfer_id, e)
+            raise
 
 
 # Singleton instance

@@ -16,6 +16,19 @@ import {
   SignalQualityListResponse,
   ChargerError,
   ChargerErrorListResponse,
+  Franchisee,
+  FranchiseeCreate,
+  FranchiseeUpdate,
+  FranchiseeListResponse,
+  FranchiseeStakeholder,
+  StakeholderCreate,
+  StakeholderUpdate,
+  RazorpayApiLog,
+  SubmitKYCResponse,
+  CommissionUpdate,
+  CommissionAuditEntry,
+  FranchiseeStation,
+  AdminSettlementEntry,
 } from "@/types/api";
 
 export const stationService = {
@@ -59,6 +72,17 @@ export const stationService = {
 
   delete: (id: number) => api.delete<ApiResponse>(`/api/admin/stations/${id}`),
 };
+
+// Success payload from POST /api/admin/chargers/{id}/change-availability.
+// Backend captures the charger's OCPP ChangeAvailability response. The hook
+// (lib/queries/chargers.ts:useChangeAvailability) branches on ocpp_response.
+export interface ChangeAvailabilityResponse {
+  success: boolean;
+  message: string;
+  ocpp_response: "Accepted" | "Scheduled" | "Rejected" | string;
+  type: "Operative" | "Inoperative";
+  previous_status?: string;
+}
 
 export const chargerService = {
   getAll: (params?: {
@@ -109,7 +133,7 @@ export const chargerService = {
     type: "Inoperative" | "Operative",
     connectorId: number
   ) =>
-    api.post<ApiResponse>(
+    api.post<ChangeAvailabilityResponse>(
       `/api/admin/chargers/${id}/change-availability?type=${type}&connector_id=${connectorId}`
     ),
 
@@ -200,6 +224,19 @@ export const transactionService = {
 };
 
 // Public stations service for user-facing pages
+export interface PublicStationChargerInfo {
+  charge_point_string_id: string;
+  name: string;
+  latest_status: string;
+  connectors: Array<{
+    connector_type: string;
+    max_power_kw: number | null;
+  }>;
+  tariff_per_kwh: number | null;
+  tariff_per_kwh_all_in: number | null;
+  tariff_gst_percent: number | null;
+}
+
 export interface PublicStationResponse {
   id: number;
   name: string;
@@ -214,8 +251,17 @@ export interface PublicStationResponse {
     max_power_kw: number | null;
     available_count: number;
     total_count: number;
+    ready_count: number;
+    in_use_count: number;
+    out_of_service_count: number;
+    min_tariff_all_in: number | null;
+    max_tariff_all_in: number | null;
   }>;
+  chargers?: PublicStationChargerInfo[];
   price_per_kwh: number | null;
+  min_price_per_kwh_all_in: number | null;
+  max_price_per_kwh_all_in: number | null;
+  franchisee_name: string | null;
 }
 
 export interface PublicStationsListResponse {
@@ -251,7 +297,13 @@ export interface QRTransactionItem {
   razorpay_gst: string | null;
   fee_source: string | null;
   refund_amount: string | null;
+  razorpay_refund_id: string | null;
+  razorpay_refund_speed_processed: string | null;
+  refund_processed_at: string | null;
+  refund_failure_reason: string | null;
   charger_name: string | null;
+  station_name: string | null;
+  franchisee_name: string | null;
   duration_minutes: number | null;
   start_time: string | null;
   end_time: string | null;
@@ -264,6 +316,38 @@ export interface QRTransactionListResponse {
   page: number;
   limit: number;
 }
+
+export type QRActiveSessionSubState = "waiting" | "charging" | "paused" | "stopping";
+
+export interface QRActiveSessionItem {
+  qr_payment_id: number;
+  transaction_id: number | null;
+  amount_paid: string;
+  started_at: string;
+  charger_name: string | null;
+  station_name: string | null;
+  franchisee_name: string | null;
+  sub_state: QRActiveSessionSubState;
+  energy_kwh: string | null;
+  spent_so_far: string | null;
+  refund_if_stopped_now: string | null;
+  power_kw: number | null;
+  /** Set only on `waiting` sub-state — remaining seconds until the stale-payment
+   * watchdog will auto-refund. Frontend renders this as e.g. "auto-refund in N min". */
+  stale_threshold_seconds?: number;
+}
+
+export interface QRActiveSessionListResponse {
+  data: QRActiveSessionItem[];
+  total: number;
+}
+
+export const publicQRActiveSessionService = {
+  getByVpa: (vpa: string) =>
+    api.get<QRActiveSessionListResponse>(
+      `/api/public/qr-active-sessions?vpa=${encodeURIComponent(vpa)}`,
+    ),
+};
 
 export const publicQRTransactionService = {
   getByVpa: (params: { vpa: string; page?: number; limit?: number; status?: string }) => {
@@ -540,10 +624,28 @@ export const firmwareService = {
     ),
 
   /**
-   * Cancel a pending firmware update
+   * Cancel a pending firmware update (only PENDING with no attempts)
    */
   cancelUpdate: (updateId: number) =>
     api.post(`/api/admin/firmware/updates/${updateId}/cancel`, {}),
+
+  /**
+   * Admin: manually close an update as INSTALLED (polling chargers / out-of-band installs)
+   */
+  markInstalled: (updateId: number) =>
+    api.post<import("@/types/api").FirmwareUpdate>(
+      `/api/admin/firmware/updates/${updateId}/mark-installed`,
+      {}
+    ),
+
+  /**
+   * Admin: manually close a stuck update as FAILED
+   */
+  markFailed: (updateId: number) =>
+    api.post<import("@/types/api").FirmwareUpdate>(
+      `/api/admin/firmware/updates/${updateId}/mark-failed`,
+      {}
+    ),
 };
 
 /**
@@ -672,3 +774,244 @@ export const qrCodeService = {
     );
   },
 };
+
+// ─── Franchisee Service ────────────────────────────────────────────
+
+export const franchiseeService = {
+  getAll: (params?: {
+    page?: number;
+    limit?: number;
+    status?: string;
+    search?: string;
+  }) => {
+    const searchParams = new URLSearchParams();
+    if (params?.page) searchParams.set("page", params.page.toString());
+    if (params?.limit) searchParams.set("limit", params.limit.toString());
+    if (params?.status) searchParams.set("status", params.status);
+    if (params?.search) searchParams.set("search", params.search);
+
+    const query = searchParams.toString();
+    return api.get<FranchiseeListResponse>(
+      `/api/admin/franchisees${query ? `?${query}` : ""}`
+    );
+  },
+
+  getById: (id: number) => api.get<Franchisee>(`/api/admin/franchisees/${id}`),
+
+  create: (data: FranchiseeCreate) =>
+    api.post<Franchisee>("/api/admin/franchisees", data),
+
+  update: (id: number, data: FranchiseeUpdate) =>
+    api.put<Franchisee>(`/api/admin/franchisees/${id}`, data),
+
+  updateCommission: (id: number, data: CommissionUpdate) =>
+    api.put<{ message: string }>(`/api/admin/franchisees/${id}/commission`, data),
+
+  updateTDS: (id: number, data: { tds_rate_percent: number; notes?: string }) =>
+    api.put<{ message: string }>(`/api/admin/franchisees/${id}/tds`, data),
+
+  getCommissionHistory: (id: number) =>
+    api.get<CommissionAuditEntry[]>(
+      `/api/admin/franchisees/${id}/commission-history`
+    ),
+
+  getStations: (id: number) =>
+    api.get<FranchiseeStation[]>(`/api/admin/franchisees/${id}/stations`),
+
+  assignStations: (id: number, stationIds: number[]) =>
+    api.post<{ message: string }>(`/api/admin/franchisees/${id}/stations`, {
+      station_ids: stationIds,
+    }),
+
+  unassignStation: (franchiseeId: number, stationId: number) =>
+    api.delete<{ message: string }>(
+      `/api/admin/franchisees/${franchiseeId}/stations/${stationId}`
+    ),
+
+  updateStatus: (id: number, status: string, reason?: string) => {
+    const searchParams = new URLSearchParams({ status });
+    if (reason) searchParams.set("reason", reason);
+    return api.put<{ message: string }>(
+      `/api/admin/franchisees/${id}/status?${searchParams.toString()}`
+    );
+  },
+
+  resendInvitation: (id: number) =>
+    api.post<{ message: string; email: string }>(
+      `/api/admin/franchisees/${id}/resend-invitation`,
+      {}
+    ),
+
+  onboardRazorpay: (id: number) =>
+    api.post<{
+      message?: string;
+      account_id?: string;
+      status?: string;
+      razorpay_onboarding_url?: string | null;
+    }>(`/api/admin/franchisees/${id}/onboard-razorpay`, {}),
+
+  listStakeholders: (id: number) =>
+    api.get<FranchiseeStakeholder[]>(
+      `/api/admin/franchisees/${id}/stakeholders`
+    ),
+
+  createStakeholder: (id: number, body: StakeholderCreate) =>
+    api.post<FranchiseeStakeholder>(
+      `/api/admin/franchisees/${id}/stakeholders`,
+      body
+    ),
+
+  updateStakeholder: (
+    id: number,
+    stakeholderId: number,
+    body: StakeholderUpdate
+  ) =>
+    api.put<FranchiseeStakeholder>(
+      `/api/admin/franchisees/${id}/stakeholders/${stakeholderId}`,
+      body
+    ),
+
+  submitKYC: (id: number) =>
+    api.post<SubmitKYCResponse>(
+      `/api/admin/franchisees/${id}/submit-kyc`,
+      {}
+    ),
+
+  deleteRazorpayAccount: (id: number) =>
+    api.delete<{
+      status: string;
+      franchisee_id: number;
+      razorpay_account_id?: string;
+      stakeholders_removed?: number;
+    }>(`/api/admin/franchisees/${id}/razorpay-account`),
+
+  listRazorpayApiLogs: (id: number, limit = 50) =>
+    api.get<RazorpayApiLog[]>(
+      `/api/admin/franchisees/${id}/razorpay-api-logs?limit=${limit}`
+    ),
+
+  // ─── Settlement ledger (admin) ────────────────────────────────
+  listSettlements: (
+    id: number,
+    params: { page?: number; limit?: number; status?: string } = {}
+  ) => {
+    const searchParams = new URLSearchParams();
+    if (params.page) searchParams.set("page", params.page.toString());
+    if (params.limit) searchParams.set("limit", params.limit.toString());
+    if (params.status) searchParams.set("status", params.status);
+    const query = searchParams.toString();
+    return api.get<{
+      data: AdminSettlementEntry[];
+      total: number;
+      page: number;
+      limit: number;
+    }>(
+      `/api/admin/franchisees/${id}/settlements${query ? `?${query}` : ""}`
+    );
+  },
+
+  retryFailedSettlements: (id: number) =>
+    api.post<{ message: string }>(
+      `/api/admin/franchisees/${id}/settlements/retry-failed`,
+      {}
+    ),
+
+  holdSettlement: (id: number, entryId: number) =>
+    api.post<{ message: string }>(
+      `/api/admin/franchisees/${id}/settlements/${entryId}/hold`,
+      {}
+    ),
+
+  releaseSettlement: (id: number, entryId: number) =>
+    api.post<{ message: string }>(
+      `/api/admin/franchisees/${id}/settlements/${entryId}/release`,
+      {}
+    ),
+};
+
+// ─── Franchisee Portal Service ─────────────────────────────────────
+
+// Franchisee portal endpoints return loosely-typed payloads that flow
+// straight into admin-style UIs reading ad-hoc fields. Defining strict
+// response schemas for all of these is a follow-up; for now, allow
+// `any` in this section only.
+/* eslint-disable @typescript-eslint/no-explicit-any */
+export const franchiseePortalService = {
+  getDashboard: () => api.get<any>("/api/franchisee/dashboard"),
+
+  getStations: () => api.get<any[]>("/api/franchisee/stations"),
+
+  getStation: (id: number) => api.get<any>(`/api/franchisee/stations/${id}`),
+
+  getCharger: (id: number) => api.get<any>(`/api/franchisee/chargers/${id}`),
+
+  remoteStop: (chargerId: number) =>
+    api.post<any>(`/api/franchisee/chargers/${chargerId}/remote-stop`),
+
+  resetCharger: (chargerId: number) =>
+    api.post<any>(`/api/franchisee/chargers/${chargerId}/reset`),
+
+  changeAvailability: (chargerId: number, available: boolean) =>
+    api.post<any>(
+      `/api/franchisee/chargers/${chargerId}/change-availability?available=${available}`
+    ),
+
+  getTransactions: (params?: { page?: number; limit?: number; status?: string }) => {
+    const searchParams = new URLSearchParams();
+    if (params?.page) searchParams.set("page", params.page.toString());
+    if (params?.limit) searchParams.set("limit", params.limit.toString());
+    if (params?.status) searchParams.set("status", params.status);
+    const query = searchParams.toString();
+    return api.get<any>(`/api/franchisee/transactions${query ? `?${query}` : ""}`);
+  },
+
+  getTransaction: (id: number) =>
+    api.get<any>(`/api/franchisee/transactions/${id}`),
+
+  getSettlements: (params?: { page?: number; limit?: number }) => {
+    const searchParams = new URLSearchParams();
+    if (params?.page) searchParams.set("page", params.page.toString());
+    if (params?.limit) searchParams.set("limit", params.limit.toString());
+    const query = searchParams.toString();
+    return api.get<any>(`/api/franchisee/settlements${query ? `?${query}` : ""}`);
+  },
+
+  getProfile: () => api.get<any>("/api/franchisee/profile"),
+
+  getQRCodes: () =>
+    api.get<{
+      data: PortalQRCode[];
+      can_create_direct: boolean;
+      razorpay_account_status: string | null;
+      franchisee_status: string;
+    }>("/api/franchisee/qr-codes"),
+
+  createQRCode: (charger_id: number) =>
+    api.post<PortalQRCode>("/api/franchisee/qr-codes", { charger_id }),
+
+  regenerateQRCode: (qr_id: number) =>
+    api.post<PortalQRCode>(
+      `/api/franchisee/qr-codes/${qr_id}/regenerate`,
+      {}
+    ),
+
+  closeQRCode: (qr_id: number) =>
+    api.post<{ message: string; id: number }>(
+      `/api/franchisee/qr-codes/${qr_id}/close`,
+      {}
+    ),
+};
+/* eslint-enable @typescript-eslint/no-explicit-any */
+
+export interface PortalQRCode {
+  id: number;
+  charger_id: number;
+  charger_name: string | null;
+  razorpay_qr_code_id: string;
+  image_url: string;
+  short_url: string | null;
+  is_active: boolean;
+  owner: "franchisee" | "platform";
+  payee_display_name: string;
+  created_at: string;
+}

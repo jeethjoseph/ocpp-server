@@ -4,6 +4,10 @@ export interface Station {
   latitude: number;
   longitude: number;
   address: string;
+  franchisee_id?: number | null;
+  state?: string | null;
+  state_code?: string | null;
+  pincode?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -13,6 +17,10 @@ export interface StationCreate {
   latitude: number;
   longitude: number;
   address: string;
+  franchisee_id?: number;
+  state?: string;
+  state_code?: string;
+  pincode?: string;
 }
 
 export interface StationUpdate {
@@ -46,6 +54,7 @@ export interface Charger {
   updated_at: string;
   tariff_per_kwh?: number;
   tariff_gst_percent?: number;
+  tariff_per_kwh_all_in?: number;
   latest_error?: LatestErrorInfo;
 }
 
@@ -57,7 +66,7 @@ export interface ChargerCreate {
   serial_number?: string;
   external_charger_id?: string;
   connectors: ConnectorInput[];
-  tariff_per_kwh?: number;
+  tariff_per_kwh_all_in?: number;
 }
 
 export interface ConnectorInput {
@@ -72,7 +81,7 @@ export interface ChargerUpdate {
   vendor?: string;
   latest_status?: string;
   external_charger_id?: string;
-  tariff_per_kwh?: number;
+  tariff_per_kwh_all_in?: number;
 }
 
 export interface ChargerListResponse {
@@ -97,6 +106,11 @@ export interface ChargerDetail {
     id: number;
     name: string;
     address: string;
+    franchisee_name?: string | null;
+    // True when the station is franchisee-owned AND
+    // WALLET_SETTLEMENT_ENABLED is off on the backend. UI hides the wallet
+    // payment button so wallet draws don't accrue stuck settlements.
+    wallet_payment_disabled?: boolean;
   };
   connectors: Connector[];
   transactions?: Array<{
@@ -316,14 +330,14 @@ export interface FirmwareFileListResponse {
   limit: number;
 }
 
+// State machine v2 (post-migration 35): completion is driven by BootNotification,
+// not the unreliable FirmwareStatusNotification channel. Intermediate states
+// (DOWNLOADING/DOWNLOADED/INSTALLING) and split failure states
+// (DOWNLOAD_FAILED/INSTALLATION_FAILED) were collapsed.
 export type FirmwareUpdateStatus =
   | 'PENDING'
-  | 'DOWNLOADING'
-  | 'DOWNLOADED'
-  | 'INSTALLING'
   | 'INSTALLED'
-  | 'DOWNLOAD_FAILED'
-  | 'INSTALLATION_FAILED'
+  | 'FAILED'
   | 'CANCELLED';
 
 export interface FirmwareUpdate {
@@ -336,7 +350,9 @@ export interface FirmwareUpdate {
   started_at?: string;
   completed_at?: string;
   error_message?: string;
-  retry_count?: number;
+  attempt_count: number;
+  last_attempt_at?: string;
+  next_retry_at?: string;
   firmware_version?: string;
 }
 
@@ -371,8 +387,6 @@ export interface BulkUpdateResult {
 
 export interface UpdateStatusSummary {
   pending: number;
-  downloading: number;
-  installing: number;
   completed_today: number;
   failed_today: number;
 }
@@ -385,6 +399,9 @@ export interface UpdateStatusDashboard {
     charge_point_id: string;
     firmware_version: string;
     status: FirmwareUpdateStatus;
+    attempt_count: number;
+    last_attempt_at?: string;
+    next_retry_at?: string;
     started_at?: string;
     initiated_at: string;
   }>;
@@ -488,6 +505,7 @@ export interface QRPayment {
   razorpay_gst?: string;
   fee_source?: string;
   refund_amount?: string;
+  razorpay_refund_speed_processed?: string | null;
   status: QRPaymentStatus;
   failure_reason?: string;
   transaction_id?: number;
@@ -499,4 +517,206 @@ export interface QRPaymentListResponse {
   total: number;
   page: number;
   limit: number;
+}
+
+// ─── Franchisee Types ──────────────────────────────────────────────
+
+export interface Franchisee {
+  id: number;
+  business_name: string;
+  business_type?: string | null;
+  contact_name: string;
+  contact_email: string;
+  contact_phone: string;
+  address?: string | null;
+  pan_number?: string | null;
+  gstin?: string | null;
+  tan_number?: string | null;
+  city?: string | null;
+  state?: string | null;
+  state_code?: string | null;
+  pincode?: string | null;
+  commission_percent: number;
+  tds_rate_percent: number;
+  status: string;
+  status_reason?: string | null;
+  razorpay_account_id?: string | null;
+  razorpay_account_status?: string | null;
+  razorpay_product_id?: string | null;
+  razorpay_onboarding_url?: string | null;
+  transfers_enabled: boolean;
+  funds_on_hold: boolean;
+  bank_account_name?: string | null;
+  bank_account_number?: string | null;
+  bank_ifsc_code?: string | null;
+  bank_account_type?: string | null;
+  kyc_verifications?: Record<string, unknown> | null;
+  station_count: number;
+  total_invoiced: string;
+  total_transferred: string;
+  activated_at?: string | null;
+  created_at: string;
+  updated_at: string;
+  notes?: string | null;
+}
+
+export interface FranchiseeCreate {
+  business_name: string;
+  contact_name: string;
+  contact_email: string;
+  contact_phone: string;
+  commission_percent?: number;
+  tds_rate_percent?: number;
+  notes?: string;
+}
+
+export interface FranchiseeUpdate {
+  business_name?: string;
+  contact_name?: string;
+  contact_phone?: string;
+  address?: string;
+  business_type?: string;
+  pan_number?: string;
+  gstin?: string;
+  tan_number?: string;
+  city?: string;
+  state?: string;
+  state_code?: string;
+  pincode?: string;
+  bank_account_name?: string;
+  bank_account_number?: string;
+  bank_ifsc_code?: string;
+  bank_account_type?: string;
+  notes?: string;
+}
+
+export interface StakeholderResidential {
+  street?: string;
+  city?: string;
+  state?: string;
+  postal_code?: string;
+  country?: string;
+}
+
+export interface FranchiseeStakeholder {
+  id: number;
+  razorpay_stakeholder_id: string | null;
+  name: string;
+  email: string;
+  phone_primary?: string | null;
+  relationship_director: boolean;
+  relationship_executive: boolean;
+  pan_number?: string | null;
+  residential_street?: string | null;
+  residential_city?: string | null;
+  residential_state?: string | null;
+  residential_postal_code?: string | null;
+  residential_country?: string | null;
+  created_at: string;
+}
+
+export interface StakeholderCreate {
+  name: string;
+  email: string;
+  phone_primary?: string;
+  relationship_director?: boolean;
+  relationship_executive?: boolean;
+  pan_number?: string;
+  residential?: StakeholderResidential;
+}
+
+export interface StakeholderUpdate {
+  name?: string;
+  email?: string;
+  phone_primary?: string;
+  relationship_director?: boolean;
+  relationship_executive?: boolean;
+  pan_number?: string;
+  residential?: StakeholderResidential;
+}
+
+export interface RazorpayApiLog {
+  id: number;
+  created_at: string;
+  method: string;
+  endpoint: string;
+  request_body?: Record<string, unknown> | null;
+  response_status?: number | null;
+  response_body?: Record<string, unknown> | null;
+  success: boolean;
+  error_message?: string | null;
+  razorpay_account_id?: string | null;
+}
+
+export interface SubmitKYCResponse {
+  product_id: string;
+  activation_status: string;
+  requirements: Array<{
+    field_reference: string;
+    status: string;
+    reason_code: string;
+    resolution_url?: string;
+  }>;
+  stakeholder_count: number;
+}
+
+export interface AdminSettlementEntry {
+  id: number;
+  transaction_id: number;
+  payment_method: string;
+  gross_amount: string;
+  refund_amount: string;
+  pg_fee_amount: string;
+  net_amount: string;
+  gst_collected: string;
+  net_excl_gst: string;
+  commission_percent: string;
+  platform_commission: string;
+  tds_amount: string;
+  transfer_fee: string;
+  franchisee_payout: string;
+  energy_consumed_kwh: number;
+  settlement_status: string;
+  razorpay_payment_id?: string | null;
+  razorpay_transfer_id?: string | null;
+  failure_reason?: string | null;
+  retry_count: number;
+  created_at: string;
+}
+
+export interface FranchiseeListResponse {
+  data: Franchisee[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+export interface CommissionUpdate {
+  new_percent: number;
+  reason: string;
+  effective_from: string;
+  notes?: string;
+}
+
+export interface CommissionAuditEntry {
+  id: number;
+  previous_percent?: number | null;
+  new_percent: number;
+  reason: string;
+  effective_from: string;
+  notes?: string | null;
+  changed_by_email?: string | null;
+  created_at: string;
+}
+
+export interface FranchiseeStation {
+  id: number;
+  name: string;
+  address?: string;
+  latitude?: number;
+  longitude?: number;
+  state?: string;
+  state_code?: string;
+  pincode?: string;
+  charger_count: number;
 }

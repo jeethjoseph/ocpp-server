@@ -1,15 +1,19 @@
 # routers/chargers.py
+from decimal import Decimal
 from typing import List, Optional, Dict
 from fastapi import APIRouter, HTTPException, Query, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime, timedelta, timezone
 import uuid
 import logging
 
+from core.config import RAZORPAY_PLATFORM_FEE_PERCENT
 from models import Charger, ChargingStation, Connector, Transaction, OCPPLog, User, ChargerError, Tariff
 from tortoise.exceptions import IntegrityError
+from tortoise.transactions import in_transaction
 from auth_middleware import require_admin, require_user_or_admin
 from crud import log_audit_event
+from services.tariff_utils import back_derive_rate_per_kwh
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +24,11 @@ class ConnectorInput(BaseModel):
     max_power_kw: Optional[float] = None
 
 class ChargerCreate(BaseModel):
+    """ADR 0003: tariff is operator-typed as the all-inclusive per-kWh rate
+    (`tariff_per_kwh_all_in`). The legacy `tariff_per_kwh` / `tariff_per_kwh_incl_tax`
+    request fields are rejected via `extra='forbid'`."""
+    model_config = {"extra": "forbid"}
+
     station_id: int
     name: str
     model: Optional[str] = None
@@ -27,15 +36,25 @@ class ChargerCreate(BaseModel):
     serial_number: Optional[str] = None
     external_charger_id: Optional[str] = None
     connectors: List[ConnectorInput]
-    tariff_per_kwh: Optional[float] = None
+    tariff_per_kwh_all_in: Optional[float] = Field(
+        None, ge=1.0, le=100.0,
+        description="All-inclusive per-kWh tariff (incl. GST + 2% gateway fee). 1.0–100.0.",
+    )
+
 
 class ChargerUpdate(BaseModel):
+    """ADR 0003: see ChargerCreate."""
+    model_config = {"extra": "forbid"}
+
     name: Optional[str] = None
     model: Optional[str] = None
     vendor: Optional[str] = None
     latest_status: Optional[str] = None
     external_charger_id: Optional[str] = None
-    tariff_per_kwh: Optional[float] = None
+    tariff_per_kwh_all_in: Optional[float] = Field(
+        None, ge=1.0, le=100.0,
+        description="All-inclusive per-kWh tariff (incl. GST + 2% gateway fee). 1.0–100.0.",
+    )
 
 class LatestErrorInfo(BaseModel):
     """Summary of latest unresolved error for a charger"""
@@ -59,8 +78,9 @@ class ChargerResponse(BaseModel):
     connection_status: bool
     created_at: datetime
     updated_at: datetime
-    tariff_per_kwh: Optional[float] = None
+    tariff_per_kwh: Optional[float] = None  # back-derived; internal billing math
     tariff_gst_percent: Optional[float] = None
+    tariff_per_kwh_all_in: Optional[float] = None  # operator-set, customer-displayed
     latest_error: Optional[LatestErrorInfo] = None
 
     class Config:
@@ -156,8 +176,13 @@ async def get_bulk_connection_status(chargers: List[Charger]) -> Dict[str, bool]
     
     return status_dict
 
-def charger_to_response(charger: Charger, connection_status: bool, latest_error: Optional[ChargerError] = None) -> ChargerResponse:
-    """Convert a Charger model to ChargerResponse with connection status and latest error"""
+def charger_to_response(
+    charger: Charger,
+    connection_status: bool,
+    latest_error: Optional[ChargerError] = None,
+    tariff: Optional[Tariff] = None,
+) -> ChargerResponse:
+    """Convert a Charger model to ChargerResponse with connection status, latest error, and tariff"""
     error_info = None
     if latest_error:
         error_info = LatestErrorInfo(
@@ -166,6 +191,10 @@ def charger_to_response(charger: Charger, connection_status: bool, latest_error:
             info=latest_error.info,
             created_at=latest_error.created_at
         )
+
+    tariff_rate = float(tariff.rate_per_kwh) if tariff else None
+    tariff_gst = float(tariff.gst_percent) if tariff else None
+    tariff_all_in = float(tariff.tariff_per_kwh_all_in) if tariff else None
 
     return ChargerResponse(
         id=charger.id,
@@ -182,8 +211,30 @@ def charger_to_response(charger: Charger, connection_status: bool, latest_error:
         created_at=charger.created_at,
         updated_at=charger.updated_at,
         connection_status=connection_status,
-        latest_error=error_info
+        latest_error=error_info,
+        tariff_per_kwh=tariff_rate,
+        tariff_gst_percent=tariff_gst,
+        tariff_per_kwh_all_in=tariff_all_in,
     )
+
+
+async def get_applicable_tariffs_for_chargers(charger_ids: List[int]) -> Dict[int, Tariff]:
+    """Bulk-resolve the applicable tariff for each charger.
+    Priority: charger-specific tariff -> global tariff."""
+    if not charger_ids:
+        return {}
+
+    specific = await Tariff.filter(charger_id__in=charger_ids)
+    by_charger = {t.charger_id: t for t in specific}
+
+    missing = [cid for cid in charger_ids if cid not in by_charger]
+    if missing:
+        global_tariff = await Tariff.filter(is_global=True).first()
+        if global_tariff:
+            for cid in missing:
+                by_charger[cid] = global_tariff
+
+    return by_charger
 
 async def get_latest_errors_for_chargers(charger_ids: List[int]) -> Dict[int, ChargerError]:
     """Get the latest unresolved error for multiple chargers efficiently"""
@@ -246,12 +297,18 @@ async def list_chargers(
     charger_ids = [c.id for c in chargers]
     error_dict = await get_latest_errors_for_chargers(charger_ids)
 
-    # Build response with connection status and errors
+    # Bulk-resolve applicable tariff per charger (charger-specific or global fallback)
+    tariff_dict = await get_applicable_tariffs_for_chargers(charger_ids)
+
+    # Build response with connection status, errors, and tariff
     charger_responses = []
     for charger in chargers:
         connection_status = connection_status_dict.get(charger.charge_point_string_id, False)
         latest_error = error_dict.get(charger.id)
-        charger_responses.append(charger_to_response(charger, connection_status, latest_error))
+        tariff = tariff_dict.get(charger.id)
+        charger_responses.append(
+            charger_to_response(charger, connection_status, latest_error, tariff)
+        )
 
     return ChargerListResponse(
         data=charger_responses,
@@ -273,30 +330,45 @@ async def create_charger(charger_data: ChargerCreate, admin_user: User = Depends
     charge_point_id = str(uuid.uuid4())
     
     try:
-        # Create charger
-        charger = await Charger.create(
-            charge_point_string_id=charge_point_id,
-            external_charger_id=charger_data.external_charger_id,
-            station_id=charger_data.station_id,
-            name=charger_data.name,
-            model=charger_data.model,
-            vendor=charger_data.vendor,
-            serial_number=charger_data.serial_number,
-            latest_status="Unavailable"
-        )
-        
-        # Create connectors
-        for connector_input in charger_data.connectors:
-            await Connector.create(
-                charger_id=charger.id,
-                connector_id=connector_input.connector_id,
-                connector_type=connector_input.connector_type,
-                max_power_kw=connector_input.max_power_kw
+        # All three writes (Charger + Connectors + Tariff) must succeed or fail
+        # together — otherwise a partial-failure scenario leaves an orphan
+        # charger row with no connectors or no tariff. Issue 05 / M6.
+        # Audit log stays OUTSIDE the transaction so the "we attempted this"
+        # trail is preserved even on rollback.
+        async with in_transaction():
+            charger = await Charger.create(
+                charge_point_string_id=charge_point_id,
+                external_charger_id=charger_data.external_charger_id,
+                station_id=charger_data.station_id,
+                name=charger_data.name,
+                model=charger_data.model,
+                vendor=charger_data.vendor,
+                serial_number=charger_data.serial_number,
+                latest_status="Unavailable"
             )
 
-        # Create charger-specific tariff if provided
-        if charger_data.tariff_per_kwh is not None:
-            await Tariff.create(charger=charger, rate_per_kwh=charger_data.tariff_per_kwh)
+            for connector_input in charger_data.connectors:
+                await Connector.create(
+                    charger_id=charger.id,
+                    connector_id=connector_input.connector_id,
+                    connector_type=connector_input.connector_type,
+                    max_power_kw=connector_input.max_power_kw
+                )
+
+            # Create charger-specific tariff if provided.
+            # The operator types the all-inclusive per-kWh rate; we back-derive
+            # rate_per_kwh server-side and persist both. ADR 0003.
+            if charger_data.tariff_per_kwh_all_in is not None:
+                gst_default = Tariff._meta.fields_map["gst_percent"].default
+                gst = Decimal(str(gst_default))
+                all_in = Decimal(str(charger_data.tariff_per_kwh_all_in))
+                rate = back_derive_rate_per_kwh(all_in, gst, RAZORPAY_PLATFORM_FEE_PERCENT)
+                await Tariff.create(
+                    charger=charger,
+                    rate_per_kwh=rate,
+                    tariff_per_kwh_all_in=all_in,
+                    gst_percent=gst,
+                )
 
         await log_audit_event(
             action="charger.created",
@@ -314,12 +386,37 @@ async def create_charger(charger_data: ChargerCreate, admin_user: User = Depends
         # Get connection status for response (new charger won't be connected yet)
         connection_status_dict = await get_bulk_connection_status([charger])
         connection_status = connection_status_dict.get(charger.charge_point_string_id, False)
+        applicable_tariff = (await get_applicable_tariffs_for_chargers([charger.id])).get(charger.id)
         return {
-            "charger": charger_to_response(charger, connection_status),
+            "charger": charger_to_response(charger, connection_status, tariff=applicable_tariff),
             "ocpp_url": ocpp_url,
             "message": "Charger onboarded successfully"
         }
     except IntegrityError as e:
+        # The transaction has already rolled back at this point — no Charger /
+        # Connector / Tariff row persists. Record the attempt anyway so the
+        # audit trail captures "operator tried, system refused" with enough
+        # context to debug. Best-effort: a secondary audit failure shouldn't
+        # mask the original 400 response.
+        try:
+            await log_audit_event(
+                action="charger.create_failed",
+                entity_type="charger",
+                entity_id=charge_point_id,
+                actor_type="admin",
+                actor=admin_user,
+                changes={
+                    "charge_point_string_id": charge_point_id,
+                    "station_id": charger_data.station_id,
+                    "name": charger_data.name,
+                    "failure_reason": str(e),
+                },
+            )
+        except Exception as audit_err:
+            logger.warning(
+                "Failed to write rollback audit for charger create attempt %s: %s",
+                charge_point_id, audit_err,
+            )
         raise HTTPException(status_code=400, detail="Charger creation failed - check serial number or external charger ID uniqueness")
 
 @router.get("/{charger_id}", response_model=ChargerDetailResponse)
@@ -338,7 +435,6 @@ async def get_charger_details(charger_id: int, user: User = Depends(require_user
     # Get applicable tariff for this charger
     from services.wallet_service import WalletService
     tariff = await WalletService.get_applicable_tariff(charger_id)
-    tariff_rate = tariff.rate_per_kwh if tariff else None
 
     # Get current active transaction if any
     current_transaction = await Transaction.filter(
@@ -368,14 +464,11 @@ async def get_charger_details(charger_id: int, user: User = Depends(require_user
     ).order_by("-created_at").first()
 
     # Build charger response with tariff and error
-    charger_response = charger_to_response(charger, connection_status, latest_error)
-    charger_dict = charger_response.model_dump()
-    charger_dict['tariff_per_kwh'] = float(tariff_rate) if tariff_rate else None
-    charger_dict['tariff_gst_percent'] = float(tariff.gst_percent) if tariff else None
+    charger_response = charger_to_response(charger, connection_status, latest_error, tariff)
 
     # Build response
     response = ChargerDetailResponse(
-        charger=ChargerResponse(**charger_dict),
+        charger=charger_response,
         station=StationBasicInfo.model_validate(station, from_attributes=True),
         connectors=[ConnectorResponse.model_validate(c, from_attributes=True) for c in connectors]
     )
@@ -412,12 +505,25 @@ async def update_charger(charger_id: int, update_data: ChargerUpdate, admin_user
     # Update only provided fields
     update_dict = update_data.model_dump(exclude_unset=True)
 
-    # Handle tariff separately (not a Charger model field)
-    tariff_per_kwh = update_dict.pop("tariff_per_kwh", None)
-    if tariff_per_kwh is not None:
+    # Tariff is handled out-of-band — back-derive rate_per_kwh from the
+    # operator-typed all-in value and persist both columns. ADR 0003.
+    tariff_per_kwh_all_in = update_dict.pop("tariff_per_kwh_all_in", None)
+    if tariff_per_kwh_all_in is not None:
+        existing = await Tariff.filter(charger_id=charger_id).first()
+        if existing:
+            gst = existing.gst_percent
+        else:
+            gst_default = Tariff._meta.fields_map["gst_percent"].default
+            gst = Decimal(str(gst_default))
+        all_in = Decimal(str(tariff_per_kwh_all_in))
+        rate = back_derive_rate_per_kwh(all_in, gst, RAZORPAY_PLATFORM_FEE_PERCENT)
         await Tariff.update_or_create(
-            defaults={"rate_per_kwh": tariff_per_kwh},
-            charger_id=charger_id
+            defaults={
+                "rate_per_kwh": rate,
+                "tariff_per_kwh_all_in": all_in,
+                "gst_percent": gst,
+            },
+            charger_id=charger_id,
         )
 
     for field, value in update_dict.items():
@@ -440,8 +546,9 @@ async def update_charger(charger_id: int, update_data: ChargerUpdate, admin_user
     # Get connection status for response
     connection_status_dict = await get_bulk_connection_status([charger])
     connection_status = connection_status_dict.get(charger.charge_point_string_id, False)
+    applicable_tariff = (await get_applicable_tariffs_for_chargers([charger.id])).get(charger.id)
     return {
-        "charger": charger_to_response(charger, connection_status),
+        "charger": charger_to_response(charger, connection_status, tariff=applicable_tariff),
         "message": "Charger updated successfully"
     }
 
@@ -603,23 +710,56 @@ async def remote_stop_charging(charger_id: int, reason: Optional[str] = "Request
 async def change_charger_availability(
     charger_id: int,
     type: str = Query(..., regex="^(Inoperative|Operative)$"),
-    connector_id: int = Query(..., ge=0),
+    connector_id: int = Query(..., ge=0,
+        description="Must be 0 — admin operates at whole-charger granularity. See docstring."),
     admin_user: User = Depends(require_admin())
 ):
     """
-    Change charger availability (Operative/Inoperative) - OCPP 1.6 compliant
+    Change charger availability (Operative/Inoperative) — OCPP 1.6 compliant.
 
-    Per OCPP 1.6 spec, ChangeAvailability can be sent at any time.
-    The charger responds with:
+    Per OCPP 1.6 spec, ChangeAvailability can be sent at any time. The charger
+    responds with:
     - Accepted: Change applied immediately
     - Scheduled: Will change after current transaction ends
     - Rejected: Cannot comply (e.g., hardware fault)
+
+    Contract notes:
+    - `connector_id` must be 0 (whole-charger semantic per OCPP 1.6). The
+      admin UI doesn't expose per-connector control; the validator rejects
+      anything else with 422 so a curl/ops typo doesn't send a doomed
+      OCPP message. If per-connector toggle becomes a product feature later,
+      relax the ceiling and add the UI affordance together.
+    - `type` uses OCPP vocabulary (Operative/Inoperative). The parallel
+      franchisee endpoint at `routers/franchisee_portal.change_availability`
+      uses a `?available=bool` query param instead — this divergence is
+      intentional (admins are debugging an OCPP layer; franchisees want a
+      self-serve boolean). See docs/v1/comprehensive-architecture-documentation.md
+      "Charger control surface" for the rationale; do not unify them blindly.
     """
+
+    # Whole-charger semantics only — see contract notes in docstring. Explicit
+    # check (not a Pydantic le=0) so the 422 message names the constraint
+    # instead of "Input should be less than or equal to 0".
+    if connector_id != 0:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "connector_id must be 0 — admin availability toggle operates "
+                "at whole-charger granularity. Per-connector control is not "
+                "exposed via the admin API."
+            ),
+        )
 
     charger = await Charger.filter(id=charger_id).first()
     if not charger:
         raise HTTPException(status_code=404, detail="Charger not found")
 
+    # Snapshot the charger's state at the moment the operator clicked. This is
+    # captured BEFORE the OCPP exchange so `previous_status` reflects "what
+    # was the charger doing when the operator pressed the button" — the right
+    # audit semantic. (An earlier revision read it AFTER the exchange; that
+    # broke the field's meaning whenever the charger Accepted and immediately
+    # fired a StatusNotification reflecting the new state.)
     current_status = charger.latest_status
 
     # Check if charger is connected (via Redis - works across all workers)
@@ -658,7 +798,6 @@ async def change_charger_availability(
             "ocpp_response": ocpp_status,
             "type": type,
             "previous_status": current_status,
-            "note": "Scheduled" if ocpp_status == "Scheduled" else None
         }
     else:
         raise HTTPException(status_code=500, detail=f"Failed to change availability: {response}")

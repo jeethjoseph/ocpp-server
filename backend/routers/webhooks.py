@@ -151,6 +151,25 @@ async def handle_user_created(data: dict):
                     f"existing DB user (ID={existing_user.id}) has a different Clerk account. "
                     f"User record NOT updated. Manually resolve this conflict."
                 )
+                return
+
+            # Self-heal role drift: the frontend middleware routes on Clerk
+            # public_metadata.role, so if our authoritative DB role
+            # disagrees with what Clerk holds (e.g. a franchisee signed up
+            # without an invitation, or an invitation's metadata got
+            # stripped), push the DB role back to Clerk. USER is the
+            # default and safe to skip to avoid needless API calls.
+            db_role = existing_user.role.value if hasattr(existing_user.role, "value") else str(existing_user.role)
+            clerk_role = public_metadata.get("role")
+            if db_role != "USER" and db_role != clerk_role:
+                from services.clerk_invitation_service import push_role_to_clerk
+                try:
+                    await push_role_to_clerk(clerk_user_id, db_role)
+                except Exception:
+                    logger.exception(
+                        "Role sync to Clerk failed for %s — will retry on next login.",
+                        primary_email,
+                    )
             return
         
         # Generate unique RFID/ID tag for OCPP
@@ -172,9 +191,21 @@ async def handle_user_created(data: dict):
             rfid_card_id=rfid_card_id
         )
         
-        # Create wallet for user
-        await Wallet.create(user=user, balance=0.00)
-        
+        # Internal-role users (ADMIN, FRANCHISEE) don't get a wallet — their
+        # sessions are operational, not customer-facing. See ADR 0004 and
+        # `services/wallet_service.py` for the runtime skip that handles any
+        # legacy backfilled wallets defensively. Promotion USER → ADMIN keeps
+        # the existing wallet (orphaned, never touched); demotion ADMIN → USER
+        # is handled lazily at `routers/wallet_payments.py` on first top-up.
+        from core.roles import INTERNAL_ROLES
+        if user_role not in INTERNAL_ROLES:
+            await Wallet.create(user=user)
+        else:
+            logger.info(
+                f"Skipping wallet creation for internal-role ({user_role.value}) "
+                f"user {primary_email} per ADR 0004"
+            )
+
         logger.info(f"Created new user {primary_email} from Clerk webhook")
 
         await log_webhook_event(
@@ -353,6 +384,22 @@ async def handle_razorpay_webhook(
         # Handle QR code credited event (appless charging payment)
         elif event_type == "qr_code.credited":
             await handle_qr_code_credited(event_data)
+
+        # Razorpay Route: account lifecycle
+        elif event_type.startswith("account."):
+            await handle_account_event(event_type, event_data)
+
+        # Razorpay Route: transfer lifecycle
+        elif event_type.startswith("transfer."):
+            await handle_transfer_event(event_type, event_data)
+
+        # Razorpay Route: settlement lifecycle (money landing in linked account bank)
+        elif event_type.startswith("settlement."):
+            await handle_settlement_event(event_type, event_data)
+
+        # Refund lifecycle (customer refund has left Razorpay)
+        elif event_type.startswith("refund."):
+            await handle_refund_event(event_type, event_data)
 
         else:
             logger.info(f"Unhandled Razorpay webhook event: {event_type}")
@@ -624,3 +671,199 @@ async def handle_qr_code_credited(event_data: dict):
             status="failed",
             error_message=str(e),
         )
+
+
+async def handle_account_event(event_type: str, event_data: dict):
+    """Handle Razorpay Route account lifecycle webhooks."""
+    try:
+        account_data = event_data.get("account", {}).get("entity", {})
+        if not account_data:
+            logger.warning("No account entity in %s webhook", event_type)
+            return
+
+        from services.franchisee_onboarding_service import FranchiseeOnboardingService
+        await FranchiseeOnboardingService.handle_account_webhook(
+            event_type, account_data
+        )
+
+        await log_webhook_event(
+            source=WebhookSourceEnum.RAZORPAY,
+            event_type=event_type,
+            event_id=account_data.get("id"),
+            payload=event_data,
+            status="processed",
+        )
+    except Exception as e:
+        logger.error("Error handling %s webhook: %s", event_type, e, exc_info=True)
+        await log_webhook_event(
+            source=WebhookSourceEnum.RAZORPAY,
+            event_type=event_type,
+            event_id=event_data.get("account", {}).get("entity", {}).get("id"),
+            payload=event_data,
+            status="failed",
+            error_message=str(e),
+        )
+
+
+async def handle_transfer_event(event_type: str, event_data: dict):
+    """Handle Razorpay Route transfer lifecycle webhooks."""
+    try:
+        transfer_data = event_data.get("transfer", {}).get("entity", {})
+        if not transfer_data:
+            logger.warning("No transfer entity in %s webhook", event_type)
+            return
+
+        from services.franchisee_settlement_service import FranchiseeSettlementService
+        await FranchiseeSettlementService.handle_transfer_webhook(
+            event_type, transfer_data
+        )
+
+        await log_webhook_event(
+            source=WebhookSourceEnum.RAZORPAY,
+            event_type=event_type,
+            event_id=transfer_data.get("id"),
+            payload=event_data,
+            status="processed",
+        )
+    except Exception as e:
+        logger.error("Error handling %s webhook: %s", event_type, e, exc_info=True)
+        await log_webhook_event(
+            source=WebhookSourceEnum.RAZORPAY,
+            event_type=event_type,
+            event_id=event_data.get("transfer", {}).get("entity", {}).get("id"),
+            payload=event_data,
+            status="failed",
+            error_message=str(e),
+        )
+
+
+async def handle_settlement_event(event_type: str, event_data: dict):
+    """Handle Razorpay Route settlement webhooks (money landed in the
+    linked account's bank). Used to close out ledger entries and record
+    actual transfer fees."""
+    try:
+        settlement_data = event_data.get("settlement", {}).get("entity", {})
+        if not settlement_data:
+            logger.warning("No settlement entity in %s webhook", event_type)
+            return
+
+        from services.franchisee_settlement_service import FranchiseeSettlementService
+        await FranchiseeSettlementService.handle_settlement_webhook(
+            event_type, settlement_data
+        )
+
+        await log_webhook_event(
+            source=WebhookSourceEnum.RAZORPAY,
+            event_type=event_type,
+            event_id=settlement_data.get("id"),
+            payload=event_data,
+            status="processed",
+        )
+    except Exception as e:
+        logger.error("Error handling %s webhook: %s", event_type, e, exc_info=True)
+        await log_webhook_event(
+            source=WebhookSourceEnum.RAZORPAY,
+            event_type=event_type,
+            event_id=event_data.get("settlement", {}).get("entity", {}).get("id"),
+            payload=event_data,
+            status="failed",
+            error_message=str(e),
+        )
+
+
+async def handle_refund_event(event_type: str, event_data: dict):
+    """Handle Razorpay refund lifecycle webhooks (refund.processed /
+    refund.failed). Stamps the corresponding QRPayment row so we know
+    the customer refund has actually left Razorpay."""
+    try:
+        from models import QRPayment
+
+        refund = event_data.get("refund", {}).get("entity", {})
+        if not refund:
+            logger.warning("No refund entity in %s webhook", event_type)
+            return
+
+        refund_id = refund.get("id")
+        if not refund_id:
+            return
+
+        qr_payment = await QRPayment.filter(razorpay_refund_id=refund_id).first()
+        if not qr_payment:
+            # Refund might be on a non-QR payment (e.g. wallet top-up),
+            # which we don't track a per-row lifecycle for today.
+            logger.info(
+                "No QRPayment for refund %s (%s) — skipping",
+                refund_id, event_type,
+            )
+            await log_webhook_event(
+                source=WebhookSourceEnum.RAZORPAY,
+                event_type=event_type,
+                event_id=refund_id,
+                payload=event_data,
+                status="processed",
+            )
+            return
+
+        if event_type == "refund.processed":
+            qr_payment.refund_processed_at = time_now_utc()
+            qr_payment.refund_failure_reason = None
+            speed = refund.get("speed_processed")
+            if speed:
+                qr_payment.razorpay_refund_speed_processed = speed
+            await qr_payment.save()
+            logger.info(
+                "Refund processed for QR payment %s (refund=%s, speed=%s)",
+                qr_payment.id, refund_id, speed or "unchanged",
+            )
+        elif event_type == "refund.failed":
+            reason = (
+                refund.get("error", {}).get("description")
+                or refund.get("status_reason")
+                or "unknown"
+            )
+            qr_payment.refund_failure_reason = str(reason)[:500]
+            await qr_payment.save()
+            logger.error(
+                "Refund failed for QR payment %s (refund=%s): %s",
+                qr_payment.id, refund_id, reason,
+            )
+        elif event_type == "refund.speed_changed":
+            # Razorpay can silently downgrade instant→normal (or upgrade) when
+            # the bank rails change their mind mid-flight. Capture the new
+            # `speed_processed` so the customer-facing ETA stays honest;
+            # see ADR 0005.
+            new_speed = refund.get("speed_processed")
+            if new_speed:
+                qr_payment.razorpay_refund_speed_processed = new_speed
+                await qr_payment.save()
+                logger.info(
+                    "Refund speed changed for QR payment %s (refund=%s): %s",
+                    qr_payment.id, refund_id, new_speed,
+                )
+            else:
+                logger.warning(
+                    "refund.speed_changed for %s missing speed_processed", refund_id,
+                )
+
+        await log_webhook_event(
+            source=WebhookSourceEnum.RAZORPAY,
+            event_type=event_type,
+            event_id=refund_id,
+            payload=event_data,
+            status="processed",
+        )
+    except Exception as e:
+        logger.error("Error handling %s webhook: %s", event_type, e, exc_info=True)
+        await log_webhook_event(
+            source=WebhookSourceEnum.RAZORPAY,
+            event_type=event_type,
+            event_id=event_data.get("refund", {}).get("entity", {}).get("id"),
+            payload=event_data,
+            status="failed",
+            error_message=str(e),
+        )
+
+
+def time_now_utc():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc)

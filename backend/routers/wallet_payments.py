@@ -125,7 +125,7 @@ async def create_recharge_order(
         wallet = await Wallet.filter(user=current_user).first()
         if not wallet:
             # Create wallet if it doesn't exist
-            wallet = await Wallet.create(user=current_user, balance=Decimal('0.00'))
+            wallet = await Wallet.create(user=current_user)
             logger.info(f"Created wallet for user {current_user.id}")
 
         # Convert amount to Decimal
@@ -252,7 +252,7 @@ async def verify_payment(
             return VerifyPaymentResponse(
                 success=True,
                 message="Payment already verified",
-                wallet_balance=float(wallet.balance),
+                wallet_balance=float(await WalletService.get_balance(wallet.id)),
                 transaction_id=wallet_transaction.id
             )
 

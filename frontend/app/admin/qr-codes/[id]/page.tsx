@@ -31,6 +31,25 @@ function getStatusBadge(status: QRPaymentStatus) {
   return <Badge variant={variants[status] || "outline"}>{status}</Badge>;
 }
 
+function getRefundSpeedBadge(speed?: string | null) {
+  if (!speed) return null;
+  if (speed === "instant") {
+    return (
+      <Badge
+        variant="outline"
+        className="bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400 border-transparent"
+      >
+        Instant
+      </Badge>
+    );
+  }
+  return (
+    <Badge variant="secondary">
+      Normal (5-7 days)
+    </Badge>
+  );
+}
+
 export default function QRCodeDetailPage() {
   const params = useParams();
   const qrId = parseInt(params.id as string);
@@ -227,6 +246,7 @@ export default function QRCodeDetailPage() {
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b">
+                      <th className="text-left py-3 px-2 font-medium">ID</th>
                       <th className="text-left py-3 px-2 font-medium">Date</th>
                       <th className="text-right py-3 px-2 font-medium">
                         Amount
@@ -257,6 +277,9 @@ export default function QRCodeDetailPage() {
                         key={payment.id}
                         className="border-b hover:bg-accent/50"
                       >
+                        <td className="py-3 px-2 font-mono text-xs text-muted-foreground">
+                          #{payment.id}
+                        </td>
                         <td className="py-3 px-2 text-muted-foreground">
                           {new Date(payment.created_at).toLocaleString()}
                         </td>
@@ -285,9 +308,14 @@ export default function QRCodeDetailPage() {
                             : "-"}
                         </td>
                         <td className="py-3 px-2 text-right">
-                          {payment.refund_amount
-                            ? `₹${Number(payment.refund_amount).toFixed(2)}`
-                            : "-"}
+                          {payment.refund_amount ? (
+                            <div className="flex items-center justify-end gap-1.5">
+                              <span>{`₹${Number(payment.refund_amount).toFixed(2)}`}</span>
+                              {getRefundSpeedBadge(payment.razorpay_refund_speed_processed)}
+                            </div>
+                          ) : (
+                            "-"
+                          )}
                         </td>
                         <td className="py-3 px-2">
                           {getStatusBadge(payment.status)}

@@ -4,6 +4,7 @@ from decimal import Decimal
 from unittest.mock import patch, AsyncMock, MagicMock
 
 from services.transaction_finalizer import finalize_stopped_transaction
+from services.wallet_service import WalletService
 from models import Transaction, TransactionStatusEnum, MeterValue, Wallet
 
 
@@ -46,9 +47,9 @@ class TestFinalizeStoppedTransaction:
         assert refreshed.energy_charge == Decimal("150.00")
         assert refreshed.gst_amount == Decimal("27.00")
         assert refreshed.total_billed == Decimal("177.00")
-        # Wallet should have been debited
+        # Wallet should have been debited (balance derived from the log)
         wallet = await Wallet.get(user_id=test_user.id)
-        assert wallet.balance == Decimal("500.00") - Decimal("177.00")
+        assert await WalletService.get_balance(wallet.id) == Decimal("500.00") - Decimal("177.00")
 
     @pytest.mark.asyncio
     async def test_no_meter_values_skips_billing(
@@ -72,7 +73,7 @@ class TestFinalizeStoppedTransaction:
         assert refreshed.gst_amount is None
         # Wallet untouched
         wallet = await Wallet.get(user_id=test_user.id)
-        assert wallet.balance == Decimal("500.00")
+        assert await WalletService.get_balance(wallet.id) == Decimal("500.00")
 
     @pytest.mark.asyncio
     async def test_already_stopped_is_idempotent(
@@ -96,7 +97,7 @@ class TestFinalizeStoppedTransaction:
         assert refreshed.stop_reason == "ORIGINAL_REASON"
         # Wallet should NOT have been debited
         wallet = await Wallet.get(user_id=test_user.id)
-        assert wallet.balance == Decimal("500.00")
+        assert await WalletService.get_balance(wallet.id) == Decimal("500.00")
 
     @pytest.mark.asyncio
     async def test_already_billing_failed_is_idempotent(

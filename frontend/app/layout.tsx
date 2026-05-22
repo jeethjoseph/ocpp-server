@@ -20,7 +20,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "OCPP Admin Dashboard",
+  title: "voltNOW EV Charging",
   description: "EV Charging Station Management System",
 };
 

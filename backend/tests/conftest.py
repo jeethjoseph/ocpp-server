@@ -21,13 +21,49 @@ from models import (
 )
 from auth_middleware import get_current_user_with_db
 
-# Test database configuration
-# Reads TEST_DATABASE_URL env var so tests can run via `docker exec ocpp-backend pytest ...`
-# (where postgres is reachable as host `postgres`) and also via local venv if needed.
+# Test database configuration.
+# Default targets the postgres container's hostname (`postgres`) since the
+# expected runner is `docker exec ocpp-backend pytest ...` per CLAUDE.md.
+# Override TEST_DATABASE_URL when running outside the container.
 TEST_DB_URL = os.environ.get(
     "TEST_DATABASE_URL",
-    "postgres://test_user:test_pass@localhost:5432/test_ocpp_db",
+    "postgres://test_user:test_pass@postgres:5432/test_ocpp_db",
 )
+
+# Track whether the test schema has been (re)generated this pytest session.
+# First test in a session drops the whole `public` schema and regenerates it,
+# so column additions to models after a migration land without manual
+# intervention. Subsequent tests in the same session reuse the schema and
+# just clear rows in the per-function fixture below — keeps the sweep fast.
+_SCHEMA_GENERATED_THIS_SESSION = False
+
+
+@pytest.fixture(autouse=True)
+def _flush_public_endpoint_rate_limit_keys():
+    """Public endpoints (`/api/public/qr-transactions/*`) use a 20-req/min
+    per-IP rate limiter backed by Redis (`public_qr_transactions:*`).
+    Function-scoped autouse flush so every test starts with a clean
+    window — otherwise the cumulative request count across the suite
+    trips the limiter on the last few tests of `test_invoice_pdf_endpoint`
+    (each test makes 1-2 requests but ~20 tests collectively cross the
+    threshold within 60s). Cost is one Redis DEL per test (~ms).
+
+    Uses the synchronous redis client (not asyncio) — calling
+    `asyncio.run()` from inside a sync pytest fixture that's used
+    alongside pytest-asyncio's async tests clashes with pytest-asyncio's
+    event-loop management."""
+    import redis as _sync_redis
+    redis_url = os.environ.get("REDIS_URL", "redis://redis:6379/0")
+    try:
+        client = _sync_redis.from_url(redis_url, decode_responses=True)
+        keys = client.keys("ratelimit:public_qr_transactions:*")
+        keys += client.keys("ratelimit:public_qr_active_sessions:*")
+        if keys:
+            client.delete(*keys)
+        client.close()
+    except Exception:
+        pass  # Redis unavailable in some test envs — non-fatal
+    yield
 
 @pytest.fixture(scope="module")
 def anyio_backend():
@@ -53,7 +89,22 @@ async def client() -> AsyncGenerator[AsyncClient, None]:
         mock_redis.remove_connected_charger = AsyncMock(return_value=True)
         mock_redis.get_charger_connected_at = AsyncMock(return_value=None)
         
-        # Initialize test database
+        # Initialize test database.
+        # Tortoise.init() internally calls close_all(discard=True) on any
+        # existing connections. When a prior test exits inside an @atomic()
+        # block (or its sync TestClient counterpart leaks into our loop),
+        # the current connection is a TransactionWrapper that doesn't have
+        # `_template`, and base_postgres.client.close() crashes with
+        # AttributeError: 'TransactionWrapper' object has no attribute
+        # '_template'. Bypass Tortoise's broken close path by purging the
+        # connection storage directly before Tortoise.init runs its own
+        # close_all (which would now find an empty registry).
+        from tortoise import connections as _conn
+        try:
+            _conn._clear_storage()
+        except Exception:
+            pass
+        Tortoise._inited = False
         config = {
             "connections": {"default": TEST_DB_URL},
             "apps": {
@@ -64,11 +115,31 @@ async def client() -> AsyncGenerator[AsyncClient, None]:
             },
         }
         await Tortoise.init(config=config)
-        await Tortoise.generate_schemas()
-        
+        global _SCHEMA_GENERATED_THIS_SESSION
+        if not _SCHEMA_GENERATED_THIS_SESSION:
+            # First test in this session — wipe the public schema so any new
+            # columns added to models are picked up, then regenerate.
+            # `generate_schemas(safe=True)` (default) won't add columns to
+            # existing tables, causing UndefinedColumnError surprises after
+            # migrations land. This avoids the manual "drop test_ocpp_db" step.
+            from tortoise import connections as _conn2
+            conn = _conn2.get("default")
+            await conn.execute_script(
+                "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;"
+            )
+            await Tortoise.generate_schemas()
+            _SCHEMA_GENERATED_THIS_SESSION = True
+        else:
+            await Tortoise.generate_schemas()
+
         # Clean up database before each test (order matters for FK constraints)
-        from models import WalletTransaction, MeterValue
+        from models import (
+            WalletTransaction, MeterValue,
+            CommissionLedgerEntry, FranchiseeStakeholder, Franchisee,
+        )
         await MeterValue.all().delete()
+        await CommissionLedgerEntry.all().delete()
+        await FranchiseeStakeholder.all().delete()
         await WalletTransaction.all().delete()
         await Wallet.all().delete()
         await Transaction.all().delete()
@@ -76,6 +147,7 @@ async def client() -> AsyncGenerator[AsyncClient, None]:
         await Connector.all().delete()
         await Charger.all().delete()
         await ChargingStation.all().delete()
+        await Franchisee.all().delete()
         await OCPPLog.all().delete()
         await VehicleProfile.all().delete()
         await User.all().delete()
@@ -145,6 +217,7 @@ async def test_tariff(test_charger):
     return await Tariff.create(
         charger=test_charger,
         rate_per_kwh=Decimal("15.00"),
+        tariff_per_kwh_all_in=Decimal("17.7000"),  # 15 × 1.18 — migration-equivalent backfill
         gst_percent=Decimal("18.00"),
         is_global=False,
     )
@@ -152,9 +225,95 @@ async def test_tariff(test_charger):
 
 @pytest.fixture
 async def test_wallet(test_user):
-    """Create a wallet for the test user with a default balance"""
+    """Create a wallet for the test user, seeded to ₹500 via a COMPLETED
+    TOP_UP row (balance is derived from the log; no stored column)."""
     from decimal import Decimal
-    return await Wallet.create(user=test_user, balance=Decimal("500.00"))
+    from models import WalletTransaction, TransactionTypeEnum
+    wallet = await Wallet.create(user=test_user)
+    await WalletTransaction.create(
+        wallet=wallet,
+        amount=Decimal("500.00"),
+        type=TransactionTypeEnum.TOP_UP,
+        description="Test seed top-up",
+        payment_metadata={"status": "COMPLETED"},
+    )
+    return wallet
+
+
+@pytest.fixture
+async def test_franchisee():
+    """Create a Franchisee row activated for transfers, past cooling period.
+
+    Defaults aim at the happy-path: ACTIVE status, transfers_enabled=True,
+    funds_on_hold=False, activated_at well outside the 24h cooling window.
+    Override individual fields by passing a different fixture or by
+    mutating the returned row in the test.
+    """
+    from datetime import datetime, timedelta, timezone
+    from decimal import Decimal
+    import random
+    from models import Franchisee, FranchiseeStatusEnum
+    suffix = random.randint(100000000, 999999999)
+    return await Franchisee.create(
+        business_name=f"Test Franchisee {suffix}",
+        contact_name="Test Contact",
+        contact_email=f"franchisee_{suffix}@voltlync.test",
+        contact_phone=f"9{suffix}",
+        commission_percent=Decimal("20.00"),
+        tds_rate_percent=Decimal("10.00"),
+        status=FranchiseeStatusEnum.ACTIVE,
+        razorpay_account_id=f"acc_test_{suffix}",
+        transfers_enabled=True,
+        funds_on_hold=False,
+        activated_at=datetime.now(timezone.utc) - timedelta(days=2),
+    )
+
+
+@pytest.fixture
+async def test_commission_ledger_entry(test_franchisee, test_charger, test_user):
+    """Create a CommissionLedgerEntry in PENDING state with consistent
+    commission math (gross == sum of components).
+
+    Requires `test_charger` + `test_user` so the linked Transaction row
+    exists; mirrors the production process_settlement flow.
+    """
+    from decimal import Decimal
+    from models import (
+        CommissionLedgerEntry, SettlementStatusEnum, Transaction,
+        TransactionStatusEnum,
+    )
+    txn = await Transaction.create(
+        charger=test_charger,
+        user=test_user,
+        transaction_status=TransactionStatusEnum.COMPLETED,
+    )
+    # Math (TDS on post-commission earning):
+    #   gross 1000 = refund 0 + pg 0 + gst 152.54 + commission 169.49
+    #              + tds 67.80 + payout 610.17.
+    # net_amount = 1000, net_excl_gst = 847.46, commission@20% = 169.49,
+    # earning = 847.46 - 169.49 = 677.97, tds@10% = 67.80, payout = 610.17.
+    return await CommissionLedgerEntry.create(
+        transaction=txn,
+        franchisee=test_franchisee,
+        gross_amount=Decimal("1000.00"),
+        payment_method="QR_UPI",
+        razorpay_payment_id=f"pay_test_{txn.id}",
+        refund_amount=Decimal("0.00"),
+        pg_fee_amount=Decimal("0.00"),
+        net_amount=Decimal("1000.00"),
+        gst_collected=Decimal("152.54"),
+        net_excl_gst=Decimal("847.46"),
+        commission_percent=Decimal("20.00"),
+        platform_commission=Decimal("169.49"),
+        tds_rate_percent=Decimal("10.00"),
+        tds_amount=Decimal("67.80"),
+        transfer_fee=Decimal("0.00"),
+        franchisee_payout=Decimal("610.17"),
+        energy_consumed_kwh=10.0,
+        tariff_rate_per_kwh=Decimal("15.00"),
+        settlement_status=SettlementStatusEnum.PENDING,
+        idempotency_key=f"txn_{txn.id}",
+    )
 
 
 @pytest.fixture
@@ -193,6 +352,39 @@ async def client_admin(client, test_admin_user):
         app.dependency_overrides.pop(get_current_user_with_db, None)
 
 
+@pytest.fixture
+async def test_franchisee_user(test_franchisee):
+    """Create a User with FRANCHISEE role linked to the test_franchisee row.
+
+    Mirrors `test_admin_user`. Pairs with `client_franchisee` to exercise
+    the portal endpoints under realistic auth: the User → Franchisee link is
+    what ``require_franchisee()`` resolves.
+    """
+    import random
+    suffix = random.randint(100000000, 999999999)
+    user = await User.create(
+        email=f"franchisee_user_{suffix}@voltlync.test",
+        phone_number=f"9{suffix}",
+        role=UserRoleEnum.FRANCHISEE,
+    )
+    test_franchisee.user = user
+    await test_franchisee.save()
+    return user
+
+
+@pytest.fixture
+async def client_franchisee(client, test_franchisee_user):
+    """HTTP test client with FRANCHISEE auth dependency overridden.
+
+    Use for `require_franchisee()` / `require_admin_or_franchisee()` paths.
+    """
+    app.dependency_overrides[get_current_user_with_db] = lambda: test_franchisee_user
+    try:
+        yield client
+    finally:
+        app.dependency_overrides.pop(get_current_user_with_db, None)
+
+
 # ============================================================================
 # Sync test fixtures — for tests that need FastAPI's sync TestClient
 # (in particular, OCPP WebSocket integration tests via websocket_connect()).
@@ -220,8 +412,13 @@ async def _init_test_db_async():
 
 async def _cleanup_test_db_async():
     """Delete all rows in FK-safe order."""
-    from models import WalletTransaction, MeterValue
+    from models import (
+        WalletTransaction, MeterValue,
+        CommissionLedgerEntry, FranchiseeStakeholder, Franchisee,
+    )
     await MeterValue.all().delete()
+    await CommissionLedgerEntry.all().delete()
+    await FranchiseeStakeholder.all().delete()
     await WalletTransaction.all().delete()
     await Wallet.all().delete()
     await Transaction.all().delete()
@@ -229,6 +426,7 @@ async def _cleanup_test_db_async():
     await Connector.all().delete()
     await Charger.all().delete()
     await ChargingStation.all().delete()
+    await Franchisee.all().delete()
     await OCPPLog.all().delete()
     await VehicleProfile.all().delete()
     await User.all().delete()

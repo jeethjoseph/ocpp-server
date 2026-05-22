@@ -7,6 +7,7 @@ import dynamic from "next/dynamic";
 import { Button } from "@/components/ui/button";
 import { usePublicStations } from "@/lib/queries/public-stations";
 import type { StationWithDistance } from "@/components/StationMap";
+import { formatTariffRangeAllIn } from "@/lib/utils";
 
 // Dynamic import for Leaflet to avoid SSR issues
 const Map = dynamic(() => import("@/components/StationMap"), {
@@ -131,6 +132,11 @@ export default function StationsPage() {
                     <div className="flex justify-between items-start">
                       <div className="flex-1">
                         <h3 className="font-medium text-gray-900">{station.name}</h3>
+                        {station.franchisee_name && (
+                          <p className="text-xs text-gray-500">
+                            Operator: <span className="font-medium">{station.franchisee_name}</span>
+                          </p>
+                        )}
                         <p className="text-sm text-gray-600 mb-2">{station.address}</p>
                         
                         <div className="flex items-center space-x-4 text-sm">
@@ -156,11 +162,12 @@ export default function StationsPage() {
                             {station.connector_types.join(', ')}
                           </div>
                           
-                          {station.price_per_kwh && (
-                            <div className="text-sm font-medium text-gray-900">
-                              ₹{station.price_per_kwh}/kWh
-                            </div>
-                          )}
+                          <div className="text-sm font-medium text-gray-900">
+                            {formatTariffRangeAllIn(
+                              station.min_price_per_kwh_all_in,
+                              station.max_price_per_kwh_all_in,
+                            )}
+                          </div>
                         </div>
                       </div>
                       
@@ -213,41 +220,51 @@ export default function StationsPage() {
                   </div>
                 </div>
                 
-                {/* Individual Charger Details */}
-                <div>
-                  <h4 className="text-sm font-medium text-gray-900 mb-2">Charger Details</h4>
-                  <div className="space-y-2">
-                    {selectedStation.connector_details.map((detail, index) => (
-                      <div key={index} className="flex items-center justify-between p-2 bg-gray-50 rounded">
-                        <div className="flex items-center space-x-2">
-                          <div className={`w-2 h-2 rounded-full ${
-                            detail.available_count > 0 ? 'bg-green-500' : 'bg-red-500'
-                          }`}></div>
-                          <span className="text-sm font-medium text-gray-900">
-                            {detail.connector_type}
-                          </span>
-                          {detail.max_power_kw && (
-                            <span className="text-xs text-gray-600">
-                              ({detail.max_power_kw}kW)
-                            </span>
-                          )}
-                        </div>
-                        <span className="text-xs text-gray-600">
-                          {detail.available_count}/{detail.total_count} available
-                        </span>
-                      </div>
-                    ))}
+                {/* Per-charger detail with tariff */}
+                {selectedStation.chargers && selectedStation.chargers.length > 0 && (
+                  <div>
+                    <h4 className="text-sm font-medium text-gray-900 mb-2">Chargers</h4>
+                    <div className="space-y-2">
+                      {selectedStation.chargers.map((charger) => {
+                        const isAvailable = charger.latest_status === 'AVAILABLE';
+                        return (
+                          <div key={charger.charge_point_string_id} className="p-2 bg-gray-50 rounded">
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center space-x-2 min-w-0">
+                                <div className={`w-2 h-2 rounded-full flex-shrink-0 ${
+                                  isAvailable ? 'bg-green-500' : 'bg-red-500'
+                                }`}></div>
+                                <span className="text-sm font-medium text-gray-900 truncate">
+                                  {charger.name}
+                                </span>
+                                <span className="text-xs text-gray-600 flex-shrink-0">
+                                  {charger.latest_status}
+                                </span>
+                              </div>
+                              <span className="text-xs text-gray-600 flex-shrink-0 ml-2">
+                                {charger.connectors
+                                  .map((c) =>
+                                    c.max_power_kw
+                                      ? `${c.connector_type} (${c.max_power_kw}kW)`
+                                      : c.connector_type
+                                  )
+                                  .join(', ')}
+                              </span>
+                            </div>
+                            <div className="mt-1 text-xs text-gray-700 text-right">
+                              {charger.tariff_per_kwh_all_in != null
+                                ? `₹${charger.tariff_per_kwh_all_in.toFixed(2)}/kWh (all-inclusive)`
+                                : 'Tariff: N/A'}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
                   </div>
-                </div>
+                )}
               </div>
-              
+
               <div className="space-y-2">
-                <div className="flex justify-between">
-                  <span className="text-gray-600">Price per kWh:</span>
-                  <span className="font-medium text-gray-900">
-                    ₹{selectedStation.price_per_kwh}
-                  </span>
-                </div>
                 <div className="flex justify-between">
                   <span className="text-gray-600">Distance:</span>
                   <span className="font-medium text-gray-900">

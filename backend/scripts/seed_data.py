@@ -156,14 +156,22 @@ class DatabaseSeeder:
                 # Admins start with a higher balance for testing
                 initial_balance = Decimal(random.uniform(1000, 2000)).quantize(Decimal('0.01'))
                 
-            wallet, created = await Wallet.get_or_create(
-                user=user,
-                defaults={"balance": initial_balance}
-            )
+            wallet, created = await Wallet.get_or_create(user=user)
             if not created:
                 print(f"  ⏭️  Wallet already exists for {user.email}")
-            
-            # Create some top-up transactions (only for regular users to keep it simple)
+                continue
+
+            # Seed the initial balance as a COMPLETED TOP_UP row. Only
+            # COMPLETED top-ups count toward derived balance.
+            await WalletTransaction.create(
+                wallet=wallet,
+                amount=initial_balance,
+                type=TransactionTypeEnum.TOP_UP,
+                description="Seed top-up (dev fixture)",
+                payment_metadata={"status": "COMPLETED"},
+            )
+
+            # Create some additional top-up transactions (only for regular users)
             if user.role == UserRoleEnum.USER:
                 top_up_count = random.randint(2, 5)
                 for i in range(top_up_count):
@@ -174,14 +182,18 @@ class DatabaseSeeder:
                         type=TransactionTypeEnum.TOP_UP,
                         description=f"Top-up via payment gateway #{i+1}",
                         payment_metadata={
+                            "status": "COMPLETED",
                             "gateway": "stripe",
                             "payment_method": random.choice(["card", "bank_transfer"]),
                             "transaction_id": f"txn_{random.randint(100000, 999999)}"
                         },
                         created_at=datetime.now() - timedelta(days=random.randint(1, 60))
                     )
-            
-            print(f"  ✅ Created wallet for {user.email} with balance ₹{initial_balance}")
+
+            # Show derived balance (proves the ledger writes worked).
+            from services.wallet_service import WalletService
+            derived = await WalletService.get_balance(wallet.id)
+            print(f"  ✅ Created wallet for {user.email}: derived balance ₹{derived}")
 
     async def create_payment_gateways(self):
         """Create payment gateway configurations"""
@@ -340,22 +352,37 @@ class DatabaseSeeder:
         """Create tariff structures"""
         print("💵 Creating tariffs...")
         
-        # Global default tariff
+        # Global default tariff. Seed data mirrors production semantics
+        # (post-ADR 0003): pick an all-in customer-facing rate first, then
+        # back-derive rate_per_kwh so the runtime identity check passes.
+        from core.config import RAZORPAY_PLATFORM_FEE_PERCENT
+        from services.tariff_utils import back_derive_rate_per_kwh
+
+        gst = Decimal("18.00")
+        all_in_global = Decimal("0.41")  # ≈ ₹0.35/kWh excl, post-fee + GST
+        rate_global = back_derive_rate_per_kwh(all_in_global, gst, RAZORPAY_PLATFORM_FEE_PERCENT)
         await Tariff.create(
-            rate_per_kwh=Decimal("0.35"),
-            is_global=True
+            rate_per_kwh=rate_global,
+            tariff_per_kwh_all_in=all_in_global,
+            gst_percent=gst,
+            is_global=True,
         )
-        print("  ✅ Created global tariff: ₹0.35/kWh")
-        
-        # Specific tariffs for some chargers
+        print(f"  ✅ Created global tariff: ₹{all_in_global}/kWh all-in (rate_per_kwh={rate_global})")
+
+        # Specific tariffs for some chargers — pick all_in in a plausible
+        # range, then back-derive.
         premium_chargers = random.sample(self.chargers, min(3, len(self.chargers)))
         for charger in premium_chargers:
+            all_in = Decimal(random.uniform(0.30, 0.60)).quantize(Decimal('0.01'))
+            rate = back_derive_rate_per_kwh(all_in, gst, RAZORPAY_PLATFORM_FEE_PERCENT)
             await Tariff.create(
                 charger=charger,
-                rate_per_kwh=Decimal(random.uniform(0.25, 0.50)).quantize(Decimal('0.01')),
-                is_global=False
+                rate_per_kwh=rate,
+                tariff_per_kwh_all_in=all_in,
+                gst_percent=gst,
+                is_global=False,
             )
-            print(f"  ✅ Created specific tariff for {charger.charge_point_string_id}")
+            print(f"  ✅ Created specific tariff for {charger.charge_point_string_id}: ₹{all_in}/kWh all-in")
 
     async def create_charging_transactions(self):
         """Create realistic charging transactions with history"""
@@ -451,16 +478,14 @@ class DatabaseSeeder:
                 
                 await WalletTransaction.create(
                     wallet=wallet,
-                    amount=-cost,  # Negative for deduction
+                    amount=cost,  # Positive; direction carried by type=CHARGE_DEDUCT
                     type=TransactionTypeEnum.CHARGE_DEDUCT,
                     description=f"Charging at {charger.charge_point_string_id}",
                     charging_transaction=transaction,
                     created_at=end_time
                 )
-                
-                # Update wallet balance
-                wallet.balance -= cost
-                await wallet.save()
+                # No stored wallet.balance — the CHARGE_DEDUCT row above
+                # is the deduction; balance is derived from the log.
             
         print(f"  ✅ Created {transaction_count} charging transactions")
 

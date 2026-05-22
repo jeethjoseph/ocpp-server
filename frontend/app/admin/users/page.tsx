@@ -229,6 +229,7 @@ function UsersTable() {
         <Table>
           <TableHeader>
             <TableRow>
+              <TableHead>ID</TableHead>
               <TableHead>User</TableHead>
               <TableHead>Contact</TableHead>
               <TableHead>Status</TableHead>
@@ -240,11 +241,13 @@ function UsersTable() {
           <TableBody>
             {users.map((user) => (
               <TableRow key={user.id}>
+                <TableCell className="font-mono text-xs text-muted-foreground">
+                  #{user.id}
+                </TableCell>
                 <TableCell>
                   <div>
                     <div className="font-medium">{user.display_name}</div>
                     <div className="text-sm text-gray-600">{user.email}</div>
-                    <div className="text-xs text-gray-500">ID: {user.id}</div>
                   </div>
                 </TableCell>
                 <TableCell>

@@ -19,6 +19,8 @@ import {
   useCreateCharger,
   useUpdateCharger,
 } from "@/lib/queries/chargers";
+import { PLATFORM_FEE_PERCENT, DEFAULT_GST_PERCENT } from "@/lib/constants";
+import { TariffBreakdownPreview } from "@/components/TariffBreakdownPreview";
 
 export default function AdminChargersPage() {
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -100,18 +102,22 @@ export default function AdminChargersPage() {
   };
 
   const getAvailabilityToggleState = (status: string) => {
-    // Green/ON for operational states, Gray/OFF for Unavailable/Faulted
-    return status !== "Unavailable" && status !== "Faulted";
+    // Toggle reflects OCPP availability only. Per OCPP 1.6, `Faulted` is a
+    // hardware/error state ORTHOGONAL to availability — a Faulted charger
+    // can still be Operative. Only `Unavailable` flips the toggle off.
+    // (Faulted is communicated separately in the status pill.)
+    return status !== "Unavailable";
   };
 
   const handleChangeAvailability = async (
     chargerId: number,
     currentStatus: string
   ) => {
-    // OCPP 1.6: ChangeAvailability can be sent at any time
-    // Toggle logic: if currently operational -> Inoperative, otherwise -> Operative
-    // The charger may respond with Accepted, Scheduled, or Rejected
-    const isCurrentlyOperational = currentStatus !== "Unavailable" && currentStatus !== "Faulted";
+    // OCPP 1.6: ChangeAvailability can be sent at any time. Use the same
+    // operational-state check the UI uses, so the two never drift. The
+    // charger surfaces the real outcome via the OCPP response (Accepted /
+    // Scheduled / Rejected), which the hook branches on.
+    const isCurrentlyOperational = getAvailabilityToggleState(currentStatus);
     const newType: "Inoperative" | "Operative" = isCurrentlyOperational ? "Inoperative" : "Operative";
 
     // Add charger to loading set
@@ -246,6 +252,9 @@ export default function AdminChargersPage() {
                 <thead className="bg-muted">
                   <tr>
                     <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap">
+                      ID
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap">
                       Name
                     </th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap">
@@ -262,6 +271,9 @@ export default function AdminChargersPage() {
                     </th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap">
                       Station
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap">
+                      Tariff
                     </th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap">
                       Last Heartbeat
@@ -283,6 +295,9 @@ export default function AdminChargersPage() {
                       <tr
                         key={charger.id}
                         className="hover:bg-accent/50 transition-colors">
+                        <td className="px-6 py-4 whitespace-nowrap text-xs text-muted-foreground font-mono">
+                          #{charger.id}
+                        </td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-card-foreground">
                           {charger.name}
                         </td>
@@ -331,6 +346,18 @@ export default function AdminChargersPage() {
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm text-muted-foreground">
                           {station?.name || "Unknown"}
+                        </td>
+                        <td className="px-6 py-4 whitespace-nowrap text-sm">
+                          {charger.tariff_per_kwh_all_in != null ? (
+                            <div className="flex flex-col">
+                              <span className="text-card-foreground font-medium">
+                                ₹{charger.tariff_per_kwh_all_in.toFixed(2)}/kWh
+                              </span>
+                              <span className="text-xs text-muted-foreground">(all-inclusive)</span>
+                            </div>
+                          ) : (
+                            <span className="text-xs text-muted-foreground">—</span>
+                          )}
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm text-muted-foreground">
                           {charger.last_heart_beat_time
@@ -463,7 +490,7 @@ function ChargerModal({ stations, onSubmit, onClose }: ChargerModalProps) {
     vendor: "",
     serial_number: "",
     external_charger_id: "",
-    tariff_per_kwh: "",
+    tariff_per_kwh_all_in: "",
     connectors: [
       { connector_id: 1, connector_type: "Type2", max_power_kw: 22 },
     ],
@@ -478,7 +505,9 @@ function ChargerModal({ stations, onSubmit, onClose }: ChargerModalProps) {
       vendor: formData.vendor || undefined,
       serial_number: formData.serial_number || undefined,
       external_charger_id: formData.external_charger_id || undefined,
-      tariff_per_kwh: formData.tariff_per_kwh ? parseFloat(formData.tariff_per_kwh) : undefined,
+      tariff_per_kwh_all_in: formData.tariff_per_kwh_all_in
+        ? parseFloat(formData.tariff_per_kwh_all_in)
+        : undefined,
     });
   };
 
@@ -617,19 +646,24 @@ function ChargerModal({ stations, onSubmit, onClose }: ChargerModalProps) {
 
           <div>
             <label className="block text-sm font-medium text-card-foreground mb-1">
-              Tariff (₹/kWh)
+              Tariff (₹/kWh, all-inclusive)
             </label>
             <input
               type="number"
               step="0.01"
-              min="0"
-              value={formData.tariff_per_kwh}
+              min="1"
+              max="100"
+              value={formData.tariff_per_kwh_all_in}
               onChange={(e) =>
-                setFormData({ ...formData, tariff_per_kwh: e.target.value })
+                setFormData({ ...formData, tariff_per_kwh_all_in: e.target.value })
               }
-              placeholder="Leave empty to use global tariff"
+              placeholder="Leave empty to use global tariff (1.0–100.0)"
               className="w-full px-3 py-2 border border-border bg-input text-foreground rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 transition-colors"
             />
+            <p className="text-xs text-muted-foreground mt-1">
+              The customer sees this number. Includes GST and the 2% gateway fee.
+            </p>
+            <TariffBreakdownPreview value={formData.tariff_per_kwh_all_in} feePercent={PLATFORM_FEE_PERCENT} gstPercent={DEFAULT_GST_PERCENT} />
           </div>
 
           <div>
@@ -748,7 +782,10 @@ function EditChargerModal({ charger, onSubmit, onClose }: EditChargerModalProps)
     model: charger.model || "",
     vendor: charger.vendor || "",
     external_charger_id: charger.external_charger_id || "",
-    tariff_per_kwh: charger.tariff_per_kwh != null ? String(charger.tariff_per_kwh) : "",
+    tariff_per_kwh_all_in:
+      charger.tariff_per_kwh_all_in != null
+        ? charger.tariff_per_kwh_all_in.toFixed(2)
+        : "",
   });
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -758,7 +795,9 @@ function EditChargerModal({ charger, onSubmit, onClose }: EditChargerModalProps)
       model: formData.model || undefined,
       vendor: formData.vendor || undefined,
       external_charger_id: formData.external_charger_id || undefined,
-      tariff_per_kwh: formData.tariff_per_kwh ? parseFloat(formData.tariff_per_kwh) : undefined,
+      tariff_per_kwh_all_in: formData.tariff_per_kwh_all_in
+        ? parseFloat(formData.tariff_per_kwh_all_in)
+        : undefined,
     });
   };
 
@@ -829,19 +868,24 @@ function EditChargerModal({ charger, onSubmit, onClose }: EditChargerModalProps)
 
           <div>
             <label className="block text-sm font-medium text-card-foreground mb-1">
-              Tariff (₹/kWh)
+              Tariff (₹/kWh, all-inclusive)
             </label>
             <input
               type="number"
               step="0.01"
-              min="0"
-              value={formData.tariff_per_kwh}
+              min="1"
+              max="100"
+              value={formData.tariff_per_kwh_all_in}
               onChange={(e) =>
-                setFormData({ ...formData, tariff_per_kwh: e.target.value })
+                setFormData({ ...formData, tariff_per_kwh_all_in: e.target.value })
               }
-              placeholder="Leave empty to use global tariff"
+              placeholder="Leave empty to use global tariff (1.0–100.0)"
               className="w-full px-3 py-2 border border-border bg-input text-foreground rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 transition-colors"
             />
+            <p className="text-xs text-muted-foreground mt-1">
+              The customer sees this number. Includes GST and the 2% gateway fee.
+            </p>
+            <TariffBreakdownPreview value={formData.tariff_per_kwh_all_in} feePercent={PLATFORM_FEE_PERCENT} gstPercent={DEFAULT_GST_PERCENT} />
           </div>
 
           <div className="flex justify-end space-x-3 pt-4">
@@ -862,3 +906,4 @@ function EditChargerModal({ charger, onSubmit, onClose }: EditChargerModalProps)
     </div>
   );
 }
+

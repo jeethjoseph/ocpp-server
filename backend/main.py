@@ -2,6 +2,7 @@
 import os
 import asyncio
 import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Dict, List
 from fastapi import Depends, FastAPI, HTTPException, Query
 from auth_middleware import require_admin
@@ -19,6 +20,7 @@ from crud import (
 )
 from models import OCPPLog, Transaction, TransactionStatusEnum, MeterValue
 from services.wallet_service import WalletService
+from services.wallet_session_service import WalletSessionService
 from redis_manager import redis_manager
 from core.connection_manager import connection_manager
 from utils import safe_create_task, mask_id_tag, mask_email
@@ -245,6 +247,18 @@ class ChargePoint(OcppChargePoint):
             connector = await Connector.filter(charger=charger).first()
             if connector and self.id in connected_charge_points:
                 connected_charge_points[self.id]["connector_type"] = connector.connector_type
+
+            # Cross-check any pending firmware updates: a BootNotification with
+            # the target firmware_version is our reliable completion signal
+            # (FirmwareStatusNotification cannot be trusted on Quectel modems).
+            try:
+                from services.firmware_update_service import firmware_update_service
+                await firmware_update_service.handle_boot_notification(charger, firmware_version)
+            except Exception as fw_err:
+                logger.error(
+                    f"📦 Error checking pending firmware updates on boot for {self.id}: {fw_err}",
+                    exc_info=True,
+                )
         except Exception as e:
             logger.error(f"❌ Error updating charger info from BootNotification: {e}", exc_info=True)
 
@@ -587,6 +601,26 @@ class ChargePoint(OcppChargePoint):
         except Exception as qr_err:
             logger.warning(f"QR payment handling error (non-fatal): {qr_err}")
 
+        # Franchisee settlement
+        try:
+            from services.franchisee_settlement_service import FranchiseeSettlementService
+            safe_create_task(
+                FranchiseeSettlementService.process_settlement(transaction.id),
+                name=f"settlement-txn-{transaction.id}",
+            )
+        except Exception as settle_err:
+            logger.error("Settlement trigger error for txn %s: %s", transaction.id, settle_err)
+
+        # GST invoice generation
+        try:
+            from services.invoice_service import InvoiceService
+            safe_create_task(
+                InvoiceService.generate_invoice(transaction.id),
+                name=f"invoice-txn-{transaction.id}",
+            )
+        except Exception as inv_err:
+            logger.error("Invoice trigger error for txn %s: %s", transaction.id, inv_err)
+
     @on('Heartbeat')
     async def on_heartbeat(self, **kwargs):
         # Record heartbeat metric (lightweight, don't trace entire transaction)
@@ -760,7 +794,7 @@ class ChargePoint(OcppChargePoint):
                 user=user,
                 charger=charger,
                 vehicle=vehicle,
-                start_meter_kwh=float(meter_start) / 1000,  # Convert Wh to kWh
+                start_meter_kwh=Decimal(str(meter_start)) / Decimal(1000),  # Convert Wh to kWh
                 transaction_status=TransactionStatusEnum.RUNNING  # Changed from STARTED to RUNNING
             )
 
@@ -782,6 +816,23 @@ class ChargePoint(OcppChargePoint):
                 )
             except Exception as qr_err:
                 logger.warning(f"QR payment link check failed (non-fatal): {qr_err}")
+
+            # Wallet session budget cap — mirror of QR's check_budget_and_auto_stop.
+            # Skipped if a QR payment was linked above (QR enforces its own cap).
+            # Cache failure is non-fatal; only the in-session balance cap is forfeited.
+            try:
+                from models import QRPayment, Wallet
+                qr = await QRPayment.filter(transaction_id=transaction.id).first()
+                if not qr:
+                    wallet = await Wallet.filter(user_id=user.id).first()
+                    if wallet:
+                        tariff = await WalletService.get_applicable_tariff(charger.id)
+                        await WalletSessionService.cache_session_on_start(
+                            transaction.id, wallet, tariff,
+                            float(transaction.start_meter_kwh or 0), charger.id,
+                        )
+            except Exception as ws_err:
+                logger.warning(f"Wallet session cache failed (non-fatal): {ws_err}")
 
             # Record transaction started event
             await OCPPMetrics.record_transaction_started(self.id, user.id)
@@ -808,7 +859,6 @@ class ChargePoint(OcppChargePoint):
         logger.info(f"🛑 StopTransaction from {self.id}: transaction_id={transaction_id}, meter_stop={meter_stop}")
         
         from models import Transaction, TransactionStatusEnum
-        from services.wallet_service import WalletService
         import datetime
         
         try:
@@ -826,8 +876,8 @@ class ChargePoint(OcppChargePoint):
                 logger.info(f"🛑 Stopping SUSPENDED transaction {transaction_id} — charger chose to end rather than resume")
 
             # Update transaction with end values
-            transaction.end_meter_kwh = float(meter_stop) / 1000  # Convert Wh to kWh
-            transaction.energy_consumed_kwh = transaction.end_meter_kwh - (transaction.start_meter_kwh or 0)
+            transaction.end_meter_kwh = Decimal(str(meter_stop)) / Decimal(1000)  # Convert Wh to kWh
+            transaction.energy_consumed_kwh = transaction.end_meter_kwh - (transaction.start_meter_kwh or Decimal(0))
             transaction.end_time = datetime.datetime.now(datetime.timezone.utc)
             transaction.transaction_status = TransactionStatusEnum.COMPLETED
             transaction.stop_reason = kwargs.get('reason', 'Remote')
@@ -850,6 +900,12 @@ class ChargePoint(OcppChargePoint):
                 await clear_zero_energy_tracking(transaction_id)
             except Exception as e:
                 logger.debug(f"Zero-energy cleanup error (non-fatal): {e}")
+
+            # Clean up wallet session budget cache (no-op if QR session)
+            try:
+                await redis_manager.delete_wallet_session(transaction_id)
+            except Exception as e:
+                logger.debug(f"Wallet session cleanup error (non-fatal): {e}")
 
             safe_create_task(log_audit_event(
                 action="transaction.status_changed",
@@ -886,6 +942,26 @@ class ChargePoint(OcppChargePoint):
                 await QRPaymentService.process_qr_session_billing(transaction_id)
             except Exception as qr_err:
                 logger.error(f"QR billing error for transaction {transaction_id}: {qr_err}", exc_info=True)
+
+            # Franchisee settlement
+            try:
+                from services.franchisee_settlement_service import FranchiseeSettlementService
+                safe_create_task(
+                    FranchiseeSettlementService.process_settlement(transaction_id),
+                    name=f"settlement-txn-{transaction_id}",
+                )
+            except Exception as settle_err:
+                logger.error("Settlement trigger error for txn %s: %s", transaction_id, settle_err)
+
+            # GST invoice generation
+            try:
+                from services.invoice_service import InvoiceService
+                safe_create_task(
+                    InvoiceService.generate_invoice(transaction_id),
+                    name=f"invoice-txn-{transaction_id}",
+                )
+            except Exception as inv_err:
+                logger.error("Invoice trigger error for txn %s: %s", transaction_id, inv_err)
 
             return call_result.StopTransaction(
                 id_tag_info={"status": "Accepted"}
@@ -996,9 +1072,9 @@ class ChargePoint(OcppChargePoint):
                     try:
                         if measurand == 'Energy.Active.Import.Register':
                             # Store energy reading
-                            reading_kwh = float(value)
+                            reading_kwh = Decimal(str(value))
                             if unit == 'Wh':
-                                reading_kwh = reading_kwh / 1000  # Convert Wh to kWh
+                                reading_kwh = reading_kwh / Decimal(1000)  # Convert Wh to kWh
                             meter_data['reading_kwh'] = reading_kwh
                             logger.debug(f"🔋   ✅ Energy: {reading_kwh} kWh")
                             
@@ -1028,7 +1104,7 @@ class ChargePoint(OcppChargePoint):
                         else:
                             logger.debug(f"🔋   ⚠️ Unknown measurand: {measurand} - ignoring")
                             
-                    except (ValueError, TypeError) as e:
+                    except (ValueError, TypeError, InvalidOperation) as e:
                         logger.error(f"🔋   ❌ Error parsing {measurand} value '{value}': {e}", exc_info=True)
                         continue
                 
@@ -1064,9 +1140,23 @@ class ChargePoint(OcppChargePoint):
             if meter_records_created > 0 and meter_data.get('reading_kwh') is not None:
                 try:
                     from services.qr_payment_service import QRPaymentService
-                    await QRPaymentService.check_budget_and_auto_stop(transaction_id, meter_data['reading_kwh'])
+                    await QRPaymentService.check_budget_and_auto_stop(
+                        transaction_id,
+                        meter_data['reading_kwh'],
+                        power_kw=meter_data.get('power_kw'),
+                    )
                 except Exception as qr_err:
                     logger.warning(f"QR budget check failed (non-fatal): {qr_err}")
+
+                # Wallet-paid session budget cap — mirror of QR's check above.
+                # check_balance_and_auto_stop short-circuits if this isn't a
+                # wallet session (the Redis key won't exist for QR sessions).
+                try:
+                    await WalletSessionService.check_balance_and_auto_stop(
+                        transaction_id, meter_data['reading_kwh']
+                    )
+                except Exception as ws_err:
+                    logger.warning(f"Wallet budget check failed (non-fatal): {ws_err}")
 
             # Check zero-energy watchdog (stalled charging detection)
             if meter_records_created > 0 and meter_data.get('reading_kwh') is not None:
@@ -1093,73 +1183,17 @@ class ChargePoint(OcppChargePoint):
 
     @on('FirmwareStatusNotification')
     async def on_firmware_status_notification(self, status: str, **kwargs):
+        """OCPP 1.6 FirmwareStatusNotification — informational only.
+
+        Quectel-based chargers drop the OCPP WSS during firmware download to
+        free their single TLS context, so these messages are unreliable. State
+        transitions are driven by BootNotification (see firmware_update_service).
+        We log for audit only.
         """
-        OCPP 1.6 FirmwareStatusNotification handler
-        Charger sends this to report firmware update progress
-        """
-        # Record metric
         await OCPPMetrics.record_message("FirmwareStatusNotification", "IN")
-
-        logger.info(f"📦 FirmwareStatusNotification from {self.id}: status={status}")
-
-        from models import Charger, FirmwareUpdate, FirmwareFile
+        logger.info(f"📦 FirmwareStatusNotification from {self.id}: status={status} (informational)")
 
         try:
-            # Get charger from database
-            charger = await Charger.get(charge_point_string_id=self.id)
-
-            # Find the most recent active update for this charger
-            # Note: With new schema, each charger+firmware combo has one row
-            # Only one should be "active" (in progress) at a time per charger
-            firmware_update = await FirmwareUpdate.filter(
-                charger_id=charger.id,
-                status__in=["PENDING", "DOWNLOADING", "DOWNLOADED", "INSTALLING"]
-            ).order_by('-started_at', '-initiated_at').first()
-
-            if not firmware_update:
-                logger.warning(
-                    f"📦 No active firmware update found for {self.id}, "
-                    f"but received FirmwareStatusNotification: {status}"
-                )
-                return call_result.FirmwareStatusNotification()
-
-            # Map OCPP status to our database status
-            status_mapping = {
-                "Idle": "PENDING",
-                "Downloading": "DOWNLOADING",
-                "Downloaded": "DOWNLOADED",
-                "Installing": "INSTALLING",
-                "Installed": "INSTALLED",
-                "DownloadFailed": "DOWNLOAD_FAILED",
-                "InstallationFailed": "INSTALLATION_FAILED",
-                "InstallVerificationFailed": "INSTALLATION_FAILED"
-            }
-
-            new_status = status_mapping.get(status, status)
-            firmware_update.status = new_status
-
-            # Track timestamps
-            if status == "Downloading" and not firmware_update.started_at:
-                firmware_update.started_at = datetime.datetime.now(datetime.timezone.utc)
-                logger.info(f"📦 ✅ Firmware download started for {self.id}")
-
-            elif status in ["Installed", "DownloadFailed", "InstallationFailed", "InstallVerificationFailed"]:
-                firmware_update.completed_at = datetime.datetime.now(datetime.timezone.utc)
-
-                if status == "Installed":
-                    # Update success - update charger's firmware version
-                    firmware_file = await firmware_update.firmware_file
-                    charger.firmware_version = firmware_file.version
-                    await charger.save()
-                    logger.info(f"📦 ✅ Firmware update completed for {self.id} - new version: {firmware_file.version}")
-                else:
-                    # Update failed
-                    firmware_update.error_message = f"Firmware update failed with status: {status}"
-                    logger.error(f"📦 ❌ Firmware update failed for {self.id} with status: {status}")
-
-            await firmware_update.save()
-
-            # Log to OCPP logs for audit trail
             await OCPPLog.create(
                 charge_point_id=self.id,
                 message_type="FirmwareStatusNotification",
@@ -1168,11 +1202,8 @@ class ChargePoint(OcppChargePoint):
                 status="SUCCESS",
                 timestamp=datetime.datetime.now(datetime.timezone.utc)
             )
-
-            logger.info(f"📦 Updated firmware_update ID={firmware_update.id} to status={new_status}")
-
         except Exception as e:
-            logger.error(f"📦 ❌ Error processing FirmwareStatusNotification from {self.id}: {e}", exc_info=True)
+            logger.error(f"📦 Error logging FirmwareStatusNotification from {self.id}: {e}", exc_info=True)
 
         return call_result.FirmwareStatusNotification()
 
@@ -1481,9 +1512,16 @@ app.include_router(logs.router)
 app.include_router(firmware.router)
 app.include_router(firmware.public_router)
 
-from routers import qr_codes, public_qr_transactions
+from routers import qr_codes, public_qr_transactions, public_qr_active_sessions
 app.include_router(qr_codes.router)
 app.include_router(public_qr_transactions.router)
+app.include_router(public_qr_active_sessions.router)
+
+from routers import franchisees, franchisee_portal, invoices, admin_settlements
+app.include_router(franchisees.router)
+app.include_router(franchisee_portal.router)
+app.include_router(invoices.router)
+app.include_router(admin_settlements.router)
 
 # OCPP WebSocket endpoint (connection management + message handling)
 from routers import ocpp_ws
@@ -1590,6 +1628,42 @@ async def startup_event():
     await init_db()
     await redis_manager.connect()
 
+    # Compliance preflight: GST invoices cannot be issued without a supplier
+    # GSTIN (CGST Rule 46). Surface this loudly at boot rather than silently
+    # at per-session issuance time, so a misconfigured deploy doesn't accrue
+    # un-invoiced sessions for hours before anyone notices.
+    if not os.getenv("VOLTLYNC_GSTIN"):
+        logger.error(
+            "STARTUP WARNING: VOLTLYNC_GSTIN is not configured. "
+            "Customer-facing GST invoices will NOT be issued until this is "
+            "set (see backend/services/invoice_service.py:generate_invoice). "
+            "All charging sessions will complete and be billed, but no "
+            "gst_invoice row will be created."
+        )
+
+    # ADR 0001 + issue 03: synthetic platform fee drives all customer-facing
+    # math. Validate at startup across four bands (≤0 fail / 0–5 ok / 5–10 warn
+    # / >10 fail) so a misconfigured deploy never reaches a real user.
+    from core.config import RAZORPAY_PLATFORM_FEE_PERCENT, validate_platform_fee_percent
+    validate_platform_fee_percent(RAZORPAY_PLATFORM_FEE_PERCENT, logger)
+
+    # Tariff back-calc identity check (issue 02): catch the scenario where
+    # RAZORPAY_PLATFORM_FEE_PERCENT was changed AFTER migration 36 ran, leaving
+    # legacy-backfilled rows violating the identity until operators re-save them.
+    # Non-fatal — startup proceeds and operators are nudged via the warning.
+    from services.tariff_drift_check import warn_on_tariff_identity_drift
+    try:
+        await warn_on_tariff_identity_drift(RAZORPAY_PLATFORM_FEE_PERCENT, logger)
+    except Exception as e:
+        logger.warning("Tariff identity check failed (non-fatal): %s", e)
+
+    if not os.getenv("AWS_S3_INVOICE_BUCKET"):
+        logger.warning(
+            "STARTUP WARNING: AWS_S3_INVOICE_BUCKET is not configured. "
+            "PDF generation will fall back to inline streaming (no S3 "
+            "persistence); first download per invoice will be slow."
+        )
+
     # Ensure system guest user exists for QR payment fallback
     from services.qr_payment_service import ensure_guest_user
     try:
@@ -1624,6 +1698,18 @@ async def startup_event():
     cleanup_interval_hours = int(os.environ.get("CLEANUP_INTERVAL_HOURS", "24"))
     await start_data_retention_service(retention_days=retention_days, cleanup_interval_hours=cleanup_interval_hours)
 
+    # Start franchisee payout retry service (drains ON_HOLD/FAILED ledger entries
+    # after cooling-period / funds_unhold gates clear). No-op when
+    # RAZORPAY_ROUTE_ENABLED != "true".
+    from services.franchisee_payout_retry_service import (
+        start_franchisee_payout_retry_service,
+    )
+    await start_franchisee_payout_retry_service()
+
+    # Start stuck-payout detector (Sentry alert on entries past threshold).
+    from services.stuck_payout_detector import start_stuck_payout_detector
+    await start_stuck_payout_detector()
+
     logger.info("Database initialized with Tortoise ORM")
     logger.info("Redis connection established")
     logger.info("Periodic cleanup task started")
@@ -1646,6 +1732,12 @@ async def startup_event():
     else:
         logger.info("ℹ️ Sentry Error Tracking: DISABLED")
 
+    # ADR 0002 kill-switch for Razorpay instant refunds on _full_refund flows.
+    if os.getenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true").lower() == "true":
+        logger.info("✅ Razorpay Instant Refunds: ENABLED (speed=optimum on _full_refund)")
+    else:
+        logger.info("ℹ️ Razorpay Instant Refunds: DISABLED (normal speed, 5–7 working days)")
+
 @app.on_event("shutdown")
 async def shutdown_event():
     """Close database and Redis connections on shutdown"""
@@ -1663,6 +1755,16 @@ async def shutdown_event():
     # Stop data retention service
     from services.data_retention_service import stop_data_retention_service
     await stop_data_retention_service()
+
+    # Stop franchisee payout retry service
+    from services.franchisee_payout_retry_service import (
+        stop_franchisee_payout_retry_service,
+    )
+    await stop_franchisee_payout_retry_service()
+
+    # Stop stuck-payout detector
+    from services.stuck_payout_detector import stop_stuck_payout_detector
+    await stop_stuck_payout_detector()
 
     await close_db()
     await redis_manager.disconnect()

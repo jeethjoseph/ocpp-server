@@ -23,8 +23,10 @@ import {
   useDeleteFirmware,
   useUpdateStatus,
   useCancelUpdate,
+  useMarkInstalled,
+  useMarkFailed,
 } from "@/lib/queries/firmware";
-import { Upload, Trash2, RefreshCw, AlertCircle, CheckCircle2, Clock, Download, XCircle, X } from "lucide-react";
+import { Upload, Trash2, RefreshCw, AlertCircle, CheckCircle2, Clock, XCircle, X } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
 
 export default function AdminFirmwarePage() {
@@ -42,6 +44,8 @@ export default function AdminFirmwarePage() {
   const uploadMutation = useUploadFirmware();
   const deleteMutation = useDeleteFirmware();
   const cancelMutation = useCancelUpdate();
+  const markInstalledMutation = useMarkInstalled();
+  const markFailedMutation = useMarkFailed();
 
   const firmwareFiles = firmwareData?.data || [];
   const inProgressUpdates = statusData?.in_progress || [];
@@ -68,8 +72,20 @@ export default function AdminFirmwarePage() {
   };
 
   const handleCancelUpdate = async (updateId: number) => {
-    if (confirm("Are you sure you want to cancel this pending update?")) {
+    if (confirm("Cancel this pending update? Only allowed before any attempt has been made.")) {
       await cancelMutation.mutateAsync(updateId);
+    }
+  };
+
+  const handleMarkInstalled = async (updateId: number) => {
+    if (confirm("Mark this update as INSTALLED? This will also update the charger's firmware version.")) {
+      await markInstalledMutation.mutateAsync(updateId);
+    }
+  };
+
+  const handleMarkFailed = async (updateId: number) => {
+    if (confirm("Mark this update as FAILED? The admin must re-trigger if the charger needs another attempt.")) {
+      await markFailedMutation.mutateAsync(updateId);
     }
   };
 
@@ -82,12 +98,8 @@ export default function AdminFirmwarePage() {
   const getStatusBadge = (status: string) => {
     const variants: Record<string, { variant: "default" | "secondary" | "destructive" | "outline"; icon: React.ReactElement }> = {
       PENDING: { variant: "secondary", icon: <Clock className="h-3 w-3" /> },
-      DOWNLOADING: { variant: "default", icon: <Download className="h-3 w-3" /> },
-      DOWNLOADED: { variant: "default", icon: <CheckCircle2 className="h-3 w-3" /> },
-      INSTALLING: { variant: "default", icon: <RefreshCw className="h-3 w-3 animate-spin" /> },
       INSTALLED: { variant: "outline", icon: <CheckCircle2 className="h-3 w-3" /> },
-      DOWNLOAD_FAILED: { variant: "destructive", icon: <XCircle className="h-3 w-3" /> },
-      INSTALLATION_FAILED: { variant: "destructive", icon: <AlertCircle className="h-3 w-3" /> },
+      FAILED: { variant: "destructive", icon: <XCircle className="h-3 w-3" /> },
       CANCELLED: { variant: "secondary", icon: <X className="h-3 w-3" /> },
     };
 
@@ -96,9 +108,21 @@ export default function AdminFirmwarePage() {
     return (
       <Badge variant={variant} className="flex items-center gap-1">
         {icon}
-        {status.replace(/_/g, " ")}
+        {status}
       </Badge>
     );
+  };
+
+  const formatRelative = (iso?: string): string => {
+    if (!iso) return "—";
+    const target = new Date(iso).getTime();
+    const diff = target - Date.now();
+    const absMin = Math.abs(diff) / 60000;
+    if (absMin < 1) return diff > 0 ? "in <1m" : "<1m ago";
+    if (absMin < 60) return `${diff > 0 ? "in " : ""}${Math.round(absMin)}m${diff > 0 ? "" : " ago"}`;
+    const absHr = absMin / 60;
+    if (absHr < 24) return `${diff > 0 ? "in " : ""}${absHr.toFixed(1)}h${diff > 0 ? "" : " ago"}`;
+    return new Date(iso).toLocaleString();
   };
 
   return (
@@ -118,7 +142,7 @@ export default function AdminFirmwarePage() {
 
         {/* Status Summary */}
         {summary && (
-          <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <Card>
               <CardHeader className="pb-2">
                 <CardDescription>Pending</CardDescription>
@@ -127,19 +151,7 @@ export default function AdminFirmwarePage() {
             </Card>
             <Card>
               <CardHeader className="pb-2">
-                <CardDescription>Downloading</CardDescription>
-                <CardTitle className="text-2xl">{summary.downloading}</CardTitle>
-              </CardHeader>
-            </Card>
-            <Card>
-              <CardHeader className="pb-2">
-                <CardDescription>Installing</CardDescription>
-                <CardTitle className="text-2xl">{summary.installing}</CardTitle>
-              </CardHeader>
-            </Card>
-            <Card>
-              <CardHeader className="pb-2">
-                <CardDescription>Completed Today</CardDescription>
+                <CardDescription>Installed Today</CardDescription>
                 <CardTitle className="text-2xl">{summary.completed_today}</CardTitle>
               </CardHeader>
             </Card>
@@ -157,22 +169,31 @@ export default function AdminFirmwarePage() {
           <Card>
             <CardHeader>
               <CardTitle>Active Updates</CardTitle>
-              <CardDescription>Real-time monitoring of ongoing firmware updates</CardDescription>
+              <CardDescription>
+                Completion is confirmed by BootNotification (or admin manual close). Retries: up to 5 attempts over ~6h with exponential backoff.
+              </CardDescription>
             </CardHeader>
             <CardContent>
               <Table>
                 <TableHeader>
                   <TableRow>
+                    <TableHead>ID</TableHead>
                     <TableHead>Charger</TableHead>
                     <TableHead>Version</TableHead>
                     <TableHead>Status</TableHead>
-                    <TableHead>Started</TableHead>
+                    <TableHead>Attempts</TableHead>
+                    <TableHead>Last Attempt</TableHead>
+                    <TableHead>Next Retry</TableHead>
+                    <TableHead>Initiated</TableHead>
                     <TableHead>Actions</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {inProgressUpdates.map((update) => (
                     <TableRow key={update.update_id}>
+                      <TableCell className="font-mono text-xs text-muted-foreground">
+                        #{update.update_id}
+                      </TableCell>
                       <TableCell>
                         <div>
                           <div className="font-medium">{update.charger_name}</div>
@@ -181,22 +202,52 @@ export default function AdminFirmwarePage() {
                       </TableCell>
                       <TableCell>{update.firmware_version}</TableCell>
                       <TableCell>{getStatusBadge(update.status)}</TableCell>
-                      <TableCell>
-                        {update.started_at
-                          ? new Date(update.started_at).toLocaleString()
-                          : new Date(update.initiated_at).toLocaleString()}
+                      <TableCell>{update.attempt_count}</TableCell>
+                      <TableCell className="text-sm text-muted-foreground">
+                        {formatRelative(update.last_attempt_at)}
+                      </TableCell>
+                      <TableCell className="text-sm text-muted-foreground">
+                        {formatRelative(update.next_retry_at)}
+                      </TableCell>
+                      <TableCell className="text-sm text-muted-foreground">
+                        {formatRelative(update.initiated_at)}
                       </TableCell>
                       <TableCell>
-                        {update.status === "PENDING" && (
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => handleCancelUpdate(update.update_id)}
-                            disabled={cancelMutation.isPending}
-                          >
-                            <X className="h-4 w-4 text-destructive" />
-                          </Button>
-                        )}
+                        <div className="flex gap-1">
+                          {update.status === "PENDING" && update.attempt_count === 0 && (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              title="Cancel (only before any attempt)"
+                              onClick={() => handleCancelUpdate(update.update_id)}
+                              disabled={cancelMutation.isPending}
+                            >
+                              <X className="h-4 w-4 text-destructive" />
+                            </Button>
+                          )}
+                          {update.status === "PENDING" && (
+                            <>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                title="Mark installed"
+                                onClick={() => handleMarkInstalled(update.update_id)}
+                                disabled={markInstalledMutation.isPending}
+                              >
+                                <CheckCircle2 className="h-4 w-4 text-green-600" />
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                title="Mark failed"
+                                onClick={() => handleMarkFailed(update.update_id)}
+                                disabled={markFailedMutation.isPending}
+                              >
+                                <XCircle className="h-4 w-4 text-destructive" />
+                              </Button>
+                            </>
+                          )}
+                        </div>
                       </TableCell>
                     </TableRow>
                   ))}
@@ -226,6 +277,7 @@ export default function AdminFirmwarePage() {
               <Table>
                 <TableHeader>
                   <TableRow>
+                    <TableHead>ID</TableHead>
                     <TableHead>Version</TableHead>
                     <TableHead>Filename</TableHead>
                     <TableHead>Size</TableHead>
@@ -237,6 +289,9 @@ export default function AdminFirmwarePage() {
                 <TableBody>
                   {firmwareFiles.map((firmware) => (
                     <TableRow key={firmware.id}>
+                      <TableCell className="font-mono text-xs text-muted-foreground">
+                        #{firmware.id}
+                      </TableCell>
                       <TableCell className="font-medium">{firmware.version}</TableCell>
                       <TableCell>{firmware.filename}</TableCell>
                       <TableCell>{(firmware.file_size / 1024 / 1024).toFixed(2)} MB</TableCell>
@@ -336,16 +391,18 @@ export default function AdminFirmwarePage() {
         {/* Info Card */}
         <Card>
           <CardHeader>
-            <CardTitle>How to Update Chargers</CardTitle>
+            <CardTitle>How firmware updates work</CardTitle>
           </CardHeader>
           <CardContent className="space-y-2 text-sm text-muted-foreground">
-            <p>1. Upload a firmware file using the &quot;Upload Firmware&quot; button above</p>
-            <p>2. Go to the Chargers page to select chargers for update</p>
-            <p>3. Click on a charger and use the &quot;Update Firmware&quot; button</p>
-            <p>4. Monitor update progress here in the &quot;Active Updates&quot; section</p>
+            <p>1. Upload a firmware file via the &quot;Upload Firmware&quot; button (stored on S3).</p>
+            <p>2. Trigger an update from the charger&apos;s page — server schedules a PENDING row.</p>
+            <p>3. Server sends OCPP UpdateFirmware when the charger is online and idle. WebSocket is expected to drop during download.</p>
+            <p>4. Completion is confirmed when the charger reboots and reports the new firmware version on BootNotification.</p>
+            <p>5. If a retry is needed, the scheduler backs off exponentially: 5m → 30m → 2h → 4h, up to 5 attempts / ~6h total.</p>
+            <p>6. For polling/out-of-network chargers, the &quot;Mark installed&quot; / &quot;Mark failed&quot; actions are how you close stuck rows.</p>
             <p className="mt-4 font-medium text-foreground">
               <AlertCircle className="inline h-4 w-4 mr-1" />
-              Updates will only trigger if charger is online and not actively charging
+              Updates won&apos;t fire while the charger is offline or mid-transaction — the row stays PENDING until the charger is ready.
             </p>
           </CardContent>
         </Card>

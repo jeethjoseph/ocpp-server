@@ -129,7 +129,7 @@ export function useBulkUpdate() {
 }
 
 /**
- * Cancel a pending firmware update
+ * Cancel a pending firmware update (only valid when no attempts yet)
  */
 export function useCancelUpdate() {
   const queryClient = useQueryClient();
@@ -145,6 +145,49 @@ export function useCancelUpdate() {
       const errorMessage = err instanceof Error ? err.message : String(err);
       console.error("Cancel update error:", errorMessage);
       toast.error(`Failed to cancel update: ${errorMessage}`);
+    },
+  });
+}
+
+/**
+ * Admin manually marks an update as INSTALLED (for polling chargers
+ * or other out-of-band confirmations).
+ */
+export function useMarkInstalled() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (updateId: number) => firmwareService.markInstalled(updateId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: firmwareKeys.status() });
+      queryClient.invalidateQueries({ queryKey: firmwareKeys.all });
+      toast.success("Firmware update marked as installed");
+    },
+    onError: (err) => {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      console.error("Mark installed error:", errorMessage);
+      toast.error(`Failed to mark installed: ${errorMessage}`);
+    },
+  });
+}
+
+/**
+ * Admin manually marks an update as FAILED (for stuck PENDING rows).
+ */
+export function useMarkFailed() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (updateId: number) => firmwareService.markFailed(updateId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: firmwareKeys.status() });
+      queryClient.invalidateQueries({ queryKey: firmwareKeys.all });
+      toast.success("Firmware update marked as failed");
+    },
+    onError: (err) => {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      console.error("Mark failed error:", errorMessage);
+      toast.error(`Failed to mark failed: ${errorMessage}`);
     },
   });
 }

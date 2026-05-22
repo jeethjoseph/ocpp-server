@@ -257,40 +257,65 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 
 #### Firmware Management (`backend/routers/firmware.py`)
 **Endpoints**: `/api/admin/firmware/*` (admin) and `/api/firmware/*` (public)
-**Purpose**: Complete firmware update lifecycle for OCPP and non-OCPP charge points
+**Purpose**: Firmware update lifecycle for OCPP and polling chargers, with BootNotification-driven completion and CSMS-side exponential backoff retries.
 
 **Admin Endpoints**:
-- `POST /api/admin/firmware/upload` - Upload new firmware files (.bin, .hex, .fw)
-- `GET /api/admin/firmware` - List all firmware with pagination and filtering
-- `DELETE /api/admin/firmware/{id}` - Soft delete firmware (sets is_active=False)
-- `POST /api/admin/firmware/chargers/{id}/update` - Trigger OCPP firmware update for single charger
-- `POST /api/admin/firmware/bulk-update` - Trigger updates for multiple chargers
-- `GET /api/admin/firmware/chargers/{id}/history` - Get firmware update history
-- `GET /api/admin/firmware/updates/status` - Real-time dashboard of all firmware updates
+- `POST /api/admin/firmware/upload` - Upload firmware files (.bin, .hex, .fw); stored on S3 (`AWS_S3_FIRMWARE_BUCKET`).
+- `GET /api/admin/firmware` - List firmware files
+- `DELETE /api/admin/firmware/{id}` - Soft delete (`is_active=False`)
+- `POST /api/admin/firmware/chargers/{id}/update` - Schedule update; resets any existing row for this (charger, firmware) pair regardless of prior status.
+- `POST /api/admin/firmware/bulk-update` - Bulk schedule
+- `GET /api/admin/firmware/chargers/{id}/history` - History per charger
+- `GET /api/admin/firmware/updates/status` - Dashboard (PENDING rows + counts)
+- `POST /api/admin/firmware/updates/{id}/cancel` - Cancel a PENDING row that has not yet been attempted (`attempt_count == 0`)
+- `POST /api/admin/firmware/updates/{id}/mark-installed` - Admin manual close for polling chargers (also updates `Charger.firmware_version`)
+- `POST /api/admin/firmware/updates/{id}/mark-failed` - Admin manual close (does not touch `Charger.firmware_version`)
 
-**Public Endpoints**:
-- `GET /api/firmware/latest` - **NEW** - Public API for non-OCPP charge points to discover latest firmware
+**Public Endpoint**:
+- `GET /api/firmware/latest?external_charger_id=X&current_firmware_version=Y` - Polling chargers fetch their pending update here. When `current_firmware_version` matches the pending target, the server auto-closes the row as INSTALLED.
 
-**Key Features**:
-- OCPP 1.6 UpdateFirmware command integration
-- FirmwareStatusNotification handling with status tracking
-- Pre-update safety validation (online check, no active transactions)
-- MD5 checksum verification for file integrity
-- Real-time progress monitoring with dashboard
-- File storage with static serving via `/firmware/{filename}`
-- Supports OCPP (UpdateFirmware) and non-OCPP (API discovery) devices
+**State machine (v2, migration 35)**:
+4 states only — **PENDING / INSTALLED / FAILED / CANCELLED**. Intermediate states (DOWNLOADING / DOWNLOADED / INSTALLING) and split failures (DOWNLOAD_FAILED / INSTALLATION_FAILED) were collapsed because they encoded signals (`FirmwareStatusNotification`) that aren't reliably delivered.
 
-**OCPP Flow**:
-1. Admin triggers update → Sends OCPP UpdateFirmware command
-2. Charger downloads firmware from provided URL
-3. Charger sends FirmwareStatusNotification updates (Downloading → Downloaded → Installing → Installed)
-4. Server updates FirmwareUpdate status and charger.firmware_version
+**Why BootNotification is the source of truth (CRITICAL — non-obvious)**:
+Chargers using Quectel cellular modems (BG95/BG96, EC25, EG21/25 family) cannot reliably maintain the OCPP WSS connection during firmware download. The modem suspends WSS to free its single TLS context, or WSS keepalive starves under the download throughput. So `FirmwareStatusNotification: Downloading/Downloaded/Installing/Installed/DownloadFailed` may never arrive. **The only reliable completion signal is the BootNotification the charger sends after install + reboot, carrying its new `firmware_version`.** `FirmwareStatusNotification` handler (`main.py:1168+`) is therefore logging-only — it writes to OCPPLog but does not transition state.
 
-**Non-OCPP Flow**:
-1. Device calls `GET /api/firmware/latest`
-2. Receives version, download URL, checksum, file size
-3. Downloads and verifies firmware
-4. Installs and reboots with new version
+**Retry semantics (CSMS-side)**:
+- Each attempt = one `UpdateFirmware` command. Server records `attempt_count`, `last_attempt_at`.
+- `handle_boot_notification(charger, reported_version)` runs from the BootNotification handler:
+  - Match → INSTALLED (terminal)
+  - Mismatch within `FIRMWARE_BOOT_DEBOUNCE_SECONDS` (default 300s) → ignore (charger may still be mid-download)
+  - Mismatch outside debounce → attempt failed; schedule next via backoff
+- Phase B timeout: if no BootNotification arrives within `FIRMWARE_ATTEMPT_TIMEOUT_SECONDS` (default 7200s/2h), the scheduler declares the attempt failed.
+- Backoff schedule: **5min → 30min → 2h → 4h**. Capped by `FIRMWARE_MAX_ATTEMPTS` (default 5) AND `FIRMWARE_MAX_ELAPSED_SECONDS` (default 21600s/6h).
+- Budget exhausted → FAILED. Admin must re-trigger to retry.
+
+**Storage**:
+- S3 with presigned GET URLs. TTL = `max(FIRMWARE_MAX_ELAPSED_SECONDS, 24h) + 1h` so a URL handed out at attempt 1 outlives the retry window.
+- `FirmwareFile.s3_key` is the bucket key. `FirmwareFile.file_path` and the local `/firmware/{filename}` StaticFiles mount remain as legacy fallback for rows with `s3_key=NULL`.
+
+**OCPP flow (post-redesign)**:
+1. Admin triggers update → row = PENDING.
+2. Background scheduler waits for charger online + idle, then sends OCPP `UpdateFirmware` with a presigned S3 URL.
+3. WS drops within seconds (expected — `expected_ws_drop_until` flag suppresses alerts for 30 min).
+4. Charger downloads, installs, reboots.
+5. Post-install BootNotification arrives with new `firmware_version` → row → INSTALLED.
+6. If BootNotification reports the old version (outside the 5-min debounce) OR no boot within 2h → attempt failed; scheduler picks the next backoff bucket.
+7. After 5 attempts or 6h elapsed, row → FAILED.
+
+**Polling flow (out-of-network chargers)**:
+1. Charger polls `GET /api/firmware/latest?external_charger_id=...&current_firmware_version=...` every ~30 min.
+2. Server returns the PENDING row's URL + checksum.
+3. Charger downloads + installs out-of-band.
+4. Next poll carries the new version → server auto-marks INSTALLED. If the charger can't report version, admin uses `mark-installed` to close the row.
+
+**Env vars** (defaults shown; configurable in all three docker-compose files):
+- `FIRMWARE_MAX_ATTEMPTS=5`
+- `FIRMWARE_MAX_ELAPSED_SECONDS=21600` (6h wall-clock)
+- `FIRMWARE_ATTEMPT_TIMEOUT_SECONDS=7200` (2h per-attempt timeout)
+- `FIRMWARE_BOOT_DEBOUNCE_SECONDS=300` (5min)
+- `AWS_S3_FIRMWARE_BUCKET=...`
+- `FIRMWARE_PUBLIC_BASE_URL=...` (legacy fallback URL when `s3_key` is null)
 
 #### QR Code Management (`backend/routers/qr_codes.py`)
 **Endpoints**: `/api/admin/qr-codes/*`
@@ -315,6 +340,13 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 - List stations with charger availability counts (requires USER auth)
 - Get station details by ID (requires USER auth)
 - Shared helper `_fetch_stations_with_availability()` provides Redis+heartbeat filtering, connector aggregation, and tariff lookup for both authenticated and public endpoints
+- **Tariff display (post-ADR 0003, 2026-05-18)**: tariff is per-charger. `Tariff.tariff_per_kwh_all_in` is the operator-typed, customer-displayed source of truth; `Tariff.rate_per_kwh` is back-derived. `StationChargerInfo` carries `tariff_per_kwh` (back-derived), `tariff_per_kwh_all_in`, `tariff_gst_percent`; `PublicStationResponse` carries station-level `min/max_price_per_kwh_all_in` (collapse to a single value when uniform). `price_per_kwh` is preserved for compat as the min back-derived rate. Backend helpers live in `backend/services/tariff_utils.py` (`back_derive_rate_per_kwh`, `compute_station_tariff_range`). Frontend renders the all-in figure with an `(all-inclusive)` label via `formatTariffRangeAllIn` in `frontend/lib/utils.ts`. The admin chargers form (`frontend/app/admin/chargers/page.tsx`) takes a single `tariff_per_kwh_all_in` input bounded to ₹1.0–100.0 and renders a live `TariffBreakdownPreview` (computed client-side via `breakdownAllInTariff`) showing the back-derived `rate_per_kwh`, the gateway-fee per kWh, and the GST per kWh — mirroring the backend back-derivation so the operator sees exactly what will be stored.
+
+- **Invoice tariff snapshot (post-2026-05-19)**: `GSTInvoice.tariff_per_kwh_all_in` (nullable, added by migration 38) captures the operator's `Tariff.tariff_per_kwh_all_in` at the moment of issuance. The PDF renders this snapshot in the `Tariff / kWh (Including Taxes and Gateway Charges)` column when present, so the invoice always shows the operator's promised customer-facing rate — even if the operator later changes the tariff. Legacy invoices (pre-cutover) have NULL and fall back to the GST-only-effective `tariff_rate_incl_tax` field with the legacy column header `Tariff / kWh (Including Taxes)`. See ADR 0003 "Invoice display."
+
+- **Migration cutover note**: migration 36 shrinks every `Tariff.rate_per_kwh` by 2% so customer-facing displayed prices stay constant; the franchisee absorbs the 2% on legacy tariffs until they re-save via the new API. The originally-planned `operator_set_all_in_at` audit column + `/api/admin/tariffs/legacy` banner endpoint were dropped at the time of cutover (two live chargers — ops handles re-entry manually). See ADR 0003 for the conditions to add the banner back.
+
+- **`ConnectorInfo` per-plug-type schema (post-2026-05-21, /my-charges modal redesign)**: `_aggregate_connectors` now emits per-plug-type `ready_count` / `in_use_count` / `out_of_service_count` (3-bucket mapping from `ChargerStatusEnum` via `_status_bucket`: AVAILABLE→ready, PREPARING/CHARGING/SUSPENDED_*/FINISHING→in_use, FAULTED/UNAVAILABLE/RESERVED→out_of_service) plus per-plug-type `min_tariff_all_in` / `max_tariff_all_in` (collapse to single value when uniform; falls back to global tariff for chargers without their own). Legacy `available_count` / `total_count` are still emitted (=`ready_count` / total) for `/stations` and the leaflet popup which still render the simple "X/Y available" form. The customer-facing `/my-charges` station modal uses the new fields under a "Chargers" heading (1 charger ↔ 1 connector working fleet invariant per `CONTEXT.md`) with a single "all prices include GST & fees" footnote; the station-wide tariff range tile and the "Available Chargers" headline tile were dropped in the same change.
 
 #### Public Station Map (`backend/routers/public_station_map.py`)
 **Endpoints**: `GET /api/public/stations/map`
@@ -323,23 +355,38 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 - In-memory per-IP rate limiting (20 requests per 60-second window)
 - Reuses `_fetch_stations_with_availability()` from `public_stations.py`
 - Frontend: Leaflet map on `/my-charges` page
+- Carries the same station-level `min/max_price_per_kwh_incl_tax` as `/api/public/stations` but deliberately omits per-charger detail (no `charge_point_string_id`). Popup/list/my-charges modal render the range string `₹min–₹max/kWh (incl. GST)`.
 
 #### Public QR Transaction History (`backend/routers/public_qr_transactions.py`)
 **Endpoints**: `GET /api/public/qr-transactions?vpa=xxx&page=1&limit=10&status=COMPLETED`
 **Purpose**: Public (no auth) endpoint for QR users to look up transaction history by UPI ID
 - Paginated list of QR payments filtered by `customer_vpa` (exact match, case-insensitive)
 - Returns amount paid, status, energy consumed, duration, charger name, refund info
-- Minimal data exposure: omits Razorpay IDs, customer PII, internal DB IDs
+- Minimal data exposure: omits customer PII and internal DB IDs
 - VPA format validation (`xxx@yyy`)
 - Frontend page: `/my-charges` (public route in Clerk middleware)
+- **Refund lifecycle surface (2026-05-21, ADR 0005)**: response now carries `razorpay_refund_id`, `razorpay_refund_speed_processed`, `refund_processed_at`, `refund_failure_reason`. The frontend renders a 3-state lifecycle (Initiated / Sent to bank / Failed) with speed-conditional wording on the terminal state — "Refunded to your account on `<date>`" when `speed_processed == "instant"` (UPI/IMPS is real-time, so `refund.processed` ≈ customer-side credit) vs. "Sent to your bank on `<date>` — usually credits within 5–10 working days" when `speed_processed == "normal"` (NEFT/card reversal, Razorpay genuinely cannot confirm bank settlement). The `razorpay_refund_id` is shown collapsed as a "Ref:" line for support traces.
+
+#### Public QR Active Sessions (`backend/routers/public_qr_active_sessions.py`)
+**Endpoints**: `GET /api/public/qr-active-sessions?vpa=xxx`
+**Purpose**: Live view of in-progress QR sessions for a customer, identified by their UPI VPA. Powers the active-session card on `/my-charges`.
+
+- No auth — VPA is the implicit identifier; same trust model as `/api/public/qr-transactions`. **Read-only by design — see ADR 0006**: no remote-stop or other action endpoint is exposed because VPAs are not credentials (they appear on UPI receipts and screenshots customers freely share). Adding any state-mutating action behind a VPA check would create a grief-stop attack surface that rate-limiting only paper-overs.
+- Same 20 req/60s/IP rate limit as the history endpoint, keyed `public_qr_active_sessions:{ip}` in Redis. VPA validation pattern lives in `backend/core/validators.py` (single source for both QR routers).
+- **Canonical sub-state classifier**: `services/qr_session_state.customer_sub_state(qr_payment, transaction, stale_threshold_seconds=...)` is the single source of truth for "is this QR session active and in which sub-state?". Returns one of `waiting` / `charging` / `paused` / `stopping`, or `None` (exclude). The endpoint, watchdog, and any future caller should import this rather than re-encoding the QR/transaction state mapping.
+- For `charging` / `paused` / `stopping` rows, the endpoint computes live KPIs **entirely from the `qr_session:{txn_id}` Redis row** — no per-session MeterValue DB query on the hot path. The cache row carries `tariff_rate` / `gst_percent` / `platform_fee` (synthetic) / `budget_limit_paise` / `start_meter_kwh` (stamped at StartTransaction) PLUS `latest_reading_kwh` / `latest_power_kw` / `latest_meter_at` (re-stamped by `QRPaymentService.check_budget_and_auto_stop` on every MeterValues frame — 2026-05-22, Option 1 of review item #4). Computed fields: `energy_kwh`, `spent_so_far` = `energy × rate × (1 + gst/100) + synthetic_platform_fee`, `refund_if_stopped_now` = `max(0, amount_paid - spent_so_far)`, `power_kw`. Pre-first-frame (cache row exists but `latest_reading_kwh` is absent) or cache-rebuild scenarios fall back to a one-row MeterValue query and increment `Custom/ActiveSession/MeterSnapshotDbFallback`. `waiting` entries instead carry `stale_threshold_seconds` (remaining seconds until the stale-watchdog auto-refund fires).
+- **Cache contract (issue 05, 2026-05-21):** the `qr_session:{txn_id}` Redis row stores Decimal fields as strings (`amount_paid`, `platform_fee`, `tariff_rate`, `gst_percent`, `start_meter_kwh`), not floats. Readers parse via `Decimal(value)`. Legacy in-flight rows pre-2026-05-21 wrote floats — readers accept those via `Decimal(str(value))` for one TTL window (24h). On cache miss the endpoint AND `QRPaymentService.check_budget_and_auto_stop` log a structured WARNING and increment a counter (`Custom/ActiveSession/CacheMiss` and `Custom/QrSession/BudgetCheckCacheMiss` respectively) so ops can detect Redis instability or operator-edits-mid-session. The cache-miss path uses the **current** Tariff (intentional, matches final-billing math — see issue 05 / ADR 0005 area discussion).
+- **Hardening (issue 04, 2026-05-21):** per-row classification + KPI computation is wrapped in `try/except`; one bad row logs + increments `Custom/ActiveSession/SessionComputeError` and is skipped without breaking the rest of the response. Per-request counter `Custom/ActiveSession/Request` and per-sub-state breakdown `Custom/ActiveSession/SubState/<waiting|charging|paused|stopping>` are emitted on every successful response.
+- Frontend integration: `frontend/lib/queries/public-qr-active-sessions.ts` polls **adaptively** — 15s when at least one session is active, 60s when the response is empty — and pauses entirely when `document.visibilityState !== "visible"`. Frontend components live in `frontend/app/my-charges/_components/` (`ActiveSessionCard`, `ActiveSessionSkeleton`, `ActiveSessionsError`, `RefundLifecycle`, `TransactionCard`, `ChargerRow`). The 1-second duration tick is driven by a module-level **shared clock singleton** in `frontend/lib/hooks/useNowTick.ts` — first subscriber starts the interval, last unsubscriber tears it down, N hook callers = 1 timer. Multi-session VPAs render as a stacked list. First-load shows a skeleton; subsequent polls update silently. A retry-able error banner appears only when the query has no last-good response to fall back to — transient poll failures with cached data render silently. VPA persistence uses the namespaced `localStorage["voltlync.myCharges.lastVpa"]` key (with one-time migration from the pre-namespacing `voltlync.lastVpa`).
 
 #### Webhook Handler (`backend/routers/webhooks.py`)
 **Endpoints**: `/webhooks/*`
 **Purpose**: Clerk webhook processing for user lifecycle events + Razorpay payment webhooks
 - User creation and role assignment automation (Clerk)
 - Webhook signature validation (Clerk SVIX + Razorpay HMAC-SHA256)
-- **NEW**: `POST /webhooks/razorpay` - Handles `payment.captured`, `payment.failed`, `order.paid`, **`qr_code.credited`**
+- **NEW**: `POST /webhooks/razorpay` - Handles `payment.captured`, `payment.failed`, `order.paid`, **`qr_code.credited`**, `refund.*`
 - Routes `qr_code.credited` events to `QRPaymentService.handle_qr_payment()` for appless charging
+- **Refund lifecycle (`handle_refund_event`)** handles three Razorpay events: `refund.processed` stamps `refund_processed_at` and captures `speed_processed` onto the row; `refund.failed` records the bank/error reason into `refund_failure_reason`; **`refund.speed_changed` (added 2026-05-21)** updates `razorpay_refund_speed_processed` when Razorpay silently downgrades instant→normal (or upgrades), so the customer-facing `/my-charges` ETA stays honest per ADR 0005. Razorpay does NOT emit any event confirming the refund has actually credited the customer's source bank account — `refund.processed` is the terminal Razorpay-side signal and for normal-speed refunds the 5–10 working-day issuing-bank settlement is outside Razorpay's visibility.
 - **Cross-environment handling**: All handlers gracefully skip "not found" transactions (return 200, log warning) since production and staging share the same Razorpay live keys and both receive all webhook events. Only real errors (DB, API) return 500 for Razorpay retry.
 
 ### Business Logic Services (`backend/services/`)
@@ -373,6 +420,12 @@ energy_charge = energy_kwh * rate_per_kwh
 gst_amount = energy_charge * gst_percent / 100   # GST on energy cost only
 total_billed = energy_charge + gst_amount         # Wallet deducts total_billed
 ```
+
+**Internal-role skip (ADR 0004, added 2026-05-19)**: Before the QR / idempotency / energy / tariff checks, `_do_transaction_billing` resolves the initiator's `User.role` and returns immediately when it is in `core.roles.INTERNAL_ROLES` (`{ADMIN, FRANCHISEE}`). The session is set to `COMPLETED`, an awaited `transaction.status_changed` audit row is written with `trigger="InternalRoleSkip"`, and `Custom/Wallet/InternalRoleSkipped` is incremented. The mirror skip in `WalletSessionService.cache_session_on_start` (`Custom/WalletSession/InternalRoleSkipped`) ensures no `wallet_session:{txn_id}` Redis row is snapshotted. `services/invoice_service.py` was already gating GST invoice issuance on the same role set. The audit log is awaited (not `safe_create_task`) so it joins the same `@atomic` transaction — a spawned task would inherit the in-progress connection context which is unusable after the atomic exits. See `docs/adr/0004-internal-role-sessions-are-operational.md`.
+
+**Internal-role wallet creation gate**: `routers/webhooks.py:handle_user_created` calls `Wallet.create(user=user)` only when `user_role not in INTERNAL_ROLES`. This pairs with the runtime skip above — the runtime skip is defense-in-depth against any legacy wallet that exists, the creation gate is the prevention going forward. One-shot SQL deleted the historical backfilled wallets on 2026-05-19: dev had 2 (user IDs 2, 8), staging had 9 (user IDs 12, 16, 19, 20, 22, 23, 24, 31, 39). Prod runs on the next `deploy`-branch push.
+
+**Zero-energy watchdog Decimal serialization fix (2026-05-20)**: The MeterValues parser at `main.py:1075` constructs `reading_kwh` as `Decimal(str(value))`. This Decimal was passed through to `services/zero_energy_watchdog.check_zero_energy`, stuffed into a dict, and handed to `redis_manager.set_zero_energy_state` which serialised it via `json.dumps(data)` — no encoder for Decimal. Result: every MeterValues frame of every active session logged `Object of type Decimal is not JSON serializable` (223 occurrences in a recent staging log window) and the watchdog's tracking state never persisted. Two-layer fix: (1) the watchdog now does `reading_kwh = float(reading_kwh)` at entry — kWh precision down to the milliwatt-hour is well above what the minute-scale stall check needs; (2) all four `json.dumps(data)` writers in `redis_manager.py` (`set_qr_session`, `set_wallet_session`, `set_zero_energy_state`, `set_socket_grace_period`) now pass `default=str` as defense for any future Decimal-bearing field. Regression tests in `tests/test_zero_energy_watchdog.py` (`TestDecimalReadingKwh`, `TestRedisManagerDefaultStrDefense`).
 
 #### Billing Retry Service (`backend/services/billing_retry_service.py`)
 **Purpose**: Background service for recovering failed transactions and cleaning up stale state
@@ -410,16 +463,79 @@ class QRPaymentService:
         """Called from MeterValues: calculates cost vs budget, schedules RemoteStop if exceeded"""
 
     async def process_qr_session_billing(transaction_id)
-        """Called from StopTransaction: calculates final cost, issues partial refund for unused balance"""
+        """Called from StopTransaction: calculates final cost (capped at budget),
+        issues partial refund for unused balance.
+
+        Over-consumption cap: the charger keeps delivering for a few seconds
+        after we send RemoteStopTransaction, so metered kWh can overshoot the
+        Redis-enforced budget. Billable energy_cost is capped at the budgeted
+        pre-tax ceiling = (amount_paid - platform_fee) / (1 + gst%/100). The
+        over-delivered energy is absorbed by the operator and logged as a
+        WARNING. transaction.energy_consumed_kwh remains the authoritative
+        meter reading; only billable values on qr_payment and on the invoice
+        reflect the cap. The customer-facing invoice's `energy_consumed_kwh`
+        column is the *billable* kWh (energy_charge / tariff_rate) so the
+        line-item math reconciles."""
 
     async def handle_charging_failure(transaction_id)
         """Handles failures: sets status=FAILED, issues full refund"""
 ```
 
+**Charger control surface — admin vs franchisee API divergence**: two endpoints expose ChangeAvailability, deliberately with different contracts:
+- `POST /api/admin/chargers/{id}/change-availability?type=Operative|Inoperative&connector_id=0` — admin endpoint, OCPP-aligned vocabulary. `connector_id` is validated to be `0` (whole-charger only); per-connector toggle isn't a product feature today. The query-param shape preserves OCPP terminology so admins debugging via curl or audit logs see exactly what was sent to the charger.
+- `POST /api/franchisee/chargers/{id}/change-availability?available=true|false` — franchisee endpoint, operator-intuitive boolean. Internally maps to OCPP Operative/Inoperative and hardcodes `connector_id=0`.
+
+This divergence is intentional. Admins debug at the OCPP layer and want explicit Operative/Inoperative terminology; franchisees want a self-serve on/off toggle. A future contributor who tries to "DRY" them into one shape will lose either the admin debugging vocabulary or the franchisee simplicity. Frontend mirrors the split — `lib/api-services.ts:chargerService.changeAvailability` (admin) vs `franchiseeService.changeAvailability` (franchisee).
+
+The frontend's `useChangeAvailability` hook (admin) branches on the OCPP response status (Accepted → success + keep optimistic update, Scheduled → info toast + revert optimistic, Rejected → error toast + revert). Per issue 01 of the availability-toggle-fixes batch.
+
+**Charger creation atomicity (issue 05, post-2026-05-18)**: `routers/chargers.py:create_charger` wraps the three writes (`Charger.create`, `Connector.create` per connector input, `Tariff.create`) in `async with in_transaction()`. If any step raises, the whole creation rolls back — no orphan chargers with partial connector sets or no tariff. Two audit-log paths:
+- **Happy path**: `action="charger.created"` written after the transaction commits.
+- **Rollback path**: `action="charger.create_failed"` written inside the `except IntegrityError` branch with the input data + `failure_reason`. Operators can query `WHERE action IN ('charger.created', 'charger.create_failed')` to see every attempted onboarding. The audit write itself is best-effort — wrapped in its own try/except so a secondary audit failure doesn't mask the original 400.
+
 **Configuration**:
-- `RAZORPAY_PLATFORM_FEE_PERCENT`: 2.0% fallback (actual fee extracted from Razorpay webhook/API)
-- `MINIMUM_REFUND_AMOUNT`: ₹1.0 (env var)
+- `RAZORPAY_PLATFORM_FEE_PERCENT`: 2.0% — **authoritative synthetic rate** used for every customer-facing calculation (post-ADR 0001). Validated at startup (issue 03) in four bands via `core.config.validate_platform_fee_percent`: `≤0` and `>10` refuse startup with `RuntimeError`; `>5` logs `ERROR` and proceeds (legitimately high — ops should confirm intent); `0–5` is the normal range with an info log. Configurable ceilings live in `core/config.py` as `PLATFORM_FEE_HARD_CEILING` (10) and `PLATFORM_FEE_SOFT_CEILING` (5). The actual Razorpay fee is still captured on the `QRPayment` row for ops/reconciliation but is no longer used for budget, refund, or invoice math.
 - `QR_PAYMENT_PENDING_TIMEOUT`: 300 seconds (env var)
+
+**Tariff back-calc identity drift check (issue 02, post-2026-05-18)**:
+- `services/tariff_drift_check.py` exposes `find_drifting_tariffs(fee_percent, sample_size)` and `warn_on_tariff_identity_drift(fee_percent, logger)`. Invoked from `main.py` startup after DB init.
+- Samples up to 10 `Tariff` rows. For each, verifies `back_derive_rate_per_kwh(all_in, gst, current_fee) ≈ stored_rate_per_kwh` within ±0.0002. Catches the H3 scenario: migration 36 baked in the 2% fee assumption, but `RAZORPAY_PLATFORM_FEE_PERCENT` was changed afterwards — legacy-backfilled rows now violate the identity until operators re-save them via the admin form.
+- One `WARNING` log per drifting row (named by `tariff_id` / `charger_id` / drift magnitude). `Custom/Tariff/IdentityDrift` counter increments once per startup if any drift detected — not once per row, to avoid alert storms on fleet-wide env changes.
+- Non-fatal: startup proceeds either way. Operators clear drift by re-entering the affected tariff via the admin form, which recomputes `rate_per_kwh` under the current env-var value.
+
+**Synthetic platform fee policy (effective 2026-05-18, ADR 0001)**:
+- Three helpers replace the old `_resolve_platform_fee`. Public helpers live in `services/tariff_utils.py` (the single home for synthetic-fee policy math + the back-derivation formula); the side-effect writer stays in `qr_payment_service.py` because it talks to the Razorpay SDK.
+  - `synthetic_platform_fee(amount_paid)` (in `tariff_utils`) — pure function, returns `amount_paid × RAZORPAY_PLATFORM_FEE_PERCENT/100`. Drives budget cap, over-payment refund, and invoice gateway-charges line.
+  - `synthetic_fee_split(amount_paid)` (in `tariff_utils`) — returns the (commission, GST) breakdown, treating the 2% as all-in: commission = `× 2/118`, GST = `total − commission` (residual, not independently rounded).
+  - `_ensure_actual_fee_captured(qr_payment)` (in `qr_payment_service`) — side-effect writer: ensures the actual Razorpay fee lives on the `QRPayment` row (`platform_fee` / `razorpay_commission` / `razorpay_gst`). Priority: webhook > API fetch > 2% estimate fallback.
+- `RAZORPAY_PLATFORM_FEE_PERCENT` itself lives in `backend/core/config.py` (project-level config). Read by `main.py` (startup validation), `routers/chargers.py` (back-derivation on POST/PATCH), and `tariff_utils.py` (synthetic-fee math). Re-exported from `qr_payment_service.py` for backwards compatibility.
+- `GSTInvoice.gateway_charges` / `gateway_gst` snapshot the synthetic 2% split at issuance, NOT the QRPayment row's actual fee. Customers see a deterministic gateway-charges line regardless of what Razorpay actually charged.
+- Variance between actual and synthetic is absorbed by VoltLync as P&L — queryable via `SUM(qr_payment.platform_fee - 0.02 × amount_paid)`.
+
+**Refund / over-consumption policy (effective 2026-05-13)**:
+- **Positive balance** (customer paid more than they used) → **always refunded** via Razorpay, regardless of amount. The historical `MINIMUM_REFUND_AMOUNT` threshold has been removed.
+- **Negative balance** (customer used more energy than they paid for, due to stop-signal latency) → **operator absorbs**. Existing budget cap on `energy_charge` stays; `Custom/QR/OverConsumptionCapped` / `Custom/QR/OverDeliveryKwh` metrics continue tracking magnitude.
+- **Invariant**: `transaction_amount = total_amount + refund_amount` holds on every new QR invoice.
+
+**Zero-energy refund policy (effective 2026-05-18, ADR 0002)**:
+- When a QR session finalises with `energy_consumed_kwh ≤ 0`, `handle_charging_failure` → `_full_refund` issues a refund equal to the entire `amount_paid` (NOT `amount_paid - platform_fee` as in the pre-ADR behaviour).
+- The actual Razorpay fee is still captured on the `QRPayment` row (`platform_fee` / `razorpay_commission` / `razorpay_gst`) for reconciliation, but the refund formula ignores it. VoltLync absorbs the Razorpay gateway fee and refund-processing fee as P&L loss — no service rendered, customer is made whole.
+- No `GSTInvoice` is issued for zero-energy sessions (the invoice service short-circuits at `energy <= 0` in `generate_invoice`).
+- Idempotency preserved: `razorpay_refund_id` guard prevents duplicate refunds on webhook retries.
+- See `docs/adr/0002-zero-energy-full-refund.md` for the policy rationale and rejected alternatives.
+
+**Razorpay instant refunds for full-refund flows (effective 2026-05-20, ADR 0002 amendment)**:
+- All six `_full_refund` call sites — zero-energy at StopTransaction, stale payment, concurrent rejection on busy charger, charger not connected at start, RemoteStart failure, plug-in timeout — request Razorpay's `speed=optimum` mode. Customers see refunds in minutes instead of the default 5–7 working days.
+- VoltLync absorbs Razorpay's per-refund instant fee (~₹5–₹6 + 18% GST per UPI refund) **in addition to** the original gateway fee. Same philosophy as the gateway-fee absorption: the customer experiencing a failure should not feel the cost of the failure.
+- Partial unused-credit refunds in `process_qr_session_billing` remain on Razorpay's default `normal` speed. The partial-refund case = "here's your change" after service was rendered; not the same urgency as "we failed you."
+- `speed=optimum` is best-effort. Razorpay falls back to `normal` server-side when rails or payment method don't support instant. The actual outcome is exposed in `speed_processed`, which `RazorpayService.refund_payment` logs on every refund.
+- **Kill-switch env var**: `RAZORPAY_INSTANT_REFUND_ENABLED` (default `true`). Wired into `docker-compose.yml`, `docker-compose.staging.yml`, `docker-compose.prod.yml`, and the three `.env.*.example` files. Logged at startup in `backend/main.py`. Set to `false` and redeploy to revert all full refunds to normal speed without a code change.
+- **Outcome persisted on the QRPayment row**: column `razorpay_refund_speed_processed` (VARCHAR(20), nullable; migration 40) holds Razorpay's reported `speed_processed` value (`"instant"` or `"normal"`) for every full-refund call — including the `RazorpayAlreadyRefundedError` reconciliation path when the existing-refund dict carries the field. NULL on partial refunds and on all pre-feature rows. The admin QR detail page (`/admin/qr-codes/[id]`) renders an `Instant` (green) or `Normal (5-7 days)` (gray) badge next to the refund amount when the column is non-null; customer-facing `/my-charges` is unchanged.
+- **Monitoring counters** (emitted from `OCPPMetrics.record_refund_speed`, gated on `speed=optimum` actually being requested):
+  - `Custom/QR/RefundInstantSucceeded` — `speed_processed == "instant"`.
+  - `Custom/QR/RefundInstantFallback` — `speed_processed` came back as anything other than `"instant"` (typically `"normal"`).
+  - Neither counter fires when `RAZORPAY_INSTANT_REFUND_ENABLED=false` (a normal-speed refund under the kill-switch is intentional, not a Razorpay-side fallback). A sudden spike in `RefundInstantFallback` is the operational alert for rail outages, account-level rate limits, or payment-method shifts.
+  - A `QRRefundSpeed` New Relic event is also emitted with `charger_id`, `qr_payment_id`, and `speed_processed` for ad-hoc querying.
 
 **Error Handling**:
 - **Idempotency**: Checks `razorpay_payment_id` uniqueness before processing
@@ -429,7 +545,6 @@ class QRPaymentService:
 - **Plug-in timeout**: Background task polls 10s intervals for 5 minutes, refunds on timeout
 - **RemoteStart failure**: Up to 2 retries with 5s delay, full refund if all fail
 - **Budget exceeded**: Schedules RemoteStopTransaction as asyncio.create_task (avoids deadlock)
-- **Refund below minimum**: Amounts <₹1.0 absorbed as operator credit (Razorpay fee > refund)
 
 **Redis Session Cache**:
 ```
@@ -509,14 +624,22 @@ User → Frontend Modal → Create Order → Razorpay Checkout → Payment
 - Runs as background task started during app startup
 
 #### Firmware Storage Service (`backend/services/storage_service.py`)
-**Purpose**: Local filesystem storage for firmware files
+**Purpose**: Dual-mode storage for firmware files — S3 (primary) with a local-disk fallback for short-URL stopgap.
+
+**Storage backend selection (effective 2026-05-20)**:
+- `POST /api/admin/firmware/upload` reads `AWS_S3_FIRMWARE_BUCKET` at request time:
+  - **Bucket set** (production-default behavior): bytes uploaded to S3, `FirmwareFile.s3_key` populated, `file_path=""`. `_try_trigger_update` dispatches `UpdateFirmware` with the ~1700-byte presigned URL.
+  - **Bucket empty/unset** (stopgap for charger URL-parser limits): bytes written to `/app/firmware_files/{version}_{filename}` on the backend container, `s3_key=NULL`, `file_path` populated. `get_firmware_download_url_for_file` returns the legacy ~62-byte URL `{FIRMWARE_PUBLIC_BASE_URL}/firmware/{filename}` served by FastAPI's static-files mount (`main.py:158`) and proxied by nginx `location /firmware/`.
+- Audit log records `storage_backend: "s3" | "local"` on every upload.
+- Why: an EC2 instance-role-signed S3 presigned URL is ~1700 bytes due to the `X-Amz-Security-Token` (~1100 bytes of base64). Firmware on some chargers (Quectel modems) has a smaller URL-parse buffer. The stopgap lets ops flip to local-disk mode for staging without a code change — set `AWS_S3_FIRMWARE_BUCKET=""` and redeploy env. The proper long-term replacement is a backend proxy endpoint with a short opaque token (see follow-up issue).
+- Security caveat: the legacy `/firmware/{filename}` URL has no signature/TTL — anyone who reaches the host with the right path can download the blob. Acceptable for staging; **must not be enabled on prod** without first landing the token-based proxy.
 
 **Key Features**:
-- Firmware file upload and storage in `/backend/firmware_files/`
+- Firmware file upload and storage — S3 in normal mode, `/app/firmware_files/` in stopgap mode
 - MD5 checksum calculation for integrity verification
-- Download URL generation for OCPP UpdateFirmware commands
+- Download URL generation for OCPP UpdateFirmware commands — automatically picks per-row based on `s3_key`
 - File naming convention: `{version}_{original_filename}`
-- Static file serving via `/firmware/{filename}` endpoint
+- Static file serving via `/firmware/{filename}` endpoint (always live; serves whatever is on disk regardless of S3 mode)
 
 **Methods**:
 ```python
@@ -541,6 +664,18 @@ def file_exists(file_path: str) -> bool:
 - Maximum file size: 100MB
 - Unique version enforcement
 - Soft deletion (keeps physical files after database soft delete)
+
+**Volume ownership (production image)**:
+- The `firmware_files/` directory is mounted as a Docker named volume
+  (`backend_firmware_prod`, `backend_firmware_staging`) so uploads survive
+  container recreation.
+- Named volumes are seeded once at first mount; later image rebuilds do
+  not re-apply ownership. To guarantee the app user (`uid 1001`) can
+  write to the volume regardless of when it was created, the production
+  image ships without a `USER` directive — `docker-entrypoint.sh` starts
+  as root, `chown`s `/app/firmware_files` to `app:app`, then re-execs
+  itself under `app` via `gosu`. The rest of the container lifecycle
+  (migrations, uvicorn, healthcheck's CMD target) runs unprivileged.
 
 **Static File Configuration** (`main.py`):
 ```python
@@ -699,12 +834,14 @@ A txn with no signals at all returns `(False, None)` — the helper defers to th
 - Hooked into `MeterValues` handler
 - Tracks per-transaction state in Redis (`zero_energy:{txn_id}`)
 - Skips check during initial grace period (`ZERO_ENERGY_GRACE_PERIOD_SECONDS`, default 60s)
-- If energy hasn't advanced for `ZERO_ENERGY_TIMEOUT_SECONDS` (default 120s), schedules `RemoteStopTransaction`
+- If energy hasn't advanced for `ZERO_ENERGY_TIMEOUT_SECONDS` (default 7200s / 2h, bumped 2026-05-21 from 120s), schedules `RemoteStopTransaction`
 - **W5 hook**: when energy advances, also pops `disconnect_handler._disconnect_reset_count` for the transaction (zeros the flap counter)
+
+**Rationale for 2-hour window** (2026-05-21): the previous 120s timeout was killing sessions whose EV had taper-completed (SOC cap reached, BMS pause) only a couple of minutes earlier. Operators wanted EVs to be able to sit idle on the connector for up to 2 hours before being auto-stopped — covers natural taper-end without leaving infinitely-stuck sessions. Customers paying via QR see their refund window extend from ~3 min after taper-end to ~2 hr after taper-end; flag this in customer-comms if relevant.
 
 **Cleanup**: `clear_zero_energy_tracking(transaction_id)` is called from `transaction_finalizer.finalize_stopped_transaction`, ensuring state is removed on every stop path.
 
-**Redis TTL**: 7200 seconds (2h) — well above the longest plausible session, bounded leak in case of missed cleanup.
+**Redis TTL invariant**: `set_zero_energy_state` uses `ttl=14400` (4h). This MUST remain strictly greater than `ZERO_ENERGY_TIMEOUT_SECONDS`, otherwise a charger that goes silent mid-stall lets the Redis state expire and resets the stall clock on reconnect — the watchdog would never trip. If you raise the timeout, raise the TTL too.
 
 #### Operational Runbooks (`docs/runbooks/`)
 **Purpose**: Single source of truth for on-call triage. Each runbook is linked from a New Relic alert condition via `runbook_url`, so the on-call engineer gets a one-click path from page → triage steps.
@@ -1390,6 +1527,91 @@ The QR-based appless charging feature enables customers to charge their EV by sc
 - **Concurrent-payment rejection** — `handle_qr_payment` wraps the active-transaction + pending-QR check in a transaction with `Charger.select_for_update().get(id=charger.id)`. If the charger is busy, the new payment is created with `FAILED` status and auto-refunded outside the lock; the charger holder is unaffected.
 - **Razorpay "already refunded" reconciliation** — When Razorpay returns a fully-refunded error, `razorpay_service` raises `RazorpayAlreadyRefundedError`. `_full_refund` catches it, calls `find_refund_for_payment()`, persists the pre-existing refund ID, and logs `refund_reconciled=true`. The database row ends consistent with Razorpay's state.
 - **Indexed order-id lookup** — `WalletTransaction.razorpay_order_id` is a dedicated indexed column (migration 14). Webhook handlers use a direct indexed lookup instead of scanning the 1000 most recent rows (old JSON fallback retained for pre-migration rows only).
+- **Rate-limit Redis keys are `ratelimit:public_qr_transactions:{ip}`** (the `ratelimit:` prefix is added by `RedisConnectionManager.rate_limit_check`, not by callers). Test conftest function-scoped autouse fixture flushes `ratelimit:public_qr_transactions:*` before every test so cumulative request counts across the suite don't trip the 20-req/60s public-endpoint limiter.
+- **Non-negative `wallet_transaction.amount`** — `WalletTransaction.save()` raises `ValueError` if `amount < 0`, and migration 32 added a Postgres CHECK constraint `wallet_transaction_amount_non_negative (amount >= 0) NOT VALID`. Migration 33 backfilled `ABS(amount)` on legacy negative CHARGE_DEDUCT rows and redeemed the constraint to `VALID`. Convention: `amount` is always non-negative; direction is carried entirely by `type` (`TOP_UP` credits, `CHARGE_DEDUCT` debits). Frontend wallet-history views (`admin/chargers/[id]/page.tsx`) render direction from `type`, not from amount sign.
+
+- **Wallet session budget cap + RemoteStop auto-stop (Module B).** Wallet-paid charging sessions enforce the same kind of in-session budget cap as QR sessions. On StartTransaction the wallet's available balance is snapshotted into Redis as `wallet_session:{transaction_id}` (paise-int, 24 h TTL, payload includes `tariff_rate`, `gst_percent`, `start_meter_kwh`, `auto_stop_scheduled`). On every MeterValues frame, `WalletSessionService.check_balance_and_auto_stop` (`backend/services/wallet_session_service.py`) recomputes the accumulated cost `(reading_kwh − start_meter_kwh) × rate × (1 + gst%)` and compares it to the snapshot. When `cost ≥ budget_limit`, it schedules `RemoteStopTransaction` via `safe_create_task` — never awaits, because the MeterValues handler has not yet sent its CALLRESULT and awaiting an outbound CALL would deadlock the OCPP session. The `auto_stop_scheduled` flag in the payload, set *before* dispatch, makes late MeterValues frames in the same window no-ops so a charger that sends rapid-fire frames doesn't fire a second stop. After a server restart the Redis cache is empty; `_rebuild_session_from_db` reconstructs the payload by reading the live wallet balance via `WalletService.get_balance` and re-writing the cache, so restarts mid-session don't forfeit the cap. The cache key is deleted on StopTransaction. QR sessions are filtered out of the rebuild path (they're driven by their own QR budget cache); the two systems coexist cleanly side-by-side at `main.py:1108-1140`.
+
+- **Wallet balance is derived from the log (Module C, migration 33).** The `wallet.balance` column was dropped. Balance is now `SUM(amount)` over `wallet_transaction` rows where `type = 'TOP_UP' AND payment_metadata->>'status' = 'COMPLETED'` minus `SUM(amount)` over `type = 'CHARGE_DEDUCT'` rows — a single-table aggregate served by `WalletService.get_balance(wallet_id)` (`backend/services/wallet_service.py`). PENDING and FAILED top-ups are filtered out by design so unconfirmed Razorpay orders never credit the wallet. The hot read path (`/users/me`, admin user list, recharge endpoints) is fronted by a Redis cache (`wallet_balance:{wallet_id}`, paise-int, 1 h TTL) invalidated by `WalletService._invalidate_balance_cache` on every successful billing or top-up (invalidation runs **after** the outer `@atomic()` commits, so concurrent readers can't repopulate the cache with pre-commit data). The index `idx_wallet_txn_balance (wallet_id)` keeps the aggregate cheap — measured 0.18ms at N=200, 0.97ms at N=5000. **Migration 33 captured pre-existing stored-vs-derived drift as auto-generated adjustment rows** (description "Pre-ledger-migration drift correction (auto-generated by migration 33)") so derived balance post-migration matches each wallet's stored balance at migration time. The `wallet` row still exists to anchor FKs and serve as the row-level lock target for serialising concurrent top-ups / charges on the same user. To audit drift after the fact, `backend/scripts/reconcile_wallet_balance.py` reads the live ledger and prints discrepancies.
+
+#### Wallet migration rollback runbook (32 / 33 / 34)
+
+**Important caveat:** Aerich's `aerich` tracking table can lag behind the filesystem migration list — `aerich downgrade` operates on its tracked version and may try to roll back unrelated earlier migrations (e.g. `gst_invoice`) and fail with `DependentObjectsStillExistError`. **Do not rely on `aerich downgrade` for production rollback of migrations 32–34.** Run the SQL by hand instead. Verified the down/up cycle works for migration 34 in dev.
+
+**Pre-flight:** take a logical backup of the `wallet`, `wallet_transaction`, and `aerich` tables before any rollback. `pg_dump` filtered to those tables is sufficient — the wallet domain is the entire scope of these migrations.
+
+**To roll back migration 34** (the index tightening):
+```sql
+DROP INDEX IF EXISTS "idx_wallet_txn_balance";
+CREATE INDEX IF NOT EXISTS "idx_wallet_txn_balance"
+    ON "wallet_transaction" (wallet_id) INCLUDE (amount, type);
+```
+Safe under live traffic — the index is rebuilt while the old one is dropped. Brief lock during DROP.
+
+**To roll back migration 33** (the ledger migration — destructive of the new ledger model):
+```sql
+-- Re-add the column with derived values so the old code can boot.
+ALTER TABLE "wallet" ADD COLUMN "balance" DECIMAL(10,2);
+
+UPDATE "wallet" w
+   SET balance = COALESCE((
+       SELECT SUM(CASE
+                  WHEN type = 'TOP_UP'
+                       AND payment_metadata->>'status' = 'COMPLETED'
+                       THEN amount
+                  WHEN type = 'CHARGE_DEDUCT'
+                       THEN -amount
+                  ELSE 0
+              END)
+         FROM "wallet_transaction"
+        WHERE wallet_id = w.id
+   ), 0);
+
+-- Drop the covering index and roll the CHECK back to NOT VALID.
+DROP INDEX IF EXISTS "idx_wallet_txn_balance";
+ALTER TABLE "wallet_transaction"
+  DROP CONSTRAINT IF EXISTS "wallet_transaction_amount_non_negative";
+ALTER TABLE "wallet_transaction"
+  ADD CONSTRAINT "wallet_transaction_amount_non_negative"
+  CHECK (amount >= 0) NOT VALID;
+```
+**Caveat 1:** the drift-correction adjustment rows inserted by 33's auto-heal remain in `wallet_transaction` (description `'Pre-ledger-migration drift correction...'`). They are harmless but visible in the wallet history UI. Delete them if you need a clean rollback: `DELETE FROM wallet_transaction WHERE description LIKE 'Pre-ledger-migration drift correction%';`. **Caveat 2:** the sign-normalisation `UPDATE ... SET amount = ABS(amount)` is irreversible without a backup — the original negative signs are lost. **For full rollback, restore from the pre-migration `pg_dump` instead.**
+
+**To roll back migration 32** (the CHECK constraint):
+```sql
+ALTER TABLE "wallet_transaction"
+  DROP CONSTRAINT IF EXISTS "wallet_transaction_amount_non_negative";
+```
+Always safe.
+
+**Post-rollback verification:**
+1. `\d+ wallet` shows `balance` column present.
+2. `\d+ wallet_transaction` shows expected constraint state.
+3. `python -m scripts.reconcile_wallet_balance` exits zero with drift = 0 across all wallets (because step 33's UPDATE built `balance` from the same formula `get_balance` would use).
+4. Deploy the old code; smoke-test wallet recharge + charge.
+
+**Aerich reconciliation:** if you also want `aerich` state to reflect the rollback, manually `DELETE FROM aerich WHERE version IN (...)` the relevant rows. Skipping this is fine for emergency rollback — the next deploy can re-sync.
+
+#### Wallet drift alerting
+
+The reconciliation script (`backend/scripts/reconcile_wallet_balance.py`) is read-only, exits zero on no drift and non-zero on drift above the threshold. Recommended deployment as a daily cron on both staging and prod:
+
+```cron
+# Nightly wallet ledger reconciliation @ 02:30 IST
+30 2 * * *  docker exec ocpp-backend python -m scripts.reconcile_wallet_balance --threshold 1.00 >> /var/log/voltlync/reconcile.log 2>&1
+```
+
+For AWS-managed staging/prod, the equivalent remote invocation (matches the project's standard `voltlync` profile pattern documented elsewhere in this doc):
+
+```bash
+aws ssm send-command \
+  --profile voltlync \
+  --instance-ids <ec2-id-from-Makefile> \
+  --document-name AWS-RunShellScript \
+  --parameters 'commands=["docker exec ocpp-backend python -m scripts.reconcile_wallet_balance --threshold 1.00"]'
+```
+
+**Alert wiring:** the script exits non-zero when any wallet's drift exceeds the threshold. Wire that exit code into the existing monitoring path — Sentry (if the script's stderr is forwarded), or a CloudWatch alarm on the SSM command's `Status` field, or a Slack webhook from the cron wrapper. Drift > ₹1 should page on-call; drift > 0 but < ₹1 should ticket. The `Custom/Wallet/NegativeBalance` New Relic metric (emitted by `WalletService.get_balance` whenever a derived balance comes out negative) is the runtime-side complement to this batch check.
 - **Webhook retries avoided** — All Razorpay webhook handlers return HTTP 200 on application errors (logged) so Razorpay does not retry. Only infrastructure failures (DB/Redis) surface as 5xx.
 - **PII masked in logs** — `mask_vpa()`, `mask_phone()`, `mask_payment_id()`, `mask_email()` helpers in `utils.py` are applied in all QR payment log statements. Logs forwarded to New Relic contain only masked identifiers.
 
@@ -1471,8 +1693,8 @@ The QR-based appless charging feature enables customers to charge their EV by sc
 - Calls `process_qr_session_billing(transaction_id)`
 - Calculates: `energy_cost = energy_consumed × tariff_rate`
 - Calculates: `gst_amount = energy_cost × gst_percent / 100` (GST on energy cost only)
-- Resolves `platform_fee` via `_resolve_platform_fee()`: actual Razorpay fee from webhook/API, fallback to 2% estimate
-- Calculates: `refund = amount_paid - energy_cost - gst_amount - platform_fee`
+- Computes `platform_fee = _synthetic_platform_fee(amount_paid)` (fixed 2%, ADR 0001). Also calls `_ensure_actual_fee_captured(qr_payment)` so the actual Razorpay fee lands on the row for ops/reconciliation.
+- Calculates: `refund = amount_paid - energy_cost - gst_amount - synthetic_platform_fee`
 - **If refund >= ₹1.0**: Issues partial refund via Razorpay, sets status=REFUNDED
 - **If refund < ₹1.0**: Absorbed as operator credit, sets status=COMPLETED
 - Deletes Redis session cache
@@ -1503,8 +1725,7 @@ REFUND_FAILED
 ### Configuration
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `RAZORPAY_PLATFORM_FEE_PERCENT` | 2.0 | Fallback fee estimate (%) when actual Razorpay fee unavailable |
-| `MINIMUM_REFUND_AMOUNT` | 1.0 | Minimum refund amount in ₹ (below this, absorbed) |
+| `RAZORPAY_PLATFORM_FEE_PERCENT` | 2.0 | Authoritative synthetic platform-fee rate (%) used for budget cap, over-payment refund, and invoice gateway-charges line. ADR 0001. Startup fails loud if missing/zero. |
 | `QR_PAYMENT_PENDING_TIMEOUT` | 300 | Seconds before a payment is considered stale |
 
 ### Test Script
@@ -1618,15 +1839,36 @@ CREATE TABLE charger (
 );
 
 -- Tariff configuration per charger
--- Defined in: backend/models.py (Tariff)
+-- Defined in: backend/models.py (Tariff). ADR 0003 added the all-in column.
 CREATE TABLE tariff (
     id SERIAL PRIMARY KEY,
     charger_id INTEGER REFERENCES charger(id),
-    rate_per_kwh DECIMAL(10, 2) NOT NULL,
-    gst_percent DECIMAL(5, 2) DEFAULT 18.00,  -- GST percentage applied on energy cost
+    rate_per_kwh DECIMAL(8, 4) NOT NULL,                   -- INTERNAL back-derived rate (= all_in × 0.98 / 1.18); used by line-item billing math only, never customer-facing
+    tariff_per_kwh_all_in DECIMAL(10, 4) NOT NULL,         -- OPERATOR-TYPED, CUSTOMER-DISPLAYED all-inclusive rate (incl. GST + synthetic 2% gateway fee). Authoritative for display
+    gst_percent DECIMAL(5, 2) DEFAULT 18.00,               -- GST percentage; used in the back-derivation formula and at billing time
+    hsn_sac_code VARCHAR(10),
+    is_global BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
+-- Admin-facing UX (post issue 04): the chargers admin UI takes the
+-- *all-inclusive* per-kWh price (operator's intended customer-visible rate).
+-- The API accepts ONLY `tariff_per_kwh_all_in` (validated 1.0–100.0); the
+-- router back-derives `rate_per_kwh = all_in × (1 - fee_pct/100) / (1 + gst_percent/100)`
+-- and persists both. The legacy `tariff_per_kwh` / `tariff_per_kwh_incl_tax`
+-- request fields are rejected with 422 (`extra='forbid'`).
+--
+-- Migration 36 (2026-05-18) backfilled `tariff_per_kwh_all_in = rate × (1 + gst/100)`
+-- and shrunk `rate_per_kwh *= 0.98` so the back-calc identity holds going
+-- forward. Franchisees absorb a 2% margin on legacy tariffs until they
+-- re-save via the new API; with two live chargers at cutover, ops handles
+-- re-entry manually instead of via a banner endpoint. See ADR 0003.
+
+-- Decimal precision convention (post migration 31):
+--   Rate-like columns (per-kWh, per-unit prices): DECIMAL(8, 4)
+--   Amount-like columns (line totals, GST amounts, ledger amounts): DECIMAL(*, 2) — paisa-precise to match Razorpay
+--   Energy/kWh columns: DECIMAL(12, 3) — OCPP reports Wh resolution
+--   Percentage rates (GST/commission/TDS): DECIMAL(5, 2) — statutory whole/half percentages
 ```
 
 #### Firmware Management Tables
@@ -1657,7 +1899,7 @@ CREATE TABLE firmware_update (
     status VARCHAR(19) NOT NULL DEFAULT 'PENDING',  -- FirmwareUpdateStatusEnum
     initiated_by_id INTEGER REFERENCES app_user(id) ON DELETE CASCADE,
     initiated_at TIMESTAMP DEFAULT NOW(),
-    download_url VARCHAR(500) NOT NULL,  -- URL for charger to download from
+    download_url TEXT NOT NULL,  -- Presigned S3 URL; TEXT because role-assumed STS tokens push URLs past 500 chars
     started_at TIMESTAMP,                -- When download began
     completed_at TIMESTAMP,              -- When update completed/failed
     error_message TEXT,                  -- Failure details
@@ -1807,11 +2049,12 @@ CREATE TABLE transaction (
     user_id INTEGER REFERENCES user(id),
     charger_id INTEGER REFERENCES charger(id),
     vehicle_id INTEGER REFERENCES vehicle_profile(id),
-    start_meter_kwh DECIMAL(10, 3),
-    end_meter_kwh DECIMAL(10, 3),
-    energy_consumed_kwh DECIMAL(10, 3),
+    start_meter_kwh DECIMAL(12, 3),
+    end_meter_kwh DECIMAL(12, 3),
+    energy_consumed_kwh DECIMAL(12, 3),
     energy_charge DECIMAL(10, 2),       -- energy_kwh × rate_per_kwh
-    gst_amount DECIMAL(10, 2),          -- GST on energy_charge (18% default)
+    gst_amount DECIMAL(10, 2),          -- GST on energy_charge
+    gst_rate_percent DECIMAL(5, 2) DEFAULT 18.00,  -- rate snapshot at billing
     total_billed DECIMAL(10, 2),        -- energy_charge + gst_amount
     start_time TIMESTAMP DEFAULT NOW(),
     end_time TIMESTAMP,
@@ -1829,7 +2072,7 @@ CREATE TABLE transaction (
 CREATE TABLE meter_value (
     id SERIAL PRIMARY KEY,
     transaction_id INTEGER REFERENCES transaction(id),
-    reading_kwh DECIMAL(10, 3) NOT NULL,
+    reading_kwh DECIMAL(12, 3) NOT NULL,
     current DECIMAL(6, 2),      -- Amperes
     voltage DECIMAL(6, 2),      -- Volts
     power_kw DECIMAL(8, 3),     -- Kilowatts
@@ -2247,6 +2490,274 @@ export default clerkMiddleware((auth, req) => {
 - **Role-Based Redirects**: Admin vs User dashboard routing
 - **Session Management**: Automatic token refresh handling
 - **Public Route Handling**: Sign-in/sign-up accessibility
+
+#### Admin-Onboarded Users: Invitation + Role Sync
+
+Franchisee users are created by admins in the DB first, then invited into
+Clerk rather than asked to self-sign-up. The flow:
+
+1. `POST /api/admin/franchisees` creates the `Franchisee` + `User(role=FRANCHISEE)` rows inside one transaction.
+2. `services/clerk_invitation_service.send_invitation()` calls Clerk's
+   `invitations.create` with `public_metadata={"role": "FRANCHISEE"}` and
+   `redirect_url = FRONTEND_URL + /franchisee`. Clerk emails the magic
+   link.
+3. User clicks link → Clerk creates the auth account, copying the
+   invitation's `public_metadata` onto the user.
+4. Clerk fires `user.created` webhook → `routers/webhooks.py` matches the
+   existing DB User by email, attaches `clerk_user_id`. If the Clerk
+   `public_metadata.role` drifts from the DB role (user signed up
+   without the invitation link, metadata was stripped, etc.) the
+   handler calls `clerk_invitation_service.push_role_to_clerk()` to
+   re-sync — important because the frontend middleware routes on the
+   Clerk session claim, not the DB.
+5. Admin can resend the invitation via
+   `POST /api/admin/franchisees/{id}/resend-invitation`, which revokes
+   any pending invitation first so the newest email wins.
+
+Authority: **DB `User.role` is the source of truth.** Clerk
+`public_metadata.role` is a mirror, kept consistent by the invitation at
+creation time and the webhook self-heal at first login.
+
+Env vars required for this flow: `CLERK_SECRET_KEY`, `CLERK_WEBHOOK_SECRET`, `FRONTEND_URL`.
+
+#### Payer-Payee Transparency on QR Codes (RBI Route Compliance)
+
+The Razorpay QR code a customer scans at a charger is a PNG that Razorpay
+generates server-side. The **big bold label on that image is the owning
+merchant's legal business name as registered during KYC** — it is *not*
+something we pass via the `name` field in the API payload.
+
+Current model: **all QRs are platform-owned**. Every UPI payment lands
+in VoltLync's nodal balance first; the franchisee's share is disbursed
+via a Razorpay Route transfer after the charging session settles. This
+keeps fund flow auditable from a single point and lets refunds execute
+from the platform nodal without needing to claw money back from a
+franchisee. The QR image therefore displays "VOLTLYNC PRIVATE LIMITED";
+the franchisee's business name is included in the QR *description*
+(shown under the big label on Razorpay's rendered image and in the
+customer's UPI app transaction history) but not as the payee.
+
+Implementation notes:
+
+1. `services/razorpay_service.create_qr_code` still accepts an
+   `account_id` parameter (forwarded as `X-Razorpay-Account`) for
+   backward-compatible close/fetch on legacy QRs, but new QRs are
+   always created with `account_id=None` (see
+   `routers/qr_codes._create_qr_for_charger` and
+   `routers/franchisee_portal._create_franchisee_qr`).
+2. `ChargerQRCode.owner_razorpay_account_id` remains on the model for
+   legacy rows; on new rows it is always NULL.
+3. Franchisees can still create/regenerate/close their chargers' QRs
+   via `/franchisee/qr-codes`, but the `can_create_direct` flag now
+   always returns False since franchisee-scoping is disabled
+   platform-wide.
+4. Route transfer lifecycle: settlement service creates a
+   `CommissionLedgerEntry` after QR billing + refund complete, then
+   `initiate_transfer` picks one of two Razorpay endpoints based on
+   whether the ledger entry carries a source `razorpay_payment_id`:
+   - **QR sessions** → `create_payment_transfer` → `POST /v1/payments/
+     {payment_id}/transfers` (no on-demand activation needed; Razorpay
+     enforces `sum(transfers) ≤ captured_amount`). Each call writes a
+     `RazorpayApiLog` audit row with full request/response wire data.
+     Application-level idempotency: `_validate_ledger_for_transfer`
+     rejects a second ledger row with the same `razorpay_payment_id`.
+   - **Wallet sessions** → `create_transfer` → `POST /v1/transfers`
+     with `X-Transfer-Idempotency` header. **This endpoint requires an
+     on-demand Razorpay merchant feature** ("Direct Transfers"); until
+     ops opens a support ticket against the parent merchant the call
+     fails with `400 "This feature is not enabled for this merchant."`
+     The retry service will keep marking these `FAILED` until the flag
+     flips.
+
+   The franchisee's Route account status (`transfers_enabled`,
+   `funds_on_hold`) gates every transfer attempt; when gated, the
+   entry is marked `ON_HOLD` and retried automatically when a
+   subsequent `account.funds_unhold` / `account.activated` webhook
+   flips the gate off. A separate **24-hour cooling-period guard** in
+   `initiate_transfer` parks transfers as `ON_HOLD` with
+   `failure_reason="cooling_period"` when `franchisee.activated_at`
+   is within the last 24h — Razorpay rejects transfers in that
+   window.
+
+5. **KYC payload shape** (post-2026-04 audit; documented to prevent
+   regression of the `acc_Sg73UwyOU3jziR` stuck-account pattern):
+   - `create_linked_account` payload sends `type: "route"` (canonical
+     and required per Razorpay's `create-linked-account` API spec) and
+     `addresses.registered` only — Razorpay rejects `operational` for
+     `business_type: individual` with `"operational is/are not required
+     and should not be sent"` (caught 2026-04-29 via the new audit log).
+     After create, a WARNING is logged if Razorpay echoes a different
+     `business_type` than we sent (Razorpay silently downgraded
+     `individual` → `not_yet_registered` for `acc_Sg73UwyOU3jziR`).
+     `profile.category/subcategory` is hardcoded to
+     `services / automotive_service_shops` (lowercase). Razorpay's
+     enum is **lowercase-strict** — UPPERCASE 400s with
+     `"Invalid business subcategory"`. Earlier values
+     (`utilities/electric_vehicle_charging`, then
+     `services/service_stations`) were silently rejected by KYC
+     review and parked accounts in `needs_clarification +
+     requirements: []` (broken Razorpay-side state machine — the
+     subcategory rejection isn't surfaced through `requirements[]`).
+     Diagnostic PATCH on `acc_SjK7ZBzAfiA4QF` (2026-04-30) confirmed
+     `automotive_service_shops` activates immediately; see
+     `docs/razorpay-onboarding-acc_SjK7ZBzAfiA4QF.md` "Resolution"
+     section and project memory `project_razorpay_subcategory_fix`.
+   - `add_stakeholder` derives `(director, executive)` defaults from
+     the franchisee's `business_type` via `_relationship_defaults` —
+     INDIVIDUAL/PROPRIETORSHIP get `(False, True)` (no "director" of an
+     individual), corporate types get `(True, True)`. Stakeholder
+     payload includes `kyc.pan` and optional `addresses.residential`.
+   - `submit_bank_details` PATCH includes `tnc_accepted: true` (per
+     Razorpay's `update-product-config` doc) and the three documented
+     settlement fields (`account_number`, `ifsc_code`,
+     `beneficiary_name`) only. **`account_type` is NOT sent** —
+     Razorpay rejects it with "account_type is/are not required and
+     should not be sent" despite being on bank-account schemas
+     elsewhere (verified 2026-04-29 via the audit log on a fresh
+     onboarding). The `Franchisee.bank_account_type` column stays for
+     invoicing / reconciliation use.
+     **Name-chain advisory (not enforced):** Razorpay requires the
+     bank passbook account-holder name == `settlements.beneficiary_name`
+     (PATCH product config) == `legal_business_name` (POST /v2/accounts).
+     Today `beneficiary_name` is `franchisee.bank_account_name` and
+     `legal_business_name` is `franchisee.business_name` — two
+     independent admin inputs with no equality guarantee. The
+     franchisee detail page surfaces an advisory note in the Bank
+     Account section. Hard enforcement is pending confirmation that
+     the rule applies uniformly across all `business_type` values.
+   - **Pre-transfer validator** (`_validate_ledger_for_transfer` in
+     `franchisee_settlement_service.py`) runs six foolproof checks
+     before any `create_transfer` SDK call: positive payout, payout ≤
+     gross − refund, components sum to gross within a 2-paisa
+     tolerance, settlement_status not in a terminal state, franchisee
+     has a matching razorpay_account_id, and razorpay_payment_id
+     (when present) hasn't already been used on a sibling ledger
+     entry's transfer. Math/state failures mark the entry FAILED with
+     a `validation_*` `failure_reason` and do NOT increment
+     retry_count — they require admin investigation. Razorpay-side
+     audit linkage is achieved by enriching the transfer's `notes`
+     dict with `transaction_id`, `ledger_entry_id`, `franchisee_id`,
+     `voltlync_payment_id` (source payment_id or "wallet"), and
+     `idempotency_key`.
+   - **Background payout retry service**
+     (`services/franchisee_payout_retry_service.py`, mirrors the
+     `data_retention_service` pattern) wakes every
+     `FRANCHISEE_PAYOUT_RETRY_INTERVAL_SECONDS` (default 600) and
+     calls `retry_failed_transfers()` to drain ON_HOLD/FAILED entries
+     after cooling-period / funds_unhold gates clear. Started from
+     `main.py:@app.on_event("startup")`; no-op when
+     `RAZORPAY_ROUTE_ENABLED != "true"`. Closes the manual-retry-only
+     gap that previously left `account.funds_unhold` and
+     `account.activated` webhook firings without an automated trigger.
+   - `update_stakeholder` (PUT
+     `/api/admin/franchisees/{id}/stakeholders/{sid}`) PATCHes an
+     existing Razorpay stakeholder so admins can backfill PAN /
+     residential address without recreating.
+   - `handle_account_webhook` correctly parses `requirements` as a list
+     of `{field_reference, resolution_url, reason_code, status}` dicts
+     (NOT a dict — fixed in migration-23 era code) and persists
+     Razorpay's `verification` subtree on `Franchisee.kyc_verifications`
+     (JSONB) so admins can see per-dimension KYC progress beyond the
+     top-level `activation_status`.
+
+6. **Outbound API audit log (migration-24 era)**:
+   `services/razorpay_service._audit_call` is an async helper that wraps
+   every mutating onboarding-chain SDK call (`account.create`,
+   `account.edit`, `account.delete`, `stakeholder.create`,
+   `stakeholder.edit`, `product.requestProductConfiguration`,
+   `product.edit`) and writes one row to the `razorpay_api_log` table
+   capturing method, endpoint, request body, response status,
+   response body, success flag, and error message. PII keys
+   (`pan`, `account_number`, `ifsc_code`, `aadhaar`, `gst`, `gstin`,
+   `tan`, `card_number`, `card_id`) are masked to `***LAST4` via the
+   `_mask_sensitive` recursive helper. Audit-write failures are
+   swallowed so the SDK call result is preserved. Read-only fetches and
+   high-volume calls (transfers, refunds, payments, QR ops) are
+   intentionally NOT logged — they have idempotency keys as their audit
+   anchor. The table mirrors `webhook_event` (inbound), giving symmetric
+   end-to-end traceability for any Razorpay-side dispute. FK to
+   `franchisee` uses `ON DELETE SET NULL` so logs survive franchisee
+   deletion while staying joinable.
+
+7. **Hard-delete linked account flow (admin self-serve)**:
+   `DELETE /api/admin/franchisees/{id}/razorpay-account`, orchestrated
+   by `FranchiseeOnboardingService.delete_linked_account`. Order: call
+   Razorpay `DELETE /v2/accounts/{id}` first (audit-logged), then in a
+   `tortoise.transactions.in_transaction()` block delete
+   `franchisee_stakeholder` rows and clear all `razorpay_*` / `kyc_*` /
+   `activated_at` / `status_reason` fields on the franchisee with
+   `status` reset to `DRAFT`. Safety: refuses if any
+   `CommissionLedgerEntry` rows exist for the franchisee (no force
+   flag). Idempotent on already-cleared local state. Tolerates Razorpay
+   404 / "not found" errors so admins can re-run after a partial
+   failure. Frontend confirmation dialog requires typing the exact
+   `acc_*` ID before the destructive button is enabled.
+
+8. **Per-franchisee financial rollup on admin reads**:
+   `FranchiseeResponse` carries two derived totals — `total_invoiced`
+   and `total_transferred` — populated by helpers in
+   `routers/franchisees.py`. `total_invoiced` =
+   `SUM(GSTInvoice.total_amount)` for the franchisee (gross,
+   GST-inclusive). `total_transferred` =
+   `SUM(CommissionLedgerEntry.franchisee_payout)` filtered by
+   `settlement_status IN (TRANSFER_PROCESSED, SETTLED)` so
+   pending/failed/on-hold entries are excluded — the value reflects
+   money actually moved to the franchisee. `list_franchisees` batches
+   both aggregations with a single `group_by("franchisee_id")` query
+   per metric to avoid N+1 on the admin list page; `get_franchisee`
+   runs single-id sums. The fields are surfaced as two columns on the
+   `/admin/franchisees` table and two overview cards on the
+   `/admin/franchisees/[id]` detail page (formatted via
+   `frontend/lib/utils.ts::formatINR`).
+
+Complementary transparency surfaces (all read-only, franchisee name
+sourced from the `Charger → Station → Franchisee` FK chain):
+
+- `/api/public/stations` and `/api/public/stations/map` include `franchisee_name` on each station.
+- `/api/public/qr-transactions` returns `franchisee_name` and `station_name` alongside `charger_name` for transaction history.
+- `/api/users/charger/{id}` surfaces `station.franchisee_name`.
+- The `/my-charges`, `/stations`, `/charge/[id]` and `StationMap` popup all render an "Operator:" line when populated.
+- The GST invoice PDF has always included the franchisee's business name as the supplier (no change needed there).
+
+### GST Tax Invoicing
+
+**Supplier identity: VoltLync, always.** Every customer-facing GST invoice carries VoltLync's name, GSTIN, address, and state code in the `supplier_*` columns. VoltLync is the GST merchant-of-record (Razorpay Route MOR model): customers pay VoltLync, VoltLync remits output GST, and franchisees receive their share via Route transfer.
+
+**Franchisee as substore (Razorpay disclosure).** Razorpay's payer-payee transparency rule requires that customers can clearly identify the payee when a third party delivers the goods or service. Since franchisees physically operate the chargers, every invoice tied to a franchisee-owned station snapshots the franchisee's `business_name`, `gstin`, `address`, `state`, and `state_code` onto the row and renders an "Operated by" block on the PDF below the VoltLync supplier block. Invoices for VoltLync-owned stations omit the block entirely. The `franchisee_id` FK on the invoice drives both this disclosure and the per-franchisee numbering (see Sequencing).
+
+Per-session, customer-facing tax invoice generated for every completed charging session. Schema and code live in:
+- `backend/models.py` — `GSTInvoice`, `GSTInvoiceCounter`
+- `backend/services/invoice_service.py` — generation + PDF rendering
+- `backend/routers/invoices.py` — list endpoints, PDF redirect
+- `backend/services/s3_service.py` — PDF persistence (S3, lazy)
+
+**Sequencing.** Invoice numbers are issued per `(franchisee_id, series, financial_year)` — each franchisee operates as a substore with its own running sequence. `series` is `WAL` for wallet-funded sessions, `QR` for UPI-guest sessions. Format:
+
+- `VL/F{franchisee_id}/{SERIES}/{FY_NODASH}/{SEQ:05d}` — franchisee-owned station (e.g. `VL/F5/QR/202627/00017`)
+- `VL/{SERIES}/{FY_NODASH}/{SEQ:05d}` — VoltLync-owned station (e.g. `VL/QR/202627/00001`)
+
+The counter row is incremented under `SELECT FOR UPDATE` and the full `generate_invoice` call holds a row lock on the underlying `transaction` to prevent gaps from concurrent callers. Migration 28 briefly consolidated counters across franchisees; migration 29 reverted to per-franchisee sequences (with snapshot fields added) to satisfy Razorpay disclosure.
+
+**Tax math.** `gst_rate_percent` is snapshotted onto the `transaction` row at billing time (from `tariff.gst_percent`). The invoice reads stored taxable values directly — `energy_taxable_value = transaction.energy_charge`, `gateway_charges = qr_payment.razorpay_commission`. No reverse-calc from a tax-inclusive total. CGST+SGST (intra-state) vs IGST (inter-state) is decided by comparing `supplier_state_code` to the station's `state_code`; the latter is frozen on the invoice as `place_of_supply_state_code`.
+
+**Compliance guards.**
+- A tax invoice without supplier GSTIN is not valid under CGST Rule 46. `generate_invoice` aborts and logs an error when the supplier (`Franchisee.gstin` or `VOLTLYNC_GSTIN`) is empty.
+- HSN/SAC defaults to `996749` on the invoice; per-tariff `hsn_sac_code` overrides it when set.
+- GST state codes are 2-digit numeric (per CBIC). Mismatched alpha codes (e.g. `"KL"`) would silently break the intra-state check; normalise via `backend/scripts/backfill_gst_schema.py` if older rows are found.
+- **Internal-role skip.** Sessions whose `Transaction.user.role` is `ADMIN` or `FRANCHISEE` are treated as operational (admin test/courtesy charges, franchisees remote-starting their own stations for diagnostics) and never receive an invoice. The guard sits in `generate_invoice` immediately after the energy check, returns `None`, and increments the `Custom/Invoice/InternalRoleSkipped` metric. No invoice number is consumed, keeping the per-(franchisee, series, FY) sequence clean of internal events. Customer roles (`USER`, `UPI_GUEST`) are unaffected. Going-forward only — existing invoices for past admin/franchisee sessions are left as-is.
+
+**Refunds.** Credit notes and refund vouchers are not modelled. The invoice's `transaction_amount` is net of refund (`amount_paid − refund_amount` for QR sessions). When B2B customers (with claimable Input Tax Credit) are introduced, a `gst_credit_note` table and IRP integration (IRN/signed QR/cancellation ack) will need to be added — schema today is B2C-only.
+
+**PDF persistence.** PDFs are rendered with ReportLab and uploaded to S3 lazily on first download request. `gst_invoice.pdf_url` stores the S3 key; downloads redirect to a 15-minute presigned URL. Env vars: `AWS_S3_INVOICE_BUCKET`, `AWS_REGION`. Credentials resolve via the EC2 instance role on staging/prod and via `AWS_PROFILE=voltlync` locally.
+
+**Branding overlay.** Every PDF page is stamped with the voltNOW A4 header/footer image (`backend/assets/invoice_header_footer.png`, 1241×1754 px ≈ 150 DPI) via a `_draw_branding` closure passed as both `onFirstPage` and `onLaterPages` to `doc.build`. Top/bottom margins on `SimpleDocTemplate` are 38 mm / 22 mm respectively so flowable content never overlaps the lime "EV Charging" header band or the lime footer band. The asset path is resolved relative to `services/invoice_service.py`; if the file is absent the renderer logs a warning and falls back to the legacy 15 mm margins so production is never broken by a missing asset.
+
+**Cancellation.** Invoices are immutable once issued. Cancellation columns (`status`, `cancelled_at`, `cancellation_reason`) and the orphaned `gst_credit_note` table were removed in migration 27.
+
+**Admin "GST Filings" window.** `/admin/gst-filings` (frontend page at `frontend/app/admin/gst-filings/page.tsx`) is the accountant-facing UI: filterable, tally-friendly table of every `gst_invoice` row plus top-of-page totals. The default row shows the lean tally column set — Invoice#, Date, Series, Customer, Operated by, HSN, kWh, Taxable ₹, GST %, CGST ₹, SGST ₹, IGST ₹, Total ₹, Refund ₹ — and clicking a row expands an inline detail panel with the remaining PDF-bill values (place of supply / inter-state flag, station + location, charger + connector, charged-on, duration, tariff/kWh, energy and gateway line breakdowns with their HSNs, total tax, payment method, transaction ₹, amount in words). PoS was dropped from the main row in favour of the expanded panel; the GSTR-1 CSV still carries it. Backed by three admin-only endpoints in `backend/routers/invoices.py`:
+- `GET /api/admin/invoices` — paginated list with filters: `financial_year`, `series`, `franchisee_id`, `start_date`/`end_date` (ISO 8601 with TZ, applied to `invoice_date`), `place_of_supply_state_code`, `is_inter_state`, `q` (free-text matches invoice number / customer name / customer identifier). The JSON projection (`_invoice_to_dict`) carries the full PDF-equivalent field set so the UI can render the detail panel without extra round-trips.
+- `GET /api/admin/invoices/summary` — aggregates (count, total taxable, CGST/SGST/IGST sums, total amount, by-series counts) over the same filtered set.
+- `GET /api/admin/invoices/export.csv` — streaming flat CSV with one row per invoice and a superset of every UI-visible column (tariff_rate_incl_tax, charged_on, duration_seconds, gateway_hsn_code, station_location, connector_type, supplier/customer addresses, amount_in_words). Filename `gst_invoices_{fy_or_all}_{YYYY-MM-DD}.csv`. Memory stays flat regardless of result size — rows yielded one at a time via `StreamingResponse`. Sectional GSTR-1 exports (B2C state-wise, HSN summary) are deliberately out of scope; revisit if the CA explicitly needs them.
 
 ### Role-Based Access Control (RBAC)
 
@@ -3399,7 +3910,9 @@ make staging-logs     # Tail staging container logs
 
 # Development
 make docker-build     # Build all images
-make docker-seed      # Seed database with test data
+make seed             # Seed dev DB (users, stations, chargers, franchisees)
+                      # Pass CLERK_ADMIN_ID=user_xxx ADMIN_EMAIL=you@... to seed yourself as admin
+                      # `make docker-seed` is kept as an alias
 ```
 
 ### Environment Configuration
@@ -4306,7 +4819,7 @@ CLERK_WEBHOOK_SECRET=whsec_...
 # Razorpay Payment Gateway
 RAZORPAY_KEY_ID=rzp_live_...
 RAZORPAY_KEY_SECRET=...
-RAZORPAY_PLATFORM_FEE_PERCENT=2.0  # Fallback only; actual fee from Razorpay webhook/API
+RAZORPAY_PLATFORM_FEE_PERCENT=2.0  # Authoritative synthetic rate for customer-facing math (ADR 0001)
 
 # Transaction Suspend/Resume
 DISCONNECT_SUSPEND_TIMEOUT_SECONDS=180  # Timeout after charger disconnect (before marking STOPPED)
@@ -4520,7 +5033,7 @@ CORS_ORIGINS = [
   - `GET /api/admin/qr-codes/{id}/payments` - Payment history
   - `POST /webhooks/razorpay` (qr_code.credited event) - Webhook handler
 - **Database Migrations**: 3 new migrations (10, 11, 12)
-- **Configuration**: `RAZORPAY_PLATFORM_FEE_PERCENT`, `MINIMUM_REFUND_AMOUNT`, `QR_PAYMENT_PENDING_TIMEOUT`
+- **Configuration**: `RAZORPAY_PLATFORM_FEE_PERCENT`, `QR_PAYMENT_PENDING_TIMEOUT`
 - **Files Added**:
   - `backend/services/qr_payment_service.py` - Core service (~600 lines)
   - `backend/routers/qr_codes.py` - Admin API router

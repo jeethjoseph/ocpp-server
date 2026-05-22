@@ -1,17 +1,15 @@
 """Public endpoint for QR payment users to look up transaction history by UPI ID"""
-import re
 import logging
 from fastapi import APIRouter, HTTPException, Query, Request
 from typing import Optional
 
-from models import QRPayment, QRPaymentStatusEnum
+from core.validators import VPA_PATTERN
+from models import GSTInvoice, QRPayment, QRPaymentStatusEnum
 from redis_manager import redis_manager
+from routers.invoices import serve_invoice_pdf
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/public/qr-transactions", tags=["Public QR Transactions"])
-
-# UPI VPA: alphanumeric start, optional dots/hyphens/underscores, @ followed by bank code (2+ alpha chars)
-VPA_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9.\-_]{0,253}@[a-zA-Z][a-zA-Z0-9]{1,}$")
 
 RATE_LIMIT_MAX = 20  # requests per window
 RATE_LIMIT_WINDOW = 60  # seconds
@@ -47,7 +45,9 @@ async def get_transactions_by_vpa(
 
     vpa = _validate_vpa_format(vpa)
 
-    query = QRPayment.filter(customer_vpa=vpa).prefetch_related("charger", "transaction")
+    query = QRPayment.filter(customer_vpa=vpa).prefetch_related(
+        "charger__station__franchisee", "transaction",
+    )
 
     if status:
         try:
@@ -63,6 +63,8 @@ async def get_transactions_by_vpa(
     for p in payments:
         txn = p.transaction if p.transaction_id else None
         charger = p.charger
+        station = charger.station if charger else None
+        franchisee = station.franchisee if station else None
 
         duration_minutes = None
         if txn and txn.start_time and txn.end_time:
@@ -82,7 +84,13 @@ async def get_transactions_by_vpa(
             "razorpay_gst": str(p.razorpay_gst) if p.razorpay_gst is not None else None,
             "fee_source": p.fee_source,
             "refund_amount": str(p.refund_amount) if p.refund_amount else None,
+            "razorpay_refund_id": p.razorpay_refund_id,
+            "razorpay_refund_speed_processed": p.razorpay_refund_speed_processed,
+            "refund_processed_at": p.refund_processed_at.isoformat() if p.refund_processed_at else None,
+            "refund_failure_reason": p.refund_failure_reason,
             "charger_name": charger.name if charger else None,
+            "station_name": station.name if station else None,
+            "franchisee_name": franchisee.business_name if franchisee else None,
             "duration_minutes": duration_minutes,
             "start_time": txn.start_time.isoformat() if txn and txn.start_time else None,
             "end_time": txn.end_time.isoformat() if txn and txn.end_time else None,
@@ -93,3 +101,36 @@ async def get_transactions_by_vpa(
     logger.info(f"QR txn lookup: vpa={masked_vpa}, results={total}, page={page}")
 
     return {"data": results, "total": total, "page": page, "limit": limit}
+
+
+@router.get("/{qr_payment_id}/invoice/pdf")
+async def public_invoice_pdf(
+    qr_payment_id: int,
+    request: Request,
+    vpa: str = Query(..., description="Customer's UPI VPA — must match the QR payment"),
+):
+    """Public PDF download — customer authenticates by knowing their own VPA.
+
+    Rate-limited per IP. Same trust model as the QR-transactions list endpoint:
+    the VPA is treated as the implicit credential. We don't leak whether a
+    qr_payment exists for an unknown id vs. wrong VPA — both return 404.
+    """
+    client_ip = request.client.host if request.client else "unknown"
+    await _check_rate_limit(client_ip)
+    vpa = _validate_vpa_format(vpa)
+
+    qr_payment = await QRPayment.filter(id=qr_payment_id).first()
+    if not qr_payment or (qr_payment.customer_vpa or "").lower() != vpa.lower():
+        # Indistinguishable error so we don't disclose whether the id exists.
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    if not qr_payment.transaction_id:
+        raise HTTPException(status_code=404, detail="Invoice not available for this payment")
+
+    invoice = await GSTInvoice.filter(transaction_id=qr_payment.transaction_id).first()
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not available for this payment")
+
+    masked_vpa = f"***{vpa[-6:]}" if len(vpa) > 6 else "***"
+    logger.info(f"Public invoice PDF: qr_payment_id={qr_payment_id}, vpa={masked_vpa}")
+    return await serve_invoice_pdf(invoice.id)
