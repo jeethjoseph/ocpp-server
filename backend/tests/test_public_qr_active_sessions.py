@@ -249,6 +249,56 @@ async def test_endpoint_other_vpa_excluded(client, active_charger, active_qr_cod
     assert resp.json()["total"] == 0
 
 
+async def test_endpoint_uses_cached_meter_snapshot_without_db_query(
+    client, active_charger, active_qr_code,
+):
+    """When `check_budget_and_auto_stop` has stamped `latest_reading_kwh` /
+    `latest_power_kw` into the qr_session cache, the active-sessions endpoint
+    must read from the cache and NOT query MeterValue (Option 1 of review
+    item #4, 2026-05-22).
+    """
+    from services.qr_payment_service import QRPaymentService
+
+    # Ensure the async Redis client is initialized — the ASGI lifespan that
+    # normally calls `redis_manager.connect()` doesn't fire under
+    # AsyncClient(transport=ASGITransport(app)).
+    if redis_manager.redis_client is None:
+        await redis_manager.connect()
+
+    payment = await _qr_payment(
+        active_charger, active_qr_code, status=QRPaymentStatusEnum.CHARGING,
+    )
+    user = await payment.user
+    txn = await _transaction(
+        active_charger, user, status=TransactionStatusEnum.RUNNING,
+    )
+    payment.transaction_id = txn.id
+    await payment.save()
+
+    # Clear any prior session for this txn_id (carry-over from another test).
+    await redis_manager.delete_qr_session(txn.id)
+
+    # Simulate one MeterValues frame: this is what main.py's MeterValues
+    # handler does after persisting a MeterValue row. The function stamps
+    # the latest snapshot into the qr_session Redis cache.
+    await QRPaymentService.check_budget_and_auto_stop(
+        txn.id, reading_kwh=100.500, power_kw=6.4,
+    )
+
+    # Deliberately do NOT create a MeterValue row in the DB — the endpoint
+    # must serve from the cache alone. (In production a MeterValue WOULD
+    # exist; we're proving the read path doesn't depend on it.)
+    resp = await client.get(ENDPOINT, params={"vpa": VPA})
+    assert resp.status_code == 200
+    entry = resp.json()["data"][0]
+    assert entry["sub_state"] == "charging"
+    # 0.500 kWh × 20 = 10, GST = 1.80, + 1.00 synthetic fee = 12.80 spent.
+    assert entry["energy_kwh"] == "0.500"
+    assert entry["spent_so_far"] == "12.80"
+    assert entry["refund_if_stopped_now"] == "37.20"
+    assert entry["power_kw"] == 6.4
+
+
 async def test_endpoint_cache_miss_uses_db_fallback(
     client, active_charger, active_qr_code,
 ):

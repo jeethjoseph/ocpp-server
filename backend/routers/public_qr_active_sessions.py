@@ -77,21 +77,48 @@ async def _resolve_session_context(qr_payment: QRPayment, txn: Transaction) -> d
     }
 
 
+async def _latest_meter_snapshot(ctx: dict, txn: Transaction) -> tuple[Optional[Decimal], Optional[float]]:
+    """Return `(reading_kwh, power_kw)` for the most recent MeterValue.
+
+    Reads from the qr_session cache first (`latest_reading_kwh` / `latest_power_kw`,
+    stamped by `check_budget_and_auto_stop` on every MeterValues frame — review
+    item #4, 2026-05-22). Falls back to a one-row MeterValue DB query only when
+    the cache is missing the snapshot (pre-first-frame, cache miss from a TTL
+    expiry, or in-flight legacy cache rows). Returns `(None, None)` when no
+    MeterValue exists yet.
+    """
+    cached_reading = ctx.get("latest_reading_kwh")
+    if cached_reading is not None:
+        reading = Decimal(str(cached_reading))
+        power = ctx.get("latest_power_kw")
+        power_f = float(power) if power is not None else None
+        return reading, power_f
+
+    # Cache miss — fall back to DB (rare, only on cache rebuild or pre-first-frame).
+    MetricsCollector.increment_counter("Custom/ActiveSession/MeterSnapshotDbFallback")
+    latest = await MeterValue.filter(transaction_id=txn.id).order_by("-id").first()
+    if latest is None:
+        return None, None
+    return Decimal(latest.reading_kwh), latest.power_kw
+
+
 async def _compute_live_kpis(qr_payment: QRPayment, txn: Transaction) -> dict:
     """Compute the live KPI block for a charging/paused/stopping session.
 
-    Accepts both string-form (new) and float-form (legacy) cache values via
-    `Decimal(str(v))`. Pure function modulo the cache read + meter-values lookup.
+    Live meter readings come from the qr_session cache (filled by every
+    MeterValues frame); falls back to a MeterValue DB query only when the
+    cache row lacks a snapshot. Accepts both string-form (new) and float-form
+    (legacy) cache values via `Decimal(str(v))`.
     """
     ctx = await _resolve_session_context(qr_payment, txn)
-    latest = await MeterValue.filter(transaction_id=txn.id).order_by("-id").first()
+    reading_kwh, power_kw = await _latest_meter_snapshot(ctx, txn)
 
     tariff_rate = Decimal(str(ctx["tariff_rate"]))
     gst_percent = Decimal(str(ctx["gst_percent"]))
     platform_fee = Decimal(str(ctx["platform_fee"]))
     start_kwh = Decimal(str(ctx["start_meter_kwh"]))
 
-    if latest is None:
+    if reading_kwh is None:
         return {
             "energy_kwh": "0.000",
             "spent_so_far": str(platform_fee.quantize(Decimal("0.01"))),
@@ -101,7 +128,7 @@ async def _compute_live_kpis(qr_payment: QRPayment, txn: Transaction) -> dict:
             "power_kw": None,
         }
 
-    energy_kwh = max(Decimal("0"), Decimal(latest.reading_kwh) - start_kwh)
+    energy_kwh = max(Decimal("0"), reading_kwh - start_kwh)
     energy_cost = energy_kwh * tariff_rate
     gst_amount = energy_cost * gst_percent / Decimal("100")
     spent_so_far = (energy_cost + gst_amount + platform_fee).quantize(Decimal("0.01"))
@@ -111,7 +138,7 @@ async def _compute_live_kpis(qr_payment: QRPayment, txn: Transaction) -> dict:
         "energy_kwh": str(energy_kwh.quantize(Decimal("0.001"))),
         "spent_so_far": str(spent_so_far),
         "refund_if_stopped_now": str(refund),
-        "power_kw": latest.power_kw,
+        "power_kw": power_kw,
     }
 
 

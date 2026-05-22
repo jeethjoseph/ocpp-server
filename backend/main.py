@@ -1140,7 +1140,11 @@ class ChargePoint(OcppChargePoint):
             if meter_records_created > 0 and meter_data.get('reading_kwh') is not None:
                 try:
                     from services.qr_payment_service import QRPaymentService
-                    await QRPaymentService.check_budget_and_auto_stop(transaction_id, meter_data['reading_kwh'])
+                    await QRPaymentService.check_budget_and_auto_stop(
+                        transaction_id,
+                        meter_data['reading_kwh'],
+                        power_kw=meter_data.get('power_kw'),
+                    )
                 except Exception as qr_err:
                     logger.warning(f"QR budget check failed (non-fatal): {qr_err}")
 

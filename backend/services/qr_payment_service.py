@@ -505,8 +505,18 @@ class QRPaymentService:
         return qr_payment
 
     @staticmethod
-    async def check_budget_and_auto_stop(transaction_id: int, reading_kwh: float):
-        """Check if QR session has exceeded budget and auto-stop if needed."""
+    async def check_budget_and_auto_stop(
+        transaction_id: int, reading_kwh: float, power_kw: Optional[float] = None,
+    ):
+        """Check if QR session has exceeded budget and auto-stop if needed.
+
+        Also stamps the latest meter snapshot (`latest_reading_kwh`,
+        `latest_power_kw`, `latest_meter_at`) into the qr_session Redis row so
+        the `/api/public/qr-active-sessions` endpoint can serve live KPIs
+        without an extra MeterValue DB lookup per session (review item #4,
+        2026-05-22). `power_kw` is optional — older callers that don't pass it
+        leave the previous snapshot's value in place.
+        """
         session = await redis_manager.get_qr_session(transaction_id)
 
         if not session:
@@ -572,6 +582,16 @@ class QRPaymentService:
             Decimal("0.01"), rounding=ROUND_HALF_UP
         )
         remaining = budget_limit - cost
+
+        # Stamp the latest snapshot into the cache so the active-sessions
+        # endpoint can render live KPIs without a per-row MeterValue lookup.
+        # Done after the budget math so a slow Redis write doesn't delay the
+        # auto-stop decision below.
+        session["latest_reading_kwh"] = str(Decimal(str(reading_kwh)))
+        if power_kw is not None:
+            session["latest_power_kw"] = float(power_kw)
+        session["latest_meter_at"] = datetime.now(timezone.utc).isoformat()
+        await redis_manager.set_qr_session(transaction_id, session)
 
         logger.info(
             f"QR budget check txn {transaction_id}: "
