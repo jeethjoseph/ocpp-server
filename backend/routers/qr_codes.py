@@ -39,6 +39,19 @@ async def _resolve_qr_franchisee(charger: Charger) -> Optional[Franchisee]:
     return station.franchisee
 
 
+def _close_orphan_razorpay_qr(qr_code_id: str) -> None:
+    """Best-effort close of a Razorpay QR whose local row failed to persist.
+    Swallows close-side errors after logging so the caller can re-raise the
+    original DB exception unmasked."""
+    try:
+        razorpay_service.close_qr_code(qr_code_id, account_id=None)
+    except Exception as close_exc:
+        logger.warning(
+            "Failed to close orphan Razorpay QR %s after local insert failure: %s",
+            qr_code_id, close_exc,
+        )
+
+
 async def _create_qr_for_charger(charger: Charger) -> dict:
     """Create a platform-owned QR code for a charger. Franchisee (if any)
     is referenced only for descriptive labeling; the QR itself is NOT
@@ -53,14 +66,19 @@ async def _create_qr_for_charger(charger: Charger) -> dict:
         account_id=None,
     )
 
-    qr_code = await ChargerQRCode.create(
-        charger=charger,
-        razorpay_qr_code_id=result["id"],
-        image_url=result.get("image_url", ""),
-        short_url=result.get("short_url"),
-        is_active=True,
-        owner_razorpay_account_id=None,
-    )
+    try:
+        qr_code = await ChargerQRCode.create(
+            charger=charger,
+            razorpay_qr_code_id=result["id"],
+            image_url=result.get("image_url", ""),
+            short_url=result.get("short_url"),
+            is_active=True,
+            owner_razorpay_account_id=None,
+        )
+    except Exception:
+        _close_orphan_razorpay_qr(result["id"])
+        raise
+
     return {
         "id": qr_code.id,
         "charger_id": charger.id,
