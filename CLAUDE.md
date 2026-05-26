@@ -57,6 +57,23 @@ Checklist when adding a new env var:
 6. `backend/main.py` startup event — log a warning/error if the var is critical and empty (so a misconfigured deploy fails loud)
 7. Run `docker compose build backend && docker exec <container> env | grep NEW_VAR` to verify locally before claiming done
 
+## Frontend env vars / build args (CRITICAL — analogous trap to the backend one above)
+
+Frontend env vars are **build-time only** for the production image — the Next.js bundler inlines `NEXT_PUBLIC_*` values when `next build` runs inside the Docker builder stage. Anything not present in `process.env` at that moment ends up as `undefined` in the client bundle.
+
+Frontend has a 5th step the backend doesn't have: **the `frontend/Dockerfile` must declare an `ARG` for every value passed in via `build.args:` in compose, and an `ENV` if Next.js needs to read it at build time.** If you skip this, compose silently sends the build arg, the Dockerfile silently ignores it, and `next build` silently bakes the wrong/empty value into the bundle. No error anywhere. We hit this with Sentry source-map uploads (2026-05-26) — three docker-compose `build.args:` were set, but the Dockerfile had no matching `ARG` declarations, so `@sentry/nextjs` saw `SENTRY_AUTH_TOKEN` as empty at build time and skipped the upload silently.
+
+Symptom: build log claims success, the deployed app behaves as if the var was never set, `docker exec ocpp-frontend-staging env | grep VAR` returns nothing (because runtime envs don't reflect build args anyway).
+
+Checklist when adding a new frontend env var:
+1. `frontend/.env.example` — add with comment + safe placeholder
+2. `.env.staging.example` and `.env.prod.example` — add to the Frontend section
+3. `docker-compose.yml` — only matters for dev (Next.js dev server reads `frontend/.env`); skip unless adding a runtime env override
+4. `docker-compose.staging.yml` — add to `frontend.build.args:`
+5. `docker-compose.prod.yml` — add to `frontend.build.args:`
+6. **`frontend/Dockerfile` — add `ARG VAR_NAME` and (for `NEXT_PUBLIC_*` only) `ENV VAR_NAME=$VAR_NAME` in the builder stage**. Secrets that are only consumed by a single build step (e.g. `SENTRY_AUTH_TOKEN`) should be `ARG`-only and injected inline on that `RUN` line to keep them out of any image layer.
+7. Verify: rebuild frontend, then `docker exec ocpp-frontend-<env> sh -c "grep -l <something-that-should-be-baked> /app/.next/static/chunks/*.js | head -3"` — should find references. Or for Sentry: confirm the build log prints `Uploaded XX sourcemaps` and a Release with artifacts shows up in Sentry UI.
+
 ## Agent skills
 
 ### Issue tracker
