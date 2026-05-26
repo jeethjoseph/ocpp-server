@@ -108,10 +108,14 @@ class BillingRetryService:
         """Retry failed QR payment refunds (e.g. insufficient Razorpay balance)"""
         cutoff_time = datetime.now(timezone.utc) - timedelta(hours=self.max_retry_age_hours)
 
+        # Exclude payments that failed for "below Razorpay minimum" — these
+        # are permanent (Razorpay's ₹1 floor will not change) and retrying
+        # generates noise. They surface separately via reporting if admin
+        # wants to triage.
         failed_refunds = await QRPayment.filter(
             status=QRPaymentStatusEnum.REFUND_FAILED,
             updated_at__gte=cutoff_time,
-        ).all()
+        ).exclude(failure_reason="below_razorpay_minimum").all()
 
         if not failed_refunds:
             logger.debug("No failed QR refunds to retry")

@@ -15,7 +15,12 @@ from models import (
     QRPaymentStatusEnum, AuthProviderEnum, ChargerStatusEnum,
     TransactionStatusEnum, UserRoleEnum
 )
-from services.razorpay_service import razorpay_service, RazorpayAlreadyRefundedError, extract_fee_from_payment
+from services.razorpay_service import (
+    razorpay_service,
+    RazorpayAlreadyRefundedError,
+    RazorpayRefundBelowMinimumError,
+    extract_fee_from_payment,
+)
 from services.tariff_utils import synthetic_platform_fee, synthetic_fee_split
 from services.wallet_service import WalletService
 from services.monitoring_service import MetricsCollector, OCPPMetrics
@@ -741,6 +746,17 @@ class QRPaymentService:
                 qr_payment.razorpay_refund_id = refund_result.get("id")
                 qr_payment.status = QRPaymentStatusEnum.REFUNDED
                 logger.info(f"Refund of ₹{refund} issued for QR payment {qr_payment.id}")
+            except RazorpayRefundBelowMinimumError:
+                # Razorpay rejects refunds < ₹1.00. Customer effectively
+                # forfeits the sub-rupee remainder; not a real failure.
+                # Tag with a specific reason so admin/billing-retry can
+                # disambiguate from genuine refund errors.
+                qr_payment.status = QRPaymentStatusEnum.REFUND_FAILED
+                qr_payment.failure_reason = "below_razorpay_minimum"
+                logger.info(
+                    "QR payment %s refund ₹%s below Razorpay minimum; not refunded",
+                    qr_payment.id, refund,
+                )
             except Exception as e:
                 qr_payment.status = QRPaymentStatusEnum.REFUND_FAILED
                 qr_payment.failure_reason = str(e)

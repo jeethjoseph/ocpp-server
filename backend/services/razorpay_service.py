@@ -23,6 +23,24 @@ class RazorpayAlreadyRefundedError(Exception):
         super().__init__(f"Payment {payment_id} is already refunded: {original_error}")
 
 
+class RazorpayRefundBelowMinimumError(Exception):
+    """Raised when Razorpay rejects a refund because the amount is below
+    its ₹1.00 (100 paise) minimum. Common business edge case: a QR session
+    bills almost the entire pre-paid amount, leaving a sub-rupee unused
+    balance the customer is contractually owed but that Razorpay won't
+    process. Callers should treat as 'no refund issued' rather than a
+    fault — log at info, do not alert.
+    """
+
+    def __init__(self, payment_id: str, original_error: Exception):
+        self.payment_id = payment_id
+        self.original_error = original_error
+        super().__init__(
+            f"Refund for {payment_id} below Razorpay minimum (₹1.00): "
+            f"{original_error}"
+        )
+
+
 def extract_fee_from_payment(payment_data: dict) -> Optional[Tuple[Decimal, Decimal]]:
     """Extract actual Razorpay fee and tax from a payment object.
 
@@ -46,6 +64,15 @@ def _is_already_refunded_error(err: Exception) -> bool:
     """Detect Razorpay 'already refunded' / 'fully refunded' responses."""
     msg = str(err).lower()
     return any(token in msg for token in ("already refund", "fully refund", "refunded fully"))
+
+
+def _is_amount_below_minimum_error(err: Exception) -> bool:
+    """Detect Razorpay 'amount must be at least INR 1.00' rejections.
+    Razorpay accepts both spellings ('at least' / 'atleast'). The check
+    is intentionally narrow — only this exact rejection class — so other
+    amount-related errors still escalate normally."""
+    msg = str(err).lower()
+    return ("amount must be atleast" in msg) or ("amount must be at least" in msg)
 
 
 # Sensitive field names that get masked before being persisted to
@@ -480,6 +507,12 @@ class RazorpayService:
         except Exception as e:
             if _is_already_refunded_error(e):
                 raise RazorpayAlreadyRefundedError(payment_id, e)
+            if _is_amount_below_minimum_error(e):
+                logger.info(
+                    "Refund for %s skipped: amount below Razorpay ₹1.00 minimum",
+                    payment_id,
+                )
+                raise RazorpayRefundBelowMinimumError(payment_id, e)
             logger.error(f"Failed to create refund for payment {payment_id}: {e}")
             raise
 

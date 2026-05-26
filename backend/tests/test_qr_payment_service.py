@@ -22,7 +22,11 @@ from services.qr_payment_service import (
     _ensure_actual_fee_captured,
 )
 from services.tariff_utils import synthetic_platform_fee, synthetic_fee_split
-from services.razorpay_service import RazorpayAlreadyRefundedError, extract_fee_from_payment
+from services.razorpay_service import (
+    RazorpayAlreadyRefundedError,
+    RazorpayRefundBelowMinimumError,
+    extract_fee_from_payment,
+)
 from services.wallet_service import WalletService
 from models import (
     User, Charger, ChargingStation, Connector, ChargerQRCode, QRPayment,
@@ -681,6 +685,55 @@ async def test_partial_refund_does_not_request_instant_speed(
     mock_rzp.refund_payment.assert_called_once()
     # speed kwarg either absent entirely or None — both mean "normal".
     assert mock_rzp.refund_payment.call_args.kwargs.get("speed") is None
+
+
+@pytest.mark.asyncio
+async def test_partial_refund_below_razorpay_minimum_marks_failed_without_error_log(
+    client, qr_charger, qr_code, qr_tariff, monkeypatch, caplog
+):
+    """When the unused-credit refund is below Razorpay's ₹1.00 minimum,
+    refund_payment raises RazorpayRefundBelowMinimumError. The session
+    must (a) not crash, (b) mark status=REFUND_FAILED with
+    failure_reason='below_razorpay_minimum' so the billing-retry sweep
+    excludes the entry, and (c) only log at INFO level so Sentry's
+    LoggingIntegration (ERROR threshold by default) does not capture it.
+
+    Regression for the 2026-05-26 staging Sentry noise from
+    pay_SpuaKiPYNEFPL6 — a small-balance QR session retrying every
+    interval with no possible resolution.
+    """
+    monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
+
+    _, txn, qr_payment = await _make_qr_billing_fixture(
+        qr_charger, qr_code, qr_tariff, energy_consumed_kwh=0.5,
+    )
+
+    below_min_error = RazorpayRefundBelowMinimumError(
+        qr_payment.razorpay_payment_id,
+        Exception("The amount must be atleast INR 1.00"),
+    )
+
+    with patch("services.qr_payment_service.redis_manager") as mock_redis:
+        mock_redis.delete_qr_session = AsyncMock()
+        with patch("services.qr_payment_service.razorpay_service") as mock_rzp:
+            mock_rzp.refund_payment.side_effect = below_min_error
+            with caplog.at_level("INFO", logger="services.qr_payment_service"):
+                await QRPaymentService.process_qr_session_billing(txn.id)
+
+    await qr_payment.refresh_from_db()
+    assert qr_payment.status == QRPaymentStatusEnum.REFUND_FAILED
+    assert qr_payment.failure_reason == "below_razorpay_minimum"
+
+    # No ERROR-level "Refund failed" log from this path — Sentry's
+    # LoggingIntegration only captures ERROR by default.
+    error_refund_logs = [
+        r for r in caplog.records
+        if r.levelname == "ERROR" and "Refund failed" in r.getMessage()
+    ]
+    assert not error_refund_logs, (
+        f"unexpected ERROR-level refund log: "
+        f"{[r.getMessage() for r in error_refund_logs]}"
+    )
 
 
 # ============================================================================

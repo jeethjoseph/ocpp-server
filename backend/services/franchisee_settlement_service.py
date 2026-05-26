@@ -384,11 +384,19 @@ class FranchiseeSettlementService:
             )
         )
         if validation_failure:
+            # Saturate retry_count so the retry sweep
+            # (settlement_status=FAILED AND retry_count<MAX_TRANSFER_RETRIES)
+            # stops re-picking the entry. The validator's contract is
+            # "admin must investigate"; without this the entry cycles
+            # through the sweep every interval and the Sentry log fires
+            # on every tick. Stuck-payout detector still surfaces these
+            # via its FAILED+retry_count>=max branch.
             await CommissionLedgerEntry.filter(id=entry.id).update(
                 settlement_status=SettlementStatusEnum.FAILED,
                 failure_reason=validation_failure,
+                retry_count=MAX_TRANSFER_RETRIES,
             )
-            logger.error(
+            logger.warning(
                 "Transfer rejected for entry %s by validator: %s",
                 entry.id, validation_failure,
             )

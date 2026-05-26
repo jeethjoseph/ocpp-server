@@ -1768,6 +1768,16 @@ async def shutdown_event():
 
     await close_db()
     await redis_manager.disconnect()
+
+    # Drain Sentry's in-memory event queue so events buffered up to the
+    # SIGTERM aren't lost on container shutdown. No-op when the SDK was
+    # never initialized (Sentry disabled in dev).
+    try:
+        import sentry_sdk
+        sentry_sdk.flush(timeout=2)
+    except Exception as e:
+        logger.warning("Sentry flush on shutdown failed (non-fatal): %s", e)
+
     logger.info("Database and Redis connections closed")
 
 if __name__ == "__main__":
