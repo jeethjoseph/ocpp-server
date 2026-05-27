@@ -50,7 +50,7 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
 **Protocol**: OCPP 1.6 via WebSocket with full message support
 **Authentication**: Clerk (6.29.0 web, 5.56.1 mobile) JWT with role-based access control + UPI_GUEST for appless users
 **Payments**: Razorpay SDK 2.0.0 for wallet recharge + UPI QR code generation + refunds
-**Deployment**: AWS EC2 with Docker Compose (backend, frontend, nginx, redis, postgres)
+**Deployment**: AWS EC2 with Docker Compose (backend, frontend, nginx, redis). Staging postgres is **AWS RDS** since 2026-05-27 — see Database tier section below. Prod postgres still Docker.
 **Monitoring**: Sentry (error tracking) + New Relic (APM) + structured logging
 **Testing**: Pytest 8.3.4 with async support
 
@@ -568,6 +568,40 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
 - **`backend/requirements.txt`** - Python dependencies (FastAPI, python-ocpp, Tortoise ORM, etc.)
 - **`frontend/package.json`** - Node dependencies (Next.js 15, React 19, Clerk, TanStack Query, etc.)
 - **`backend/pyproject.toml`** - pytest configuration and Aerich migration settings
+
+---
+
+## Database tier (post-2026-05-27 staging RDS cutover)
+
+The three environments now use asymmetric Postgres topologies. The asymmetry is intentional and lasts until a future prod migration project.
+
+- **Local dev**: Docker postgres in `docker-compose.yml`. No SSL. `make local-db-reset` is the canonical fresh-start path.
+- **Staging**: **AWS RDS Postgres at `ocpp-staging-db.c1608qm4i94k.ap-south-1.rds.amazonaws.com`**. Single-AZ `db.t4g.micro` in `ap-south-1` (placed in `ap-south-1c`; the EC2 is in `ap-south-1a` — cross-AZ adds ~1ms per query, invisible in practice). 20GB gp3 storage with auto-scaling to 100GB. 14-day automated backup retention with 5-minute PITR. TLS `verify-full` required, using the AWS RDS global CA bundle baked into the backend image at `/etc/ssl/rds-ca-bundle.pem`. The local Docker postgres service is still in `docker-compose.staging.yml` as a rollback target for the 14-day validation window; backend no longer connects to it (no `depends_on`). Cutover completed via `.scratch/rds-staging-migration/`. Decommission via issue 07 in that folder after validation triggers all-green.
+- **Prod**: Docker postgres in `docker-compose.prod.yml`. Same pattern as pre-migration staging. Migration planned but not scheduled — see `.scratch/rds-prod-migration/` when that exists.
+
+### SSL config (`backend/db_ssl.py`)
+
+Single `get_ssl_config()` helper drives all three DB-connect call sites — runtime (`database.py`), Aerich (`tortoise_config.py`), and the entrypoint pre-flight loop (`docker-entrypoint.sh`). Don't add a 4th call site without using this helper. Env-var contract:
+
+- `DB_SSL_MODE=` (empty) → legacy fallback: `disable` for local/Docker hosts, `require` otherwise. Local dev + prod use this.
+- `DB_SSL_MODE=verify-full` → TLS with CA validation. Required for RDS. Staging uses this.
+- `DB_SSL_MODE=verify-ca|require|prefer|allow|disable` → passthrough to asyncpg.
+
+### Cutover learnings (saved as feedback memory)
+
+- **The entrypoint pre-flight check has its own DB connection logic.** It hardcoded `ssl='disable'` and was missed in the initial issue 02 PR. Caused ~5 min of bonus downtime during the staging cutover. Always grep for ALL `asyncpg.connect` / `psycopg.connect` / `pg_isready` / `psql -h` call sites when changing DB connection config. See [[feedback-check-entrypoint-during-db-config-changes]].
+- **RDS provisioning took ~20 min**, not the typical 5-10 min — likely due to Performance Insights + CloudWatch Logs export adding setup steps. Provision earlier in any maintenance window.
+- **`DROP DATABASE` requires ownership.** RDS master user is `rds_superuser`, not real superuser — can't drop a DB owned by another user. Use `DROP OWNED BY <app_user> CASCADE` as the app user instead.
+- **Plain SQL `pg_dump` format restored cleanly** for the 486MB staging DB. Custom format (`-F c`) is unnecessary at this size; reserve it for parallel-restore scenarios on multi-GB DBs.
+
+### Charger state — two orthogonal fields (post-2026-05-27)
+
+The `charger` row carries **two state-shaped columns by design**, captured in **ADR 0008**:
+
+- `latest_status` (`ChargerStatusEnum`): what the charger reports via OCPP `StatusNotification`. Written only by the `StatusNotification` handler in `main.py`. Read by the status pill, OCPP routing, billing logic.
+- `availability` (`ChargerAvailabilityEnum`): what an admin or franchisee has commanded via `ChangeAvailability`. Written by the admin/franchisee endpoints on OCPP `Accepted`/`Scheduled`. Read by the admin UI toggle.
+
+The two are independent — a `Faulted` charger can be admin-set `Operative`; a `Charging` charger that admin clicks `Inoperative` stays `Charging` (per OCPP `Scheduled` semantics) but flips `availability=Inoperative` immediately. The toggle was previously broken because it read `latest_status` as a proxy for both concerns; this stopped working any time a charger Accepted ChangeAvailability without sending a follow-up StatusNotification. See ADR 0008 for the full rationale and considered alternatives.
 
 ---
 

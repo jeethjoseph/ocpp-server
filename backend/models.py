@@ -27,6 +27,10 @@ class ChargerStatusEnum(str, enum.Enum):
     UNAVAILABLE = "Unavailable"
     FAULTED = "Faulted"
 
+class ChargerAvailabilityEnum(str, enum.Enum):
+    OPERATIVE = "Operative"
+    INOPERATIVE = "Inoperative"
+
 class TransactionStatusEnum(str, enum.Enum):
     STARTED = "STARTED"
     PENDING_START = "PENDING_START"
@@ -309,12 +313,19 @@ class Charger(Model):
     meter_type = fields.CharField(max_length=100, null=True)
     meter_serial_number = fields.CharField(max_length=100, null=True)
     latest_status = fields.CharEnumField(ChargerStatusEnum)
+    # Admin-set availability intent — orthogonal to latest_status which
+    # reflects what the charger reports. The toggle in the admin UI reads
+    # THIS field, not latest_status. See ADR 0008.
+    availability = fields.CharEnumField(
+        ChargerAvailabilityEnum,
+        default=ChargerAvailabilityEnum.OPERATIVE,
+    )
     last_heart_beat_time = fields.DatetimeField(null=True)
-    
+
     # Relationships
     tariffs: fields.ReverseRelation["Tariff"]
     connectors: fields.ReverseRelation["Connector"]
-    
+
     class Meta:
         table = "charger"
 

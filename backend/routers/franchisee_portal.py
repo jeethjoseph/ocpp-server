@@ -166,6 +166,9 @@ async def get_station(station_id: int, auth=Depends(require_franchisee())):
                 "model": c.model,
                 "vendor": c.vendor,
                 "latest_status": c.latest_status,
+                "availability": (
+                    c.availability.value if hasattr(c.availability, "value") else str(c.availability)
+                ),
                 "last_heart_beat_time": c.last_heart_beat_time.isoformat() if c.last_heart_beat_time else None,
             }
             for c in chargers
@@ -189,6 +192,9 @@ async def get_charger(charger_id: int, auth=Depends(require_franchisee())):
         "serial_number": charger.serial_number,
         "firmware_version": charger.firmware_version,
         "latest_status": charger.latest_status,
+        "availability": (
+            charger.availability.value if hasattr(charger.availability, "value") else str(charger.availability)
+        ),
         "last_heart_beat_time": charger.last_heart_beat_time.isoformat() if charger.last_heart_beat_time else None,
         "station_id": charger.station_id,
         "station_name": charger.station.name,
@@ -267,6 +273,32 @@ async def change_availability(
         },
     )
     if success:
+        ocpp_status = getattr(response, "status", str(response))
+
+        # Persist admin intent when the charger acknowledged the command.
+        # See ADR 0008 for why availability is separate from latest_status.
+        from models import ChargerAvailabilityEnum
+        new_availability = None
+        if ocpp_status in ("Accepted", "Scheduled"):
+            new_availability = (
+                ChargerAvailabilityEnum.OPERATIVE if available
+                else ChargerAvailabilityEnum.INOPERATIVE
+            )
+            await Charger.filter(id=charger_id).update(availability=new_availability)
+
+        await log_audit_event(
+            action="charger.availability_changed",
+            entity_type="charger",
+            entity_id=charger.charge_point_string_id,
+            actor_type="franchisee",
+            actor=franchisee,
+            changes={
+                "available": available,
+                "ocpp_response": ocpp_status,
+                "new_availability": new_availability.value if new_availability else None,
+            },
+        )
+
         return {"success": True, "message": "Availability changed"}
     raise HTTPException(status_code=500, detail=f"Failed: {response}")
 

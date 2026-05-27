@@ -74,6 +74,9 @@ class ChargerResponse(BaseModel):
     serial_number: Optional[str]
     firmware_version: Optional[str]
     latest_status: str
+    # Admin-set availability ("Operative" | "Inoperative"). Distinct from
+    # latest_status — the UI toggle reads THIS field. See ADR 0008.
+    availability: str
     last_heart_beat_time: Optional[datetime]
     connection_status: bool
     created_at: datetime
@@ -207,6 +210,11 @@ def charger_to_response(
         serial_number=charger.serial_number,
         firmware_version=charger.firmware_version,
         latest_status=charger.latest_status,
+        availability=(
+            charger.availability.value
+            if hasattr(charger.availability, "value")
+            else str(charger.availability)
+        ),
         last_heart_beat_time=charger.last_heart_beat_time,
         created_at=charger.created_at,
         updated_at=charger.updated_at,
@@ -783,13 +791,31 @@ async def change_charger_availability(
         # Get the OCPP response status (Accepted/Scheduled/Rejected)
         ocpp_status = getattr(response, 'status', str(response))
 
+        # Persist admin intent when the charger acknowledged the command.
+        # See ADR 0008 for why availability is separate from latest_status.
+        from models import ChargerAvailabilityEnum
+        new_availability = None
+        if ocpp_status in ("Accepted", "Scheduled"):
+            new_availability = (
+                ChargerAvailabilityEnum.OPERATIVE
+                if type == "Operative"
+                else ChargerAvailabilityEnum.INOPERATIVE
+            )
+            await Charger.filter(id=charger_id).update(availability=new_availability)
+
         await log_audit_event(
             action="charger.availability_changed",
             entity_type="charger",
             entity_id=charger.charge_point_string_id,
             actor_type="admin",
             actor=admin_user,
-            changes={"type": type, "connector_id": connector_id, "ocpp_response": ocpp_status, "previous_status": current_status},
+            changes={
+                "type": type,
+                "connector_id": connector_id,
+                "ocpp_response": ocpp_status,
+                "previous_status": current_status,
+                "new_availability": new_availability.value if new_availability else None,
+            },
         )
 
         return {

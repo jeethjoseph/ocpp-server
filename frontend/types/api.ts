@@ -48,6 +48,9 @@ export interface Charger {
   serial_number?: string;
   firmware_version?: string;
   latest_status: string;
+  // Admin-set availability ("Operative" | "Inoperative"). Distinct from
+  // latest_status — the UI toggle reads THIS field. See ADR 0008.
+  availability: "Operative" | "Inoperative";
   last_heart_beat_time?: string;
   connection_status: boolean;
   created_at: string;

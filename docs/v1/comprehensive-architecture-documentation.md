@@ -489,6 +489,20 @@ This divergence is intentional. Admins debug at the OCPP layer and want explicit
 
 The frontend's `useChangeAvailability` hook (admin) branches on the OCPP response status (Accepted → success + keep optimistic update, Scheduled → info toast + revert optimistic, Rejected → error toast + revert). Per issue 01 of the availability-toggle-fixes batch.
 
+**Two-field charger state model (post-2026-05-27, ADR 0008)**: the `charger` row carries two state-shaped columns that are intentionally NOT redundant:
+
+- `latest_status` (`ChargerStatusEnum`): what the charger reports via OCPP `StatusNotification`. Values: `Available`, `Preparing`, `Charging`, `SuspendedEVSE`, `SuspendedEV`, `Finishing`, `Reserved`, `Unavailable`, `Faulted`. Written exclusively by the `StatusNotification` handler in `main.py`. Read by the status pill, OCPP routing, billing logic, and any other consumer of "what is the charger actually doing right now."
+- `availability` (`ChargerAvailabilityEnum`): what an admin or franchisee has commanded via `ChangeAvailability`. Values: `Operative`, `Inoperative`. Written by `routers/chargers.change_charger_availability` and `routers/franchisee_portal.change_availability` on OCPP `Accepted` and `Scheduled` responses (NOT on `Rejected`). Read by the admin UI toggle.
+
+The split exists because a `Faulted` charger can still be admin-set `Operative` (the admin wants it available; the hardware is broken — orthogonal concerns), and a `Charging` charger that admin clicks `Inoperative` flips `availability=Inoperative` immediately while `latest_status` stays `Charging` until the session ends per OCPP `Scheduled` semantics. Surfaced as a bug on 2026-05-27 against charger `ffeadb01-78bc-4b6e-b5cd-1ff657cbedbc` on staging where the toggle appeared broken because the charger Accepted `ChangeAvailability:Operative` but didn't send a follow-up `StatusNotification` — `latest_status` stayed `Unavailable`, the toggle read it as a proxy for admin intent, and clicks appeared to have no effect. ADR 0008 captures the considered alternatives (optimistic latest_status update, TriggerMessage:StatusNotification, audit-log-derived intent) and why none of them survives a real-world firmware quirk.
+
+For "command pending vs applied" indicator semantics, a future UI can join the two fields:
+- `availability=Inoperative AND latest_status=Unavailable` → applied
+- `availability=Inoperative AND latest_status ∈ {Charging, Preparing, ...}` → Scheduled, awaiting session end
+- `availability=Inoperative AND latest_status ∈ {Available, Faulted, ...}` for extended period → charger ignored the command (firmware-side issue, worth surfacing)
+
+That indicator is a deliberate future enhancement; not built yet.
+
 **Charger creation atomicity (issue 05, post-2026-05-18)**: `routers/chargers.py:create_charger` wraps the three writes (`Charger.create`, `Connector.create` per connector input, `Tariff.create`) in `async with in_transaction()`. If any step raises, the whole creation rolls back — no orphan chargers with partial connector sets or no tariff. Two audit-log paths:
 - **Happy path**: `action="charger.created"` written after the transaction commits.
 - **Rollback path**: `action="charger.create_failed"` written inside the `except IntegrityError` branch with the input data + `failure_reason`. Operators can query `WHERE action IN ('charger.created', 'charger.create_failed')` to see every attempted onboarding. The audit write itself is best-effort — wrapped in its own try/except so a secondary audit failure doesn't mask the original 400.
@@ -1742,6 +1756,57 @@ docker compose exec backend python scripts/test_qr_webhook.py \
 ---
 
 ## Database Schema
+
+### Database tier (post-2026-05-27 staging RDS cutover)
+
+The three environments use asymmetric Postgres topologies until a future prod migration project closes the gap.
+
+**Local dev** (`docker-compose.yml`): Postgres 15 in a Docker container, network name `postgres`, no SSL. Backend connects via the Docker bridge network. Schema reset via `docker volume rm`.
+
+**Staging** (`docker-compose.staging.yml` + AWS RDS): As of 2026-05-27, the live database is AWS RDS Postgres at `ocpp-staging-db.c1608qm4i94k.ap-south-1.rds.amazonaws.com`. Specifications:
+- Engine: Postgres 15.18
+- Instance class: `db.t4g.micro` (1 vCPU burst, 1GB RAM, ARM Graviton)
+- Storage: 20GB gp3 with auto-scaling to 100GB, storage-encrypted (AWS-managed KMS key)
+- Multi-AZ: **no** (Single-AZ in `ap-south-1c`)
+- Subnet group: spans all 3 default-VPC subnets (1a/1b/1c) for future Multi-AZ promotion
+- Security: SG `ocpp-rds-staging-sg` allows TCP/5432 inbound only from EC2 SG `sg-02d9c48a3163116f8`; not publicly accessible (private IP `172.31.29.50`)
+- Backup: 14-day automated backup retention with 5-minute PITR
+- TLS: `verify-full` required; backend uses the AWS RDS global CA bundle at `/etc/ssl/rds-ca-bundle.pem` baked during `docker build`
+- Master user `ocpp_admin` (one-time setup), app user `ocpp_staging` (runtime); both passwords in `.env.staging`
+- Performance Insights enabled (7-day retention); CloudWatch Logs export `postgresql`
+- The local Docker `postgres` service still exists in the compose file as a rollback target for the 14-day validation window post-cutover; backend's `depends_on` no longer references it
+
+**Prod** (`docker-compose.prod.yml`): Postgres 15 in a Docker container on the prod EC2 host. Same shape as pre-migration staging. Migration to RDS planned but not scheduled.
+
+### SSL config contract (`backend/db_ssl.py`)
+
+A single `get_ssl_config()` helper drives all DB connection paths so that local/staging/prod can differ via env vars only. Three call sites — all must use the helper:
+
+1. `backend/database.py` — runtime DSN in the Tortoise FastAPI app
+2. `backend/tortoise_config.py` — Aerich CLI configuration (used for migrations)
+3. `backend/docker-entrypoint.sh` — pre-flight wait-for-DB loop (added in the cutover-fix PR after the initial issue 02 PR missed it)
+
+Env-var rules:
+- `DB_SSL_MODE=` (empty) → legacy heuristic: `disable` for `postgres`/`localhost`/`127.0.0.1` hosts, `require` otherwise. Local dev + prod use this.
+- `DB_SSL_MODE=verify-full` → TLS with hostname + chain validation against the CA bundle. Required for RDS.
+- `DB_SSL_MODE=verify-ca|require|prefer|allow|disable` → passthrough to asyncpg.
+
+### Cutover artifacts (preserved during validation window)
+
+On the staging EC2 host at `/home/ec2-user/ocpp-server/`:
+- `backups/staging_cutover_20260527T054652Z.sql` — final `pg_dump` from Docker postgres immediately before cutover, ~469MB plain SQL
+- `.env.staging.pre-rds-cutover` — exact `.env.staging` contents from before the host/password/SSL_MODE switch (rollback target)
+- Docker `postgres` service still running with its original data volume intact
+
+Rollback in the 14-day window is a 30-second operation: `cp .env.staging.pre-rds-cutover .env.staging && docker compose ... up -d backend`. Both Docker postgres and the old credentials are still present.
+
+### Cutover post-mortem highlights
+
+The 2026-05-27 cutover surfaced one real bug and two operational notes (see `.scratch/rds-staging-migration/PRD.md` "Lessons learned" for the full version):
+
+- **The entrypoint pre-flight DB check was missed in issue 02.** `database.py` and `tortoise_config.py` correctly used the new `db_ssl.get_ssl_config()` helper, but `backend/docker-entrypoint.sh` had its own inline `asyncpg.connect(..., ssl='disable')` that didn't. The pre-flight failed against RDS, the entrypoint exited, the container restart-looped, and the backend never reached uvicorn. Cost ~5 min of bonus downtime. Fix was to import the same helper into the entrypoint script. Codified as feedback memory `feedback_check_entrypoint_during_db_config_changes`.
+- **RDS provisioning took ~20 min**, not the 5-10 expected. Performance Insights + CloudWatch Logs export add provisioning steps. Provision well before the cutover window in any future migration.
+- **`DROP DATABASE` requires ownership.** RDS master user is `rds_superuser` (not real superuser); can't drop a DB owned by another user. The clean-up pattern is `DROP OWNED BY <app_user> CASCADE` run as the app user. Useful any time a trial-restore needs a fresh slate.
 
 ### Entity Relationship Overview
 

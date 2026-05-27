@@ -35,6 +35,40 @@ If you find yourself reaching for `wallet.balance` or writing a negative `amount
 - Both share the same Clerk app and Razorpay **live** keys (QR payments require live mode)
 - Razorpay webhook handlers gracefully skip "not found" transactions (cross-environment events) — do not change this to raise errors
 
+## Database tier (asymmetric — staging on RDS, prod on Docker)
+
+Since the **RDS staging migration on 2026-05-27**, the two environments use different Postgres topologies. This is intentional and temporary — prod migration is a separate future project.
+
+- **Local dev**: Docker postgres (`docker-compose.yml`). No SSL. Schema-reset via `docker volume rm` is cheap. No change.
+- **Staging**: **AWS RDS Postgres `ocpp-staging-db.c1608qm4i94k.ap-south-1.rds.amazonaws.com`**. Single-AZ `db.t4g.micro`, 20GB gp3, 14-day automated backup retention with PITR. TLS `verify-full` required, using the AWS RDS global CA bundle baked into the backend image at `/etc/ssl/rds-ca-bundle.pem` during `docker build`. The local Docker postgres container is still defined in `docker-compose.staging.yml` for now — it stays as a rollback target until the 14-day validation window closes (see `.scratch/rds-staging-migration/issues/07-decommission-docker-postgres.md`).
+- **Prod**: Docker postgres in `docker-compose.prod.yml`. Same caveats as pre-RDS staging. Will migrate eventually — see `.scratch/rds-prod-migration/` when that project starts.
+
+### SSL config contract
+
+The single source of truth is `backend/db_ssl.py`'s `get_ssl_config()` helper. Three places must use it; if you change DB connection logic, search for ALL of them:
+
+1. `backend/database.py` — runtime DSN for the live app
+2. `backend/tortoise_config.py` — Aerich CLI config
+3. `backend/docker-entrypoint.sh` — pre-flight wait-for-DB loop (the trap that bit the staging cutover — see [[feedback-check-entrypoint-during-db-config-changes]])
+
+Env-var contract for SSL:
+- `DB_SSL_MODE=` (unset/empty) → legacy behavior: `disable` for `postgres`/`localhost`/`127.0.0.1` host, `require` otherwise. This is what local dev + prod (pre-migration) use.
+- `DB_SSL_MODE=verify-full` → TLS with CA validation. Required for RDS. Uses the CA bundle baked into the image.
+- `DB_SSL_MODE=require` → TLS without cert validation. Avoid for new uses; verify-full is strictly better.
+
+### Tooling
+
+| Action | Staging (RDS) | Prod (Docker) |
+|---|---|---|
+| Ad-hoc psql shell | `make staging-rds-shell` (uses backend container's env vars) | `docker exec ocpp-postgres-prod psql ...` |
+| Backups | RDS automated daily snapshots + PITR (managed) | `pg_dump` via `docker exec` |
+| Restore | RDS Console → PITR or snapshot restore | `psql < dump.sql` |
+| `make staging-backup-db` / `staging-restore-db` | warn-and-exit (post-cutover) | n/a |
+
+### Cutover artifact preserved
+
+The staging cutover dump lives on the staging EC2 at `/home/ec2-user/ocpp-server/backups/staging_cutover_20260527T054652Z.sql` (~469MB). The pre-cutover env backup is `.env.staging.pre-rds-cutover` on the same host. Both stay until the 14-day validation window closes.
+
 ## Env vars (CRITICAL — read before adding any new env var)
 
 **Adding a new env var to `.env.example` / `.env.staging.example` / `.env.prod.example` is NOT enough.** Docker compose's `--env-file` flag only loads vars into the *shell where compose runs* (for `${VAR}` substitution in YAML). It does **not** automatically pass them into the container.
@@ -73,6 +107,18 @@ Checklist when adding a new frontend env var:
 5. `docker-compose.prod.yml` — add to `frontend.build.args:`
 6. **`frontend/Dockerfile` — add `ARG VAR_NAME` and (for `NEXT_PUBLIC_*` only) `ENV VAR_NAME=$VAR_NAME` in the builder stage**. Secrets that are only consumed by a single build step (e.g. `SENTRY_AUTH_TOKEN`) should be `ARG`-only and injected inline on that `RUN` line to keep them out of any image layer.
 7. Verify: rebuild frontend, then `docker exec ocpp-frontend-<env> sh -c "grep -l <something-that-should-be-baked> /app/.next/static/chunks/*.js | head -3"` — should find references. Or for Sentry: confirm the build log prints `Uploaded XX sourcemaps` and a Release with artifacts shows up in Sentry UI.
+
+## Charger state model (two fields, intentionally)
+
+The `charger` table carries TWO orthogonal state-shaped fields. They are NOT redundant — see **ADR 0008** for the full rationale.
+
+- **`latest_status`** (`ChargerStatusEnum`): what the charger reports via OCPP `StatusNotification`. Values: `Available`, `Preparing`, `Charging`, `SuspendedEVSE`, `SuspendedEV`, `Finishing`, `Reserved`, `Unavailable`, `Faulted`. Written exclusively by the `StatusNotification` handler in `main.py`. Read by the status pill, OCPP routing, billing logic.
+
+- **`availability`** (`ChargerAvailabilityEnum`, added 2026-05-27): what an admin or franchisee has commanded via the `ChangeAvailability` endpoint. Values: `Operative`, `Inoperative`. Written by `routers/chargers.change_charger_availability` and `routers/franchisee_portal.change_availability` on OCPP `Accepted`/`Scheduled` responses (not on `Rejected`). Read by the admin UI toggle.
+
+**Why two fields**: a `Faulted` charger can still be admin-set `Operative` (the admin wants it available; the hardware is broken — orthogonal concerns). A `Charging` charger that admin clicks `Inoperative` goes to `availability=Inoperative` immediately, but `latest_status` stays `Charging` until the session ends per OCPP `Scheduled` semantics. Conflating the two breaks the toggle UX for any charger whose firmware doesn't reliably send a follow-up `StatusNotification` after `ChangeAvailability:Accepted` — see ADR 0008 for the specific bug that surfaced this.
+
+If you ever consider unifying these or deriving one from the other, re-read ADR 0008 first.
 
 ## Agent skills
 
