@@ -655,6 +655,18 @@ class QRPaymentService:
             return
 
         energy_kwh = transaction.energy_consumed_kwh or 0
+
+        # ADR 0002: zero-energy QR session must full-refund (amount_paid),
+        # not amount_paid - synthetic_platform_fee. The over-payment formula
+        # below is correct only when service was actually delivered. Route
+        # zero-energy cases to _full_refund so they hit the same path as the
+        # other "service not rendered" failures (RemoteStart fail, plug-in
+        # timeout, etc.) — `_full_refund` already handles the audit + the
+        # instant-refund speed=optimum amendment (ADR 0002, 2026-05-20).
+        if Decimal(str(energy_kwh)) <= 0:
+            await QRPaymentService._full_refund(qr_payment, "Zero energy delivered")
+            return
+
         tariff = await WalletService.get_applicable_tariff(qr_payment.charger_id)
         tariff_rate = tariff.rate_per_kwh if tariff else Decimal('0')
         gst_percent = tariff.gst_percent if tariff else Decimal('18')

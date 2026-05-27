@@ -394,6 +394,61 @@ async def test_handle_charging_failure_issues_full_refund(client, qr_charger, qr
     assert await GSTInvoice.filter(transaction_id=txn.id).count() == 0
 
 
+@pytest.mark.asyncio
+async def test_process_qr_session_billing_zero_energy_issues_full_refund(
+    client, qr_charger, qr_code, qr_tariff, monkeypatch
+):
+    """ADR 0002: process_qr_session_billing must full-refund a zero-energy session.
+
+    Regression for the 2026-05-27 bug where the function fell through to the
+    over-payment formula `refund = amount_paid - energy_cost - gst - synth_fee`
+    when energy_consumed_kwh was 0. With energy=0 the formula returned
+    `amount_paid - synthetic_fee`, leaving the customer short by the synthetic
+    platform fee (~2%) when ADR 0002 promises a full refund.
+
+    Surfaced on payment id 96 (staging): ₹1500 paid, 0 kWh delivered, ₹1470
+    refunded — should have been ₹1500. This test routes a clean StopTransaction
+    with zero energy through process_qr_session_billing and asserts:
+      - the full amount_paid is refunded (no synthetic fee deduction)
+      - speed=optimum is requested (matches the _full_refund / ADR 0002 amendment)
+      - QR payment ends REFUNDED
+      - no GST invoice is issued (zero-energy = no taxable supply)
+    """
+    monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
+
+    _, txn, qr_payment = await _make_qr_billing_fixture(
+        qr_charger, qr_code, qr_tariff, energy_consumed_kwh=0.0,
+    )
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment.return_value = {
+        "id": "rfnd_ZERO_ENERGY",
+        "speed_processed": "instant",
+    }
+
+    with patch("services.qr_payment_service.razorpay_service", mock_razorpay), \
+         patch("services.qr_payment_service.redis_manager") as mock_redis:
+        mock_redis.delete_qr_session = AsyncMock()
+        await QRPaymentService.process_qr_session_billing(txn.id)
+
+    mock_razorpay.refund_payment.assert_called_once()
+    call_kwargs = mock_razorpay.refund_payment.call_args.kwargs
+    # Full refund — not amount_paid - synthetic_fee.
+    assert call_kwargs["amount"] == Decimal("20.00")
+    # Routed through _full_refund → instant speed per ADR 0002 amendment.
+    assert call_kwargs["speed"] == "optimum"
+
+    await qr_payment.refresh_from_db()
+    assert qr_payment.refund_amount == Decimal("20.00")
+    assert qr_payment.status == QRPaymentStatusEnum.REFUNDED
+    # razorpay_refund_id populated proves _full_refund ran (not the over-payment path).
+    assert qr_payment.razorpay_refund_id == "rfnd_ZERO_ENERGY"
+
+    # No GST invoice for zero-energy sessions (ADR 0002 — no taxable supply).
+    from models import GSTInvoice
+    assert await GSTInvoice.filter(transaction_id=txn.id).count() == 0
+
+
 # ============================================================================
 # Razorpay instant refund speed wiring (ADR 0002)
 # ============================================================================
