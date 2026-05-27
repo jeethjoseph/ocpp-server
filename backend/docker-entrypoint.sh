@@ -33,10 +33,15 @@ MAX_RETRIES=30
 RETRY_COUNT=0
 
 while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+    # Use the shared SSL helper so this pre-flight check honors DB_SSL_MODE
+    # exactly like the runtime code paths (database.py, tortoise_config.py).
     if python3 -c "
 import asyncio
 import asyncpg
 import os
+import sys
+sys.path.insert(0, '/app')
+from db_ssl import get_ssl_config
 
 async def check_db():
     try:
@@ -46,11 +51,11 @@ async def check_db():
             user=os.getenv('DB_USER'),
             password=os.getenv('DB_PASSWORD'),
             database=os.getenv('DB_NAME'),
-            ssl='disable'
+            ssl=get_ssl_config()
         )
         await conn.close()
         return True
-    except Exception as e:
+    except Exception:
         return False
 
 exit(0 if asyncio.run(check_db()) else 1)
