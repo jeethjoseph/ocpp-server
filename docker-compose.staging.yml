@@ -1,3 +1,12 @@
+# Cap each container's log file growth. 5 × 50 MB = 250 MB max per container
+# before the oldest file rotates out. `docker logs` still reads across the
+# rotated files transparently. Referenced from every service below.
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
 services:
   # PostgreSQL Database
   postgres:
@@ -17,6 +26,7 @@ services:
     networks:
       - ocpp-network-staging
     restart: unless-stopped
+    logging: *default-logging
     deploy:
       resources:
         limits:
@@ -41,6 +51,7 @@ services:
     networks:
       - ocpp-network-staging
     restart: unless-stopped
+    logging: *default-logging
     deploy:
       resources:
         limits:
@@ -156,6 +167,7 @@ services:
     networks:
       - ocpp-network-staging
     restart: unless-stopped
+    logging: *default-logging
     deploy:
       resources:
         limits:
@@ -199,6 +211,7 @@ services:
     networks:
       - ocpp-network-staging
     restart: unless-stopped
+    logging: *default-logging
     deploy:
       resources:
         limits:
@@ -235,6 +248,7 @@ services:
     networks:
       - ocpp-network-staging
     restart: unless-stopped
+    logging: *default-logging
 
   # Certbot for SSL certificate management
   certbot:
@@ -247,6 +261,7 @@ services:
     networks:
       - ocpp-network-staging
     restart: unless-stopped
+    logging: *default-logging
 
 volumes:
   postgres_data_staging:

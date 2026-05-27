@@ -293,19 +293,20 @@ prod-nuke:
 	$(PROD_COMPOSE) down -v --rmi local
 	@echo "All containers, volumes, and images removed."
 
-# View production logs (all services)
+# View production logs — last 100 lines + live tail.
+# For full history pipe `$(PROD_COMPOSE) logs > prod.log` (no -f) and grep.
 prod-logs:
-	$(PROD_COMPOSE) logs -f
+	$(PROD_COMPOSE) logs --tail=100 -f
 
-# View specific service logs
+# View specific service logs — last 100 lines + live tail.
 prod-logs-backend:
-	$(PROD_COMPOSE) logs -f backend
+	$(PROD_COMPOSE) logs --tail=100 -f backend
 
 prod-logs-frontend:
-	$(PROD_COMPOSE) logs -f frontend
+	$(PROD_COMPOSE) logs --tail=100 -f frontend
 
 prod-logs-nginx:
-	$(PROD_COMPOSE) logs -f nginx
+	$(PROD_COMPOSE) logs --tail=100 -f nginx
 
 # Run migrations on production
 prod-migrate:
@@ -508,19 +509,20 @@ staging-nuke:
 	$(STAGING_COMPOSE) down -v --rmi local
 	@echo "All staging containers, volumes, and images removed."
 
-# View staging logs (all services)
+# View staging logs — last 100 lines + live tail.
+# For full history pipe `$(STAGING_COMPOSE) logs > staging.log` (no -f) and grep.
 staging-logs:
-	$(STAGING_COMPOSE) logs -f
+	$(STAGING_COMPOSE) logs --tail=100 -f
 
-# View specific service logs
+# View specific service logs — last 100 lines + live tail.
 staging-logs-backend:
-	$(STAGING_COMPOSE) logs -f backend
+	$(STAGING_COMPOSE) logs --tail=100 -f backend
 
 staging-logs-frontend:
-	$(STAGING_COMPOSE) logs -f frontend
+	$(STAGING_COMPOSE) logs --tail=100 -f frontend
 
 staging-logs-nginx:
-	$(STAGING_COMPOSE) logs -f nginx
+	$(STAGING_COMPOSE) logs --tail=100 -f nginx
 
 # Run migrations on staging
 staging-migrate:

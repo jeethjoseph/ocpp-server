@@ -15,6 +15,17 @@
 - **Docker build parity**: when changes touch the build (new imports, new deps, config), run `docker compose build frontend` / `docker compose build backend` locally to catch image-level failures before they hit staging.
 - Never declare a change "done" based only on `tsc` output or partial lint runs — staging/prod rebuilds enforce the full ruleset.
 
+## Logs
+
+Both compose files cap container log file growth so nothing fills the host's disk, but they do it differently:
+
+- **`docker-compose.staging.yml`** uses a single `x-default-logging` YAML anchor at the top and every service references it via `logging: *default-logging` — **5 × 50 MB = 250 MB** per container. Added 2026-05-27. New services should reference the same anchor.
+- **`docker-compose.prod.yml`** has per-service `logging:` blocks with deliberately different caps — backend gets the most room (20m × 5 = 100 MB), nginx/postgres/redis/frontend smaller (10m × 3 = 30 MB), certbot smallest (5m × 2 = 10 MB). These are tuned for actual write volume per service; don't unify them without reason.
+
+In either env, `docker logs` reads transparently across the rotated files. Don't ship a new service to either compose file without a `logging:` block.
+
+`make staging-logs` / `make prod-logs` (and the per-service variants) default to `--tail=100 -f` — last 100 lines for context, then live tail. For full history without follow, run `$(STAGING_COMPOSE) logs > staging.log` and grep the file.
+
 ## Wallet ledger pattern (CRITICAL — non-obvious from the code alone)
 
 The wallet is an **event-sourced ledger** post migrations 32 → 33 → 34. If you're touching `wallet_service.py`, `wallet_session_service.py`, `wallet_transaction`, or any code path that reads or writes a balance, read this:
