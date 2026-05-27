@@ -4,15 +4,16 @@ from dotenv import load_dotenv
 from tortoise import Tortoise
 from tortoise.contrib.fastapi import register_tortoise
 
+from db_ssl import get_ssl_config
+
 load_dotenv()
 
 # Detect environment for SSL configuration
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "development")
 
-# SSL configuration: require for cloud/external DBs, disable for local/Docker
-db_host = os.environ.get("DB_HOST", "localhost")
-is_local_db = db_host in ["localhost", "127.0.0.1", "postgres"]
-ssl_config = "disable" if is_local_db else "require"
+# SSL: driven by DB_SSL_MODE env var with sensible fallback for local dev.
+# See backend/db_ssl.py for the contract.
+ssl_config = get_ssl_config()
 
 # Use credential-based config instead of URL string
 TORTOISE_ORM = {

@@ -24,7 +24,7 @@ SCRIPTS_DIR=$(BACKEND_DIR)/scripts
 .PHONY: help db-reset db-reset-cloud db-first-time db-drop-user db-create-user db-drop db-create migrate seed setup-dev truncate-tables
 .PHONY: docker-dev docker-dev-detach docker-staging docker-staging-detach docker-prod docker-prod-detach docker-down docker-down-staging docker-down-prod docker-logs docker-logs-backend docker-logs-frontend docker-build docker-build-staging docker-build-prod docker-clean docker-migrate docker-staging-cert docker-prod-cert docker-cert-renew
 .PHONY: prod-push prod-pull prod-up prod-down prod-deploy prod-rebuild prod-rebuild-service prod-rebuild-clean prod-nuke prod-restart prod-logs prod-logs-backend prod-logs-frontend prod-logs-nginx prod-ps prod-cert prod-migrate prod-backup-db prod-restore-db prod-cache-clear prod-health prod-stats prod-shell prod-bash prod-db-reset prod-seed
-.PHONY: staging-push staging-pull staging-up staging-down staging-deploy staging-rebuild staging-rebuild-service staging-rebuild-clean staging-nuke staging-restart staging-logs staging-logs-backend staging-logs-frontend staging-logs-nginx staging-ps staging-cert staging-migrate staging-backup-db staging-restore-db staging-cache-clear staging-health staging-stats staging-shell staging-bash staging-ssm staging-db-reset staging-seed
+.PHONY: staging-push staging-pull staging-up staging-down staging-deploy staging-rebuild staging-rebuild-service staging-rebuild-clean staging-nuke staging-restart staging-logs staging-logs-backend staging-logs-frontend staging-logs-nginx staging-ps staging-cert staging-migrate staging-backup-db staging-restore-db staging-cache-clear staging-health staging-stats staging-shell staging-bash staging-ssm staging-db-reset staging-seed staging-rds-shell
 
 help:
 	@echo "OCPP Server - Available Commands"
@@ -446,9 +446,43 @@ staging-rebuild:
 		echo "Let's Encrypt certificate found."; \
 	fi
 
-# Full deploy sequence (run on staging EC2 after SSM)
-staging-deploy: staging-pull staging-rebuild
+# Full deploy sequence (run on staging EC2 after SSM).
+# `staging-prune-if-needed` runs between pull and rebuild: it's a no-op
+# when disk is healthy, and self-heals when the build cache has bloated
+# past 85% root-volume usage. This is the trade-off documented in
+# CLAUDE.md — keep deploys fast in the common case, never fail on
+# ENOSPC mid-build.
+staging-deploy: staging-pull staging-prune-if-needed staging-rebuild
 	@echo "Staging deployment complete!"
+
+# Manual disk cleanup. Safe by construction:
+#   - builder prune: drops build cache only (not images, not containers, not volumes)
+#   - image prune: drops dangling images (NOT in use by running containers)
+# Volumes are untouched, so postgres/redis/firmware data are safe.
+# Run when you see `df -h /` getting tight or want a deliberate cleanup.
+.PHONY: staging-prune
+staging-prune:
+	@echo "Pruning Docker build cache..."
+	sudo docker builder prune -af
+	@echo "Pruning dangling images..."
+	sudo docker image prune -af
+	@echo "Disk usage after prune:"
+	@df -h / | tail -2
+
+# Conditional version used by staging-deploy. Prunes only when root-volume
+# usage exceeds 85%. The shell logic must be on one line (Make runs each
+# recipe line in its own subshell) — kept readable via backslash continuations.
+.PHONY: staging-prune-if-needed
+staging-prune-if-needed:
+	@USAGE=$$(df / | tail -1 | awk '{print $$5}' | tr -d %); \
+	if [ "$$USAGE" -gt 85 ]; then \
+		echo "Disk at $$USAGE%, pruning build cache + dangling images..."; \
+		sudo docker builder prune -af; \
+		sudo docker image prune -af; \
+		df -h / | tail -2; \
+	else \
+		echo "Disk at $$USAGE%, no prune needed (threshold 85%)"; \
+	fi
 
 # Restart all services without rebuilding
 staging-restart:
@@ -538,44 +572,77 @@ staging-cache-clear:
 	$(STAGING_COMPOSE) exec redis redis-cli FLUSHALL
 	@echo "Staging cache cleared!"
 
-# Backup staging database (saves to host filesystem)
-staging-backup-db:
-	@echo "Backing up staging database..."
-	@mkdir -p backups
-	$(STAGING_COMPOSE) exec -T postgres sh -c 'pg_dump -U $$POSTGRES_USER $$POSTGRES_DB' > backups/staging_backup_$$(date +%Y%m%d_%H%M%S).sql
-	@echo "Backup saved to backups/"
-	@ls -lh backups/staging_backup_*.sql | tail -1
-
-# Restore staging database from a backup file.
-# Usage:   make staging-restore-db                      (uses newest backups/staging_backup_*.sql)
-#          make staging-restore-db DUMP=backups/x.sql   (use a specific file)
-# WARNING: Drops and recreates the staging DB before restore — destroys current state.
-staging-restore-db:
-	@echo "WARNING: Restoring staging DB will DROP all current data."
-	@echo "Press Ctrl+C in 5s to cancel..."
-	@sleep 5
-	$(eval DUMP ?= $(shell ls -t backups/staging_backup_*.sql 2>/dev/null | head -1))
-	@if [ -z "$(DUMP)" ] || [ ! -f "$(DUMP)" ]; then \
-		echo "ERROR: no dump file found. Pass DUMP=path/to/file.sql or run staging-backup-db first."; \
+# Open a psql shell against the staging RDS instance.
+# Reads connection params from the backend container's env so the secret
+# doesn't have to leave .env.staging. Works equally for pre-cutover Docker
+# postgres (DB_HOST=postgres) and post-cutover RDS.
+staging-rds-shell:
+	@if [ -z "$$($(STAGING_COMPOSE) ps -q backend)" ]; then \
+		echo "ERROR: backend container not running. Run 'make staging-up' first."; \
 		exit 1; \
 	fi
-	@echo "Restoring from $(DUMP)..."
-	$(STAGING_COMPOSE) stop backend frontend
-	$(STAGING_COMPOSE) exec -T postgres sh -c 'psql -U $$POSTGRES_USER -d postgres -c "DROP DATABASE IF EXISTS $$POSTGRES_DB;"'
-	$(STAGING_COMPOSE) exec -T postgres sh -c 'psql -U $$POSTGRES_USER -d postgres -c "CREATE DATABASE $$POSTGRES_DB OWNER $$POSTGRES_USER;"'
-	$(STAGING_COMPOSE) exec -T postgres sh -c 'psql -U $$POSTGRES_USER -d $$POSTGRES_DB' < $(DUMP)
-	$(STAGING_COMPOSE) start backend frontend
-	@echo "Restore complete from $(DUMP). Backend + frontend restarted."
+	$(STAGING_COMPOSE) exec backend sh -c \
+		'PGPASSWORD=$$DB_PASSWORD psql -h $$DB_HOST -p $$DB_PORT -U $$DB_USER -d $$DB_NAME'
 
-# Reset staging database (DANGEROUS - requires confirmation)
+# Backups: post-RDS-migration this is handled by RDS automated snapshots + PITR.
+# Pre-migration this still wrote a pg_dump from Docker postgres to backups/.
+# We keep the target name as a discoverability anchor but redirect the user
+# to the new model instead of silently doing the wrong thing.
+staging-backup-db:
+	@echo "============================================================"
+	@echo "Staging now uses RDS — automated backups are managed by AWS:"
+	@echo "  - Daily automated snapshots (14-day retention)"
+	@echo "  - Point-in-time recovery to any second in the window"
+	@echo ""
+	@echo "View snapshots:"
+	@echo "  AWS Console -> RDS -> ocpp-staging-db -> Maintenance & backups"
+	@echo "  aws rds describe-db-snapshots --profile voltlync \\"
+	@echo "    --db-instance-identifier ocpp-staging-db"
+	@echo ""
+	@echo "Trigger an on-demand snapshot:"
+	@echo "  aws rds create-db-snapshot --profile voltlync \\"
+	@echo "    --db-instance-identifier ocpp-staging-db \\"
+	@echo "    --db-snapshot-identifier ocpp-staging-manual-\$$(date +%Y%m%d-%H%M%S)"
+	@echo ""
+	@echo "For ad-hoc psql access:    make staging-rds-shell"
+	@echo "============================================================"
+	@exit 1
+
+staging-restore-db:
+	@echo "============================================================"
+	@echo "Staging now uses RDS — restores go through the RDS console:"
+	@echo "  - Point-in-time: AWS Console -> RDS -> ocpp-staging-db ->"
+	@echo "                   Actions -> Restore to point in time"
+	@echo "  - From snapshot: AWS Console -> RDS -> Snapshots ->"
+	@echo "                   <snapshot> -> Actions -> Restore snapshot"
+	@echo ""
+	@echo "Either path creates a NEW RDS instance; you then either"
+	@echo "swap DB_HOST in .env.staging or use the new endpoint directly."
+	@echo "============================================================"
+	@exit 1
+
+# Reset staging database (DANGEROUS).
+# Post-RDS-migration this targets the RDS instance, not a Docker volume.
+# Requires typing the exact phrase to confirm — no muscle-memory drops.
 staging-db-reset:
-	@echo "WARNING: This will delete the staging database!"
-	@echo "Press Ctrl+C to cancel, or wait 3 seconds to continue..."
-	@sleep 3
+	@HOST=$$(grep -E '^DB_HOST=' .env.staging | cut -d= -f2); \
+	echo "==========================================================="; \
+	echo "WARNING: This will DROP and recreate the staging database."; \
+	echo "Target host: $$HOST"; \
+	echo ""; \
+	echo "If the host above is an RDS endpoint, this destroys data"; \
+	echo "that RDS automated backups can still recover, but it WILL"; \
+	echo "take staging down until migrations re-run."; \
+	echo ""; \
+	echo "Type 'reset staging db' to confirm, anything else aborts:"; \
+	echo "==========================================================="; \
+	read confirm; [ "$$confirm" = "reset staging db" ] || (echo "Aborted."; exit 1)
 	@echo "Stopping backend to release DB connections..."
 	$(STAGING_COMPOSE) stop backend
-	$(STAGING_COMPOSE) exec postgres sh -c 'psql -U $$POSTGRES_USER -d postgres -c "DROP DATABASE IF EXISTS $$POSTGRES_DB;"'
-	$(STAGING_COMPOSE) exec postgres sh -c 'psql -U $$POSTGRES_USER -d postgres -c "CREATE DATABASE $$POSTGRES_DB OWNER $$POSTGRES_USER;"'
+	$(STAGING_COMPOSE) exec backend sh -c \
+		'PGPASSWORD=$$DB_PASSWORD psql -h $$DB_HOST -p $$DB_PORT -U $$DB_USER -d postgres \
+		 -c "DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME OWNER $$DB_USER;"' \
+		2>/dev/null || true
 	@echo "Database reset. Rebuilding backend (entrypoint runs migrations)..."
 	$(STAGING_COMPOSE) up -d --build backend
 	@echo "Staging database reset complete!"

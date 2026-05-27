@@ -80,6 +80,7 @@ import {
   useReleaseSettlement,
 } from "@/lib/queries/franchisees";
 import { useStations } from "@/lib/queries/stations";
+import { SettlementTerminalActions } from "@/components/SettlementTerminalActions";
 import { formatINR } from "@/lib/utils";
 
 const STATUS_COLORS: Record<string, string> = {
@@ -935,6 +936,14 @@ export default function FranchiseeDetailPage() {
                                 <Play className="w-3 h-3" />
                               </Button>
                             )}
+                            <SettlementTerminalActions
+                              entry={{
+                                id: entry.id,
+                                franchisee_id: id,
+                                settlement_status: entry.settlement_status,
+                                franchisee_payout: entry.franchisee_payout,
+                              }}
+                            />
                           </div>
                         </TableCell>
                       </TableRow>

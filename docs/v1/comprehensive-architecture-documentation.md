@@ -2649,6 +2649,50 @@ Implementation notes:
      `RAZORPAY_ROUTE_ENABLED != "true"`. Closes the manual-retry-only
      gap that previously left `account.funds_unhold` and
      `account.activated` webhook firings without an automated trigger.
+   - **Stuck-payout detector + admin terminal-resolution actions**
+     (`services/stuck_payout_detector.py`,
+     `routers/admin_settlements.py`). The background sweep fires a
+     Sentry warning per franchisee per tick aggregating entries that
+     are either `FAILED/ON_HOLD` past `MAX_TRANSFER_RETRIES`, `PENDING`
+     past `STUCK_PAYOUT_THRESHOLD_HOURS`, or `TRANSFER_INITIATED` past
+     the same threshold (webhook never landed). The
+     `build_stuck_filter` Tortoise predicate is shared with the admin
+     list endpoint `GET /api/admin/settlements/stuck` — single source
+     of truth for "what's stuck."
+     For entries the retry sweep cannot resolve on its own, admins
+     have two terminal-resolution endpoints, both behind
+     `require_admin()` and both audit-logged:
+     - `POST /api/admin/settlements/{entry_id}/mark-below-threshold`
+       flips a sub-floor (`franchisee_payout < MIN_TRANSFER_AMOUNT`)
+       row to `BELOW_THRESHOLD`. Validates the payout-threshold
+       check server-side (422 if not below); rejects already-terminal
+       sources (409); idempotent on re-click. Audit action
+       `settlement.mark_below_threshold`.
+     - `POST /api/admin/settlements/{entry_id}/mark-settled` accepts
+       `{ note: str (min 3 chars) }` and flips the row to `SETTLED`
+       with `settled_at = now()` set on first transition only.
+       Razorpay ID fields are left untouched (manual ⇒ no Razorpay
+       transfer). Idempotent re-clicks preserve the original
+       `settled_at` and do NOT write a second audit row. Allowed
+       sources: `PENDING/TRANSFER_INITIATED/TRANSFER_PROCESSED/FAILED/ON_HOLD`.
+       Audit action `settlement.manual_settle`, with the admin's
+       free-form `note` stored in `audit_log.changes`.
+     Per **ADR 0007** (`docs/adr/0007-manual-settlement-resolution-via-audit-log.md`),
+     there is intentionally **no `MANUAL_SETTLED` enum value and no
+     `manual_resolution_note` column on `commission_ledger_entry`**.
+     Manually-resolved rows are identifiable by the join
+     `commission_ledger_entry × audit_log on entity_id` filtered to
+     the two action strings above. Do not rename those action strings
+     without a migration of historical audit rows.
+     Frontend: a shared `components/SettlementTerminalActions.tsx`
+     renders eligibility-aware icon buttons (BELOW_THRESHOLD shown
+     only when `payout < ₹1.00 AND status in {PENDING/FAILED/ON_HOLD}`;
+     SETTLED shown when status is not already terminal). Embedded
+     in `/admin/settlements/stuck` (Actions column) and in the
+     per-franchisee Settlement Ledger card (alongside the existing
+     Hold/Release buttons). Confirmation dialog with a required note
+     textarea for the SETTLED flow; the BELOW_THRESHOLD flow has a
+     plain confirm.
    - `update_stakeholder` (PUT
      `/api/admin/franchisees/{id}/stakeholders/{sid}`) PATCHes an
      existing Razorpay stakeholder so admins can backfill PAN /

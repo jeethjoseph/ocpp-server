@@ -12,3 +12,9 @@ if (dsn) {
     debug: false,
   });
 }
+
+// Required by @sentry/nextjs to instrument Next.js App Router client-side
+// navigations. Without this export, Sentry only sees the initial page load
+// and errors fired after a client-side navigation appear with stale route
+// metadata + missing nav breadcrumbs.
+export const onRouterTransitionStart = Sentry.captureRouterTransitionStart;

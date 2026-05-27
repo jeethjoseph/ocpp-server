@@ -60,11 +60,16 @@ services:
       - CLERK_JWKS_URL=${CLERK_JWKS_URL:-}
       - CLERK_ISSUER=${CLERK_ISSUER:-}
       # Database & Redis
-      - DB_HOST=postgres
-      - DB_PORT=5432
+      # DB_HOST defaults to 'postgres' (Docker network name) for pre-RDS-migration.
+      # At cutover, .env.staging overrides this with the RDS endpoint hostname
+      # and DB_SSL_MODE flips to verify-full. See backend/db_ssl.py for the
+      # SSL contract; the CA bundle is baked into the backend image at build time.
+      - DB_HOST=${DB_HOST:-postgres}
+      - DB_PORT=${DB_PORT:-5432}
       - DB_USER=${DB_USER}
       - DB_PASSWORD=${DB_PASSWORD}
       - DB_NAME=${DB_NAME}
+      - DB_SSL_MODE=${DB_SSL_MODE:-}
       - REDIS_URL=redis://redis:6379
       # Server
       - HOST=0.0.0.0
@@ -135,9 +140,11 @@ services:
       - SENTRY_PROFILES_SAMPLE_RATE=${SENTRY_PROFILES_SAMPLE_RATE:-0.1}
     volumes:
       - backend_firmware_staging:/app/firmware_files
+    # NOTE: `postgres` removed from depends_on as part of the RDS migration.
+    # Backend now connects to either Docker postgres or RDS based on DB_HOST
+    # in .env.staging; the local Docker postgres service is retained as a
+    # rollback target during the 14-day validation window post-cutover.
     depends_on:
-      postgres:
-        condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:

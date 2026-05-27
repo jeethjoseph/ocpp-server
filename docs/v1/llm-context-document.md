@@ -402,6 +402,13 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
     `RAZORPAY_TRANSFER_FEE_PERCENT` is **removed** — was double-charging
     the franchisee on top of Razorpay's own fee.
 
+- **`routers/admin_settlements.py`** — admin operations across all franchisees' settlements.
+  - `GET /api/admin/settlements/stuck` — paginated list of entries the `StuckPayoutDetector` flags (predicate shared via `build_stuck_filter`).
+  - `POST /api/admin/settlements/{entry_id}/mark-below-threshold` — terminal-resolves a sub-floor `PENDING/FAILED/ON_HOLD` row to `BELOW_THRESHOLD`. Server validates `franchisee_payout < MIN_TRANSFER_AMOUNT` (422 otherwise). Idempotent.
+  - `POST /api/admin/settlements/{entry_id}/mark-settled` — terminal-resolves to `SETTLED` for out-of-band resolutions (e.g. bank-transferred manually). Body: `{ note: str, min_length=3 }`. Sets `settled_at = now()` on first call only — idempotent re-clicks preserve the original timestamp; Razorpay ID fields untouched. Allowed source statuses: `PENDING/TRANSFER_INITIATED/TRANSFER_PROCESSED/FAILED/ON_HOLD`.
+  - Both actions log a distinct `audit_log` `action` (`settlement.mark_below_threshold` / `settlement.manual_settle`). Per **ADR 0007**, there is no `MANUAL_SETTLED` enum value or `manual_resolution_note` column — the audit log is the system of record for who-resolved-what-when-and-why.
+  - Frontend: `/admin/settlements/stuck` and the per-franchisee Settlement Ledger card both render the shared `components/SettlementTerminalActions.tsx` per row (eligibility-aware icon buttons + confirmation dialog with note textarea for the SETTLED action).
+
 ### Frontend Core (`/frontend/`)
 - **`app/page.tsx`** - Role-based dashboard (different for ADMIN vs USER)
 - **`app/admin/`** - Complete admin interface for station/charger/user management
