@@ -5187,6 +5187,7 @@ CORS_ORIGINS = [
 - Structured logging with timestamps and correlation IDs
 - Connection manager refactored to `core/connection_manager.py`
 - Monitoring service: `services/monitoring_service.py`
+- **WebSocket disconnect telemetry (2026-05-28)**: `OCPPWebSocketDisconnect` NR custom event emitted once per disconnect from `ConnectionManager.force_disconnect` (the chokepoint for every disconnect path — natural close, server error, stale-replacement, heartbeat timeout, ops-initiated). Sibling event `OCPPWebSocketRejected` covers connect-time rejects (tombstone, validation_failed) from `routers/ocpp_ws.py`. Per-category counter metrics under `Custom/OCPP/Disconnects/*` and `Custom/OCPP/Rejects/*` survive 13 months; the rich events with full forensics attrs (charger_id, duration_seconds, ws_close_code, had_active_transaction, heartbeat_seconds_since_last, messages_received, transaction_id, reason_text) live 8–30 days. Glossary boundaries between **OCPP message log** (the `log` table), **Audit event** (the `audit_log` table), and **NR custom event** are defined under `### Observability` in `CONTEXT.md`. Feature scratch: `.scratch/ws-disconnect-tracking/`.
 
 **4. Transaction Suspend/Resume + Disconnect Handling**
 - **Feature**: Charging transactions survive charger reboots and power failures instead of being lost

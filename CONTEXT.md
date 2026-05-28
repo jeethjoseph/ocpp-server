@@ -74,6 +74,20 @@ _Avoid_: limit, cap.
 A `GSTInvoice` row issued per billable charging session. Supplier is always VoltLync (merchant-of-record); the franchisee operator is captured as a snapshot block on the PDF (Razorpay disclosure requirement). Never issued for zero-energy sessions, internal-role sessions, or wallet top-ups.
 _Avoid_: receipt, bill.
 
+### Observability
+
+**OCPP message log**:
+A row in the `log` table (`OCPPLog` model) capturing one inbound OCPP RPC call — BootNotification, Heartbeat, MeterValues, StatusNotification, etc. Direction, payload, correlation ID. Retained indefinitely for protocol-level audit.
+_Avoid_: "log entry" (ambiguous with audit log), "OCPP event" (collides with NR event below).
+
+**Audit event**:
+A row in the `audit_log` table written via `log_audit_event(...)` capturing a domain action — `charger.connected`, `charger.disconnected`, `charger.connection_rejected`, etc. The supplier-of-record for "what did the system do" questions older than NR's retention window.
+_Avoid_: "audit log" as a singular event term.
+
+**NR custom event**:
+A New Relic custom event recorded via `MetricsCollector.record_event(...)`. Operational telemetry only — disconnect lifecycle (`OCPPWebSocketDisconnect`), reject lifecycle (`OCPPWebSocketRejected`), transaction outcomes. Retained 8–30 days. Never the source of truth for billing, ledger, or compliance.
+_Avoid_: "metric" (which is the 13-month numeric counter/gauge surface, a different thing).
+
 ## Relationships
 
 - A **Charging Session** is funded by either a **Wallet** (debit at finalize) or a **QR Payment** (prepaid, refund-on-finalize).

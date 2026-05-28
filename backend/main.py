@@ -800,6 +800,12 @@ class ChargePoint(OcppChargePoint):
 
             logger.info(f"🔋 Created transaction {transaction.id} for charger {self.id} with status RUNNING")
 
+            # Track on in-memory connection state so OCPPWebSocketDisconnect can
+            # report had_active_transaction without a DB lookup on the hot path.
+            conn = connection_manager.connected_charge_points.get(self.id)
+            if conn is not None:
+                conn["active_transaction_id"] = transaction.id
+
             safe_create_task(log_audit_event(
                 action="transaction.status_changed",
                 entity_type="transaction",
@@ -885,6 +891,11 @@ class ChargePoint(OcppChargePoint):
             await transaction.save()
 
             logger.info(f"🛑 ✅ Transaction stopped {transaction_id}: {transaction.energy_consumed_kwh} kWh consumed")
+
+            # Clear the in-memory active_transaction_id paired with StartTransaction.
+            conn = connection_manager.connected_charge_points.get(self.id)
+            if conn is not None and conn.get("active_transaction_id") == transaction_id:
+                conn["active_transaction_id"] = None
 
             # Cancel any active socket grace period for this charger
             try:

@@ -48,6 +48,12 @@ async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
             actor_type="ocpp",
             changes={"reason": "tombstone_active", "close_code": 1013},
         ))
+        await OCPPMetrics.record_websocket_rejected(
+            charger_id=charge_point_id,
+            reject_reason="tombstone",
+            ws_close_code=1013,
+            tombstone_remaining_ms=remaining_ms,
+        )
         await websocket.close(code=1013, reason="Too soon after disconnect")
         return
 
@@ -67,6 +73,11 @@ async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
             actor_type="ocpp",
             changes={"reason": "validation_failed", "close_code": 1008},
         ))
+        await OCPPMetrics.record_websocket_rejected(
+            charger_id=charge_point_id,
+            reject_reason="validation_failed",
+            ws_close_code=1008,
+        )
         await websocket.close(code=1008, reason=message)
         return
 
@@ -87,7 +98,9 @@ async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
         "cp": cp,
         "heartbeat_task": heartbeat_task,  # Store for cleanup
         "connected_at": datetime.datetime.now(datetime.timezone.utc),
-        "last_seen": datetime.datetime.now(datetime.timezone.utc)
+        "last_seen": datetime.datetime.now(datetime.timezone.utc),
+        "active_transaction_id": None,
+        "messages_received": 0,
     }
     connection_manager.connected_charge_points[charge_point_id] = connection_data
 
@@ -114,17 +127,30 @@ async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
     try:
         await cp.start()
     except WebSocketDisconnect as e:
-        logger.error(f"[DISCONNECT] Charge point {charge_point_id} disconnected naturally - WebSocket code: {getattr(e, 'code', 'unknown')}, reason: {getattr(e, 'reason', 'none')}")
-        logger.error(f"[DISCONNECT] WebSocket state at disconnect: {getattr(websocket, 'client_state', 'unknown')}")
-        logger.error(f"[DISCONNECT] Last seen: {connection_data.get('last_seen', 'never') if charge_point_id in connection_manager.connected_charge_points else 'connection not found'}")
-        # Apply tombstone on natural disconnect and let finally handle cleanup
-        await connection_manager.force_disconnect(charge_point_id, "Natural WebSocket disconnect")
+        close_code = getattr(e, 'code', None)
+        close_reason = getattr(e, 'reason', None) or ""
+        logger.info(f"[DISCONNECT] Charge point {charge_point_id} disconnected naturally - WebSocket code: {close_code}, reason: {close_reason or 'none'}")
+        logger.info(f"[DISCONNECT] WebSocket state at disconnect: {getattr(websocket, 'client_state', 'unknown')}")
+        logger.info(f"[DISCONNECT] Last seen: {connection_data.get('last_seen', 'never') if charge_point_id in connection_manager.connected_charge_points else 'connection not found'}")
+        await connection_manager.force_disconnect(
+            charge_point_id,
+            "Natural WebSocket disconnect",
+            ws_close_code=close_code,
+            ws_close_reason=close_reason,
+        )
         return  # Avoid double cleanup in finally
     except Exception as e:
         logger.error(f"[DISCONNECT] WebSocket error for {charge_point_id}: {e}", exc_info=True)
         logger.error(f"[DISCONNECT] WebSocket state at error: {getattr(websocket, 'client_state', 'unknown')}")
         logger.error(f"[DISCONNECT] Connection data at error: {connection_data if charge_point_id in connection_manager.connected_charge_points else 'connection not found'}")
+        SentryHelper.capture_exception(e, extra={"charger_id": charge_point_id})
+        if charge_point_id in connection_manager.connected_charge_points:
+            await connection_manager.force_disconnect(
+                charge_point_id,
+                f"Server error in cp.start: {type(e).__name__}",
+            )
+        return  # Avoid double cleanup in finally
     finally:
-        # Use force_disconnect for proper cleanup if still connected
+        # Reached only when cp.start() returned without raising (rare for OCPP).
         if charge_point_id in connection_manager.connected_charge_points:
             await connection_manager.force_disconnect(charge_point_id, "WebSocket session ended")
