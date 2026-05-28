@@ -159,11 +159,18 @@ class WalletSessionService:
     async def _rebuild_session_from_db(transaction_id: int):
         """Reconstruct the session payload after a Redis cache miss.
 
-        Only returns a session dict if the transaction belongs to a wallet
-        user (has a wallet, not a QR-payment-linked session). Internal-role
-        users (ADMIN/FRANCHISEE) are still cached — the budget check just
-        prevents them from charging past their own wallet balance, which
-        is desirable.
+        Returns a session dict only for wallet sessions whose owner is a
+        regular customer. Skips:
+          - QR-payment-linked transactions (QR cache handles them)
+          - Transactions whose user has no wallet
+          - **Internal-role (ADMIN/FRANCHISEE) sessions per ADR 0004** —
+            mirrors the policy in `cache_session_on_start`. Without this
+            skip, an admin session with a zero-balance wallet would have a
+            budget of ₹0 reconstituted after a cache miss, and the very
+            first MeterValues frame would fire RemoteStop. Settlement is
+            already skipped for these sessions downstream (WalletService),
+            so applying a budget cap here only prevents admin test-charges
+            from running, not real revenue.
         """
         transaction = await Transaction.filter(
             id=transaction_id
@@ -179,6 +186,18 @@ class WalletSessionService:
 
         wallet = await Wallet.filter(user_id=transaction.user_id).first()
         if not wallet:
+            return None
+
+        # Match cache_session_on_start's internal-role policy (ADR 0004).
+        user = await User.filter(id=transaction.user_id).first()
+        if user and user.role in INTERNAL_ROLES:
+            MetricsCollector.increment_counter(
+                "Custom/WalletSession/InternalRoleSkipped"
+            )
+            logger.info(
+                f"Wallet session rebuild skipped for txn {transaction_id}: "
+                f"internal-role ({user.role.value}) session per policy"
+            )
             return None
 
         tariff = await WalletService.get_applicable_tariff(transaction.charger_id)
