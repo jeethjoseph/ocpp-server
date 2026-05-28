@@ -50,7 +50,7 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
 **Protocol**: OCPP 1.6 via WebSocket with full message support
 **Authentication**: Clerk (6.29.0 web, 5.56.1 mobile) JWT with role-based access control + UPI_GUEST for appless users
 **Payments**: Razorpay SDK 2.0.0 for wallet recharge + UPI QR code generation + refunds
-**Deployment**: AWS EC2 with Docker Compose (backend, frontend, nginx, redis). Staging postgres is **AWS RDS** since 2026-05-27 — see Database tier section below. Prod postgres still Docker.
+**Deployment**: AWS EC2 with Docker Compose (backend, frontend, nginx, redis). **Both staging and prod postgres are AWS RDS** as of 2026-05-28 — see Database tier section below.
 **Monitoring**: Sentry (error tracking) + New Relic (APM) + structured logging
 **Testing**: Pytest 8.3.4 with async support
 
@@ -571,28 +571,37 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
 
 ---
 
-## Database tier (post-2026-05-27 staging RDS cutover)
+## Database tier (post-2026-05-28 prod RDS cutover)
 
-The three environments now use asymmetric Postgres topologies. The asymmetry is intentional and lasts until a future prod migration project.
+Both staging and prod are on AWS RDS Postgres in `ap-south-1` as of 2026-05-28. Local dev remains Docker postgres.
 
 - **Local dev**: Docker postgres in `docker-compose.yml`. No SSL. `make local-db-reset` is the canonical fresh-start path.
-- **Staging**: **AWS RDS Postgres at `ocpp-staging-db.c1608qm4i94k.ap-south-1.rds.amazonaws.com`**. Single-AZ `db.t4g.micro` in `ap-south-1` (placed in `ap-south-1c`; the EC2 is in `ap-south-1a` — cross-AZ adds ~1ms per query, invisible in practice). 20GB gp3 storage with auto-scaling to 100GB. 14-day automated backup retention with 5-minute PITR. TLS `verify-full` required, using the AWS RDS global CA bundle baked into the backend image at `/etc/ssl/rds-ca-bundle.pem`. The local Docker postgres service is still in `docker-compose.staging.yml` as a rollback target for the 14-day validation window; backend no longer connects to it (no `depends_on`). Cutover completed via `.scratch/rds-staging-migration/`. Decommission via issue 07 in that folder after validation triggers all-green.
-- **Prod**: Docker postgres in `docker-compose.prod.yml`. Same pattern as pre-migration staging. Migration planned but not scheduled — see `.scratch/rds-prod-migration/` when that exists.
+- **Staging**: **AWS RDS Postgres at `ocpp-staging-db.c1608qm4i94k.ap-south-1.rds.amazonaws.com`**. Single-AZ `db.t4g.micro` in `ap-south-1c` (EC2 is in `ap-south-1a` — cross-AZ ~1ms per query). 20GB gp3 with auto-scaling to 100GB. 14-day automated backups + 5-min PITR. TLS `verify-full`. The local Docker postgres in `docker-compose.staging.yml` is the rollback target for the 14-day validation window. Cutover via `.scratch/rds-staging-migration/`.
+- **Prod**: **AWS RDS Postgres at `ocpp-prod-db.c1608qm4i94k.ap-south-1.rds.amazonaws.com`**. Single-AZ `db.t4g.small` in `ap-south-1a` (same-AZ as prod EC2 — sub-ms latency). 50GB gp3 with auto-scaling to 200GB. **30-day** automated backups + 5-min PITR. Performance Insights enabled (31-day retention). Deletion-protection on. TLS `verify-full`. Cutover via `.scratch/rds-prod-migration/` on 2026-05-28 09:30Z with **4 min customer-visible downtime** (well under the 10-15 min PRD budget — DB was small post-cleanup at 117 MB custom-format dump). Docker postgres in `docker-compose.prod.yml` remains the rollback target through the **28-day** validation window (longer than staging because prod rollback cost is higher). Decommission triggers + checklist live in `.scratch/rds-prod-migration/PRD.md`.
+
+Both RDS instances started single-AZ for cost (-$35/mo vs Multi-AZ). Upgrade either to Multi-AZ via `aws rds modify-db-instance --db-instance-identifier ocpp-{env}-db --multi-az --apply-immediately` — zero downtime, ~5 min.
 
 ### SSL config (`backend/db_ssl.py`)
 
 Single `get_ssl_config()` helper drives all three DB-connect call sites — runtime (`database.py`), Aerich (`tortoise_config.py`), and the entrypoint pre-flight loop (`docker-entrypoint.sh`). Don't add a 4th call site without using this helper. Env-var contract:
 
-- `DB_SSL_MODE=` (empty) → legacy fallback: `disable` for local/Docker hosts, `require` otherwise. Local dev + prod use this.
-- `DB_SSL_MODE=verify-full` → TLS with CA validation. Required for RDS. Staging uses this.
+- `DB_SSL_MODE=` (empty) → legacy fallback: `disable` for local/Docker hosts, `require` otherwise. Local dev uses this.
+- `DB_SSL_MODE=verify-full` → TLS with CA validation. Required for RDS. **Both staging and prod use this.**
 - `DB_SSL_MODE=verify-ca|require|prefer|allow|disable` → passthrough to asyncpg.
 
-### Cutover learnings (saved as feedback memory)
+The AWS RDS global CA bundle is baked into the backend image at `/etc/ssl/rds-ca-bundle.pem` during `docker build` — no code or compose change when adding a new RDS instance, only `DB_HOST` + `DB_SSL_MODE` in the env file.
 
-- **The entrypoint pre-flight check has its own DB connection logic.** It hardcoded `ssl='disable'` and was missed in the initial issue 02 PR. Caused ~5 min of bonus downtime during the staging cutover. Always grep for ALL `asyncpg.connect` / `psycopg.connect` / `pg_isready` / `psql -h` call sites when changing DB connection config. See [[feedback-check-entrypoint-during-db-config-changes]].
-- **RDS provisioning took ~20 min**, not the typical 5-10 min — likely due to Performance Insights + CloudWatch Logs export adding setup steps. Provision earlier in any maintenance window.
+### Cutover learnings (feedback memory + applied to prod)
+
+The prod cutover ran in 4 minutes because the staging cutover learnings were already absorbed:
+
+- **The entrypoint pre-flight check has its own DB connection logic.** It hardcoded `ssl='disable'` and was missed in the initial staging issue 02 PR. Caused ~5 min of bonus downtime during the staging cutover. Already fixed before prod cutover. Always grep for ALL `asyncpg.connect` / `psycopg.connect` / `pg_isready` / `psql -h` call sites when changing DB connection config. See [[feedback-check-entrypoint-during-db-config-changes]].
+- **RDS provisioning took ~26 min for prod** vs ~20 min for staging — likely due to Performance Insights enabled (deferred on staging). Plan ≥30 min for provisioning in any maintenance window.
 - **`DROP DATABASE` requires ownership.** RDS master user is `rds_superuser`, not real superuser — can't drop a DB owned by another user. Use `DROP OWNED BY <app_user> CASCADE` as the app user instead.
-- **Plain SQL `pg_dump` format restored cleanly** for the 486MB staging DB. Custom format (`-F c`) is unnecessary at this size; reserve it for parallel-restore scenarios on multi-GB DBs.
+- **Custom format (`-F c`) was used for prod**, plain SQL for staging. Both restored cleanly. Custom format is slightly faster and supports selective restore later (e.g., `pg_restore -t single_table`); use it for new cutovers by default.
+- **`pg_dump -j 4` requires `-F d` (directory format), not `-F c`.** Trying `-F c -j 4` errors with "parallel backup only supported by the directory format". For single-file custom format, drop `-j`.
+- **POSIX `/bin/sh` on Amazon Linux 2 doesn't tolerate parens in unquoted `echo` strings.** `echo --- step 2 (begins) ---` syntax-errors. Quote any echo containing parens. Bit us multiple times during prod cutover SSM scripts.
+- **CSP allow-list is env-driven.** `CSP_CLERK_HOSTS` env var is read by nginx entrypoint envsubst — switch Clerk environments without editing nginx conf. See `nginx/prod.conf` + `nginx/staging.conf`. Worker-src + js-agent.newrelic.com are also explicitly allowed.
 
 ### Charger state — two orthogonal fields (post-2026-05-27)
 

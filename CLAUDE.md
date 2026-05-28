@@ -36,7 +36,7 @@ The wallet is an **event-sourced ledger** post migrations 32 → 33 → 34. If y
 - **Cache invalidation happens AFTER the outer transaction commits.** `process_transaction_billing` and `process_wallet_topup` are split into thin outer wrappers + `@atomic`-decorated `_do_*` inner functions; the wrapper invalidates the cache after the inner returns. Do not move invalidation back inside the `in_transaction()` block — concurrent readers would repopulate stale data.
 - **Wallet-session budget cap mirrors QR.** On StartTransaction, `WalletSessionService.cache_session_on_start` snapshots the balance into `wallet_session:{txn_id}`. On every MeterValues frame, `check_balance_and_auto_stop` schedules `RemoteStopTransaction` via `safe_create_task` when `cost ≥ budget`. **Flag-less, at-least-once dispatch** — energy is monotonic so a lost stop self-heals on the next tick. Do not add an idempotency flag; duplicate RemoteStops are idempotent at the charger.
 - **Negative derived balance is observable, not impossible.** If the budget cap fails to fire (charger offline, network blip), `get_balance` returns a negative number, logs a warning, and emits `Custom/Wallet/NegativeBalance`. Do not clamp at the source-of-truth layer. UI/API may clamp for display.
-- **Drift detection**: `backend/scripts/reconcile_wallet_balance.py` is the nightly cron. See the rollback runbook in the comprehensive architecture doc for the cron entry.
+- **Drift detection**: `backend/scripts/reconcile_wallet_balance.py` is **obsolete post-migration 33** (queries the dropped `wallet.balance` column). No cron is currently wired. Runtime drift signal is the `Custom/Wallet/NegativeBalance` event emitted by `WalletService.get_balance` — wire a Sentry alert rule on that for ongoing monitoring.
 
 If you find yourself reaching for `wallet.balance` or writing a negative `amount`, stop and re-read this section.
 
@@ -46,13 +46,15 @@ If you find yourself reaching for `wallet.balance` or writing a negative `amount
 - Both share the same Clerk app and Razorpay **live** keys (QR payments require live mode)
 - Razorpay webhook handlers gracefully skip "not found" transactions (cross-environment events) — do not change this to raise errors
 
-## Database tier (asymmetric — staging on RDS, prod on Docker)
+## Database tier (both staging and prod on RDS as of 2026-05-28)
 
-Since the **RDS staging migration on 2026-05-27**, the two environments use different Postgres topologies. This is intentional and temporary — prod migration is a separate future project.
+Two RDS migrations completed back-to-back: staging on 2026-05-27, prod on 2026-05-28. Local dev still uses Docker postgres.
 
 - **Local dev**: Docker postgres (`docker-compose.yml`). No SSL. Schema-reset via `docker volume rm` is cheap. No change.
-- **Staging**: **AWS RDS Postgres `ocpp-staging-db.c1608qm4i94k.ap-south-1.rds.amazonaws.com`**. Single-AZ `db.t4g.micro`, 20GB gp3, 14-day automated backup retention with PITR. TLS `verify-full` required, using the AWS RDS global CA bundle baked into the backend image at `/etc/ssl/rds-ca-bundle.pem` during `docker build`. The local Docker postgres container is still defined in `docker-compose.staging.yml` for now — it stays as a rollback target until the 14-day validation window closes (see `.scratch/rds-staging-migration/issues/07-decommission-docker-postgres.md`).
-- **Prod**: Docker postgres in `docker-compose.prod.yml`. Same caveats as pre-RDS staging. Will migrate eventually — see `.scratch/rds-prod-migration/` when that project starts.
+- **Staging**: **AWS RDS Postgres `ocpp-staging-db.c1608qm4i94k.ap-south-1.rds.amazonaws.com`**. Single-AZ `db.t4g.micro`, 20GB gp3, 14-day automated backup retention with PITR. TLS `verify-full` required. The local Docker postgres container is still defined in `docker-compose.staging.yml` as a rollback target until the 14-day validation window closes (see `.scratch/rds-staging-migration/issues/07-decommission-docker-postgres.md`).
+- **Prod**: **AWS RDS Postgres `ocpp-prod-db.c1608qm4i94k.ap-south-1.rds.amazonaws.com`**. Single-AZ `db.t4g.small`, 50GB gp3 (auto-scaling to 200GB), **30-day** automated backup retention with PITR, Performance Insights enabled (31-day retention), deletion-protection on. TLS `verify-full`. Cutover 2026-05-28 09:30Z, 4 min downtime. Single-AZ initially for cost; bump to Multi-AZ via `aws rds modify-db-instance --multi-az` when revenue justifies (+$35/mo, zero downtime). Docker postgres in `docker-compose.prod.yml` remains as rollback target through the **28-day** validation window (longer than staging's 14d because prod rollback cost is higher). Decommission per `.scratch/rds-prod-migration/` issue 07-equivalent after triggers all-green.
+
+Both RDS instances use the same AWS RDS global CA bundle baked into the backend image at `/etc/ssl/rds-ca-bundle.pem` during `docker build`. No code change needed when adding new RDS instances — just point `DB_HOST` + set `DB_SSL_MODE=verify-full` in the env file.
 
 ### SSL config contract
 
@@ -63,22 +65,27 @@ The single source of truth is `backend/db_ssl.py`'s `get_ssl_config()` helper. T
 3. `backend/docker-entrypoint.sh` — pre-flight wait-for-DB loop (the trap that bit the staging cutover — see [[feedback-check-entrypoint-during-db-config-changes]])
 
 Env-var contract for SSL:
-- `DB_SSL_MODE=` (unset/empty) → legacy behavior: `disable` for `postgres`/`localhost`/`127.0.0.1` host, `require` otherwise. This is what local dev + prod (pre-migration) use.
-- `DB_SSL_MODE=verify-full` → TLS with CA validation. Required for RDS. Uses the CA bundle baked into the image.
+- `DB_SSL_MODE=` (unset/empty) → legacy behavior: `disable` for `postgres`/`localhost`/`127.0.0.1` host, `require` otherwise. This is what local dev uses.
+- `DB_SSL_MODE=verify-full` → TLS with CA validation. Required for RDS. Uses the CA bundle baked into the image. Set on both `.env.staging` and `.env.prod`.
 - `DB_SSL_MODE=require` → TLS without cert validation. Avoid for new uses; verify-full is strictly better.
 
 ### Tooling
 
-| Action | Staging (RDS) | Prod (Docker) |
+| Action | Staging (RDS) | Prod (RDS) |
 |---|---|---|
-| Ad-hoc psql shell | `make staging-rds-shell` (uses backend container's env vars) | `docker exec ocpp-postgres-prod psql ...` |
-| Backups | RDS automated daily snapshots + PITR (managed) | `pg_dump` via `docker exec` |
-| Restore | RDS Console → PITR or snapshot restore | `psql < dump.sql` |
-| `make staging-backup-db` / `staging-restore-db` | warn-and-exit (post-cutover) | n/a |
+| Ad-hoc psql shell | `make staging-rds-shell` | (parallel target not yet wired — use the same pattern: `docker exec -e PGPASSWORD=$DB_PASSWORD ocpp-postgres-prod psql -h ocpp-prod-db.c1608qm4i94k.ap-south-1.rds.amazonaws.com -U ocpp_prod -d ocpp_prod_db`) |
+| Backups | RDS automated daily snapshots + PITR (managed) | Same — RDS automated daily snapshots + PITR (managed) |
+| Restore | RDS Console → PITR or snapshot restore | Same |
+| `make {env}-backup-db` / `{env}-restore-db` | warn-and-exit (post-cutover) | warn-and-exit (post-cutover) |
 
-### Cutover artifact preserved
+### Cutover artifacts preserved
 
-The staging cutover dump lives on the staging EC2 at `/home/ec2-user/ocpp-server/backups/staging_cutover_20260527T054652Z.sql` (~469MB). The pre-cutover env backup is `.env.staging.pre-rds-cutover` on the same host. Both stay until the 14-day validation window closes.
+Per-environment safety nets, kept until each validation window closes:
+
+- **Staging** (14-day window): `/home/ec2-user/ocpp-server/backups/staging_cutover_20260527T054652Z.sql` (~469MB) + `.env.staging.pre-rds-cutover`
+- **Prod** (28-day window): `/home/ec2-user/ocpp-server/backups/prod_cutover_20260528T093009Z.dump` (117MB, custom format) + `.env.prod.pre-rds-cutover` + the Docker postgres container itself (still running but receiving zero writes since 2026-05-28 09:30Z)
+
+Rollback in either window: `cp .env.{env}.pre-rds-cutover .env.{env} && docker compose ... up -d backend`. Sub-minute.
 
 ## Env vars (CRITICAL — read before adding any new env var)
 
