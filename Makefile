@@ -23,7 +23,7 @@ SCRIPTS_DIR=$(BACKEND_DIR)/scripts
 
 .PHONY: help db-reset db-reset-cloud db-first-time db-drop-user db-create-user db-drop db-create migrate seed setup-dev truncate-tables
 .PHONY: docker-dev docker-dev-detach docker-staging docker-staging-detach docker-prod docker-prod-detach docker-down docker-down-staging docker-down-prod docker-logs docker-logs-backend docker-logs-frontend docker-build docker-build-staging docker-build-prod docker-clean docker-migrate docker-staging-cert docker-prod-cert docker-cert-renew
-.PHONY: prod-push prod-pull prod-up prod-down prod-deploy prod-rebuild prod-rebuild-service prod-rebuild-clean prod-nuke prod-restart prod-logs prod-logs-backend prod-logs-frontend prod-logs-nginx prod-ps prod-cert prod-migrate prod-backup-db prod-restore-db prod-cache-clear prod-health prod-stats prod-shell prod-bash prod-db-reset prod-seed
+.PHONY: prod-push prod-pull prod-up prod-down prod-deploy prod-rebuild prod-rebuild-service prod-rebuild-clean prod-nuke prod-restart prod-logs prod-logs-backend prod-logs-frontend prod-logs-nginx prod-ps prod-cert prod-migrate prod-backup-db prod-restore-db prod-cache-clear prod-health prod-stats prod-shell prod-bash prod-ssm prod-db-reset prod-seed
 .PHONY: staging-push staging-pull staging-up staging-down staging-deploy staging-rebuild staging-rebuild-service staging-rebuild-clean staging-nuke staging-restart staging-logs staging-logs-backend staging-logs-frontend staging-logs-nginx staging-ps staging-cert staging-migrate staging-backup-db staging-restore-db staging-cache-clear staging-health staging-stats staging-shell staging-bash staging-ssm staging-db-reset staging-seed staging-rds-shell
 
 help:
@@ -68,6 +68,7 @@ help:
 	@echo "  make prod-cert           Obtain/renew SSL certificate"
 	@echo "  make prod-shell          Open Python shell in backend"
 	@echo "  make prod-bash           Open bash in backend"
+	@echo "  make prod-ssm            Start SSM shell on the prod EC2 host"
 	@echo ""
 	@echo "=============== STAGING (EC2 via SSM) ==============="
 	@echo ""
@@ -108,6 +109,8 @@ help:
 	@echo "  make staging-cert           Obtain/renew SSL certificate"
 	@echo "  make staging-shell          Open Python shell in backend"
 	@echo "  make staging-bash           Open bash in backend"
+	@echo "  make staging-ssm            Start SSM shell on the staging EC2 host"
+	@echo "  make staging-rds-shell      Open psql shell against staging RDS"
 	@echo ""
 	@echo "=============== DEVELOPMENT (local) ==============="
 	@echo ""
@@ -320,6 +323,10 @@ prod-shell:
 # Open bash on production backend container
 prod-bash:
 	$(PROD_COMPOSE) exec backend bash
+
+# SSH into the production EC2 instance via AWS SSM (no inbound SSH required)
+prod-ssm:
+	aws ssm start-session --target i-0df24c96c4d5e890a --profile voltlync
 
 # Show production container status
 prod-ps:
