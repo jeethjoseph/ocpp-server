@@ -23,7 +23,7 @@ SCRIPTS_DIR=$(BACKEND_DIR)/scripts
 
 .PHONY: help db-reset db-reset-cloud db-first-time db-drop-user db-create-user db-drop db-create migrate seed setup-dev truncate-tables
 .PHONY: docker-dev docker-dev-detach docker-staging docker-staging-detach docker-prod docker-prod-detach docker-down docker-down-staging docker-down-prod docker-logs docker-logs-backend docker-logs-frontend docker-build docker-build-staging docker-build-prod docker-clean docker-migrate docker-staging-cert docker-prod-cert docker-cert-renew
-.PHONY: prod-push prod-pull prod-up prod-down prod-deploy prod-rebuild prod-rebuild-service prod-rebuild-clean prod-nuke prod-restart prod-logs prod-logs-backend prod-logs-frontend prod-logs-nginx prod-ps prod-cert prod-migrate prod-backup-db prod-restore-db prod-cache-clear prod-health prod-stats prod-shell prod-bash prod-ssm prod-db-reset prod-seed
+.PHONY: prod-push prod-pull prod-up prod-down prod-deploy prod-rebuild prod-rebuild-service prod-rebuild-clean prod-nuke prod-restart prod-prune prod-prune-if-needed prod-logs prod-logs-backend prod-logs-frontend prod-logs-nginx prod-ps prod-cert prod-migrate prod-backup-db prod-restore-db prod-cache-clear prod-health prod-stats prod-shell prod-bash prod-ssm prod-db-reset prod-seed
 .PHONY: staging-push staging-pull staging-up staging-down staging-deploy staging-rebuild staging-rebuild-service staging-rebuild-clean staging-nuke staging-restart staging-logs staging-logs-backend staging-logs-frontend staging-logs-nginx staging-ps staging-cert staging-migrate staging-backup-db staging-restore-db staging-cache-clear staging-health staging-stats staging-shell staging-bash staging-ssm staging-db-reset staging-seed staging-rds-shell
 
 help:
@@ -63,6 +63,9 @@ help:
 	@echo "  make prod-db-reset       Reset database (DANGEROUS)"
 	@echo "  make prod-seed           Run seed script"
 	@echo "  make prod-cache-clear    Clear all Redis cache"
+	@echo ""
+	@echo "Disk maintenance:"
+	@echo "  make prod-prune          Prune build cache + dangling images (safe; volumes untouched)"
 	@echo ""
 	@echo "SSL & Shell:"
 	@echo "  make prod-cert           Obtain/renew SSL certificate"
@@ -104,6 +107,9 @@ help:
 	@echo "  make staging-db-reset       Reset database (DANGEROUS)"
 	@echo "  make staging-seed           Run seed script"
 	@echo "  make staging-cache-clear    Clear all Redis cache"
+	@echo ""
+	@echo "Disk maintenance:"
+	@echo "  make staging-prune          Prune build cache + dangling images (safe; volumes untouched)"
 	@echo ""
 	@echo "SSL & Shell:"
 	@echo "  make staging-cert           Obtain/renew SSL certificate"
@@ -268,9 +274,42 @@ prod-rebuild:
 		echo "Let's Encrypt certificate found."; \
 	fi
 
-# Full deploy sequence (run on EC2 after SSM)
-prod-deploy: prod-pull prod-rebuild
+# Full deploy sequence (run on EC2 after SSM).
+# `prod-prune-if-needed` runs between pull and rebuild: it's a no-op when
+# disk is healthy, and self-heals when the build cache has bloated past
+# 85% root-volume usage. Mirrors the staging routine — keeps deploys fast
+# in the common case, never fails on ENOSPC mid-build.
+prod-deploy: prod-pull prod-prune-if-needed prod-rebuild
 	@echo "Production deployment complete!"
+
+# Manual disk cleanup. Safe by construction:
+#   - builder prune: drops build cache only (not images, not containers, not volumes)
+#   - image prune: drops dangling images (NOT in use by running containers)
+# Volumes are untouched, so postgres/redis/firmware data are safe.
+# Run when you see `df -h /` getting tight or want a deliberate cleanup.
+.PHONY: prod-prune
+prod-prune:
+	@echo "Pruning Docker build cache..."
+	sudo docker builder prune -af
+	@echo "Pruning dangling images..."
+	sudo docker image prune -af
+	@echo "Disk usage after prune:"
+	@df -h / | tail -2
+
+# Conditional version used by prod-deploy. Prunes only when root-volume
+# usage exceeds 85%. The shell logic must be on one line (Make runs each
+# recipe line in its own subshell) — kept readable via backslash continuations.
+.PHONY: prod-prune-if-needed
+prod-prune-if-needed:
+	@USAGE=$$(df / | tail -1 | awk '{print $$5}' | tr -d %); \
+	if [ "$$USAGE" -gt 85 ]; then \
+		echo "Disk at $$USAGE%, pruning build cache + dangling images..."; \
+		sudo docker builder prune -af; \
+		sudo docker image prune -af; \
+		df -h / | tail -2; \
+	else \
+		echo "Disk at $$USAGE%, no prune needed (threshold 85%)"; \
+	fi
 
 # Restart all services without rebuilding
 prod-restart:

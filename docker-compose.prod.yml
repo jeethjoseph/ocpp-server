@@ -230,6 +230,7 @@ services:
     environment:
       - ENVIRONMENT=production
       - DOMAIN_NAME=${DOMAIN_NAME}
+      - CSP_CLERK_HOSTS=${CSP_CLERK_HOSTS:-https://*.clerk.accounts.dev}
     ports:
       - "80:80"
       - "443:443"
