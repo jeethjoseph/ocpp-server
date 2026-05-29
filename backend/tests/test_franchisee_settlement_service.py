@@ -311,6 +311,44 @@ async def test_qr_ledger_agrees_with_invoice_revenue_pool(
 
 
 @pytest.mark.asyncio
+async def test_process_settlement_qr_honours_non_default_synthetic_percent(
+    client, monkeypatch,
+    test_franchisee, test_charger, test_user, test_tariff, test_station,
+):
+    """Regression guard: the policy is NOT hard-coded to 2%.
+
+    `synthetic_platform_fee` reads `RAZORPAY_PLATFORM_FEE_PERCENT` at import
+    time as a module-level constant; if ops bumps it (e.g. to 3% after
+    Razorpay re-rates UPI), the settlement ledger must follow without code
+    changes. Patches the module constant and re-verifies pg_fee_amount.
+    """
+    from decimal import Decimal as _D
+    from services import tariff_utils as _tu
+    from services.franchisee_settlement_service import FranchiseeSettlementService
+
+    monkeypatch.setattr(_tu, "RAZORPAY_PLATFORM_FEE_PERCENT", _D("3.0"))
+
+    txn = await _build_qr_session(
+        test_franchisee, test_station, test_charger, test_user,
+        amount_paid=Decimal("100.00"),
+        energy_kwh=Decimal("4.000"),
+        energy_cost=Decimal("82.20"),
+        gst_amount=Decimal("14.80"),
+        actual_commission=Decimal("0.85"),
+        actual_gst=Decimal("0.15"),  # actual ₹1.00 — irrelevant; we want 3% synthetic
+    )
+
+    entry = await FranchiseeSettlementService.process_settlement(txn.id)
+
+    assert entry is not None
+    # 3% of ₹100 = ₹3.00, not the ₹2.00 the default would have produced.
+    assert entry.pg_fee_amount == Decimal("3.00"), (
+        f"expected synthetic 3.00 after monkey-patching the percent, "
+        f"got {entry.pg_fee_amount}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_process_settlement_wallet_pg_fee_unchanged(
     client, test_franchisee, test_charger, test_user, test_tariff, test_station,
 ):
