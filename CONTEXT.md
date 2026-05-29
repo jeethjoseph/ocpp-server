@@ -61,7 +61,7 @@ Fixed percentage (default 2%, set via `RAZORPAY_PLATFORM_FEE_PERCENT`) of `amoun
 _Avoid_: platform fee (overloaded), gateway fee (also overloaded).
 
 **Actual platform fee**:
-Razorpay's real deduction on a captured payment, sourced from the payment webhook or the Razorpay API. Stored on `QRPayment.platform_fee` / `razorpay_commission` / `razorpay_gst`. Used only for ops, reconciliation, and the nightly drift detector — never for customer-facing math.
+Razorpay's real deduction on a captured payment, sourced from the payment webhook or the Razorpay API. Stored on `QRPayment.platform_fee` / `razorpay_commission` / `razorpay_gst`. Used only for ops, reconciliation, and the drift detector — never for customer-facing math AND (post 2026-05-29) never for the franchisee settlement ledger either. See ADR 0001 amendment.
 _Avoid_: real fee, captured fee.
 
 **Budget cap**:
@@ -91,7 +91,7 @@ _Avoid_: "metric" (which is the 13-month numeric counter/gauge surface, a differ
 ## Relationships
 
 - A **Charging Session** is funded by either a **Wallet** (debit at finalize) or a **QR Payment** (prepaid, refund-on-finalize).
-- A **QR Payment** carries both an **Actual platform fee** (truth from Razorpay) and a **Synthetic platform fee** (policy, fixed). They are not expected to be equal; variance is absorbed by VoltLync.
+- A **QR Payment** carries both an **Actual platform fee** (truth from Razorpay) and a **Synthetic platform fee** (policy, fixed). They are not expected to be equal; variance is absorbed entirely by VoltLync. Post 2026-05-29, both the **GST Invoice** gateway-charges line AND the **`commission_ledger_entry.pg_fee_amount`** use the Synthetic figure; the franchisee is shielded from Razorpay's instantaneous fee schedule.
 - A non-zero-energy, non-internal **Charging Session** produces exactly one **GST Invoice**.
 - A **Tariff** stores both `tariff_per_kwh_all_in` (display) and `rate_per_kwh` (math); writes update both, reads pick the one that fits the surface.
 - The **Budget cap** is computed against the **Synthetic platform fee**, never the **Actual platform fee**, to give customers a predictable contract.

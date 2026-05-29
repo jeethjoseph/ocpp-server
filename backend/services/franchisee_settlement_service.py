@@ -27,6 +27,7 @@ from models import (
     WalletTransaction,
     TransactionTypeEnum,
 )
+from services.tariff_utils import synthetic_platform_fee
 
 logger = logging.getLogger("ocpp-server")
 
@@ -166,10 +167,11 @@ class FranchiseeSettlementService:
             payment_method = "QR_UPI"
             gross_amount = qr_payment.amount_paid
             refund_amount = qr_payment.refund_amount or Decimal("0")
-            pg_fee = (
-                (qr_payment.razorpay_commission or Decimal("0"))
-                + (qr_payment.razorpay_gst or Decimal("0"))
-            )
+            # Ledger uses synthetic 2% so net_excl_gst matches the customer's
+            # invoice energy_taxable line. The actual Razorpay commission/GST
+            # stays on `qr_payment` for ops reconciliation; VoltLync absorbs
+            # 100% of the actual-vs-synthetic variance. ADR 0001 amendment.
+            pg_fee = synthetic_platform_fee(gross_amount)
             gst_collected = qr_payment.gst_amount or Decimal("0")
             razorpay_payment_id = qr_payment.razorpay_payment_id
             tariff_rate = qr_payment.energy_cost / Decimal(str(energy)) if qr_payment.energy_cost and energy else Decimal("0")

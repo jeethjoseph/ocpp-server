@@ -373,6 +373,17 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
     = franchisee_earning − tds_amount`. `transfer_fee` is NOT deducted
     at calc time — it's populated after the fact from the
     `settlement.processed` webhook (Razorpay's actual per-transfer fee).
+  - **`pg_fee_amount` uses synthetic 2% (ADR 0001 amendment, 2026-05-29)**:
+    For QR sessions, `pg_fee` passed into `calculate_settlement` is
+    `synthetic_platform_fee(amount_paid)`, not the actual
+    `razorpay_commission + razorpay_gst` on the QRPayment row. This makes
+    `commission_ledger_entry.net_excl_gst` exactly equal to
+    `gst_invoice.energy_taxable_value` — invoice and ledger now agree
+    on the revenue pool. VoltLync absorbs 100% of the actual-vs-synthetic
+    variance (was 75/25 with franchisee). Drift detection must now read
+    from `qr_payment` (actual) vs `synthetic_platform_fee(amount_paid)`
+    directly; the ledger no longer surfaces it. Wallet sessions unchanged
+    (pg_fee = 0).
   - `initiate_transfer(entry)` enforces a **24-hour cooling period**
     after `franchisee.activated_at` (Razorpay rejects transfers within
     24h of activation). Within the window the entry is parked as

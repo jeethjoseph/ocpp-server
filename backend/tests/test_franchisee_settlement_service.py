@@ -83,6 +83,269 @@ def test_calculate_settlement_tds_on_post_commission_base():
     assert abs(components_sum - Decimal("100.00")) <= Decimal("0.02")
 
 
+# ───────────────────────────────────────────────────────────────────────────
+# ADR 0001 amendment (2026-05-29) — settlement ledger uses synthetic pg_fee.
+# Tests below guard:
+#   • ledger.pg_fee_amount == synthetic 2%, regardless of actual Razorpay fee
+#   • ledger.net_excl_gst == invoice.energy_taxable_value (the motivation)
+#   • behaviour holds whether actual > synthetic or actual < synthetic
+#   • wallet path unchanged (pg_fee stays 0)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def _voltlync_supplier(monkeypatch):
+    """Stub VoltLync GSTIN constants so InvoiceService.generate_invoice can
+    proceed in tests that exercise the invoice ↔ ledger agreement."""
+    from services import invoice_service as _svc
+    monkeypatch.setattr(_svc, "VOLTLYNC_GSTIN", "32ABCDE1234F1Z5")
+    monkeypatch.setattr(_svc, "VOLTLYNC_STATE_CODE", "32")
+    monkeypatch.setattr(_svc, "VOLTLYNC_STATE", "Kerala")
+
+
+async def _build_qr_session(
+    franchisee, station, charger, user,
+    *,
+    amount_paid: Decimal,
+    energy_kwh: Decimal,
+    energy_cost: Decimal,
+    gst_amount: Decimal,
+    actual_commission: Decimal,
+    actual_gst: Decimal,
+    station_state_code: str = "32",
+):
+    """Inline helper: link station→franchisee and create a completed QR
+    txn + payment for one of the assertions below. Keeps each test's body
+    focused on the assertion, not the fixture wiring.
+    """
+    from models import (
+        Transaction, TransactionStatusEnum, QRPayment, QRPaymentStatusEnum,
+        ChargerQRCode,
+    )
+    import uuid as _uuid
+
+    station.franchisee = franchisee
+    station.state_code = station_state_code
+    station.state = "Kerala"
+    await station.save()
+
+    qr_code = await ChargerQRCode.create(
+        charger=charger,
+        razorpay_qr_code_id=f"qr_{_uuid.uuid4().hex[:8]}",
+        image_url=f"https://example.test/qr-{_uuid.uuid4().hex[:6]}.png",
+    )
+
+    txn = await Transaction.create(
+        charger=charger,
+        user=user,
+        start_meter_kwh=Decimal("0"),
+        end_meter_kwh=energy_kwh,
+        energy_consumed_kwh=energy_kwh,
+        energy_charge=energy_cost,
+        gst_amount=gst_amount,
+        gst_rate_percent=Decimal("18.00"),
+        total_billed=energy_cost + gst_amount,
+        transaction_status=TransactionStatusEnum.COMPLETED,
+    )
+    await QRPayment.create(
+        transaction=txn,
+        charger=charger,
+        charger_qr_code=qr_code,
+        razorpay_qr_code_id=qr_code.razorpay_qr_code_id,
+        razorpay_payment_id=f"pay_{_uuid.uuid4().hex[:10]}",
+        amount_paid=amount_paid,
+        energy_cost=energy_cost,
+        gst_amount=gst_amount,
+        razorpay_commission=actual_commission,
+        razorpay_gst=actual_gst,
+        status=QRPaymentStatusEnum.COMPLETED,
+    )
+    return txn
+
+
+@pytest.mark.asyncio
+async def test_process_settlement_qr_uses_synthetic_pg_fee(
+    client, test_franchisee, test_charger, test_user, test_tariff, test_station,
+):
+    """ADR 0001 amendment regression guard (actual > synthetic case).
+
+    ₹45 QR session where Razorpay actually charged ₹1.09 (~2.42%). The
+    ledger must still record the synthetic ₹0.90, and net_excl_gst must
+    match the invoice's energy_taxable_value (₹37.37) — not the
+    actual-fee-derived ₹37.18 that the pre-amendment code would have
+    produced.
+    """
+    from services.franchisee_settlement_service import FranchiseeSettlementService
+
+    txn = await _build_qr_session(
+        test_franchisee, test_station, test_charger, test_user,
+        amount_paid=Decimal("45.00"),
+        energy_kwh=Decimal("2.250"),
+        energy_cost=Decimal("37.37"),
+        gst_amount=Decimal("6.73"),
+        actual_commission=Decimal("0.92"),
+        actual_gst=Decimal("0.17"),  # actual total ₹1.09 vs synthetic ₹0.90
+    )
+
+    entry = await FranchiseeSettlementService.process_settlement(txn.id)
+
+    assert entry is not None
+    # 2% of 45 = 0.90, regardless of the 1.09 actual sitting on QRPayment.
+    assert entry.pg_fee_amount == Decimal("0.90"), (
+        f"expected synthetic 0.90, got {entry.pg_fee_amount}"
+    )
+    # net_excl_gst now matches the invoice's energy_taxable_value exactly.
+    assert entry.net_excl_gst == Decimal("37.37")
+
+
+@pytest.mark.asyncio
+async def test_process_settlement_qr_synthetic_when_actual_below_2pct(
+    client, test_franchisee, test_charger, test_user, test_tariff, test_station,
+):
+    """ADR 0001 amendment regression guard (actual < synthetic case).
+
+    ~57% of staging txns fall here. Pre-amendment, when Razorpay charged
+    less than 2%, the splittable pool grew and franchisee got a bonus.
+    Post-amendment, VoltLync pockets the surplus; the franchisee's pool
+    is locked to synthetic 2% regardless. The ledger must record
+    synthetic 0.90 even though actual is only ₹0.30.
+    """
+    from services.franchisee_settlement_service import FranchiseeSettlementService
+
+    txn = await _build_qr_session(
+        test_franchisee, test_station, test_charger, test_user,
+        amount_paid=Decimal("45.00"),
+        energy_kwh=Decimal("2.250"),
+        energy_cost=Decimal("37.37"),
+        gst_amount=Decimal("6.73"),
+        actual_commission=Decimal("0.25"),
+        actual_gst=Decimal("0.05"),  # actual ₹0.30 vs synthetic ₹0.90
+    )
+
+    entry = await FranchiseeSettlementService.process_settlement(txn.id)
+
+    assert entry is not None
+    assert entry.pg_fee_amount == Decimal("0.90"), (
+        f"expected synthetic 0.90 even when actual is lower, "
+        f"got {entry.pg_fee_amount}"
+    )
+    assert entry.net_excl_gst == Decimal("37.37")
+    # Franchisee payout is identical to the actual > synthetic case — that's
+    # the whole point of the policy: a stable per-session payout regardless
+    # of Razorpay's instantaneous fee.
+    # 37.37 × 0.80 (commission@20% from test_franchisee) = 29.90 (earning)
+    # 29.90 × 0.10 (tds) = 2.99 → payout = 26.91
+    assert entry.franchisee_payout == Decimal("26.91")
+
+
+@pytest.mark.asyncio
+async def test_qr_ledger_agrees_with_invoice_revenue_pool(
+    client, _voltlync_supplier,
+    test_franchisee, test_charger, test_user, test_tariff, test_station,
+):
+    """The motivating test: invoice gateway-charges line and ledger
+    pg_fee_amount must be the same number, and invoice energy_taxable_value
+    must equal ledger net_excl_gst. This was the stated reason for the
+    ADR 0001 amendment — if this ever fails, the amendment is broken.
+
+    Explicit GSTInvoice + GSTInvoiceCounter cleanup at the end because the
+    project-wide conftest cleanup list omits both (every other test that
+    generates an invoice has the same gap; this test trips a downstream
+    flake without the teardown).
+    """
+    from models import GSTInvoice, GSTInvoiceCounter
+    from services.franchisee_settlement_service import FranchiseeSettlementService
+    from services.invoice_service import InvoiceService
+
+    # The project conftest cleanup omits qr_session:* Redis keys, GSTInvoice,
+    # and GSTInvoiceCounter rows. This test exercises both invoice generation
+    # AND a downstream Redis-cached endpoint surface — be defensive at the
+    # boundary so we don't leave residue for the next test in the file.
+    import redis as _sync_redis
+    import os as _os
+    try:
+        _r = _sync_redis.from_url(_os.environ.get("REDIS_URL", "redis://redis:6379/0"))
+        for _k in _r.scan_iter("qr_session:*"):
+            _r.delete(_k)
+        _r.close()
+    except Exception:
+        pass
+
+    txn = await _build_qr_session(
+        test_franchisee, test_station, test_charger, test_user,
+        amount_paid=Decimal("45.00"),
+        energy_kwh=Decimal("2.250"),
+        energy_cost=Decimal("37.37"),
+        gst_amount=Decimal("6.73"),
+        actual_commission=Decimal("0.92"),
+        actual_gst=Decimal("0.17"),
+    )
+
+    try:
+        entry = await FranchiseeSettlementService.process_settlement(txn.id)
+        invoice = await InvoiceService.generate_invoice(txn.id)
+
+        assert entry is not None
+        assert invoice is not None
+
+        # Gateway line: invoice's gateway_charges + gateway_gst equals the
+        # ledger's pg_fee_amount, both being the synthetic 2% of ₹45 = ₹0.90.
+        invoice_gateway_total = (
+            invoice.gateway_charges + (invoice.gateway_gst or Decimal("0"))
+        )
+        assert invoice_gateway_total == entry.pg_fee_amount == Decimal("0.90"), (
+            f"invoice gateway total {invoice_gateway_total} != "
+            f"ledger pg_fee {entry.pg_fee_amount}"
+        )
+
+        # Revenue pool: invoice's energy_taxable_value equals the ledger's
+        # net_excl_gst. This is the line that pre-amendment disagreed by the
+        # actual-vs-synthetic variance.
+        assert invoice.energy_taxable_value == entry.net_excl_gst, (
+            f"invoice energy_taxable {invoice.energy_taxable_value} != "
+            f"ledger net_excl_gst {entry.net_excl_gst}"
+        )
+    finally:
+        await GSTInvoice.all().delete()
+        await GSTInvoiceCounter.all().delete()
+
+
+@pytest.mark.asyncio
+async def test_process_settlement_wallet_pg_fee_unchanged(
+    client, test_franchisee, test_charger, test_user, test_tariff, test_station,
+):
+    """Wallet sessions must NOT pick up the synthetic policy — they have
+    no per-session Razorpay payment fee (absorbed at top-up time, ADR 0002).
+    Regression guard against accidentally applying the QR synthetic to wallet.
+    """
+    from models import Transaction, TransactionStatusEnum
+    from services.franchisee_settlement_service import FranchiseeSettlementService
+
+    test_station.franchisee = test_franchisee
+    await test_station.save()
+
+    txn = await Transaction.create(
+        charger=test_charger,
+        user=test_user,
+        start_meter_kwh=Decimal("0"),
+        end_meter_kwh=Decimal("2.250"),
+        energy_consumed_kwh=Decimal("2.250"),
+        energy_charge=Decimal("33.90"),
+        gst_amount=Decimal("6.10"),
+        gst_rate_percent=Decimal("18.00"),
+        total_billed=Decimal("40.00"),
+        transaction_status=TransactionStatusEnum.COMPLETED,
+    )
+
+    entry = await FranchiseeSettlementService.process_settlement(txn.id)
+
+    assert entry is not None
+    assert entry.payment_method == "WALLET"
+    assert entry.pg_fee_amount == Decimal("0.00"), (
+        f"wallet pg_fee must remain 0 (ADR 0002), got {entry.pg_fee_amount}"
+    )
+
+
 def test_create_transfer_passes_idempotency_header():
     """Regression test for the bug where X-Transfer-Idempotency was
     built but dropped before the SDK call."""
