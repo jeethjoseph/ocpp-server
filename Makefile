@@ -297,18 +297,23 @@ prod-prune:
 	@df -h / | tail -2
 
 # Conditional version used by prod-deploy. Prunes only when root-volume
-# usage exceeds 85%. The shell logic must be on one line (Make runs each
-# recipe line in its own subshell) — kept readable via backslash continuations.
+# Prunes when root-volume usage exceeds 40%. Tuned down from 85% on
+# 2026-06-01 in lockstep with staging-prune-if-needed — same wedge-mode
+# can happen here, and prod's larger EBS (50GB → 200GB auto-scale) means
+# 40% still leaves comfortable headroom. See staging-prune-if-needed for
+# the failure analysis.
+# The shell logic must be on one line (Make runs each recipe line in its
+# own subshell) — kept readable via backslash continuations.
 .PHONY: prod-prune-if-needed
 prod-prune-if-needed:
 	@USAGE=$$(df / | tail -1 | awk '{print $$5}' | tr -d %); \
-	if [ "$$USAGE" -gt 85 ]; then \
+	if [ "$$USAGE" -gt 40 ]; then \
 		echo "Disk at $$USAGE%, pruning build cache + dangling images..."; \
 		sudo docker builder prune -af; \
 		sudo docker image prune -af; \
 		df -h / | tail -2; \
 	else \
-		echo "Disk at $$USAGE%, no prune needed (threshold 85%)"; \
+		echo "Disk at $$USAGE%, no prune needed (threshold 40%)"; \
 	fi
 
 # Restart all services without rebuilding
@@ -516,19 +521,26 @@ staging-prune:
 	@echo "Disk usage after prune:"
 	@df -h / | tail -2
 
-# Conditional version used by staging-deploy. Prunes only when root-volume
-# usage exceeds 85%. The shell logic must be on one line (Make runs each
-# recipe line in its own subshell) — kept readable via backslash continuations.
+# Conditional version used by staging-deploy. Prunes when root-volume usage
+# exceeds 40%. Tuned down from 85% on 2026-06-01 after a staging deploy
+# wedged dockerd at 65% disk (94% of which was reclaimable docker garbage:
+# 12GB unused images + 7GB build cache). The previous 85% gate was a no-op
+# while docker storage was bloated enough to thrash overlay2 during builds.
+# `df /` is a proxy for docker bloat here because docker is the dominant
+# disk user on this box; if that changes, switch the check to inspect
+# `docker system df` reclaimable size directly.
+# The shell logic must be on one line (Make runs each recipe line in its
+# own subshell) — kept readable via backslash continuations.
 .PHONY: staging-prune-if-needed
 staging-prune-if-needed:
 	@USAGE=$$(df / | tail -1 | awk '{print $$5}' | tr -d %); \
-	if [ "$$USAGE" -gt 85 ]; then \
+	if [ "$$USAGE" -gt 40 ]; then \
 		echo "Disk at $$USAGE%, pruning build cache + dangling images..."; \
 		sudo docker builder prune -af; \
 		sudo docker image prune -af; \
 		df -h / | tail -2; \
 	else \
-		echo "Disk at $$USAGE%, no prune needed (threshold 85%)"; \
+		echo "Disk at $$USAGE%, no prune needed (threshold 40%)"; \
 	fi
 
 # Restart all services without rebuilding
