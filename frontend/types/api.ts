@@ -156,6 +156,14 @@ export interface Transaction {
   updated_at: string;
 }
 
+export type FundingSource = "WALLET" | "QR" | "NONE";
+
+export interface QRSessionBudget {
+  budget_limit: string;
+  cost_so_far: string;
+  remaining: string;
+}
+
 export interface TransactionDetail {
   transaction: Transaction;
   user: {
@@ -177,6 +185,9 @@ export interface TransactionDetail {
     description?: string;
     created_at: string;
   }>;
+  live_energy_kwh?: number | null;
+  funding_source?: FundingSource;
+  qr_session?: QRSessionBudget | null;
 }
 
 export interface ApiResponse<T = any> {
@@ -410,12 +421,14 @@ export interface UpdateStatusDashboard {
   }>;
   summary: UpdateStatusSummary;
 }
-// Signal Quality Types
+// Signal Quality / Modem Telemetry types. The table name is a historical
+// misnomer — see ADR 0009. Rows also carry modem board temperature.
 export interface SignalQuality {
   id: number;
   charger_id: number;
   rssi: number;  // Received Signal Strength Indicator (0-31 for GSM, 99=unknown)
   ber: number;   // Bit Error Rate (0-7 for GSM, 99=unknown/not detectable)
+  temperature_celsius?: number | null;  // Modem board temperature; null on legacy rows / older firmware
   timestamp: string;
   created_at: string;
 }
@@ -428,6 +441,7 @@ export interface SignalQualityListResponse {
   charger_id: number;
   latest_rssi?: number;
   latest_ber?: number;
+  latest_temperature_celsius?: number | null;
 }
 
 // Charger Error Types

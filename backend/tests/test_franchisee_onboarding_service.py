@@ -225,6 +225,150 @@ async def test_submit_bank_details_omits_account_type_when_unset_too():
     assert body["tnc_accepted"] is True
 
 
+# ─── inline-activation promotion (post-PATCH reconciliation) ───────────
+
+
+@pytest.mark.asyncio
+async def test_submit_bank_details_promotes_on_activated_response(
+    client, test_franchisee,
+):
+    """When the PATCH response carries activation_status='activated' AND
+    requirements=[], submit_bank_details must promote the franchisee row
+    in the same transaction — without waiting for an account.activated
+    webhook (which Razorpay sometimes does not fire when activation
+    happens as a direct consequence of our PATCH call). Regression guard
+    for the prod incident on 2026-05-30 where 3 ledger entries sat at
+    PENDING for ~16 hours.
+    """
+    from decimal import Decimal
+    from models import FranchiseeStatusEnum
+    from services.franchisee_onboarding_service import (
+        FranchiseeOnboardingService,
+    )
+
+    # Seed the franchisee into the KYC_SUBMITTED state with bank details
+    # and a product id, matching what create_linked_account + add_stakeholder
+    # would have produced.
+    test_franchisee.status = FranchiseeStatusEnum.KYC_SUBMITTED
+    test_franchisee.transfers_enabled = False
+    test_franchisee.activated_at = None
+    test_franchisee.kyc_verified_at = None
+    test_franchisee.razorpay_product_id = "acc_prd_test"
+    test_franchisee.bank_account_number = "1234567890"
+    test_franchisee.bank_ifsc_code = "SBIN0001234"
+    test_franchisee.bank_account_name = "R Shyam Shankar"
+    await test_franchisee.save()
+
+    rzp = MagicMock()
+    rzp.edit_product_configuration = AsyncMock(return_value={
+        "id": "acc_prd_test",
+        "activation_status": "activated",
+        "requirements": [],
+    })
+
+    with patch("services.razorpay_service.razorpay_service", rzp):
+        await FranchiseeOnboardingService.submit_bank_details(
+            test_franchisee.id
+        )
+
+    await test_franchisee.refresh_from_db()
+    assert test_franchisee.status == FranchiseeStatusEnum.ACTIVE, (
+        f"expected ACTIVE after activated response, got {test_franchisee.status}"
+    )
+    assert test_franchisee.transfers_enabled is True
+    assert test_franchisee.activated_at is not None
+    assert test_franchisee.kyc_verified_at is not None
+
+
+@pytest.mark.asyncio
+async def test_submit_bank_details_does_not_promote_when_requirements_outstanding(
+    client, test_franchisee,
+):
+    """Reverse guard: activation_status='activated' but requirements is
+    non-empty must NOT promote. Razorpay sometimes reports activated at
+    the account level while still flagging product-level outstanding
+    items — promoting prematurely would let transfers fail downstream.
+    """
+    from models import FranchiseeStatusEnum
+    from services.franchisee_onboarding_service import (
+        FranchiseeOnboardingService,
+    )
+
+    test_franchisee.status = FranchiseeStatusEnum.KYC_SUBMITTED
+    test_franchisee.transfers_enabled = False
+    test_franchisee.activated_at = None
+    test_franchisee.kyc_verified_at = None
+    test_franchisee.razorpay_product_id = "acc_prd_test"
+    test_franchisee.bank_account_number = "1234567890"
+    test_franchisee.bank_ifsc_code = "SBIN0001234"
+    test_franchisee.bank_account_name = "R Shyam Shankar"
+    await test_franchisee.save()
+
+    rzp = MagicMock()
+    rzp.edit_product_configuration = AsyncMock(return_value={
+        "id": "acc_prd_test",
+        "activation_status": "activated",
+        "requirements": [
+            {"field_reference": "settlements.ifsc_code", "reason_code": "validation_pending"},
+        ],
+    })
+
+    with patch("services.razorpay_service.razorpay_service", rzp):
+        await FranchiseeOnboardingService.submit_bank_details(
+            test_franchisee.id
+        )
+
+    await test_franchisee.refresh_from_db()
+    assert test_franchisee.status == FranchiseeStatusEnum.KYC_SUBMITTED
+    assert test_franchisee.activated_at is None
+    assert test_franchisee.kyc_verified_at is None
+    assert test_franchisee.transfers_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_submit_bank_details_does_not_demote_already_active(
+    client, test_franchisee,
+):
+    """Idempotency guard: if the franchisee is already ACTIVE (webhook
+    arrived first, or admin previously promoted), submit_bank_details
+    must not overwrite activated_at / kyc_verified_at on a re-PATCH.
+    """
+    from datetime import datetime, timedelta, timezone
+    from models import FranchiseeStatusEnum
+    from services.franchisee_onboarding_service import (
+        FranchiseeOnboardingService,
+    )
+
+    earlier = datetime.now(timezone.utc) - timedelta(days=5)
+    test_franchisee.status = FranchiseeStatusEnum.ACTIVE
+    test_franchisee.transfers_enabled = True
+    test_franchisee.activated_at = earlier
+    test_franchisee.kyc_verified_at = earlier
+    test_franchisee.razorpay_product_id = "acc_prd_test"
+    test_franchisee.bank_account_number = "1234567890"
+    test_franchisee.bank_ifsc_code = "SBIN0001234"
+    test_franchisee.bank_account_name = "R Shyam Shankar"
+    await test_franchisee.save()
+
+    rzp = MagicMock()
+    rzp.edit_product_configuration = AsyncMock(return_value={
+        "id": "acc_prd_test",
+        "activation_status": "activated",
+        "requirements": [],
+    })
+
+    with patch("services.razorpay_service.razorpay_service", rzp):
+        await FranchiseeOnboardingService.submit_bank_details(
+            test_franchisee.id
+        )
+
+    await test_franchisee.refresh_from_db()
+    # activated_at must remain the original — the helper short-circuits
+    # before writing when status is already ACTIVE.
+    assert test_franchisee.activated_at == earlier
+    assert test_franchisee.kyc_verified_at == earlier
+
+
 # ─── handle_account_webhook ─────────────────────────────────────────────
 
 @pytest.mark.asyncio

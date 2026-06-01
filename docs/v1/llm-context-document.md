@@ -659,8 +659,8 @@ meter_value (id, transaction_id, reading_kwh, current, voltage, power_kw)
 firmware_file (id, version, filename, file_path, file_size, checksum, description, uploaded_by, is_active)
 firmware_update (id, charger_id, firmware_file_id, status, download_url, started_at, completed_at, error_message)
 
--- Signal Quality Monitoring
-signal_quality (id, charger_id, rssi, ber, timestamp, created_at) -- Cellular signal metrics via DataTransfer
+-- Signal Quality / Modem Telemetry (table name is a historical misnomer — see ADR 0009)
+signal_quality (id, charger_id, rssi, ber, temperature_celsius, timestamp, created_at) -- Modem telemetry via OCPP DataTransfer (vendorId=VoltLync, messageId=SignalQuality). `temperature_celsius` nullable (added migration 43, 2026-06-01) — older firmware that omits the field stores NULL.
 
 -- Charger Error Tracking
 charger_error (id, charger_id, connector_id, status, error_code, vendor_error_code, vendor_id, info, error_timestamp, is_resolved, resolved_at) -- OCPP StatusNotification errors
@@ -732,7 +732,7 @@ log (id, charge_point_id, direction, payload, correlation_id) -- All OCPP messag
    - Complete audit logging for compliance
 8. **DataTransfer** - **Vendor-specific data messages**
    - Handles custom data from charge points (vendor-specific extensions)
-   - **JET_EV1 Signal Quality data**: Validates and stores RSSI (0-31, 99=unknown) and BER (0-7, 99=unknown) in `signal_quality` table
+   - **SignalQuality / Modem telemetry**: Validates and stores RSSI (0-31, 99=unknown), BER (0-7, 99=unknown), and modem-board `temperature` (Celsius, optional) in `signal_quality` table. Non-numeric `temperature` values are dropped to NULL but the rest of the packet is still accepted — rssi/ber are load-bearing. See ADR 0009 for why temperature lives here and not on `meter_value`.
    - **GetLastMeterValue**: Transaction resume support — charger requests last meter reading for a transaction ID, server responds with the last known kWh reading so the charger can resume from the correct point
    - **PostBootState (server→charger)**: After BootNotification, pushes `{hasPendingTransaction, lastMeterValueWh, transactionId}` via `@after` hook. Charger resumes by sending MeterValues or StopTransaction.
 
@@ -865,7 +865,7 @@ GET /chargers/{id}/errors/latest - **NEW** Latest unresolved error for charger
 
 Transactions:
 GET /transactions - List transactions with filtering and analytics summary
-GET /transactions/{id} - Transaction details
+GET /transactions/{id} - Transaction details. Response carries: (1) a derived `live_energy_kwh` field (`latest_meter_value.reading_kwh − transaction.start_meter_kwh`, `null` if `start_meter_kwh` is NULL or no MeterValues exist) — always computed from MeterValues, never switches to reading the stored `transaction.energy_consumed_kwh` after StopTransaction; (2) `funding_source: "WALLET" | "QR" | "NONE"` — QR wins when a `QRPayment` row references the transaction, NONE for internal-role sessions (ADR 0004), WALLET otherwise; (3) `qr_session: {budget_limit, cost_so_far, remaining}` block (₹ Decimal strings) when `funding_source == "QR"`, sourced from the pure `QRPaymentService.compute_budget_snapshot` helper. The same helper drives the auto-stop dispatch in `check_budget_and_auto_stop` post-2026-06-01 — single source of truth for budget math so the admin UI and the cap-enforcement agree by construction.
 GET /transactions/{id}/meter-values - Energy consumption data with chart data
 
 GST Filings (admin window at /admin/gst-filings):

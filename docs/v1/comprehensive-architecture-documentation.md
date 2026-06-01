@@ -2008,9 +2008,10 @@ CREATE INDEX idx_firmware_update_status ON firmware_update(status);
 CREATE TABLE signal_quality (
     id SERIAL PRIMARY KEY,
     charger_id INTEGER REFERENCES charger(id) ON DELETE CASCADE,
-    rssi INTEGER NOT NULL,      -- Received Signal Strength Indicator (0-31 for GSM, 99=unknown)
-    ber INTEGER NOT NULL,        -- Bit Error Rate (0-7 for GSM, 99=unknown/not detectable)
-    timestamp VARCHAR(50) NOT NULL,  -- Timestamp from charger
+    rssi INTEGER NOT NULL,            -- Received Signal Strength Indicator (0-31 for GSM, 99=unknown)
+    ber INTEGER NOT NULL,             -- Bit Error Rate (0-7 for GSM, 99=unknown/not detectable)
+    temperature_celsius DOUBLE PRECISION,  -- Modem board temperature; nullable for legacy rows / older firmware. Added migration 43, 2026-06-01. See ADR 0009.
+    timestamp VARCHAR(50) NOT NULL,   -- Timestamp from charger
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -2018,7 +2019,9 @@ CREATE INDEX idx_signal_quality_created ON signal_quality(created_at);
 CREATE INDEX idx_signal_quality_charger ON signal_quality(charger_id);
 ```
 
-**Data Source**: OCPP DataTransfer messages from JET_EV1 chargers
+The table name is a historical misnomer — see ADR 0009. The row is the canonical home for *all* modem-emitted telemetry, not strictly signal-quality fields. A future rename (e.g. to `charger_telemetry`) is deferred.
+
+**Data Source**: OCPP DataTransfer messages from chargers (`vendorId=VoltLync`, `messageId=SignalQuality`)
 
 **Data Retention**: Records older than 90 days are automatically deleted by the data retention service
 
@@ -3156,6 +3159,57 @@ Response:
 }
 ```
 
+##### Transaction Details
+```http
+GET /api/admin/transactions/{transaction_id}
+Authorization: Bearer {jwt_token}
+
+Response: TransactionDetailResponse
+{
+  "transaction": { ... TransactionResponse fields ... },
+  "user": { ... },
+  "charger": { ... },
+  "meter_values": [ ... ],
+  "wallet_transactions": [ ... ],
+  "live_energy_kwh": 1.234,             // derived per-request, see note below
+  "funding_source": "QR",               // "WALLET" | "QR" | "NONE"
+  "qr_session": {                       // present only when funding_source=QR
+    "budget_limit": "490.00",
+    "cost_so_far": "12.34",
+    "remaining": "477.66"
+  }
+}
+```
+
+`live_energy_kwh` is computed every request as
+`latest_meter_value.reading_kwh - transaction.start_meter_kwh` and is `null`
+when either side is missing. It is the canonical live-session figure for the
+admin UI and any other surface that needs to render "kWh delivered so far"
+while a session is in progress. The stored column
+`transaction.energy_consumed_kwh` is the **finalised** value written only at
+StopTransaction (and may be lower than the raw meter delta when the QR
+budget cap truncates billable energy — see ADR 0001 / billing math). Do not
+read the column to render live UI; do not write the derived figure back to
+the column.
+
+`funding_source` classifies the session funding axis:
+- `"QR"` — a `QRPayment` row references the transaction. Wins regardless of
+  user role (per CONTEXT.md `[[qr-session]]`).
+- `"NONE"` — the initiating user has an internal role (ADMIN / FRANCHISEE in
+  `core.roles.INTERNAL_ROLES`); no Wallet is debited and no GST invoice is
+  issued. See ADR 0004.
+- `"WALLET"` — everyone else.
+
+`qr_session` carries the live budget snapshot for QR sessions. The figures
+are ₹ Decimal strings (not floats — preserves precision over the wire,
+matches the `wallet_transaction.amount` non-negative invariant style). The
+snapshot is sourced from `QRPaymentService.compute_budget_snapshot`, a pure
+helper that also backs the auto-stop dispatch in
+`check_budget_and_auto_stop`. Single source of truth: the admin UI and the
+cap-enforcement agree by construction. The block may be `null` even for QR
+sessions if the helper bails (tariff misconfigured, no QR cache row and no
+DB-derivable budget) — UI should treat as "budget temporarily unknown".
+
 ##### Transaction Meter Values
 ```http
 GET /api/admin/transactions/{transaction_id}/meter-values
@@ -3541,8 +3595,9 @@ Response: 200 OK
     {
       "id": 1,
       "charger_id": 5,
-      "rssi": 22,  // Received Signal Strength Indicator
-      "ber": 99,   // Bit Error Rate
+      "rssi": 22,                     // Received Signal Strength Indicator
+      "ber": 99,                      // Bit Error Rate
+      "temperature_celsius": 38.4,    // Modem board temperature; null on legacy rows
       "timestamp": "86",
       "created_at": "2025-01-22T14:00:00Z"
     }
@@ -3552,9 +3607,12 @@ Response: 200 OK
   "limit": 20,
   "charger_id": 5,
   "latest_rssi": 22,
-  "latest_ber": 99
+  "latest_ber": 99,
+  "latest_temperature_celsius": 38.4
 }
 ```
+
+The admin charger detail page renders a "Modem Temperature" card sourced from this endpoint (24h window). RSSI history has its own surface; the chart is temperature-only — dual-axis muddies both. See ADR 0009 for why modem temperature lives on `signal_quality` rather than `meter_value`.
 
 **Signal Strength Interpretation**:
 - **Good**: RSSI ≥ 10 (green badge)

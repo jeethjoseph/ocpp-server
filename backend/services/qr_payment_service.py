@@ -5,16 +5,27 @@ import logging
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Optional, Tuple, Dict
+from typing import NamedTuple, Optional, Tuple, Dict
 
 from tortoise.transactions import in_transaction
 
 from core.config import RAZORPAY_PLATFORM_FEE_PERCENT  # noqa: F401  (re-exported for backwards compat)
 from models import (
-    User, Wallet, Charger, Transaction, QRPayment, ChargerQRCode,
+    User, Wallet, Charger, Transaction, QRPayment, ChargerQRCode, MeterValue,
     QRPaymentStatusEnum, AuthProviderEnum, ChargerStatusEnum,
     TransactionStatusEnum, UserRoleEnum
 )
+
+
+class BudgetSnapshot(NamedTuple):
+    """Pure-read budget figures for a QR session, in ₹ (Decimal).
+
+    Returned by ``QRPaymentService.compute_budget_snapshot`` for both the
+    auto-stop dispatch path and the admin transaction-detail response.
+    """
+    budget_limit: Decimal
+    cost_so_far: Decimal
+    remaining: Decimal
 from services.razorpay_service import (
     razorpay_service,
     RazorpayAlreadyRefundedError,
@@ -510,6 +521,112 @@ class QRPaymentService:
         return qr_payment
 
     @staticmethod
+    async def _load_or_rebuild_qr_session(transaction_id: int) -> Optional[Dict]:
+        """Return the Redis ``qr_session:{txn}`` row, rebuilding from DB on
+        cache miss. Returns None when the transaction has no associated
+        ``CHARGING`` ``QRPayment`` row (i.e. not a QR session).
+
+        Extracted so both the auto-stop dispatch path and the read-only admin
+        snapshot share the same cache-miss recovery without duplicating it.
+        """
+        session = await redis_manager.get_qr_session(transaction_id)
+        if session:
+            return session
+
+        # DB fallback for cache miss (e.g., server restart). Log so ops can
+        # detect Redis blips / TTL exhaustion / operator-edits-mid-session.
+        logger.warning(
+            "qr_session cache miss for txn %s — rebuilding from DB. "
+            "If frequent, indicates Redis instability or TTL exhaustion.",
+            transaction_id,
+        )
+        MetricsCollector.increment_counter("Custom/QrSession/BudgetCheckCacheMiss")
+
+        qr_payment = await QRPayment.filter(
+            transaction_id=transaction_id,
+            status=QRPaymentStatusEnum.CHARGING,
+        ).first()
+        if not qr_payment:
+            return None
+
+        tariff = await WalletService.get_applicable_tariff(qr_payment.charger_id)
+        tariff_rate = tariff.rate_per_kwh if tariff else Decimal('0')
+        gst_percent = tariff.gst_percent if tariff else Decimal('18')
+        platform_fee = synthetic_platform_fee(qr_payment.amount_paid)
+        await _ensure_actual_fee_captured(qr_payment)
+        await qr_payment.save()
+        budget_limit_paise = int(
+            ((qr_payment.amount_paid - platform_fee) * Decimal("100"))
+            .quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        )
+
+        transaction = await Transaction.filter(id=transaction_id).first()
+        session = {
+            "qr_payment_id": qr_payment.id,
+            "amount_paid": str(qr_payment.amount_paid),
+            "platform_fee": str(platform_fee),
+            "budget_limit_paise": budget_limit_paise,
+            "tariff_rate": str(tariff_rate),
+            "gst_percent": str(gst_percent),
+            "start_meter_kwh": str(transaction.start_meter_kwh) if transaction and transaction.start_meter_kwh else "0",
+            "charger_id": qr_payment.charger_id,
+        }
+        await redis_manager.set_qr_session(transaction_id, session)
+        return session
+
+    @staticmethod
+    async def compute_budget_snapshot(
+        transaction_id: int,
+        reading_kwh: Optional[Decimal] = None,
+    ) -> Optional[BudgetSnapshot]:
+        """Pure-read budget figures for a QR session.
+
+        Returns None when the transaction is not a QR session (no CHARGING
+        QRPayment row) or when the tariff rate is non-positive (config bug —
+        the auto-stop path bails on the same condition).
+
+        ``reading_kwh`` is the meter reading to compute cost against. If None,
+        the latest ``MeterValue`` row for the transaction is used; if no
+        MeterValue exists yet, cost is zero and ``remaining == budget_limit``.
+
+        Pure: no Redis writes, no RemoteStop dispatch. Safe to call from any
+        read path (e.g., the admin transaction-detail endpoint).
+        """
+        session = await QRPaymentService._load_or_rebuild_qr_session(transaction_id)
+        if not session:
+            return None
+
+        if "budget_limit_paise" in session:
+            budget_limit = Decimal(session["budget_limit_paise"]) / Decimal("100")
+        else:
+            # Legacy float key — drains within one TTL window post-2026-05-21.
+            budget_limit = Decimal(str(session["budget_limit"]))
+        tariff_rate = Decimal(str(session["tariff_rate"]))
+        gst_percent = Decimal(str(session.get("gst_percent", 18.0)))
+        start_meter = Decimal(str(session["start_meter_kwh"]))
+
+        if tariff_rate <= 0:
+            return None
+
+        if reading_kwh is None:
+            latest = await MeterValue.filter(
+                transaction_id=transaction_id
+            ).order_by("-id").first()
+            reading_dec = Decimal(latest.reading_kwh) if latest else start_meter
+        else:
+            reading_dec = Decimal(str(reading_kwh))
+
+        energy_consumed = reading_dec - start_meter
+        gst_multiplier = Decimal("1") + (gst_percent / Decimal("100"))
+        cost = (energy_consumed * tariff_rate * gst_multiplier).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        remaining = budget_limit - cost
+        return BudgetSnapshot(
+            budget_limit=budget_limit, cost_so_far=cost, remaining=remaining,
+        )
+
+    @staticmethod
     async def check_budget_and_auto_stop(
         transaction_id: int, reading_kwh: float, power_kw: Optional[float] = None,
     ):
@@ -522,82 +639,33 @@ class QRPaymentService:
         2026-05-22). `power_kw` is optional — older callers that don't pass it
         leave the previous snapshot's value in place.
         """
-        session = await redis_manager.get_qr_session(transaction_id)
-
-        if not session:
-            # DB fallback for cache miss (e.g., server restart). Log the miss so
-            # ops can detect Redis blips / TTL exhaustion / operator-edits-mid-
-            # session in production. Counter feeds the dashboard from issue 04.
-            logger.warning(
-                "qr_session cache miss for txn %s — rebuilding from DB. "
-                "If frequent, indicates Redis instability or TTL exhaustion.",
-                transaction_id,
-            )
-            MetricsCollector.increment_counter("Custom/QrSession/BudgetCheckCacheMiss")
-
-            qr_payment = await QRPayment.filter(
-                transaction_id=transaction_id,
-                status=QRPaymentStatusEnum.CHARGING
-            ).first()
-            if not qr_payment:
-                return  # Not a QR session
-
-            # Rebuild cache (post-restart / cache miss). Synthetic fee for
-            # budget, actual fee still captured to the row — see ADR 0001.
-            tariff = await WalletService.get_applicable_tariff(qr_payment.charger_id)
-            tariff_rate = tariff.rate_per_kwh if tariff else Decimal('0')
-            gst_percent = tariff.gst_percent if tariff else Decimal('18')
-            platform_fee = synthetic_platform_fee(qr_payment.amount_paid)
-            await _ensure_actual_fee_captured(qr_payment)
-            await qr_payment.save()
-            budget_limit_paise = int(
-                ((qr_payment.amount_paid - platform_fee) * Decimal("100"))
-                .quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-            )
-
-            transaction = await Transaction.filter(id=transaction_id).first()
-            session = {
-                "qr_payment_id": qr_payment.id,
-                "amount_paid": str(qr_payment.amount_paid),
-                "platform_fee": str(platform_fee),
-                "budget_limit_paise": budget_limit_paise,
-                "tariff_rate": str(tariff_rate),
-                "gst_percent": str(gst_percent),
-                "start_meter_kwh": str(transaction.start_meter_kwh) if transaction and transaction.start_meter_kwh else "0",
-                "charger_id": qr_payment.charger_id,
-            }
-            await redis_manager.set_qr_session(transaction_id, session)
-
-        # Read paise-int (new format), fall back to legacy float "budget_limit"
-        # for one release cycle to drain in-flight Redis keys (TTL 24h).
-        if "budget_limit_paise" in session:
-            budget_limit = Decimal(session["budget_limit_paise"]) / Decimal("100")
-        else:
-            budget_limit = Decimal(str(session["budget_limit"]))
-        tariff_rate = Decimal(str(session["tariff_rate"]))
-        gst_percent = Decimal(str(session.get("gst_percent", 18.0)))
-        start_meter = Decimal(str(session["start_meter_kwh"]))
-
-        if tariff_rate <= 0:
+        snapshot = await QRPaymentService.compute_budget_snapshot(
+            transaction_id, reading_kwh=Decimal(str(reading_kwh)),
+        )
+        if snapshot is None:
             return
 
-        energy_consumed = Decimal(str(reading_kwh)) - start_meter
-        gst_multiplier = Decimal("1") + (gst_percent / Decimal("100"))
-        cost = (energy_consumed * tariff_rate * gst_multiplier).quantize(
-            Decimal("0.01"), rounding=ROUND_HALF_UP
-        )
-        remaining = budget_limit - cost
+        # Re-read the session row that the helper just populated/loaded.
+        # We need the dict to stamp the latest-meter snapshot below; the
+        # helper intentionally doesn't return it (purity over convenience).
+        session = await redis_manager.get_qr_session(transaction_id)
+        if not session:
+            return
 
         # Stamp the latest snapshot into the cache so the active-sessions
         # endpoint can render live KPIs without a per-row MeterValue lookup.
-        # Done after the budget math so a slow Redis write doesn't delay the
-        # auto-stop decision below.
         session["latest_reading_kwh"] = str(Decimal(str(reading_kwh)))
         if power_kw is not None:
             session["latest_power_kw"] = float(power_kw)
         session["latest_meter_at"] = datetime.now(timezone.utc).isoformat()
         await redis_manager.set_qr_session(transaction_id, session)
 
+        cost = snapshot.cost_so_far
+        budget_limit = snapshot.budget_limit
+        remaining = snapshot.remaining
+        gst_percent = Decimal(str(session.get("gst_percent", 18.0)))
+        start_meter = Decimal(str(session["start_meter_kwh"]))
+        energy_consumed = Decimal(str(reading_kwh)) - start_meter
         logger.info(
             f"QR budget check txn {transaction_id}: "
             f"energy={energy_consumed:.3f}kWh, cost=₹{cost:.2f} (incl GST {gst_percent}%), "

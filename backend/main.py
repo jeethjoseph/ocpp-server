@@ -1249,8 +1249,10 @@ class ChargePoint(OcppChargePoint):
 
     async def _handle_signal_quality(self, data: str):
         """
-        Handle SignalQuality DataTransfer messages (vendor-agnostic)
-        Data format: {"rssi":22,"ber":99,"timestamp":"86"}
+        Handle SignalQuality DataTransfer messages (vendor-agnostic).
+        Data format: {"rssi":22,"ber":99,"temperature":38.2,"timestamp":"86"}
+        ``temperature`` is optional — older firmware omits it; newer
+        firmware reports modem board temperature in Celsius. See ADR 0009.
         """
         from models import Charger, SignalQuality
         import json
@@ -1264,6 +1266,7 @@ class ChargePoint(OcppChargePoint):
             payload = json.loads(data)
             rssi = payload.get("rssi")
             ber = payload.get("ber")
+            temperature = payload.get("temperature")
             timestamp = payload.get("timestamp")
 
             # Validate required fields
@@ -1279,6 +1282,18 @@ class ChargePoint(OcppChargePoint):
             if not (0 <= ber <= 7 or ber == 99):
                 logger.warning(f"📡 ⚠️  BER value {ber} out of typical range for {self.id}")
 
+            # Coerce temperature to float; reject obviously-bad values quietly
+            # (a misbehaving firmware bug shouldn't reject the whole packet —
+            # rssi/ber are the original load-bearing fields).
+            temperature_celsius = None
+            if temperature is not None:
+                try:
+                    temperature_celsius = float(temperature)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        f"🌡️ ⚠️  Non-numeric temperature {temperature!r} from {self.id} — dropping"
+                    )
+
             # Get charger
             charger = await Charger.get(charge_point_string_id=self.id)
 
@@ -1287,12 +1302,14 @@ class ChargePoint(OcppChargePoint):
                 charger=charger,
                 rssi=rssi,
                 ber=ber,
+                temperature_celsius=temperature_celsius,
                 timestamp=str(timestamp) if timestamp is not None else ""
             )
 
             # Log success
             signal_strength = "Good" if rssi >= 10 else "Fair" if rssi >= 5 else "Poor" if rssi > 0 else "Unknown"
-            logger.info(f"📶 Stored signal quality for {self.id}: RSSI={rssi} ({signal_strength}), BER={ber}")
+            temp_log = f", Temp={temperature_celsius}°C" if temperature_celsius is not None else ""
+            logger.info(f"📶 Stored signal quality for {self.id}: RSSI={rssi} ({signal_strength}), BER={ber}{temp_log}")
 
             return call_result.DataTransfer(status="Accepted")
 

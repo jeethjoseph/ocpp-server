@@ -938,11 +938,18 @@ async def get_charger_logs(
 # ============ Signal Quality Endpoints ============
 
 class SignalQualityResponse(BaseModel):
-    """Response schema for signal quality data point"""
+    """Response schema for a signal-quality / modem-telemetry data point.
+
+    Despite the legacy ``signal_quality`` table name, the row also carries
+    modem board temperature (see ADR 0009). ``temperature_celsius`` is null
+    for rows captured before the temperature column was added (migration 43)
+    or for chargers on firmware that doesn't yet emit the field.
+    """
     id: int
     charger_id: int
     rssi: int  # Received Signal Strength Indicator (0-31 for GSM, 99=unknown)
     ber: int   # Bit Error Rate (0-7 for GSM, 99=unknown/not detectable)
+    temperature_celsius: Optional[float] = None  # Modem board temperature
     timestamp: str
     created_at: datetime
 
@@ -950,7 +957,7 @@ class SignalQualityResponse(BaseModel):
         from_attributes = True
 
 class SignalQualityListResponse(BaseModel):
-    """Response schema for list of signal quality data"""
+    """Response schema for list of signal quality / modem telemetry data."""
     data: List[SignalQualityResponse]
     total: int
     page: int
@@ -958,6 +965,7 @@ class SignalQualityListResponse(BaseModel):
     charger_id: int
     latest_rssi: Optional[int] = None
     latest_ber: Optional[int] = None
+    latest_temperature_celsius: Optional[float] = None
 
 @router.get("/{charger_id}/signal-quality", response_model=SignalQualityListResponse)
 async def get_charger_signal_quality(
@@ -1000,6 +1008,7 @@ async def get_charger_signal_quality(
     latest = await SignalQuality.filter(charger_id=charger_id).order_by("-created_at").first()
     latest_rssi = latest.rssi if latest else None
     latest_ber = latest.ber if latest else None
+    latest_temperature_celsius = latest.temperature_celsius if latest else None
 
     # Convert to response models
     data_responses = [SignalQualityResponse.model_validate(d, from_attributes=True) for d in signal_data]
@@ -1011,7 +1020,8 @@ async def get_charger_signal_quality(
         limit=limit,
         charger_id=charger_id,
         latest_rssi=latest_rssi,
-        latest_ber=latest_ber
+        latest_ber=latest_ber,
+        latest_temperature_celsius=latest_temperature_celsius,
     )
 
 @router.get("/{charger_id}/signal-quality/latest", response_model=Optional[SignalQualityResponse])

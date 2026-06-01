@@ -32,6 +32,10 @@ _Avoid_: test session, ops session (both are used informally in code comments bu
 A `User` row whose `role` is `ADMIN` or `FRANCHISEE`. The canonical set is `INTERNAL_ROLES = {ADMIN, FRANCHISEE}` in `services/invoice_service.py`. These users do not require a `Wallet` and any **Charging Session** they initiate is an **Internal-role Session**.
 _Avoid_: staff user, operator user.
 
+**Live energy consumed**:
+The kWh delivered so far in an in-progress **Charging Session**, derived per-request as `latest_meter_value.reading_kwh − transaction.start_meter_kwh`. Distinct from the stored column `Transaction.energy_consumed_kwh`, which is the **finalised** figure written only at StopTransaction (and possibly capped to billable kWh by the QR budget). Admin/UI surfaces that need a live readout MUST use the derived value — reading the column mid-session returns NULL and is the source of the "0.00 kWh" tile bug fixed in [[issue-01-live-energy-consumed]].
+_Avoid_: "energy consumed" without qualifier when context is ambiguous between live and finalised.
+
 ### Hardware
 
 **Charger** / **EVSE**:
@@ -87,6 +91,12 @@ _Avoid_: "audit log" as a singular event term.
 **NR custom event**:
 A New Relic custom event recorded via `MetricsCollector.record_event(...)`. Operational telemetry only — disconnect lifecycle (`OCPPWebSocketDisconnect`), reject lifecycle (`OCPPWebSocketRejected`), transaction outcomes. Retained 8–30 days. Never the source of truth for billing, ledger, or compliance.
 _Avoid_: "metric" (which is the 13-month numeric counter/gauge surface, a different thing).
+
+**SignalQuality DataTransfer** / **Modem telemetry**:
+A charger-emitted OCPP `DataTransfer` with `vendorId=VoltLync`, `messageId=SignalQuality`. The `data` field is a JSON string carrying `rssi`, `ber`, and (as of 2026-06-01) `temperature` — all modem-board-level values, sampled continuously and emitted even when no transaction is active. Stored per-**Charger** in the `signal_quality` table; see [[adr-0009-modem-temperature-in-signal-quality]] for why temperature lives here and not in `meter_value`.
+
+**Known ambiguity**: the table name is a misnomer post-temperature. A future rename to `charger_telemetry` (or similar) is on the table but not blocking. Until then, treat `signal_quality` as the canonical home for any modem-emitted telemetry, not strictly signal-quality fields.
+_Avoid_: confusing **Modem telemetry** with the (currently hypothetical) OCPP `Temperature` measurand sent inside `MeterValues.sampledValue`. The latter, if/when it appears, is per-transaction cable/socket/EV temperature and belongs on `meter_value` — see ADR 0009 "Consequences" for the orthogonality argument.
 
 ## Relationships
 
