@@ -457,7 +457,7 @@ class FranchiseeSettlementService:
             else:
                 # Wallet session — direct transfer from platform balance.
                 # Requires Razorpay support to activate ``POST /v1/transfers``.
-                result = razorpay_service.create_transfer(
+                result = await razorpay_service.create_transfer(
                     account_id=franchisee.razorpay_account_id,
                     amount_paise=amount_paise,
                     notes=notes,

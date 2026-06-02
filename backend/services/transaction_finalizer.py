@@ -122,7 +122,7 @@ async def finalize_stopped_transaction(
             "previous_status": str(previous_status),
             "new_status": "STOPPED",
             "trigger": stop_reason,
-            "energy_consumed_kwh": transaction.energy_consumed_kwh,
+            "energy_consumed_kwh": float(transaction.energy_consumed_kwh) if transaction.energy_consumed_kwh is not None else None,
         },
     ))
 

@@ -216,6 +216,13 @@ async def test_full_refund_skips_if_already_refunded(client, qr_charger, qr_code
     )
 
     mock_razorpay = MagicMock()
+    # Razorpay methods migrated to httpx.AsyncClient — mock as AsyncMock.
+    mock_razorpay.refund_payment = AsyncMock()
+    mock_razorpay.find_refund_for_payment = AsyncMock()
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock()
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
     with patch("services.qr_payment_service.razorpay_service", mock_razorpay):
         await QRPaymentService._full_refund(qr_payment, "Test reason")
 
@@ -242,6 +249,13 @@ async def test_full_refund_reconciles_already_refunded_error(client, qr_charger,
     )
 
     mock_razorpay = MagicMock()
+    # Razorpay methods migrated to httpx.AsyncClient — mock as AsyncMock.
+    mock_razorpay.refund_payment = AsyncMock()
+    mock_razorpay.find_refund_for_payment = AsyncMock()
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock()
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
     mock_razorpay.refund_payment.side_effect = RazorpayAlreadyRefundedError(
         payment_id, Exception("The payment has been refunded fully")
     )
@@ -276,6 +290,13 @@ async def test_full_refund_fails_cleanly_when_reconciliation_finds_no_refund(cli
     )
 
     mock_razorpay = MagicMock()
+    # Razorpay methods migrated to httpx.AsyncClient — mock as AsyncMock.
+    mock_razorpay.refund_payment = AsyncMock()
+    mock_razorpay.find_refund_for_payment = AsyncMock()
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock()
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
     mock_razorpay.refund_payment.side_effect = RazorpayAlreadyRefundedError(
         payment_id, Exception("fully refunded")
     )
@@ -313,6 +334,13 @@ async def test_full_refund_returns_amount_paid_in_full(client, qr_charger, qr_co
     )
 
     mock_razorpay = MagicMock()
+    # Razorpay methods migrated to httpx.AsyncClient — mock as AsyncMock.
+    mock_razorpay.refund_payment = AsyncMock()
+    mock_razorpay.find_refund_for_payment = AsyncMock()
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock()
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
     mock_razorpay.refund_payment.return_value = {"id": "rfnd_FULL"}
     # Razorpay actually charged 1.5% on this payment — should land on the row
     # for ops, but NOT be subtracted from the refund.
@@ -375,6 +403,13 @@ async def test_handle_charging_failure_issues_full_refund(client, qr_charger, qr
     )
 
     mock_razorpay = MagicMock()
+    # Razorpay methods migrated to httpx.AsyncClient — mock as AsyncMock.
+    mock_razorpay.refund_payment = AsyncMock()
+    mock_razorpay.find_refund_for_payment = AsyncMock()
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock()
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
     mock_razorpay.refund_payment.return_value = {"id": "rfnd_CHG_FAIL"}
 
     with patch("services.qr_payment_service.razorpay_service", mock_razorpay), \
@@ -421,6 +456,13 @@ async def test_process_qr_session_billing_zero_energy_issues_full_refund(
     )
 
     mock_razorpay = MagicMock()
+    # Razorpay methods migrated to httpx.AsyncClient — mock as AsyncMock.
+    mock_razorpay.refund_payment = AsyncMock()
+    mock_razorpay.find_refund_for_payment = AsyncMock()
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock()
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
     mock_razorpay.refund_payment.return_value = {
         "id": "rfnd_ZERO_ENERGY",
         "speed_processed": "instant",
@@ -497,6 +539,13 @@ async def test_full_refund_passes_speed_optimum_when_flag_enabled(
     monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
 
     mock_razorpay = MagicMock()
+    # Razorpay methods migrated to httpx.AsyncClient — mock as AsyncMock.
+    mock_razorpay.refund_payment = AsyncMock()
+    mock_razorpay.find_refund_for_payment = AsyncMock()
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock()
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
     mock_razorpay.refund_payment.return_value = {
         "id": "rfnd_INSTANT", "speed_processed": "instant",
     }
@@ -521,6 +570,13 @@ async def test_full_refund_persists_speed_processed_normal_on_fallback(
     monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
 
     mock_razorpay = MagicMock()
+    # Razorpay methods migrated to httpx.AsyncClient — mock as AsyncMock.
+    mock_razorpay.refund_payment = AsyncMock()
+    mock_razorpay.find_refund_for_payment = AsyncMock()
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock()
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
     mock_razorpay.refund_payment.return_value = {
         "id": "rfnd_FB", "speed_processed": "normal",
     }
@@ -571,6 +627,13 @@ async def test_full_refund_persists_speed_processed_from_reconciliation(
     monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
 
     mock_razorpay = MagicMock()
+    # Razorpay methods migrated to httpx.AsyncClient — mock as AsyncMock.
+    mock_razorpay.refund_payment = AsyncMock()
+    mock_razorpay.find_refund_for_payment = AsyncMock()
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock()
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
     mock_razorpay.refund_payment.side_effect = RazorpayAlreadyRefundedError(
         _refund_qr_payment.razorpay_payment_id, Exception("dup")
     )
@@ -595,6 +658,13 @@ async def test_full_refund_emits_instant_succeeded_metric(
     monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
 
     mock_razorpay = MagicMock()
+    # Razorpay methods migrated to httpx.AsyncClient — mock as AsyncMock.
+    mock_razorpay.refund_payment = AsyncMock()
+    mock_razorpay.find_refund_for_payment = AsyncMock()
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock()
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
     mock_razorpay.refund_payment.return_value = {
         "id": "rfnd_M_OK", "speed_processed": "instant",
     }
@@ -618,6 +688,13 @@ async def test_full_refund_emits_fallback_metric_when_response_is_normal(
     monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
 
     mock_razorpay = MagicMock()
+    # Razorpay methods migrated to httpx.AsyncClient — mock as AsyncMock.
+    mock_razorpay.refund_payment = AsyncMock()
+    mock_razorpay.find_refund_for_payment = AsyncMock()
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock()
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
     mock_razorpay.refund_payment.return_value = {
         "id": "rfnd_M_FB", "speed_processed": "normal",
     }
@@ -640,6 +717,13 @@ async def test_full_refund_emits_no_metric_when_flag_disabled(
     monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "false")
 
     mock_razorpay = MagicMock()
+    # Razorpay methods migrated to httpx.AsyncClient — mock as AsyncMock.
+    mock_razorpay.refund_payment = AsyncMock()
+    mock_razorpay.find_refund_for_payment = AsyncMock()
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock()
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
     mock_razorpay.refund_payment.return_value = {
         "id": "rfnd_M_OFF", "speed_processed": "normal",
     }
@@ -661,6 +745,13 @@ async def test_full_refund_reconciliation_emits_metric_when_speed_present(
     monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
 
     mock_razorpay = MagicMock()
+    # Razorpay methods migrated to httpx.AsyncClient — mock as AsyncMock.
+    mock_razorpay.refund_payment = AsyncMock()
+    mock_razorpay.find_refund_for_payment = AsyncMock()
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock()
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
     mock_razorpay.refund_payment.side_effect = RazorpayAlreadyRefundedError(
         _refund_qr_payment.razorpay_payment_id, Exception("dup")
     )
@@ -694,6 +785,12 @@ async def test_partial_refund_does_not_emit_speed_metric(
         with patch("services.qr_payment_service.razorpay_service") as mock_rzp, \
              patch("services.qr_payment_service.OCPPMetrics.record_refund_speed",
                    new_callable=AsyncMock) as mock_record:
+            mock_rzp.refund_payment = AsyncMock()
+            mock_rzp.find_refund_for_payment = AsyncMock()
+            mock_rzp.fetch_payment = AsyncMock()
+            mock_rzp.fetch_payment_fees = AsyncMock()
+            mock_rzp.fetch_order = AsyncMock()
+            mock_rzp.create_transfer = AsyncMock()
             mock_rzp.refund_payment.return_value = {"id": "rfnd_partial_M"}
             await QRPaymentService.process_qr_session_billing(txn.id)
 
@@ -708,6 +805,13 @@ async def test_full_refund_passes_speed_none_when_flag_disabled(
     monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "false")
 
     mock_razorpay = MagicMock()
+    # Razorpay methods migrated to httpx.AsyncClient — mock as AsyncMock.
+    mock_razorpay.refund_payment = AsyncMock()
+    mock_razorpay.find_refund_for_payment = AsyncMock()
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock()
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
     mock_razorpay.refund_payment.return_value = {
         "id": "rfnd_NORMAL", "speed_processed": "normal",
     }
@@ -734,6 +838,12 @@ async def test_partial_refund_does_not_request_instant_speed(
     with patch("services.qr_payment_service.redis_manager") as mock_redis:
         mock_redis.delete_qr_session = AsyncMock()
         with patch("services.qr_payment_service.razorpay_service") as mock_rzp:
+            mock_rzp.refund_payment = AsyncMock()
+            mock_rzp.find_refund_for_payment = AsyncMock()
+            mock_rzp.fetch_payment = AsyncMock()
+            mock_rzp.fetch_payment_fees = AsyncMock()
+            mock_rzp.fetch_order = AsyncMock()
+            mock_rzp.create_transfer = AsyncMock()
             mock_rzp.refund_payment.return_value = {"id": "rfnd_partial"}
             await QRPaymentService.process_qr_session_billing(txn.id)
 
@@ -771,6 +881,12 @@ async def test_partial_refund_below_razorpay_minimum_marks_failed_without_error_
     with patch("services.qr_payment_service.redis_manager") as mock_redis:
         mock_redis.delete_qr_session = AsyncMock()
         with patch("services.qr_payment_service.razorpay_service") as mock_rzp:
+            mock_rzp.refund_payment = AsyncMock()
+            mock_rzp.find_refund_for_payment = AsyncMock()
+            mock_rzp.fetch_payment = AsyncMock()
+            mock_rzp.fetch_payment_fees = AsyncMock()
+            mock_rzp.fetch_order = AsyncMock()
+            mock_rzp.create_transfer = AsyncMock()
             mock_rzp.refund_payment.side_effect = below_min_error
             with caplog.at_level("INFO", logger="services.qr_payment_service"):
                 await QRPaymentService.process_qr_session_billing(txn.id)
@@ -820,6 +936,13 @@ async def test_concurrent_payment_rejected_when_active_txn(client, qr_charger, q
     payload = _webhook_payload("pay_CONC001", "qr_TEST123", 10000)
 
     mock_razorpay = MagicMock()
+    # Razorpay methods migrated to httpx.AsyncClient — mock as AsyncMock.
+    mock_razorpay.refund_payment = AsyncMock()
+    mock_razorpay.find_refund_for_payment = AsyncMock()
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock()
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
     mock_razorpay.refund_payment.return_value = {"id": "rfnd_REJECTED"}
     mock_razorpay.fetch_payment_fees.return_value = None
 
@@ -853,6 +976,13 @@ async def test_stale_payment_full_refund_passes_speed_optimum(
     payload["payment"]["entity"]["created_at"] = stale_ts
 
     mock_razorpay = MagicMock()
+    # Razorpay methods migrated to httpx.AsyncClient — mock as AsyncMock.
+    mock_razorpay.refund_payment = AsyncMock()
+    mock_razorpay.find_refund_for_payment = AsyncMock()
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock()
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
     mock_razorpay.refund_payment.return_value = {"id": "rfnd_STALE"}
     mock_razorpay.fetch_payment_fees.return_value = None
 
@@ -875,6 +1005,13 @@ async def test_charger_not_connected_full_refund_passes_speed_optimum(
     payload = _webhook_payload("pay_NOCONN001", "qr_TEST123", 10000)
 
     mock_razorpay = MagicMock()
+    # Razorpay methods migrated to httpx.AsyncClient — mock as AsyncMock.
+    mock_razorpay.refund_payment = AsyncMock()
+    mock_razorpay.find_refund_for_payment = AsyncMock()
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock()
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
     mock_razorpay.refund_payment.return_value = {"id": "rfnd_NOCONN"}
     mock_razorpay.fetch_payment_fees.return_value = None
 
@@ -923,6 +1060,13 @@ async def test_qr_payment_stores_webhook_fee(client, qr_charger, qr_code, qr_tar
     payload = _webhook_payload("pay_FEE001", "qr_TEST123", 10000, fee_paise=0, tax_paise=0)
 
     mock_razorpay = MagicMock()
+    # Razorpay methods migrated to httpx.AsyncClient — mock as AsyncMock.
+    mock_razorpay.refund_payment = AsyncMock()
+    mock_razorpay.find_refund_for_payment = AsyncMock()
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock()
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
     mock_razorpay.refund_payment.return_value = {"id": "rfnd_FEE001"}
 
     with patch("services.qr_payment_service.razorpay_service", mock_razorpay), \
@@ -944,6 +1088,13 @@ async def test_qr_payment_no_fee_in_webhook_uses_fallback(client, qr_charger, qr
     payload = _webhook_payload("pay_NOFEE001", "qr_TEST123", 10000)
 
     mock_razorpay = MagicMock()
+    # Razorpay methods migrated to httpx.AsyncClient — mock as AsyncMock.
+    mock_razorpay.refund_payment = AsyncMock()
+    mock_razorpay.find_refund_for_payment = AsyncMock()
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock()
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
     mock_razorpay.refund_payment.return_value = {"id": "rfnd_NOFEE"}
     mock_razorpay.fetch_payment_fees.return_value = None
 
@@ -1016,6 +1167,13 @@ async def test_ensure_actual_fee_skips_when_webhook_value_already_stored(
     )
 
     mock_razorpay = MagicMock()
+    # Razorpay methods migrated to httpx.AsyncClient — mock as AsyncMock.
+    mock_razorpay.refund_payment = AsyncMock()
+    mock_razorpay.find_refund_for_payment = AsyncMock()
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock()
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
     with patch("services.qr_payment_service.razorpay_service", mock_razorpay):
         await _ensure_actual_fee_captured(qr_payment)
 
@@ -1040,6 +1198,13 @@ async def test_ensure_actual_fee_fetches_from_api_when_unset(client, qr_charger,
     )
 
     mock_razorpay = MagicMock()
+    # Razorpay methods migrated to httpx.AsyncClient — mock as AsyncMock.
+    mock_razorpay.refund_payment = AsyncMock()
+    mock_razorpay.find_refund_for_payment = AsyncMock()
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock()
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
     # Razorpay actually charged ₹2.36 here (a real 2.36% rate, NOT 2%) — must
     # land on the row verbatim, not get coerced to the synthetic value.
     mock_razorpay.fetch_payment_fees.return_value = (Decimal("2.36"), Decimal("0.36"))
@@ -1072,6 +1237,13 @@ async def test_ensure_actual_fee_falls_back_to_synthetic_when_api_silent(
     )
 
     mock_razorpay = MagicMock()
+    # Razorpay methods migrated to httpx.AsyncClient — mock as AsyncMock.
+    mock_razorpay.refund_payment = AsyncMock()
+    mock_razorpay.find_refund_for_payment = AsyncMock()
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock()
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
     mock_razorpay.fetch_payment_fees.return_value = None
 
     with patch("services.qr_payment_service.razorpay_service", mock_razorpay):
@@ -1195,6 +1367,12 @@ async def test_qr_billing_under_budget_is_unchanged(client, qr_charger, qr_code,
     with patch("services.qr_payment_service.redis_manager") as mock_redis:
         mock_redis.delete_qr_session = AsyncMock()
         with patch("services.qr_payment_service.razorpay_service") as mock_rzp:
+            mock_rzp.refund_payment = AsyncMock()
+            mock_rzp.find_refund_for_payment = AsyncMock()
+            mock_rzp.fetch_payment = AsyncMock()
+            mock_rzp.fetch_payment_fees = AsyncMock()
+            mock_rzp.fetch_order = AsyncMock()
+            mock_rzp.create_transfer = AsyncMock()
             mock_rzp.refund_payment.return_value = {"id": "rfnd_test_001"}
             await QRPaymentService.process_qr_session_billing(txn.id)
 
@@ -1228,6 +1406,12 @@ async def test_qr_billing_tiny_positive_balance_is_refunded(client, qr_charger, 
     with patch("services.qr_payment_service.redis_manager") as mock_redis:
         mock_redis.delete_qr_session = AsyncMock()
         with patch("services.qr_payment_service.razorpay_service") as mock_rzp:
+            mock_rzp.refund_payment = AsyncMock()
+            mock_rzp.find_refund_for_payment = AsyncMock()
+            mock_rzp.fetch_payment = AsyncMock()
+            mock_rzp.fetch_payment_fees = AsyncMock()
+            mock_rzp.fetch_order = AsyncMock()
+            mock_rzp.create_transfer = AsyncMock()
             mock_rzp.refund_payment.return_value = {"id": "rfnd_tiny_001"}
             await QRPaymentService.process_qr_session_billing(txn.id)
 
@@ -1310,6 +1494,12 @@ async def test_synthetic_drives_billing_and_invoice_while_actual_lands_on_row(
     )
 
     mock_rzp = MagicMock()
+    mock_rzp.refund_payment = AsyncMock()
+    mock_rzp.find_refund_for_payment = AsyncMock()
+    mock_rzp.fetch_payment = AsyncMock()
+    mock_rzp.fetch_payment_fees = AsyncMock()
+    mock_rzp.fetch_order = AsyncMock()
+    mock_rzp.create_transfer = AsyncMock()
     mock_rzp.refund_payment.return_value = {"id": "rfnd_e2e"}
 
     with patch("services.qr_payment_service.redis_manager") as mock_redis, \

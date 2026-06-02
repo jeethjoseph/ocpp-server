@@ -928,7 +928,7 @@ class ChargePoint(OcppChargePoint):
 
             # Record transaction completed event
             duration_minutes = (transaction.end_time - transaction.start_time).total_seconds() / 60 if transaction.start_time and transaction.end_time else 0
-            await OCPPMetrics.record_transaction_completed(transaction_id, transaction.energy_consumed_kwh, duration_minutes)
+            await OCPPMetrics.record_transaction_completed(transaction_id, float(transaction.energy_consumed_kwh or 0), duration_minutes)
             
             # Process wallet billing asynchronously
             try:

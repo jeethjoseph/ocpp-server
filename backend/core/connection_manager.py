@@ -9,6 +9,7 @@ import datetime
 import json
 import logging
 import os
+import weakref
 from datetime import timedelta
 from typing import Dict, Optional
 
@@ -58,7 +59,11 @@ class ConnectionManager:
 
     def __init__(self):
         self.connected_charge_points: Dict[str, Dict] = {}
-        self._cleanup_locks: Dict[str, asyncio.Lock] = {}
+        # WeakValueDictionary so locks auto-clear when no caller holds them.
+        # A strong local reference inside force_disconnect pins the Lock for
+        # the duration of `async with`; concurrent callers for the same
+        # charge_point_id see the live Lock and serialise correctly.
+        self._cleanup_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = weakref.WeakValueDictionary()
         self._recently_disconnected: Dict[str, datetime.datetime] = {}
         self._cleanup_task: Optional[asyncio.Task] = None
         self._on_disconnect_callbacks: list = []
@@ -107,10 +112,15 @@ class ConnectionManager:
         WebSocketDisconnect (natural client close); on server-initiated paths
         they remain None/"" and the close code emitted on the WS itself is 1001.
         """
-        if charge_point_id not in self._cleanup_locks:
-            self._cleanup_locks[charge_point_id] = asyncio.Lock()
+        # Strong local reference pins the Lock in the WeakValueDictionary
+        # for the duration of `async with` — concurrent callers for this
+        # charge_point_id will see and serialise on the same Lock.
+        lock = self._cleanup_locks.get(charge_point_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._cleanup_locks[charge_point_id] = lock
 
-        async with self._cleanup_locks[charge_point_id]:
+        async with lock:
             logger.info(f"[DISCONNECT] Starting force disconnect for {charge_point_id}: {reason}")
 
             connection_data = self.connected_charge_points.get(charge_point_id)
@@ -153,8 +163,8 @@ class ConnectionManager:
             for cp_id in expired:
                 del self._recently_disconnected[cp_id]
 
-            # 6. Clean up the lock for this connection to prevent memory leak
-            self._cleanup_locks.pop(charge_point_id, None)
+            # The Lock auto-clears from _cleanup_locks (WeakValueDictionary)
+            # once this `async with` exits and no other caller still holds it.
 
             logger.warning(f"[DISCONNECT] Force disconnected {charge_point_id}: {reason}")
 
@@ -264,10 +274,8 @@ class ConnectionManager:
                     logger.warning(f"Cleaning up stale connection: {charge_point_id}")
                     await self.force_disconnect(charge_point_id, f"Stale connection (inactive for {inactive_seconds:.1f}s)")
 
-                # Prune cleanup locks for charge points no longer connected
-                stale_locks = [cp_id for cp_id in self._cleanup_locks if cp_id not in self.connected_charge_points]
-                for cp_id in stale_locks:
-                    del self._cleanup_locks[cp_id]
+                # _cleanup_locks is a WeakValueDictionary — locks auto-clear
+                # when no caller holds a strong reference. No manual prune.
 
                 # Prune expired tombstones
                 expired_tombstones = [cp_id for cp_id, exp in self._recently_disconnected.items() if current_time > exp]

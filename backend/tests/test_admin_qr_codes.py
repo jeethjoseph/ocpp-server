@@ -29,8 +29,9 @@ def _razorpay_mocks(qr_ids):
         {"id": qid, "image_url": f"https://rzp.test/{qid}.png", "short_url": f"https://rzp.test/{qid}"}
         for qid in qr_ids
     ]
-    create = MagicMock(side_effect=create_payloads)
-    close = MagicMock(return_value={"id": "closed", "status": "closed"})
+    # create_qr_code / close_qr_code are async post-migration (issue #03).
+    create = AsyncMock(side_effect=create_payloads)
+    close = AsyncMock(return_value={"id": "closed", "status": "closed"})
     is_configured = MagicMock(return_value=True)
     return create, close, is_configured
 

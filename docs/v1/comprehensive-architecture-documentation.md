@@ -4554,31 +4554,56 @@ CREATE INDEX CONCURRENTLY idx_ocpp_log_charger_time
     ON log(charge_point_id, timestamp DESC);
 ```
 
-#### Connection Pooling Configuration (`backend/tortoise_config.py`)
+#### Connection Pooling & Resilience (`backend/db_ssl.py:get_pool_kwargs`)
+
+The pool kwargs are centralized in `get_pool_kwargs()` and spread into the `credentials`
+dict of both `database.py` (runtime) and `tortoise_config.py` (Aerich). They harden the
+asyncpg pool so an RDS restart/failover self-heals in seconds instead of wedging the
+backend indefinitely. Rationale, the triggering incident, and considered alternatives
+(RDS Proxy / PgBouncer / Pgpool-II) are in **ADR 0010**.
+
 ```python
-TORTOISE_ORM = {
-    "connections": {
-        "default": {
-            "engine": "tortoise.backends.asyncpg",
-            "credentials": {
-                "host": os.getenv("DB_HOST"),
-                "port": os.getenv("DB_PORT", 5432),
-                "user": os.getenv("DB_USER"),
-                "password": os.getenv("DB_PASSWORD"),
-                "database": os.getenv("DB_NAME"),
-                "ssl": "require" if os.getenv("ENVIRONMENT") == "production" else None,
-                # Connection pooling optimization
-                "minsize": 5,
-                "maxsize": 20,
-                "max_queries": 50000,
-                "max_inactive_connection_lifetime": 300,
-                "timeout": 60,
-                "command_timeout": 5
-            }
-        }
+# db_ssl.py
+def get_pool_kwargs(*, for_migrations: bool = False) -> dict:
+    server_settings = {
+        "statement_timeout": os.getenv(
+            "DB_STATEMENT_TIMEOUT_MS", "0" if for_migrations else "30000"),
+        "tcp_keepalives_idle": "60",
+        "tcp_keepalives_interval": "10",
+        "tcp_keepalives_count": "3",
+        "application_name": "ocpp-aerich" if for_migrations else "ocpp-backend",
     }
-}
+    kwargs = {
+        "minsize": int(os.getenv("DB_POOL_MIN_SIZE", "1")),
+        "maxsize": int(os.getenv("DB_POOL_MAX_SIZE", "10")),
+        "max_inactive_connection_lifetime": float(os.getenv("DB_POOL_RECYCLE_SECONDS", "180")),
+        "timeout": float(os.getenv("DB_CONNECT_TIMEOUT", "10")),      # connect timeout
+        "server_settings": server_settings,
+    }
+    if not for_migrations:
+        # Core fix: a query on a half-open socket raises TimeoutError instead of
+        # hanging forever. Omitted for Aerich so long DDL migrations aren't killed.
+        kwargs["command_timeout"] = float(os.getenv("DB_COMMAND_TIMEOUT", "30"))
+    return kwargs
 ```
+
+Tortoise (0.25.x) consumes `minsize`/`maxsize`/`server_settings` and forwards everything
+else (`command_timeout`, `max_inactive_connection_lifetime`, `timeout`, `ssl`) straight to
+`asyncpg.create_pool` as per-connection connect kwargs. All values are env-overridable with
+safe defaults, so no compose/`.env` wiring is required to ship.
+
+Two supporting changes share this concern:
+- `docker-entrypoint.sh` pre-flight `asyncpg.connect` passes `timeout=DB_CONNECT_TIMEOUT`
+  (the 3rd DB-connect site in the SSL contract) so the wait-for-DB loop can't hang on
+  asyncpg's 60s default during an RDS recovery.
+- `services/data_retention_service.py` deletes are batched (`_delete_old_in_batches`,
+  5000 rows/batch) so a large purge stays under `command_timeout`.
+
+> NOTE: this configuration makes RDS restarts *harmless* to the backend; it does not reduce
+> how often they happen. The recurring AWS `recovery` restarts on the single-AZ `db.t4g.micro`
+> staging instance are driven by memory pressure (see ADR 0010) and are addressed separately
+> by right-sizing to `t4g.small` and disabling Performance Insights/Enhanced Monitoring on
+> staging.
 
 ### Backend Performance Optimization
 

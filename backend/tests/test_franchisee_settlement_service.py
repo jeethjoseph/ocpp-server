@@ -384,61 +384,72 @@ async def test_process_settlement_wallet_pg_fee_unchanged(
     )
 
 
-def test_create_transfer_passes_idempotency_header():
-    """Regression test for the bug where X-Transfer-Idempotency was
-    built but dropped before the SDK call."""
-    from services.razorpay_service import RazorpayService
+@pytest.mark.asyncio
+async def test_create_transfer_passes_idempotency_header():
+    """Regression: X-Transfer-Idempotency must reach Razorpay.
 
-    svc = RazorpayService.__new__(RazorpayService)  # bypass __init__
-    svc.client = MagicMock()
-    svc.client.transfer.create.return_value = {"id": "trf_test"}
+    create_transfer was migrated from the sync `razorpay` SDK to
+    `httpx.AsyncClient` (see 02-asyncify-razorpay-background-and-webhook).
+    """
+    svc = _build_razorpay_service()
+    response = _mock_httpx_response({"id": "trf_test"})
+    patch_ctx, mock_client = _patch_httpx_client(response)
 
-    svc.create_transfer(
-        account_id="acc_test",
-        amount_paise=12345,
-        notes={"x": "y"},
-        idempotency_key="idem-abc-123",
-    )
+    with patch_ctx:
+        await svc.create_transfer(
+            account_id="acc_test",
+            amount_paise=12345,
+            notes={"x": "y"},
+            idempotency_key="idem-abc-123",
+        )
 
-    call = svc.client.transfer.create.call_args
-    assert call.kwargs["data"]["account"] == "acc_test"
-    assert call.kwargs["data"]["amount"] == 12345
+    call = mock_client.post.call_args
+    assert call.args[0] == "https://api.razorpay.com/v1/transfers"
+    assert call.kwargs["json"]["account"] == "acc_test"
+    assert call.kwargs["json"]["amount"] == 12345
     assert call.kwargs["headers"] == {"X-Transfer-Idempotency": "idem-abc-123"}
 
 
-def test_create_transfer_omits_headers_when_no_idempotency_key():
-    from services.razorpay_service import RazorpayService
+@pytest.mark.asyncio
+async def test_create_transfer_omits_headers_when_no_idempotency_key():
+    svc = _build_razorpay_service()
+    response = _mock_httpx_response({"id": "trf_test"})
+    patch_ctx, mock_client = _patch_httpx_client(response)
 
-    svc = RazorpayService.__new__(RazorpayService)
-    svc.client = MagicMock()
-    svc.client.transfer.create.return_value = {"id": "trf_test"}
+    with patch_ctx:
+        await svc.create_transfer(
+            account_id="acc_test",
+            amount_paise=100,
+        )
 
-    svc.create_transfer(
-        account_id="acc_test",
-        amount_paise=100,
-    )
-    call = svc.client.transfer.create.call_args
-    assert "headers" not in call.kwargs
+    call = mock_client.post.call_args
+    assert call.kwargs["headers"] is None
 
 
-def test_refund_payment_passes_idempotency_header():
-    """Regression: X-Refund-Idempotency must reach Razorpay."""
-    from services.razorpay_service import RazorpayService
+@pytest.mark.asyncio
+async def test_refund_payment_passes_idempotency_header():
+    """Regression: X-Refund-Idempotency must reach Razorpay.
 
-    svc = RazorpayService.__new__(RazorpayService)
-    svc.client = MagicMock()
-    svc.client.payment.refund.return_value = {"id": "rfnd_test"}
+    refund_payment was migrated from the sync `razorpay` SDK to
+    `httpx.AsyncClient` (see 01-asyncify-razorpay-refund-hot-path) — this
+    test verifies the header still rides on the POST.
+    """
+    svc = _build_razorpay_service()
+    response = _mock_httpx_response({"id": "rfnd_test", "speed_processed": "normal"})
+    patch_ctx, mock_client = _patch_httpx_client(response)
 
-    svc.refund_payment(
-        payment_id="pay_test",
-        amount=Decimal("100.00"),
-        idempotency_key="qr_payment_42",
-    )
+    with patch_ctx:
+        result = await svc.refund_payment(
+            payment_id="pay_test",
+            amount=Decimal("100.00"),
+            idempotency_key="qr_payment_42",
+        )
 
-    call = svc.client.payment.refund.call_args
-    # Positional args: (payment_id, data)
-    assert call.args[0] == "pay_test"
-    assert call.args[1]["amount"] == 10000  # rupees → paise
+    assert result == {"id": "rfnd_test", "speed_processed": "normal"}
+    call = mock_client.post.call_args
+    # Positional: URL; kwargs: json body, headers, auth
+    assert call.args[0] == "https://api.razorpay.com/v1/payments/pay_test/refund"
+    assert call.kwargs["json"]["amount"] == 10000  # rupees → paise
     assert call.kwargs["headers"] == {"X-Refund-Idempotency": "qr_payment_42"}
 
 

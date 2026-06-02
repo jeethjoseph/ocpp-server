@@ -135,7 +135,7 @@ async def create_recharge_order(
         receipt_id = f"wallet_recharge_{current_user.id}_{int(datetime.now(tz=timezone.utc).timestamp())}"
 
         # Create Razorpay order
-        order = razorpay_service.create_order(
+        order = await razorpay_service.create_order(
             amount=amount,
             currency="INR",
             receipt=receipt_id,

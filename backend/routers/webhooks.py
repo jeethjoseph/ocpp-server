@@ -590,7 +590,7 @@ async def handle_order_paid(event_data: dict):
         # Get payment details from Razorpay to find payment_id
         payment_id = None
         try:
-            order_details = razorpay_service.fetch_order(order_id)
+            order_details = await razorpay_service.fetch_order(order_id)
             if order_details:
                 # Get payments for this order
                 # Note: This is a simplified version, you might need to fetch payments separately

@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 from tortoise import Tortoise
 from tortoise.contrib.fastapi import register_tortoise
 
-from db_ssl import get_ssl_config
+from db_ssl import get_ssl_config, get_pool_kwargs
 
 load_dotenv()
 
@@ -27,6 +27,7 @@ TORTOISE_ORM = {
                 "password": os.environ.get("DB_PASSWORD"),
                 "database": os.environ.get("DB_NAME"),
                 "ssl": ssl_config,  # Environment-aware SSL
+                **get_pool_kwargs(),  # Pool resilience (timeouts + idle recycle)
             }
         }
     },

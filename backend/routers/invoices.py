@@ -5,6 +5,7 @@ Admin endpoints additionally support a summary aggregate and a streaming CSV
 export for GSTR-1 reconciliation.
 """
 
+import asyncio
 import csv
 import io
 import logging
@@ -429,18 +430,18 @@ async def serve_invoice_pdf(invoice_id: int):
                 invoice.id, invoice.pdf_url, e,
             )
             MetricsCollector.increment_counter("Custom/Invoice/PdfDownload/InlineFallback")
-            return _stream_pdf_inline(invoice)
+            return await _stream_pdf_inline(invoice)
 
     # Not uploaded yet — generate, try to upload, then either redirect or
     # stream inline if S3 is unavailable.
     pdf_gen_start = time.perf_counter()
-    pdf_bytes = InvoiceService.generate_pdf(invoice)
+    pdf_bytes = await asyncio.to_thread(InvoiceService.generate_pdf, invoice)
     MetricsCollector.record_metric(
         "Custom/Invoice/PdfGeneration/DurationMs",
         (time.perf_counter() - pdf_gen_start) * 1000.0,
     )
     try:
-        key = s3_service.upload_invoice_pdf(invoice, pdf_bytes)
+        key = await asyncio.to_thread(s3_service.upload_invoice_pdf, invoice, pdf_bytes)
         invoice.pdf_url = key
         await invoice.save(update_fields=["pdf_url"])
         presigned = s3_service.generate_presigned_url(key)
@@ -453,15 +454,16 @@ async def serve_invoice_pdf(invoice_id: int):
         )
         MetricsCollector.increment_counter("Custom/S3/InvoiceUpload/Failed")
         MetricsCollector.increment_counter("Custom/Invoice/PdfDownload/InlineFallback")
-        return _stream_pdf_inline(invoice, pdf_bytes=pdf_bytes)
+        return await _stream_pdf_inline(invoice, pdf_bytes=pdf_bytes)
 
 
-def _stream_pdf_inline(invoice: GSTInvoice, pdf_bytes: bytes = None):
+async def _stream_pdf_inline(invoice: GSTInvoice, pdf_bytes: bytes = None):
     """Stream a freshly-generated PDF as the response body. Used as the
-    fallback when S3 is unavailable."""
+    fallback when S3 is unavailable. PDF generation runs in a worker thread
+    so the event loop stays responsive."""
     import io
     if pdf_bytes is None:
-        pdf_bytes = InvoiceService.generate_pdf(invoice)
+        pdf_bytes = await asyncio.to_thread(InvoiceService.generate_pdf, invoice)
     safe_number = invoice.invoice_number.replace("/", "_")
     return StreamingResponse(
         io.BytesIO(pdf_bytes),

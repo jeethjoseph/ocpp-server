@@ -1,4 +1,5 @@
 # routers/firmware.py
+import asyncio
 from typing import List, Optional
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends, Request
 from pydantic import BaseModel
@@ -156,7 +157,7 @@ async def upload_firmware(
         # download location until the device-side parser is patched.
         if os.getenv("AWS_S3_FIRMWARE_BUCKET"):
             s3_key = storage_service.build_firmware_s3_key(version, safe_filename)
-            storage_service.upload_firmware_to_s3(s3_key, file_content)
+            await asyncio.to_thread(storage_service.upload_firmware_to_s3, s3_key, file_content)
             file_path = ""
             storage_backend = "s3"
         else:

@@ -603,6 +603,19 @@ Single `get_ssl_config()` helper drives all three DB-connect call sites — runt
 
 The AWS RDS global CA bundle is baked into the backend image at `/etc/ssl/rds-ca-bundle.pem` during `docker build` — no code or compose change when adding a new RDS instance, only `DB_HOST` + `DB_SSL_MODE` in the env file.
 
+### Connection pool resilience (`backend/db_ssl.py:get_pool_kwargs`)
+
+`get_pool_kwargs(for_migrations=False)` returns asyncpg pool kwargs spread into the `credentials` dict of both `database.py` (runtime) and `tortoise_config.py` (Aerich). It hardens the pool against RDS restarts/failovers so the backend self-heals instead of wedging. Added 2026-06-02 after a staging incident — see **ADR 0010**.
+
+- `command_timeout=30` (app only) — the core fix: a query on a half-open socket raises `TimeoutError` instead of hanging forever (asyncpg has no client-side keepalive knob). Aerich path omits it so long DDL isn't killed.
+- `max_inactive_connection_lifetime=180` — recycle idle connections so post-restart stale ones are dropped.
+- `timeout=10` — bounded connect; `server_settings.statement_timeout=30000` (app; `0`/disabled for migrations); `tcp_keepalives_*` so the server reclaims dead-backend connections in ~90s.
+- All env-overridable (`DB_COMMAND_TIMEOUT`, `DB_POOL_RECYCLE_SECONDS`, `DB_CONNECT_TIMEOUT`, `DB_POOL_MIN_SIZE`, `DB_POOL_MAX_SIZE`, `DB_STATEMENT_TIMEOUT_MS`) with safe defaults — no compose/`.env` wiring required.
+
+**Why it was needed**: the single-AZ `db.t4g.micro` staging instance is memory-starved (1 GiB; chronic low free memory, swap creeping ~150 MB/day) and gets **AWS-`recovery`-restarted ~daily** (not a user/API action — absent from CloudTrail). Each restart left the pool with half-open `ESTAB` sockets; with no `command_timeout`, the first query on one hung forever → loop looked "idle" in `py-spy` (suspended coroutines aren't on any thread stack), DB sat idle, `/health` stayed `200` while DB-backed endpoints `504`'d. Symptom signature + diagnostic recipe live in the auto-memory note `rds-reboot-stale-asyncpg-pool`.
+
+Pool resilience makes the reboots *harmless*; it does **not** reduce their frequency — that needs right-sizing to `t4g.small` (prod is already `t4g.small`) + disabling Performance Insights/Enhanced Monitoring on staging. Supporting changes: `docker-entrypoint.sh` pre-flight `asyncpg.connect` now passes `timeout=DB_CONNECT_TIMEOUT` (the 3rd connect site); `data_retention_service` deletes are batched (`_delete_old_in_batches`, 5000/batch) to stay under `command_timeout`.
+
 ### Cutover learnings (feedback memory + applied to prod)
 
 The prod cutover ran in 4 minutes because the staging cutover learnings were already absorbed:

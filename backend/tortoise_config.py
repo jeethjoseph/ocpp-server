@@ -1,7 +1,7 @@
 import os
 from dotenv import load_dotenv
 
-from db_ssl import get_ssl_config
+from db_ssl import get_ssl_config, get_pool_kwargs
 
 load_dotenv()
 
@@ -24,6 +24,7 @@ TORTOISE_ORM = {
                 "password": os.getenv("DB_PASSWORD"),
                 "database": os.getenv("DB_NAME"),
                 "ssl": ssl_config,  # Environment-aware SSL
+                **get_pool_kwargs(for_migrations=True),  # No command/statement timeout for long DDL
             }
         }
     },

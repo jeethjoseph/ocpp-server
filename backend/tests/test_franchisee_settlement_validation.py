@@ -176,7 +176,7 @@ async def test_initiate_transfer_uses_payment_endpoint_for_qr(
         mock_rzp.create_payment_transfer = AsyncMock(
             return_value={"id": "trf_via_payment", "fees": 2, "tax": 0}
         )
-        mock_rzp.create_transfer = MagicMock(
+        mock_rzp.create_transfer = AsyncMock(
             return_value={"id": "trf_direct"}
         )
 
@@ -186,7 +186,7 @@ async def test_initiate_transfer_uses_payment_endpoint_for_qr(
 
     assert ok is True
     mock_rzp.create_payment_transfer.assert_awaited_once()
-    mock_rzp.create_transfer.assert_not_called()
+    mock_rzp.create_transfer.assert_not_awaited()
     call_kwargs = mock_rzp.create_payment_transfer.await_args.kwargs
     assert call_kwargs["payment_id"] == "pay_qr_test"
     assert call_kwargs["account_id"] == test_franchisee.razorpay_account_id
@@ -216,7 +216,7 @@ async def test_initiate_transfer_uses_direct_endpoint_for_wallet(
         mock_rzp.create_payment_transfer = AsyncMock(
             return_value={"id": "trf_via_payment"}
         )
-        mock_rzp.create_transfer = MagicMock(
+        mock_rzp.create_transfer = AsyncMock(
             return_value={"id": "trf_direct"}
         )
 
@@ -225,7 +225,7 @@ async def test_initiate_transfer_uses_direct_endpoint_for_wallet(
         )
 
     assert ok is True
-    mock_rzp.create_transfer.assert_called_once()
+    mock_rzp.create_transfer.assert_awaited_once()
     mock_rzp.create_payment_transfer.assert_not_awaited()
 
     refreshed = await CommissionLedgerEntry.get(id=test_commission_ledger_entry.id)
@@ -248,7 +248,7 @@ async def test_initiate_transfer_holds_wallet_when_flag_disabled(
     ), patch("services.razorpay_service.razorpay_service") as mock_rzp:
         mock_rzp.is_route_enabled.return_value = True
         mock_rzp.create_payment_transfer = AsyncMock()
-        mock_rzp.create_transfer = MagicMock()
+        mock_rzp.create_transfer = AsyncMock()
 
         ok = await FranchiseeSettlementService.initiate_transfer(
             test_commission_ledger_entry
@@ -256,7 +256,7 @@ async def test_initiate_transfer_holds_wallet_when_flag_disabled(
 
     assert ok is False
     mock_rzp.create_payment_transfer.assert_not_awaited()
-    mock_rzp.create_transfer.assert_not_called()
+    mock_rzp.create_transfer.assert_not_awaited()
 
     refreshed = await CommissionLedgerEntry.get(id=test_commission_ledger_entry.id)
     assert refreshed.settlement_status == SettlementStatusEnum.ON_HOLD

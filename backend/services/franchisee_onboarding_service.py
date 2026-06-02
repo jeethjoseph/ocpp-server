@@ -413,7 +413,7 @@ class FranchiseeOnboardingService:
         if not franchisee or not franchisee.razorpay_account_id:
             raise ValueError("No Razorpay account linked")
 
-        account = razorpay_service.fetch_linked_account(
+        account = await razorpay_service.fetch_linked_account(
             franchisee.razorpay_account_id
         )
 
@@ -773,7 +773,7 @@ class FranchiseeOnboardingService:
             franchisee_id
         )
         await FranchiseeOnboardingService.submit_bank_details(franchisee_id)
-        final = razorpay_service.fetch_product_configuration(
+        final = await razorpay_service.fetch_product_configuration(
             franchisee.razorpay_account_id, product_id
         )
         # Belt-and-braces: submit_bank_details already promotes on its own
@@ -823,7 +823,7 @@ class FranchiseeOnboardingService:
             # faithfully. Cheap GET; skip on failure.
             from services.razorpay_service import razorpay_service
             try:
-                remote = razorpay_service.fetch_stakeholder(
+                remote = await razorpay_service.fetch_stakeholder(
                     franchisee.razorpay_account_id, sid
                 )
             except Exception as e:

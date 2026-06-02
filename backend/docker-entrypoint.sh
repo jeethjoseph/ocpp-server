@@ -51,7 +51,12 @@ async def check_db():
             user=os.getenv('DB_USER'),
             password=os.getenv('DB_PASSWORD'),
             database=os.getenv('DB_NAME'),
-            ssl=get_ssl_config()
+            ssl=get_ssl_config(),
+            # Bound each attempt so a reachable-but-unresponsive DB (e.g. during
+            # an RDS recovery) fails fast and the retry loop stays predictable,
+            # instead of hanging on asyncpg's 60s default. Matches the pool's
+            # DB_CONNECT_TIMEOUT (see db_ssl.get_pool_kwargs).
+            timeout=float(os.getenv('DB_CONNECT_TIMEOUT', '10'))
         )
         await conn.close()
         return True

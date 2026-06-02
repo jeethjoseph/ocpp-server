@@ -39,12 +39,12 @@ async def _resolve_qr_franchisee(charger: Charger) -> Optional[Franchisee]:
     return station.franchisee
 
 
-def _close_orphan_razorpay_qr(qr_code_id: str) -> None:
+async def _close_orphan_razorpay_qr(qr_code_id: str) -> None:
     """Best-effort close of a Razorpay QR whose local row failed to persist.
     Swallows close-side errors after logging so the caller can re-raise the
     original DB exception unmasked."""
     try:
-        razorpay_service.close_qr_code(qr_code_id, account_id=None)
+        await razorpay_service.close_qr_code(qr_code_id, account_id=None)
     except Exception as close_exc:
         logger.warning(
             "Failed to close orphan Razorpay QR %s after local insert failure: %s",
@@ -60,7 +60,7 @@ async def _create_qr_for_charger(charger: Charger) -> dict:
     business_name = franchisee.business_name if franchisee else None
     charger_name = charger.name or charger.charge_point_string_id
 
-    result = razorpay_service.create_qr_code(
+    result = await razorpay_service.create_qr_code(
         payee_name=build_qr_payee_name(business_name, charger_name),
         description=build_qr_description(business_name, charger_name),
         account_id=None,
@@ -76,7 +76,7 @@ async def _create_qr_for_charger(charger: Charger) -> dict:
             owner_razorpay_account_id=None,
         )
     except Exception:
-        _close_orphan_razorpay_qr(result["id"])
+        await _close_orphan_razorpay_qr(result["id"])
         raise
 
     return {
@@ -143,7 +143,7 @@ async def regenerate_qr_code(qr_id: int, admin_user=Depends(require_admin())):
     # be closed; proceed to create the replacement regardless).
     if qr.is_active:
         try:
-            razorpay_service.close_qr_code(
+            await razorpay_service.close_qr_code(
                 qr.razorpay_qr_code_id,
                 account_id=qr.owner_razorpay_account_id,
             )
@@ -281,7 +281,7 @@ async def close_qr_code(qr_id: int, admin_user=Depends(require_admin())):
         raise HTTPException(status_code=400, detail="QR code already inactive")
 
     try:
-        razorpay_service.close_qr_code(
+        await razorpay_service.close_qr_code(
             qr.razorpay_qr_code_id,
             account_id=qr.owner_razorpay_account_id,
         )

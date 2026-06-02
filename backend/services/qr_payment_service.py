@@ -61,7 +61,7 @@ async def _ensure_actual_fee_captured(qr_payment: QRPayment) -> None:
     if qr_payment.fee_source in ("webhook", "api") and qr_payment.platform_fee is not None:
         return
 
-    fee_data = razorpay_service.fetch_payment_fees(qr_payment.razorpay_payment_id)
+    fee_data = await razorpay_service.fetch_payment_fees(qr_payment.razorpay_payment_id)
     if fee_data:
         total_fee, tax = fee_data
         qr_payment.platform_fee = total_fee
@@ -817,7 +817,7 @@ class QRPaymentService:
         if refund > 0:
             qr_payment.refund_amount = refund
             try:
-                refund_result = razorpay_service.refund_payment(
+                refund_result = await razorpay_service.refund_payment(
                     qr_payment.razorpay_payment_id,
                     amount=refund,
                     notes={"transaction_id": str(transaction_id), "reason": "Unused charging credit refund"},
@@ -922,7 +922,7 @@ class QRPaymentService:
             refund_speed = "optimum" if instant_enabled else None
 
             try:
-                refund_result = razorpay_service.refund_payment(
+                refund_result = await razorpay_service.refund_payment(
                     locked.razorpay_payment_id,
                     amount=refund_amount,
                     notes={"reason": reason, "qr_payment_id": str(locked.id)},
@@ -944,7 +944,7 @@ class QRPaymentService:
                         locked.charger_id, locked.id, speed_processed,
                     )
             except RazorpayAlreadyRefundedError as e:
-                existing = razorpay_service.find_refund_for_payment(locked.razorpay_payment_id)
+                existing = await razorpay_service.find_refund_for_payment(locked.razorpay_payment_id)
                 if existing and existing.get("id"):
                     locked.razorpay_refund_id = existing["id"]
                     existing_speed = existing.get("speed_processed")

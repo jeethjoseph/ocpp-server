@@ -133,7 +133,7 @@ class BillingRetryService:
                     logger.warning(f"QR payment {qr_payment.id} has no refund_amount, skipping")
                     continue
 
-                refund_result = razorpay_service.refund_payment(
+                refund_result = await razorpay_service.refund_payment(
                     qr_payment.razorpay_payment_id,
                     amount=refund_amount,
                     notes={"qr_payment_id": str(qr_payment.id), "reason": "Retry: " + (qr_payment.failure_reason or "unknown")},

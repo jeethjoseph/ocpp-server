@@ -48,3 +48,46 @@ def get_ssl_config():
     # No DB_SSL_MODE set — preserve the legacy fallback so existing
     # local-dev and pre-migration staging keep working.
     return "disable" if is_local else "require"
+
+
+def get_pool_kwargs(*, for_migrations: bool = False) -> dict:
+    """asyncpg pool-resilience kwargs, passed via Tortoise's ``credentials`` dict.
+
+    Tortoise consumes ``minsize``/``maxsize``/``server_settings`` and forwards
+    everything else to ``asyncpg.create_pool`` (as per-connection connect kwargs).
+
+    These guard the RDS-restart stale-pool wedge: after the DB restarts/fails
+    over, the pool can keep half-open sockets, and with no timeout a query on
+    one hangs forever (TCP keepalive won't fire for ~2h). ``command_timeout``
+    turns that hang into a fast error; idle connections are recycled so stale
+    ones are dropped.
+    """
+    server_settings = {
+        # Server-side cancel of runaway queries (ms; 0 = disabled for migrations
+        # which legitimately run long DDL).
+        "statement_timeout": os.getenv(
+            "DB_STATEMENT_TIMEOUT_MS", "0" if for_migrations else "30000"
+        ),
+        # Server-side TCP keepalive: reclaim connections from a dead backend in
+        # ~90s instead of the ~2h OS default.
+        "tcp_keepalives_idle": "60",
+        "tcp_keepalives_interval": "10",
+        "tcp_keepalives_count": "3",
+        "application_name": "ocpp-aerich" if for_migrations else "ocpp-backend",
+    }
+    kwargs = {
+        "minsize": int(os.getenv("DB_POOL_MIN_SIZE", "1")),
+        "maxsize": int(os.getenv("DB_POOL_MAX_SIZE", "10")),
+        # Recycle idle connections so a post-restart stale one is dropped, not reused.
+        "max_inactive_connection_lifetime": float(
+            os.getenv("DB_POOL_RECYCLE_SECONDS", "180")
+        ),
+        # Bound connection establishment so a dead/blocked DB fails fast.
+        "timeout": float(os.getenv("DB_CONNECT_TIMEOUT", "10")),
+        "server_settings": server_settings,
+    }
+    if not for_migrations:
+        # The core fix: per-query client-side timeout. A query on a half-open
+        # socket raises asyncio.TimeoutError instead of hanging indefinitely.
+        kwargs["command_timeout"] = float(os.getenv("DB_COMMAND_TIMEOUT", "30"))
+    return kwargs

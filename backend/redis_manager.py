@@ -16,7 +16,19 @@ class RedisConnectionManager:
         """Initialize Redis connection"""
         try:
             redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
-            self.redis_client = redis.from_url(redis_url, decode_responses=True)
+            # Explicit timeouts so a half-dead TCP connection doesn't block
+            # awaits indefinitely (Linux default TCP keepalive is ~2h).
+            # health_check_interval periodically pings to detect dead conns
+            # before a real call hits one. retry_on_timeout retries a single
+            # transient timeout before raising.
+            self.redis_client = redis.from_url(
+                redis_url,
+                decode_responses=True,
+                socket_timeout=5,
+                socket_connect_timeout=2,
+                health_check_interval=30,
+                retry_on_timeout=True,
+            )
             # Test connection
             await self.redis_client.ping()
             logger.info("Connected to Redis successfully")

@@ -538,7 +538,7 @@ async def _create_franchisee_qr(
     business_name = franchisee.business_name
     charger_name = charger.name or charger.charge_point_string_id
 
-    result = razorpay_service.create_qr_code(
+    result = await razorpay_service.create_qr_code(
         payee_name=build_qr_payee_name(business_name, charger_name),
         description=build_qr_description(business_name, charger_name),
         account_id=None,
@@ -655,7 +655,7 @@ async def regenerate_portal_qr_code(
 
     if qr.is_active:
         try:
-            razorpay_service.close_qr_code(
+            await razorpay_service.close_qr_code(
                 qr.razorpay_qr_code_id,
                 account_id=qr.owner_razorpay_account_id,
             )
@@ -702,7 +702,7 @@ async def close_portal_qr_code(
         raise HTTPException(status_code=400, detail="QR code already inactive")
 
     try:
-        razorpay_service.close_qr_code(
+        await razorpay_service.close_qr_code(
             qr.razorpay_qr_code_id,
             account_id=qr.owner_razorpay_account_id,
         )
