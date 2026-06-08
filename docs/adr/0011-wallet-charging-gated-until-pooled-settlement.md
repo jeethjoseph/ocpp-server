@@ -45,6 +45,12 @@ correctly), until the ledger and Direct Transfer are in place.
 3. **Wallet top-up order endpoint** (`wallet_payments` router): returns 403 when
    off.
 
+The gate applies only to wallet-funded **customer** sessions. **Internal-role
+(ADMIN/FRANCHISEE) sessions are exempt** — they are operational and decoupled
+from wallets (ADR 0004), so `remote_start_charging` skips the 403 when
+`user.role in INTERNAL_ROLES`. Admins/franchisees can still start sessions while
+the gate is off.
+
 Everything downstream stays on: wallet billing at StopTransaction, budget-cap
 auto-stop, balance reads, admin wallet pages, and **all** QR flows. Wallet
 sessions already running at flip time complete and settle normally (a small,

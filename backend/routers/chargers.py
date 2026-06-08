@@ -8,6 +8,7 @@ import uuid
 import logging
 
 from core.config import RAZORPAY_PLATFORM_FEE_PERCENT, wallet_charging_enabled
+from core.roles import INTERNAL_ROLES
 from models import Charger, ChargingStation, Connector, Transaction, OCPPLog, User, ChargerError, Tariff
 from tortoise.exceptions import IntegrityError
 from tortoise.transactions import in_transaction
@@ -588,9 +589,10 @@ async def delete_charger(charger_id: int, admin_user: User = Depends(require_adm
 async def remote_start_charging(charger_id: int, connector_id: int = 1, user: User = Depends(require_user_or_admin())):
     """Start charging remotely"""
 
-    # Wallet charging is gated off until pooled multi-franchisee settlement
-    # exists — see ADR 0011. Remote start is the wallet-session entry point.
-    if not wallet_charging_enabled():
+    # Wallet gate (ADR 0011) applies only to wallet-funded customer sessions.
+    # Internal-role (ADMIN/FRANCHISEE) sessions are operational and decoupled
+    # from wallets (ADR 0004), so they are never gated.
+    if not wallet_charging_enabled() and user.role not in INTERNAL_ROLES:
         raise HTTPException(status_code=403, detail="Wallet charging is temporarily disabled")
 
     # Use the user's RFID card ID as idTag for OCPP identification
