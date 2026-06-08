@@ -20,15 +20,38 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
+  // Absolute base for og:image — scrapers (WhatsApp/Slack/iMessage) can't
+  // resolve relative URLs. Driven off the per-env app URL build arg.
+  metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL || "https://app.voltlync.com"),
   title: "voltNOW EV Charging",
   description: "EV Charging Station Management System",
   icons: {
-    // Single brand mark for all schemes: the dark/black badge. No light/dark
-    // swap — the black ellipse with white arrow + green bars reads on both
-    // light and dark tab bars.
-    icon: "/favicon.png",
+    // Theme-aware tab icon, swapped by OS color scheme (the only mechanism
+    // browser tabs support). Scheme-named: the LIGHT scheme (white tab bar)
+    // gets the dark/black badge; the DARK scheme gets the light-grey badge.
+    icon: [
+      { url: "/favicon-light.png", media: "(prefers-color-scheme: light)", type: "image/png" },
+      { url: "/favicon-dark.png", media: "(prefers-color-scheme: dark)", type: "image/png" },
+    ],
     shortcut: "/favicon.ico",
     apple: "/apple-icon.png",
+  },
+  // Link-share preview (the WhatsApp/Slack card). A real 1200×630 og:image,
+  // not an icon fallback — black card + light wordmark.
+  openGraph: {
+    type: "website",
+    siteName: "voltNOW",
+    title: "voltNOW EV Charging",
+    description: "EV Charging Station Management System",
+    images: [
+      { url: "/og-image.png", width: 1200, height: 630, alt: "voltNOW EV Charging" },
+    ],
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "voltNOW EV Charging",
+    description: "EV Charging Station Management System",
+    images: ["/og-image.png"],
   },
 };
 
