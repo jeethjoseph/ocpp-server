@@ -22,6 +22,17 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "voltNOW EV Charging",
   description: "EV Charging Station Management System",
+  icons: {
+    // Scheme-named for the media query: the LIGHT color-scheme (white tab bar)
+    // gets the dark/black badge; the DARK scheme gets the light-grey badge.
+    // This follows the OS preference — the only mechanism browser tabs support.
+    icon: [
+      { url: "/favicon-light.png", media: "(prefers-color-scheme: light)", type: "image/png" },
+      { url: "/favicon-dark.png", media: "(prefers-color-scheme: dark)", type: "image/png" },
+    ],
+    shortcut: "/favicon.ico",
+    apple: "/apple-icon.png",
+  },
 };
 
 export default function RootLayout({
