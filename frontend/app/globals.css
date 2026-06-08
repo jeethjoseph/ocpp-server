@@ -1,7 +1,11 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 
-@custom-variant dark (&:is(.dark *));
+/* The theme is applied via `data-theme="dark"` on <html> (see ThemeContext);
+   the `.dark *` form is kept for any legacy class-based usage. Without the
+   data-theme selector here, every `dark:` utility silently no-ops even though
+   the CSS-variable theming below still darkens the page. */
+@custom-variant dark (&:is([data-theme="dark"] *, .dark *));
 
 :root {
   --card: oklch(1 0 0);
