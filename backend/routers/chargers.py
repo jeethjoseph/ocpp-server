@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import uuid
 import logging
 
-from core.config import RAZORPAY_PLATFORM_FEE_PERCENT
+from core.config import RAZORPAY_PLATFORM_FEE_PERCENT, wallet_charging_enabled
 from models import Charger, ChargingStation, Connector, Transaction, OCPPLog, User, ChargerError, Tariff
 from tortoise.exceptions import IntegrityError
 from tortoise.transactions import in_transaction
@@ -587,7 +587,12 @@ async def delete_charger(charger_id: int, admin_user: User = Depends(require_adm
 @router.post("/{charger_id}/remote-start", response_model=dict)
 async def remote_start_charging(charger_id: int, connector_id: int = 1, user: User = Depends(require_user_or_admin())):
     """Start charging remotely"""
-    
+
+    # Wallet charging is gated off until pooled multi-franchisee settlement
+    # exists — see ADR 0011. Remote start is the wallet-session entry point.
+    if not wallet_charging_enabled():
+        raise HTTPException(status_code=403, detail="Wallet charging is temporarily disabled")
+
     # Use the user's RFID card ID as idTag for OCPP identification
     if not user.rfid_card_id:
         raise HTTPException(status_code=409, detail="User does not have an RFID card ID assigned")

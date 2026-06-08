@@ -29,6 +29,7 @@ import {
 } from "@/lib/queries/transactions";
 import { toast } from "sonner";
 import { isSocketCharger as checkSocketCharger } from "@/lib/utils";
+import { walletChargingEnabled } from "@/lib/feature-flags";
 
 export default function UserChargePage() {
   const params = useParams();
@@ -166,7 +167,10 @@ export default function UserChargePage() {
     }
   };
 
-  const walletDisabled = !!station?.wallet_payment_disabled;
+  // Wallet charging is gated off globally until pooled multi-franchisee
+  // settlement exists (ADR 0011). Folds into the existing per-station disable so
+  // the same "scan the QR code instead" messaging and disabled state apply.
+  const walletDisabled = !!station?.wallet_payment_disabled || !walletChargingEnabled();
 
   const canStartCharging = () => {
     const statusReady = charger?.latest_status === "Preparing" ||

@@ -1766,6 +1766,15 @@ async def startup_event():
     else:
         logger.info("ℹ️ Razorpay Instant Refunds: DISABLED (normal speed, 5–7 working days)")
 
+    # ADR 0011 gate — wallet charging is paused until pooled multi-franchisee
+    # settlement exists. Warn loudly when disabled so a misconfigured deploy
+    # (or a forgotten re-enable) is visible in the logs.
+    from core.config import wallet_charging_enabled
+    if wallet_charging_enabled():
+        logger.info("✅ Wallet Charging: ENABLED")
+    else:
+        logger.warning("⚠️ Wallet Charging: DISABLED — new wallet sessions & top-ups blocked (ADR 0011)")
+
 @app.on_event("shutdown")
 async def shutdown_event():
     """Close database and Redis connections on shutdown"""

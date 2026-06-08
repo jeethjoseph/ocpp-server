@@ -17,6 +17,18 @@ from decimal import Decimal
 RAZORPAY_PLATFORM_FEE_PERCENT = Decimal(os.getenv("RAZORPAY_PLATFORM_FEE_PERCENT", "2.0"))
 
 
+# Wallet charging gate — see ADR 0011. When false, NEW wallet sessions and
+# top-ups are blocked: the two remote-start endpoints and the recharge endpoint
+# return 403, so no unsettleable franchisee liability accrues while pooled
+# multi-franchisee settlement is unbuilt. The backend flag is the source of
+# truth (the frontend flag is cosmetic). Read at call time so a container
+# restart toggles it with no rebuild. Default true so dev/existing envs are
+# unaffected; only staging/prod set it false.
+def wallet_charging_enabled() -> bool:
+    """Whether new wallet sessions and top-ups are permitted. See ADR 0011."""
+    return os.getenv("WALLET_CHARGING_ENABLED", "true").lower() == "true"
+
+
 # Sanity bounds for RAZORPAY_PLATFORM_FEE_PERCENT (issue 03 / L2).
 #
 # Real-world Razorpay rates are 0–2% for UPI and up to ~3% for cards. Values

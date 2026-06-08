@@ -74,6 +74,9 @@ services:
       # minutes; VoltLync absorbs Razorpay's per-refund instant fee.
       # Flip to false to revert to normal speed (5–7 working days, free).
       - RAZORPAY_INSTANT_REFUND_ENABLED=${RAZORPAY_INSTANT_REFUND_ENABLED:-true}
+      # Wallet charging gate (ADR 0011). Default true. Set false to block new
+      # wallet sessions & top-ups until pooled multi-franchisee settlement exists.
+      - WALLET_CHARGING_ENABLED=${WALLET_CHARGING_ENABLED:-true}
       # VoltLync GST supplier identity (printed on every invoice)
       - VOLTLYNC_BUSINESS_NAME=${VOLTLYNC_BUSINESS_NAME:-VOLTLYNC PRIVATE LIMITED}
       - VOLTLYNC_GSTIN=${VOLTLYNC_GSTIN:-}
