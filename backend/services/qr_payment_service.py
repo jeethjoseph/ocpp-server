@@ -30,6 +30,7 @@ from services.razorpay_service import (
     razorpay_service,
     RazorpayAlreadyRefundedError,
     RazorpayRefundBelowMinimumError,
+    RazorpayIdempotencyConflictError,
     extract_fee_from_payment,
 )
 from services.tariff_utils import synthetic_platform_fee, synthetic_fee_split
@@ -47,6 +48,72 @@ logger = logging.getLogger(__name__)
 QR_PAYMENT_PENDING_TIMEOUT = int(os.getenv("QR_PAYMENT_PENDING_TIMEOUT", "300"))
 
 SYSTEM_GUEST_EMAIL = "guest@system.powerlync.com"
+
+# Canonical, non-retryable failure_reason for a refund that hit a Razorpay
+# idempotency conflict (HTTP 409) AND had no existing refund to reconcile to.
+# The BillingRetryService sweep excludes this marker — a same-key retry can
+# never clear the conflict, so hammering it just generates noise.
+IDEMPOTENCY_CONFLICT_NO_REFUND = "idempotency_conflict_no_refund"
+
+# Canonical failure_reason for a refund below Razorpay's ₹1.00 floor. Permanent
+# (the floor will not change). Older rows predate this marker and carry the
+# long-form RazorpayRefundBelowMinimumError text instead — both are matched by
+# is_retryable_refund_failure() so neither is ever retried.
+BELOW_MINIMUM_REASON = "below_razorpay_minimum"
+
+
+def is_retryable_refund_failure(failure_reason: Optional[str]) -> bool:
+    """Whether a REFUND_FAILED row is worth another BillingRetryService attempt.
+
+    Permanently-stuck reasons return False so the sweep stops hammering them:
+      - below Razorpay's ₹1 floor — canonical marker OR legacy long-form text
+        ("... below Razorpay minimum (₹1.00) ...")
+      - an idempotency conflict with no existing refund to reconcile to
+    Everything else (transient API/network errors, empty reason) is retryable.
+    Substring-based, not exact-match, so legacy/variant wording is still caught.
+    """
+    if not failure_reason:
+        return True
+    fr = failure_reason.lower()
+    if fr == IDEMPOTENCY_CONFLICT_NO_REFUND:
+        return False
+    if fr == BELOW_MINIMUM_REASON or "below razorpay minimum" in fr:
+        return False
+    return True
+
+
+def build_refund_call_kwargs(qr_payment: QRPayment, refund_amount: Decimal) -> Dict:
+    """Deterministic Razorpay refund-request kwargs for a QR payment.
+
+    Idempotency: staging and prod share ONE Razorpay LIVE account (QR needs
+    live mode). A key derived from the per-database PK (``qr_payment_{id}``)
+    collides across environments — both envs eventually refund the same
+    integer id with different bodies, so Razorpay returns HTTP 409 "Different
+    request with the same idempotency key has already been processed."
+    ``razorpay_payment_id`` is globally unique across the account, so a key
+    built from it never collides.
+
+    The body (amount + notes + speed) is built purely from the row so the
+    original attempt and every BillingRetryService retry send a byte-identical
+    request for the same payment: a same-key, same-body call replays the
+    original refund (HTTP 200) instead of returning 409. Notes are kept minimal
+    and deterministic for the same reason — variable text (transaction reason,
+    "Retry:" prefix) would change the body and re-trigger 409.
+
+    Speed: full refunds (service not rendered) request instant payout per
+    ADR 0002; partial unused-credit refunds use normal speed. Derived from the
+    amount so the retry path reproduces the original speed without extra state.
+    """
+    instant_enabled = os.getenv(
+        "RAZORPAY_INSTANT_REFUND_ENABLED", "true"
+    ).lower() == "true"
+    is_full_refund = refund_amount >= qr_payment.amount_paid
+    return {
+        "amount": refund_amount,
+        "notes": {"qr_payment_id": str(qr_payment.id)},
+        "idempotency_key": f"refund_{qr_payment.razorpay_payment_id}",
+        "speed": "optimum" if (instant_enabled and is_full_refund) else None,
+    }
 
 
 async def _ensure_actual_fee_captured(qr_payment: QRPayment) -> None:
@@ -819,9 +886,7 @@ class QRPaymentService:
             try:
                 refund_result = await razorpay_service.refund_payment(
                     qr_payment.razorpay_payment_id,
-                    amount=refund,
-                    notes={"transaction_id": str(transaction_id), "reason": "Unused charging credit refund"},
-                    idempotency_key=f"qr_payment_{qr_payment.id}",
+                    **build_refund_call_kwargs(qr_payment, refund),
                 )
                 qr_payment.razorpay_refund_id = refund_result.get("id")
                 qr_payment.status = QRPaymentStatusEnum.REFUNDED
@@ -832,10 +897,19 @@ class QRPaymentService:
                 # Tag with a specific reason so admin/billing-retry can
                 # disambiguate from genuine refund errors.
                 qr_payment.status = QRPaymentStatusEnum.REFUND_FAILED
-                qr_payment.failure_reason = "below_razorpay_minimum"
+                qr_payment.failure_reason = BELOW_MINIMUM_REASON
                 logger.info(
                     "QR payment %s refund ₹%s below Razorpay minimum; not refunded",
                     qr_payment.id, refund,
+                )
+            except RazorpayIdempotencyConflictError:
+                # HTTP 409 on the unused-credit refund (cross-env key collision
+                # or lost-response retry). Reconcile to any existing refund; if
+                # none, mark non-retryable. Partial refunds never request
+                # instant speed, so pass refund_speed=None.
+                await QRPaymentService._reconcile_conflict(
+                    qr_payment, None, "Unused charging credit refund",
+                    IDEMPOTENCY_CONFLICT_NO_REFUND,
                 )
             except Exception as e:
                 qr_payment.status = QRPaymentStatusEnum.REFUND_FAILED
@@ -877,6 +951,39 @@ class QRPaymentService:
         await redis_manager.delete_qr_session(transaction_id)
 
     @staticmethod
+    async def _reconcile_conflict(
+        payment: QRPayment, refund_speed, reason: str, no_refund_failure_reason: str,
+    ) -> None:
+        """Resolve a refund that Razorpay rejected as already-handled (an
+        'already refunded' reply or an idempotency-key conflict). A refund may
+        already exist on the payment; fetch it. If found, persist its id/speed
+        and mark REFUNDED. If not, mark REFUND_FAILED with the supplied
+        (non-retryable) reason. The caller persists the row.
+        """
+        existing = await razorpay_service.find_refund_for_payment(payment.razorpay_payment_id)
+        if existing and existing.get("id"):
+            payment.razorpay_refund_id = existing["id"]
+            existing_speed = existing.get("speed_processed")
+            payment.razorpay_refund_speed_processed = existing_speed
+            if payment.status != QRPaymentStatusEnum.EXPIRED:
+                payment.status = QRPaymentStatusEnum.REFUNDED
+            logger.warning(
+                "refund_reconciled=true qr_payment=%s existing_refund=%s reason=%s",
+                payment.id, existing["id"], reason,
+            )
+            if refund_speed == "optimum" and existing_speed:
+                await OCPPMetrics.record_refund_speed(
+                    payment.charger_id, payment.id, existing_speed,
+                )
+        else:
+            payment.status = QRPaymentStatusEnum.REFUND_FAILED
+            payment.failure_reason = no_refund_failure_reason
+            logger.error(
+                "Could not reconcile refund for payment %s: no refund record found",
+                payment.razorpay_payment_id,
+            )
+
+    @staticmethod
     async def _full_refund(qr_payment: QRPayment, reason: str):
         """Issue a full refund for a QR payment, guarded by a row lock.
 
@@ -914,20 +1021,16 @@ class QRPaymentService:
             # flows so customers see the money back in minutes, not days.
             # Razorpay falls back to normal speed server-side when rails or
             # payment method don't support instant. VoltLync absorbs the
-            # per-refund instant fee. Kill-switch:
-            # RAZORPAY_INSTANT_REFUND_ENABLED (default true).
-            instant_enabled = os.getenv(
-                "RAZORPAY_INSTANT_REFUND_ENABLED", "true"
-            ).lower() == "true"
-            refund_speed = "optimum" if instant_enabled else None
+            # per-refund instant fee. The speed decision + kill-switch
+            # (RAZORPAY_INSTANT_REFUND_ENABLED, default true) live in
+            # build_refund_call_kwargs so the retry path reproduces it exactly.
+            refund_kwargs = build_refund_call_kwargs(locked, refund_amount)
+            refund_speed = refund_kwargs["speed"]
 
             try:
                 refund_result = await razorpay_service.refund_payment(
                     locked.razorpay_payment_id,
-                    amount=refund_amount,
-                    notes={"reason": reason, "qr_payment_id": str(locked.id)},
-                    idempotency_key=f"qr_payment_{locked.id}",
-                    speed=refund_speed,
+                    **refund_kwargs,
                 )
                 locked.razorpay_refund_id = refund_result.get("id")
                 speed_processed = refund_result.get("speed_processed")
@@ -944,30 +1047,30 @@ class QRPaymentService:
                         locked.charger_id, locked.id, speed_processed,
                     )
             except RazorpayAlreadyRefundedError as e:
-                existing = await razorpay_service.find_refund_for_payment(locked.razorpay_payment_id)
-                if existing and existing.get("id"):
-                    locked.razorpay_refund_id = existing["id"]
-                    existing_speed = existing.get("speed_processed")
-                    locked.razorpay_refund_speed_processed = existing_speed
-                    if locked.status != QRPaymentStatusEnum.EXPIRED:
-                        locked.status = QRPaymentStatusEnum.REFUNDED
-                    await locked.save()
-                    logger.warning(
-                        "refund_reconciled=true qr_payment=%s existing_refund=%s reason=%s",
-                        locked.id, existing["id"], reason,
-                    )
-                    if refund_speed == "optimum" and existing_speed:
-                        await OCPPMetrics.record_refund_speed(
-                            locked.charger_id, locked.id, existing_speed,
-                        )
-                else:
-                    locked.status = QRPaymentStatusEnum.REFUND_FAILED
-                    locked.failure_reason = f"Razorpay reports already refunded but no refund record found: {e}"
-                    await locked.save()
-                    logger.error(
-                        "Could not reconcile already-refunded payment %s: no refund record found",
-                        locked.razorpay_payment_id,
-                    )
+                await QRPaymentService._reconcile_conflict(
+                    locked, refund_speed, reason,
+                    f"Razorpay reports already refunded but no refund record found: {e}",
+                )
+                await locked.save()
+            except RazorpayIdempotencyConflictError:
+                # HTTP 409: the key was already used (cross-env collision or a
+                # lost-response retry). Reconcile to any existing refund; if
+                # none, mark non-retryable so the sweep stops hammering it.
+                await QRPaymentService._reconcile_conflict(
+                    locked, refund_speed, reason, IDEMPOTENCY_CONFLICT_NO_REFUND,
+                )
+                await locked.save()
+            except RazorpayRefundBelowMinimumError:
+                # Sub-₹1 full refund (rare — amount_paid is normally ≥₹1).
+                # Tag with the canonical marker so the sweep excludes it,
+                # matching the partial-refund path.
+                locked.status = QRPaymentStatusEnum.REFUND_FAILED
+                locked.failure_reason = BELOW_MINIMUM_REASON
+                await locked.save()
+                logger.info(
+                    "QR payment %s full refund below Razorpay minimum; not refunded",
+                    locked.id,
+                )
             except Exception as e:
                 logger.error(
                     "Full refund error for QR payment %s: %s", locked.id, e, exc_info=True,

@@ -1537,3 +1537,497 @@ async def test_synthetic_drives_billing_and_invoice_while_actual_lands_on_row(
     # the invoice's snapshotted synthetic values.
     assert qr_payment.razorpay_commission != invoice.gateway_charges
     assert qr_payment.razorpay_gst != invoice.gateway_gst
+
+
+# ============================================================================
+# Refund idempotency key + request-body determinism
+# (cross-environment HTTP 409 collision fix)
+# ============================================================================
+#
+# Root cause: the refund idempotency key was f"qr_payment_{qr_payment.id}" — a
+# per-database PK. Staging and prod share ONE Razorpay LIVE account, so both
+# envs eventually refund the same integer id with different bodies and Razorpay
+# returns HTTP 409 "Different request with the same idempotency key has already
+# been processed." The fix keys off the globally-unique razorpay_payment_id and
+# makes the original + retry paths send a byte-identical body so a same-key
+# call replays the original refund instead of 409ing.
+
+from services.qr_payment_service import build_refund_call_kwargs
+from services.billing_retry_service import BillingRetryService
+
+
+@pytest.fixture
+async def _refund_failed_qr_payment(qr_charger, qr_code):
+    """A QR payment stuck in REFUND_FAILED with a 409 reason and a stored
+    refund_amount — mirrors the staging rows the retry sweep must clear."""
+    import uuid
+    user = await User.create(
+        email=f"rf_{uuid.uuid4().hex[:6]}@voltlync.test",
+        phone_number=f"9{uuid.uuid4().int % 1000000000:09d}",
+    )
+    return await QRPayment.create(
+        charger=qr_charger,
+        charger_qr_code=qr_code,
+        user=user,
+        razorpay_payment_id=f"pay_{uuid.uuid4().hex[:12]}",
+        razorpay_qr_code_id="qr_TEST123",
+        amount_paid=Decimal("150.00"),
+        refund_amount=Decimal("60.81"),
+        status=QRPaymentStatusEnum.REFUND_FAILED,
+        failure_reason=(
+            "HTTP 409: Different request with the same idempotency key "
+            "has already been processed."
+        ),
+    )
+
+
+def _make_payment(payment_id: str, qr_id: int, amount_paid: str):
+    """Lightweight stand-in for a QRPayment row — build_refund_call_kwargs
+    only reads .id, .razorpay_payment_id, and .amount_paid."""
+    return MagicMock(
+        id=qr_id,
+        razorpay_payment_id=payment_id,
+        amount_paid=Decimal(amount_paid),
+    )
+
+
+def test_refund_key_derives_from_razorpay_payment_id_not_pk(monkeypatch):
+    """The idempotency key is keyed on the globally-unique razorpay_payment_id,
+    never the per-database PK (which collides across the shared live account)."""
+    monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
+    p = _make_payment("pay_GLOBALLYUNIQUE", qr_id=235, amount_paid="150.00")
+
+    kwargs = build_refund_call_kwargs(p, Decimal("7.88"))
+
+    assert kwargs["idempotency_key"] == "refund_pay_GLOBALLYUNIQUE"
+    # The local PK must NOT appear in the key — that was the collision source.
+    assert "235" not in kwargs["idempotency_key"]
+    assert "qr_payment_235" != kwargs["idempotency_key"]
+
+
+def test_refund_key_distinct_across_payments_same_pk(monkeypatch):
+    """Two payments sharing the same integer PK (the staging-vs-prod scenario)
+    but different razorpay_payment_id get distinct, non-colliding keys."""
+    monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
+    staging = _make_payment("pay_STAGING235", qr_id=235, amount_paid="150.00")
+    prod = _make_payment("pay_PROD235", qr_id=235, amount_paid="120.00")
+
+    k_staging = build_refund_call_kwargs(staging, Decimal("7.88"))["idempotency_key"]
+    k_prod = build_refund_call_kwargs(prod, Decimal("33.65"))["idempotency_key"]
+
+    assert k_staging != k_prod
+
+
+def test_refund_notes_are_deterministic_and_minimal(monkeypatch):
+    """Notes carry only the qr_payment_id — no transaction reason, no "Retry:"
+    prefix — so the original and retry bodies are byte-identical."""
+    monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
+    p = _make_payment("pay_NOTES", qr_id=42, amount_paid="100.00")
+
+    notes = build_refund_call_kwargs(p, Decimal("10.00"))["notes"]
+
+    assert notes == {"qr_payment_id": "42"}
+
+
+@pytest.mark.parametrize(
+    "flag,refund,amount_paid,expected_speed",
+    [
+        ("true", "150.00", "150.00", "optimum"),   # full refund, flag on
+        ("true", "60.81", "150.00", None),          # partial refund, flag on
+        ("false", "150.00", "150.00", None),        # full refund, flag off (kill-switch)
+    ],
+)
+def test_refund_speed_is_deterministic_from_amount_and_flag(
+    monkeypatch, flag, refund, amount_paid, expected_speed
+):
+    """Speed is a pure function of (refund==amount_paid) and the kill-switch,
+    so the retry path reproduces the original speed without extra state."""
+    monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", flag)
+    p = _make_payment("pay_SPEED", qr_id=1, amount_paid=amount_paid)
+
+    assert build_refund_call_kwargs(p, Decimal(refund))["speed"] == expected_speed
+
+
+def test_original_and_retry_produce_identical_request_for_same_payment(monkeypatch):
+    """Same payment + same stored refund_amount → identical key, notes, amount,
+    and speed across the original path and the retry path. This is what lets a
+    same-key call replay (HTTP 200) instead of 409ing."""
+    monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
+    p = _make_payment("pay_PARITY", qr_id=236, amount_paid="200.00")
+
+    original = build_refund_call_kwargs(p, Decimal("144.22"))
+    retry = build_refund_call_kwargs(p, p.amount_paid - Decimal("55.78"))
+
+    assert original == retry
+
+
+@pytest.mark.asyncio
+async def test_retry_sweep_uses_globally_unique_key_and_clears_409_row(
+    client, _refund_failed_qr_payment
+):
+    """End-to-end: BillingRetryService retries a 409-stuck row with the NEW
+    razorpay_payment_id-based key (not the colliding qr_payment_{id} key) and,
+    on success, marks it REFUNDED."""
+    payment = _refund_failed_qr_payment
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment = AsyncMock(return_value={"id": "rfnd_RETRY_OK"})
+
+    with patch("services.billing_retry_service.razorpay_service", mock_razorpay):
+        await BillingRetryService()._process_failed_qr_refunds()
+
+    mock_razorpay.refund_payment.assert_called_once()
+    call = mock_razorpay.refund_payment.call_args
+    # First positional arg is the payment id; the body kwargs carry the fix.
+    assert call.args[0] == payment.razorpay_payment_id
+    assert call.kwargs["idempotency_key"] == f"refund_{payment.razorpay_payment_id}"
+    assert call.kwargs["notes"] == {"qr_payment_id": str(payment.id)}
+    assert call.kwargs["amount"] == Decimal("60.81")
+
+    await payment.refresh_from_db()
+    assert payment.status == QRPaymentStatusEnum.REFUNDED
+    assert payment.razorpay_refund_id == "rfnd_RETRY_OK"
+    assert payment.failure_reason is None
+
+
+# ============================================================================
+# HTTP 409 idempotency-conflict handling (reconcile or mark non-retryable)
+# ============================================================================
+
+from services.qr_payment_service import IDEMPOTENCY_CONFLICT_NO_REFUND
+from services.razorpay_service import (
+    RazorpayIdempotencyConflictError,
+    razorpay_service as _real_razorpay_service,
+)
+
+_CONFLICT_MSG = (
+    "Different request with the same idempotency key has already been processed."
+)
+
+
+def _conflict_error(payment_id: str) -> RazorpayIdempotencyConflictError:
+    return RazorpayIdempotencyConflictError(payment_id, Exception(_CONFLICT_MSG))
+
+
+@pytest.mark.asyncio
+async def test_full_refund_409_reconciles_to_existing_refund(client, qr_charger, qr_code):
+    """A 409 means the key was already used; if a refund exists at Razorpay we
+    persist it and mark REFUNDED rather than failing."""
+    import uuid
+    user = await User.create(
+        email=f"c1_{uuid.uuid4().hex[:6]}@voltlync.test",
+        phone_number=f"9{uuid.uuid4().int % 1000000000:09d}",
+    )
+    payment_id = f"pay_{uuid.uuid4().hex[:12]}"
+    qr_payment = await QRPayment.create(
+        charger=qr_charger, charger_qr_code=qr_code, user=user,
+        razorpay_payment_id=payment_id, razorpay_qr_code_id="qr_TEST123",
+        amount_paid=Decimal("100.00"), status=QRPaymentStatusEnum.PAID,
+    )
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment = AsyncMock(side_effect=_conflict_error(payment_id))
+    mock_razorpay.find_refund_for_payment = AsyncMock(
+        return_value={"id": "rfnd_EXISTING", "speed_processed": "normal"}
+    )
+    mock_razorpay.fetch_payment_fees = AsyncMock(return_value=None)
+
+    with patch("services.qr_payment_service.razorpay_service", mock_razorpay):
+        await QRPaymentService._full_refund(qr_payment, "Conflict reconcile")
+
+    await qr_payment.refresh_from_db()
+    assert qr_payment.razorpay_refund_id == "rfnd_EXISTING"
+    assert qr_payment.status == QRPaymentStatusEnum.REFUNDED
+
+
+@pytest.mark.asyncio
+async def test_full_refund_409_no_refund_marks_non_retryable(client, qr_charger, qr_code):
+    """A 409 with no existing refund (the cross-env collision case) is terminal:
+    REFUND_FAILED with the canonical non-retryable marker."""
+    import uuid
+    user = await User.create(
+        email=f"c2_{uuid.uuid4().hex[:6]}@voltlync.test",
+        phone_number=f"9{uuid.uuid4().int % 1000000000:09d}",
+    )
+    payment_id = f"pay_{uuid.uuid4().hex[:12]}"
+    qr_payment = await QRPayment.create(
+        charger=qr_charger, charger_qr_code=qr_code, user=user,
+        razorpay_payment_id=payment_id, razorpay_qr_code_id="qr_TEST123",
+        amount_paid=Decimal("100.00"), status=QRPaymentStatusEnum.PAID,
+    )
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment = AsyncMock(side_effect=_conflict_error(payment_id))
+    mock_razorpay.find_refund_for_payment = AsyncMock(return_value=None)
+    mock_razorpay.fetch_payment_fees = AsyncMock(return_value=None)
+
+    with patch("services.qr_payment_service.razorpay_service", mock_razorpay):
+        await QRPaymentService._full_refund(qr_payment, "Conflict no-refund")
+
+    await qr_payment.refresh_from_db()
+    assert qr_payment.status == QRPaymentStatusEnum.REFUND_FAILED
+    assert qr_payment.failure_reason == IDEMPOTENCY_CONFLICT_NO_REFUND
+    assert qr_payment.razorpay_refund_id is None
+
+
+@pytest.mark.asyncio
+async def test_partial_refund_409_no_refund_marks_non_retryable(
+    client, qr_charger, qr_code, qr_tariff
+):
+    """The unused-credit (partial) refund path also classifies a 409 as
+    terminal-non-retryable when no refund exists."""
+    _, txn, qr_payment = await _make_qr_billing_fixture(
+        qr_charger, qr_code, qr_tariff, energy_consumed_kwh=0.5,
+    )
+
+    with patch("services.qr_payment_service.redis_manager") as mock_redis:
+        mock_redis.delete_qr_session = AsyncMock()
+        with patch("services.qr_payment_service.razorpay_service") as mock_rzp:
+            mock_rzp.refund_payment = AsyncMock(
+                side_effect=_conflict_error(qr_payment.razorpay_payment_id)
+            )
+            mock_rzp.find_refund_for_payment = AsyncMock(return_value=None)
+            mock_rzp.fetch_payment_fees = AsyncMock(return_value=None)
+            await QRPaymentService.process_qr_session_billing(txn.id)
+
+    await qr_payment.refresh_from_db()
+    assert qr_payment.status == QRPaymentStatusEnum.REFUND_FAILED
+    assert qr_payment.failure_reason == IDEMPOTENCY_CONFLICT_NO_REFUND
+
+
+@pytest.mark.asyncio
+async def test_partial_refund_409_reconciles_to_existing_refund(
+    client, qr_charger, qr_code, qr_tariff
+):
+    """The partial path reconciles a 409 to an existing refund → REFUNDED."""
+    _, txn, qr_payment = await _make_qr_billing_fixture(
+        qr_charger, qr_code, qr_tariff, energy_consumed_kwh=0.5,
+    )
+
+    with patch("services.qr_payment_service.redis_manager") as mock_redis:
+        mock_redis.delete_qr_session = AsyncMock()
+        with patch("services.qr_payment_service.razorpay_service") as mock_rzp:
+            mock_rzp.refund_payment = AsyncMock(
+                side_effect=_conflict_error(qr_payment.razorpay_payment_id)
+            )
+            mock_rzp.find_refund_for_payment = AsyncMock(
+                return_value={"id": "rfnd_PARTIAL_EXIST", "speed_processed": "normal"}
+            )
+            mock_rzp.fetch_payment_fees = AsyncMock(return_value=None)
+            await QRPaymentService.process_qr_session_billing(txn.id)
+
+    await qr_payment.refresh_from_db()
+    assert qr_payment.status == QRPaymentStatusEnum.REFUNDED
+    assert qr_payment.razorpay_refund_id == "rfnd_PARTIAL_EXIST"
+
+
+@pytest.mark.asyncio
+async def test_retry_sweep_excludes_non_retryable_conflict_rows(
+    client, qr_charger, qr_code
+):
+    """A row marked IDEMPOTENCY_CONFLICT_NO_REFUND is never picked up by the
+    retry sweep (no Razorpay call is made for it)."""
+    import uuid
+    user = await User.create(
+        email=f"c3_{uuid.uuid4().hex[:6]}@voltlync.test",
+        phone_number=f"9{uuid.uuid4().int % 1000000000:09d}",
+    )
+    await QRPayment.create(
+        charger=qr_charger, charger_qr_code=qr_code, user=user,
+        razorpay_payment_id=f"pay_{uuid.uuid4().hex[:12]}",
+        razorpay_qr_code_id="qr_TEST123",
+        amount_paid=Decimal("100.00"), refund_amount=Decimal("40.00"),
+        status=QRPaymentStatusEnum.REFUND_FAILED,
+        failure_reason=IDEMPOTENCY_CONFLICT_NO_REFUND,
+    )
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment = AsyncMock()
+
+    with patch("services.billing_retry_service.razorpay_service", mock_razorpay):
+        await BillingRetryService()._process_failed_qr_refunds()
+
+    mock_razorpay.refund_payment.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_retry_sweep_409_marks_row_non_retryable(client, qr_charger, qr_code):
+    """If a retry itself hits a 409 with no existing refund, the row is marked
+    non-retryable so the next sweep excludes it (stops the infinite loop)."""
+    import uuid
+    user = await User.create(
+        email=f"c4_{uuid.uuid4().hex[:6]}@voltlync.test",
+        phone_number=f"9{uuid.uuid4().int % 1000000000:09d}",
+    )
+    payment_id = f"pay_{uuid.uuid4().hex[:12]}"
+    payment = await QRPayment.create(
+        charger=qr_charger, charger_qr_code=qr_code, user=user,
+        razorpay_payment_id=payment_id, razorpay_qr_code_id="qr_TEST123",
+        amount_paid=Decimal("150.00"), refund_amount=Decimal("60.81"),
+        status=QRPaymentStatusEnum.REFUND_FAILED,
+        failure_reason="HTTP 409: " + _CONFLICT_MSG,
+    )
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment = AsyncMock(side_effect=_conflict_error(payment_id))
+    mock_razorpay.find_refund_for_payment = AsyncMock(return_value=None)
+
+    with patch("services.billing_retry_service.razorpay_service", mock_razorpay):
+        await BillingRetryService()._process_failed_qr_refunds()
+
+    await payment.refresh_from_db()
+    assert payment.status == QRPaymentStatusEnum.REFUND_FAILED
+    assert payment.failure_reason == IDEMPOTENCY_CONFLICT_NO_REFUND
+
+
+@pytest.mark.asyncio
+async def test_refund_payment_maps_http_409_to_idempotency_conflict_error(monkeypatch):
+    """razorpay_service.refund_payment maps a Razorpay HTTP 409 response to the
+    dedicated RazorpayIdempotencyConflictError, not a generic Exception."""
+    monkeypatch.setattr(_real_razorpay_service, "client", MagicMock())
+    monkeypatch.setattr(_real_razorpay_service, "api_key", "rzp_test_key")
+    monkeypatch.setattr(_real_razorpay_service, "api_secret", "test_secret")
+
+    resp = MagicMock()
+    resp.is_error = True
+    resp.status_code = 409
+    resp.json.return_value = {"error": {"description": _CONFLICT_MSG}}
+
+    fake_client = MagicMock()
+    fake_client.post = AsyncMock(return_value=resp)
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=fake_client)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("services.razorpay_service.httpx.AsyncClient", return_value=ctx):
+        with pytest.raises(RazorpayIdempotencyConflictError):
+            await _real_razorpay_service.refund_payment(
+                "pay_CONFLICT", amount=Decimal("10.00"),
+                idempotency_key="refund_pay_CONFLICT",
+            )
+
+
+# ============================================================================
+# Retry exclusion robustness for below-minimum failures (canonical + legacy)
+# ============================================================================
+
+from services.qr_payment_service import (
+    is_retryable_refund_failure, BELOW_MINIMUM_REASON,
+)
+
+_LEGACY_BELOW_MIN = (
+    "Refund for pay_SpuaKiPYNEFPL6 below Razorpay minimum (₹1.00): "
+    "The amount must be atleast INR 1.00"
+)
+
+
+@pytest.mark.parametrize(
+    "reason,retryable",
+    [
+        (None, True),
+        ("", True),
+        ("Connection timeout", True),
+        ("HTTP 500: Internal Server Error", True),
+        (BELOW_MINIMUM_REASON, False),
+        (_LEGACY_BELOW_MIN, False),
+        ("refund for pay_x BELOW razorpay MINIMUM (₹1.00)", False),  # case-insensitive
+        (IDEMPOTENCY_CONFLICT_NO_REFUND, False),
+    ],
+)
+def test_is_retryable_refund_failure_predicate(reason, retryable):
+    """Robust, substring-based classification — not an exact-string match on a
+    single marker — so canonical AND legacy long-form below-minimum reasons
+    (and the conflict marker) are all treated as terminal."""
+    assert is_retryable_refund_failure(reason) is retryable
+
+
+@pytest.mark.asyncio
+async def test_retry_sweep_excludes_legacy_long_form_below_minimum(
+    client, qr_charger, qr_code
+):
+    """Regression for staging row #46: a below-minimum row carrying the legacy
+    long-form message (not the canonical marker) must NOT be retried."""
+    import uuid
+    user = await User.create(
+        email=f"lm_{uuid.uuid4().hex[:6]}@voltlync.test",
+        phone_number=f"9{uuid.uuid4().int % 1000000000:09d}",
+    )
+    await QRPayment.create(
+        charger=qr_charger, charger_qr_code=qr_code, user=user,
+        razorpay_payment_id=f"pay_{uuid.uuid4().hex[:12]}",
+        razorpay_qr_code_id="qr_TEST123",
+        amount_paid=Decimal("40.00"), refund_amount=Decimal("0.23"),
+        status=QRPaymentStatusEnum.REFUND_FAILED,
+        failure_reason=_LEGACY_BELOW_MIN,
+    )
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment = AsyncMock()
+
+    with patch("services.billing_retry_service.razorpay_service", mock_razorpay):
+        await BillingRetryService()._process_failed_qr_refunds()
+
+    mock_razorpay.refund_payment.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_retry_sweep_still_retries_transient_failures(client, qr_charger, qr_code):
+    """A genuinely transient failure (e.g. insufficient balance) is still
+    retried — the predicate only excludes permanently-stuck reasons."""
+    import uuid
+    user = await User.create(
+        email=f"tr_{uuid.uuid4().hex[:6]}@voltlync.test",
+        phone_number=f"9{uuid.uuid4().int % 1000000000:09d}",
+    )
+    payment = await QRPayment.create(
+        charger=qr_charger, charger_qr_code=qr_code, user=user,
+        razorpay_payment_id=f"pay_{uuid.uuid4().hex[:12]}",
+        razorpay_qr_code_id="qr_TEST123",
+        amount_paid=Decimal("100.00"), refund_amount=Decimal("40.00"),
+        status=QRPaymentStatusEnum.REFUND_FAILED,
+        failure_reason="HTTP 500: insufficient balance",
+    )
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment = AsyncMock(return_value={"id": "rfnd_RECOVERED"})
+
+    with patch("services.billing_retry_service.razorpay_service", mock_razorpay):
+        await BillingRetryService()._process_failed_qr_refunds()
+
+    mock_razorpay.refund_payment.assert_called_once()
+    await payment.refresh_from_db()
+    assert payment.status == QRPaymentStatusEnum.REFUNDED
+    assert payment.razorpay_refund_id == "rfnd_RECOVERED"
+
+
+@pytest.mark.asyncio
+async def test_full_refund_below_minimum_sets_canonical_marker(client, qr_charger, qr_code):
+    """A sub-₹1 full refund tags the canonical marker (not the long-form text),
+    so the row is consistently classified non-retryable."""
+    import uuid
+    user = await User.create(
+        email=f"fbm_{uuid.uuid4().hex[:6]}@voltlync.test",
+        phone_number=f"9{uuid.uuid4().int % 1000000000:09d}",
+    )
+    payment_id = f"pay_{uuid.uuid4().hex[:12]}"
+    qr_payment = await QRPayment.create(
+        charger=qr_charger, charger_qr_code=qr_code, user=user,
+        razorpay_payment_id=payment_id, razorpay_qr_code_id="qr_TEST123",
+        amount_paid=Decimal("0.50"), status=QRPaymentStatusEnum.PAID,
+    )
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment = AsyncMock(
+        side_effect=RazorpayRefundBelowMinimumError(
+            payment_id, Exception("The amount must be atleast INR 1.00")
+        )
+    )
+    mock_razorpay.find_refund_for_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock(return_value=None)
+
+    with patch("services.qr_payment_service.razorpay_service", mock_razorpay):
+        await QRPaymentService._full_refund(qr_payment, "Sub-rupee full refund")
+
+    await qr_payment.refresh_from_db()
+    assert qr_payment.status == QRPaymentStatusEnum.REFUND_FAILED
+    assert qr_payment.failure_reason == BELOW_MINIMUM_REASON

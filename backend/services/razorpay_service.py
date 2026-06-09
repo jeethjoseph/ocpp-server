@@ -41,6 +41,22 @@ class RazorpayRefundBelowMinimumError(Exception):
         )
 
 
+class RazorpayIdempotencyConflictError(Exception):
+    """Raised on Razorpay HTTP 409 'Different request with the same idempotency
+    key has already been processed.' A prior request reused this key with a
+    different body. The original refund may or may not have been created, so a
+    same-key retry can never clear the conflict — callers must reconcile via
+    find_refund_for_payment instead of blindly retrying.
+    """
+
+    def __init__(self, payment_id: str, original_error: Exception):
+        self.payment_id = payment_id
+        self.original_error = original_error
+        super().__init__(
+            f"Idempotency conflict refunding {payment_id}: {original_error}"
+        )
+
+
 def extract_fee_from_payment(payment_data: dict) -> Optional[Tuple[Decimal, Decimal]]:
     """Extract actual Razorpay fee and tax from a payment object.
 
@@ -73,6 +89,13 @@ def _is_amount_below_minimum_error(err: Exception) -> bool:
     amount-related errors still escalate normally."""
     msg = str(err).lower()
     return ("amount must be atleast" in msg) or ("amount must be at least" in msg)
+
+
+def _is_idempotency_conflict_error(err: Exception) -> bool:
+    """Detect Razorpay's idempotency-key conflict response ('Different request
+    with the same idempotency key has already been processed.'). Matched on the
+    message as a fallback to the HTTP 409 status code."""
+    return "idempotency key" in str(err).lower()
 
 
 # Sensitive field names that get masked before being persisted to
@@ -624,6 +647,12 @@ class RazorpayService:
                         payment_id,
                     )
                     raise RazorpayRefundBelowMinimumError(payment_id, http_error)
+                if resp.status_code == 409 or _is_idempotency_conflict_error(http_error):
+                    logger.warning(
+                        "Refund for %s hit idempotency conflict (HTTP %s): %s",
+                        payment_id, resp.status_code, description,
+                    )
+                    raise RazorpayIdempotencyConflictError(payment_id, http_error)
                 logger.error(f"Failed to create refund for payment {payment_id}: {description}")
                 if resp.status_code == 400:
                     raise razorpay.errors.BadRequestError(description)
@@ -639,7 +668,11 @@ class RazorpayService:
             )
             return parsed
 
-        except (RazorpayAlreadyRefundedError, RazorpayRefundBelowMinimumError):
+        except (
+            RazorpayAlreadyRefundedError,
+            RazorpayRefundBelowMinimumError,
+            RazorpayIdempotencyConflictError,
+        ):
             raise
         except httpx.HTTPError as e:
             logger.error(f"Failed to create refund for payment {payment_id}: {e}")
