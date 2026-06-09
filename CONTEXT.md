@@ -78,6 +78,14 @@ _Avoid_: limit, cap.
 A `GSTInvoice` row issued per billable charging session. Supplier is always VoltLync (merchant-of-record); the franchisee operator is captured as a snapshot block on the PDF (Razorpay disclosure requirement). Never issued for zero-energy sessions, internal-role sessions, or wallet top-ups.
 _Avoid_: receipt, bill.
 
+**Invoice Date**:
+The legal date printed on a **GST Invoice**, and the basis for both its **Financial Year** and its serial number. Defined as the **issue instant** — when the `GSTInvoice` row is generated, i.e. session finalize (≈ StopTransaction) — expressed in **IST**, not UTC. This is the orthodox GST "date of issue"; because numbers are also allocated at issue, serial order and date order always agree. Server stores instants in UTC; IST is the derivation/presentation zone (the standing convention — see [[project-admin-ui-ist-server-utc]]). The session-*start* instant is shown separately as the "Charging date/time" (`charged_on`) and is informational only — it is **not** the invoice date. See [[adr-0012-gst-invoice-date-ist-issue-basis]] for the issue-vs-start and convert-on-read-vs-DATE-column rationale.
+_Avoid_: charging date, session-start date (these name `charged_on`, a different field).
+
+**Financial Year (FY)**:
+Indian fiscal year, Apr–Mar, written `2026-27`. Derived from the **Invoice Date** (the issue instant in IST), and scopes the per-(franchisee, series) invoice serial sequence.
+_Avoid_: calendar year, billing year.
+
 ### Observability
 
 **OCPP message log**:

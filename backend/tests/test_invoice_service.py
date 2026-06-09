@@ -434,3 +434,61 @@ async def test_invoice_gateway_gst_uses_synthetic_split(client):
 
     assert wallet_invoice is not None
     assert wallet_invoice.gateway_gst is None
+
+
+# ============================================================================
+# IST invoice date / financial year (ADR 0012)
+# ============================================================================
+
+def test_to_ist_treats_naive_as_utc_and_crosses_day():
+    from datetime import datetime, timezone
+    from utils import to_ist
+
+    # 2026-03-31 20:00 UTC == 2026-04-01 01:30 IST
+    naive = datetime(2026, 3, 31, 20, 0, 0)
+    ist = to_ist(naive)
+    assert ist.strftime("%Y-%m-%d") == "2026-04-01"
+    assert ist.utcoffset().total_seconds() == 5.5 * 3600
+
+    aware = datetime(2026, 3, 31, 20, 0, 0, tzinfo=timezone.utc)
+    assert to_ist(aware).strftime("%Y-%m-%d") == "2026-04-01"
+    assert to_ist(None) is None
+
+
+def test_financial_year_rolls_at_ist_midnight_not_utc():
+    from datetime import datetime
+    from utils import to_ist
+    from services.invoice_service import _get_financial_year
+
+    # Issued 2026-03-31 20:00 UTC. In UTC that's still FY 2025-26; in IST it's
+    # 2026-04-01 01:30 -> FY 2026-27. The fix derives FY from IST.
+    boundary = datetime(2026, 3, 31, 20, 0, 0)
+    assert _get_financial_year(boundary) == "2025-26"            # old UTC behaviour
+    assert _get_financial_year(to_ist(boundary)) == "2026-27"    # new IST behaviour
+
+    # A pre-IST-midnight instant stays in the old FY either way.
+    before = datetime(2026, 3, 31, 17, 0, 0)  # IST 22:30, still 31 Mar
+    assert _get_financial_year(to_ist(before)) == "2025-26"
+
+
+@pytest.mark.asyncio
+async def test_csv_export_renders_invoice_date_in_ist(client_admin):
+    """The GSTR-1 CSV must emit the IST calendar date, not the stored UTC one."""
+    from datetime import datetime
+    from models import GSTInvoice
+
+    _, _, txn, _, _ = await _make_session(energy_kwh=2.0)
+    invoice = await InvoiceService.generate_invoice(txn.id)
+    assert invoice is not None
+
+    # Force a boundary issue instant: 2026-04-30 20:00 UTC == 2026-05-01 01:30 IST
+    await GSTInvoice.filter(id=invoice.id).update(
+        invoice_date=datetime(2026, 4, 30, 20, 0, 0),
+    )
+
+    resp = await client_admin.get("/api/admin/invoices/export.csv")
+    assert resp.status_code == 200
+    body = resp.text
+    # Legal (IST) date is 2026-05-01, and no raw UTC instant leaks into the column.
+    assert "2026-05-01" in body
+    assert "2026-04-30T20:00:00" not in body

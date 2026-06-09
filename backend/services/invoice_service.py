@@ -12,7 +12,7 @@ owned stations share a NULL-franchisee sequence.
 import io
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Optional
@@ -32,6 +32,7 @@ from models import (
     User,
 )
 from core.roles import INTERNAL_ROLES
+from utils import to_ist
 from services.wallet_service import WalletService
 from services.monitoring_service import MetricsCollector
 from services.tariff_utils import synthetic_fee_split
@@ -349,8 +350,11 @@ class InvoiceService:
                 (txn.end_time - txn.start_time).total_seconds()
             )
 
-        # Financial year and invoice number
-        now = datetime.utcnow()
+        # Financial year and invoice number. The FY (and thus the serial
+        # sequence) is the INDIAN fiscal year of the issue instant — derive it
+        # in IST, not UTC, so an invoice raised just after IST-midnight on 1 Apr
+        # lands in the new FY. See docs/adr/0012.
+        now = to_ist(datetime.now(timezone.utc))
         fy = _get_financial_year(now)
         invoice_number = await InvoiceService.get_next_invoice_number(
             franchisee_id=franchisee_id,
@@ -469,7 +473,7 @@ class InvoiceService:
         elements.append(Spacer(1, 3*mm))
 
         # Invoice meta
-        inv_date = invoice.invoice_date.strftime("%d %B %Y") if invoice.invoice_date else ""
+        inv_date = to_ist(invoice.invoice_date).strftime("%d %B %Y") if invoice.invoice_date else ""
         meta_data = [
             [Paragraph(f"<b>Invoice#:</b> {invoice.invoice_number}", normal_style),
              Paragraph(f"<b>Date:</b> {inv_date}", normal_style)],
@@ -537,7 +541,7 @@ class InvoiceService:
         elements.append(Spacer(1, 4*mm))
 
         # Line items table
-        charged_on_str = invoice.charged_on.strftime("%d/%m/%Y, %I:%M %p") if invoice.charged_on else ""
+        charged_on_str = to_ist(invoice.charged_on).strftime("%d/%m/%Y, %I:%M %p") if invoice.charged_on else ""
         duration_str = _format_duration(invoice.duration_seconds)
 
         # Tariff column shows the operator-set, customer-displayed all-in

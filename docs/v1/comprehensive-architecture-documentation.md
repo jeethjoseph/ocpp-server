@@ -561,6 +561,13 @@ That indicator is a deliberate future enhancement; not built yet.
 - **RemoteStart failure**: Up to 2 retries with 5s delay, full refund if all fail
 - **Budget exceeded**: Schedules RemoteStopTransaction as asyncio.create_task (avoids deadlock)
 
+**Refund idempotency contract (cross-environment collision fix, 2026-06-09 — live on STAGING; PROD deploy pending)**:
+- Every refund (initial partial in `process_qr_session_billing`, initial full in `_full_refund`, and `BillingRetryService` retries) builds its Razorpay request via the single helper `qr_payment_service.build_refund_call_kwargs(qr_payment, refund_amount)`, which returns `amount`, `notes`, `idempotency_key`, and `speed`.
+- **Key = `f"refund_{razorpay_payment_id}"`**, derived from the globally-unique Razorpay payment id — replacing the old `f"qr_payment_{qr_payment.id}"` (the per-database PK). **Root cause it fixes**: staging and prod share one Razorpay **live** account (QR requires live mode). The PK is a separate sequence per DB, so staging payment #235 and prod payment #235 both emitted key `qr_payment_235` to the same account; whichever env refunded that id first registered the key, and the other env's later refund (different amount/notes) got **HTTP 409 "Different request with the same idempotency key has already been processed,"** permanently stranding the refund in `REFUND_FAILED`. (Razorpay idempotency keys expire ~24h, so the collision is transient — observed self-healing once the other env's key aged out.) See `[[project-refund-idempotency-cross-env-collision]]` and `.scratch/qr-refund-idempotency-fix/`.
+- **Body is deterministic and path-independent**: `notes={"qr_payment_id": str(id)}` (no variable transaction reason / "Retry:" prefix) and `speed` derived from amount (`refund_amount >= amount_paid` → `optimum` when the instant flag is on; partial → normal). This guarantees the initial attempt and every retry send a byte-identical request for the same payment, so a same-key retry **replays** the original refund (HTTP 200) instead of 409ing.
+- **409 handling**: `razorpay_service.refund_payment` maps a 409 to `RazorpayIdempotencyConflictError` (re-raised through the outer guard). Both refund call sites and the retry loop catch it and call `QRPaymentService._reconcile_conflict()`: if a refund already exists at Razorpay it persists the id and marks `REFUNDED`; otherwise it sets `failure_reason="idempotency_conflict_no_refund"`.
+- **Retry exclusion**: `BillingRetryService` filters candidates through `is_retryable_refund_failure(failure_reason)` (substring-robust), which excludes the `idempotency_conflict_no_refund` marker AND below-minimum reasons in both the canonical (`below_razorpay_minimum`) and legacy long-form (`"... below Razorpay minimum (₹1.00) ..."`) shapes — so permanently-stuck rows are never re-hammered.
+
 **Redis Session Cache**:
 ```
 Key: qr_session:{transaction_id}
@@ -771,9 +778,11 @@ If the counter reaches `MAX_RESETS_WITHOUT_PROGRESS` (default 3), BootNotificati
 **Configuration**:
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `DISCONNECT_SUSPEND_TIMEOUT_SECONDS` | 180 | Seconds to wait after disconnect before auto-stopping |
+| `DISCONNECT_SUSPEND_TIMEOUT_SECONDS` | 180 (**staging & prod: 1800**) | Seconds to wait after disconnect before auto-stopping |
 | `SUSPEND_TIMEOUT_SECONDS` | 300 | Resume window after BootNotification resets the timeout |
 | `MAX_DISCONNECT_RESETS_WITHOUT_PROGRESS` | 3 | Max BootNotification resets allowed without energy progress |
+
+> ⚠️ **Timing invariant**: `MAX_RESUME_GAP_SECONDS` (resume staleness guard, below) MUST exceed `DISCONNECT_SUSPEND_TIMEOUT_SECONDS`, or chargers reconnecting between the gap and the disconnect timeout are force-finalized `STALE_RECONNECT` instead of resuming. Because staging/prod widened the disconnect timeout to **1800**, `MAX_RESUME_GAP_SECONDS` was raised to **2100** on both (2026-06-09). This ordering is documented but **not validated at startup** — a proposed `validate_timing_invariants()` would make it fail-loud.
 
 **Integration Points**:
 - `ConnectionManager.register_on_disconnect()` -- wires up the callback
@@ -829,7 +838,7 @@ Returns `(is_stale, gap_seconds)`. The gap is computed against the most recent o
 
 A txn with no signals at all returns `(False, None)` — the helper defers to the caller's existing state checks rather than refusing speculatively.
 
-**Threshold**: `MAX_RESUME_GAP_SECONDS=900` (15 min, configurable via env). Chosen to be comfortably above the existing 360s startup sweep cutoff so the guard never races with the primary finalize chain, yet small enough to prevent meaningful overcharging when it does fire.
+**Threshold**: `MAX_RESUME_GAP_SECONDS` — code default **900** (15 min); **staging & prod run 2100** (35 min) as of 2026-06-09. It must sit *above* the longest primary finalize timer so the guard never races it, yet small enough to limit overcharging when it does fire. **Invariant: `MAX_RESUME_GAP_SECONDS` MUST exceed `DISCONNECT_SUSPEND_TIMEOUT_SECONDS`.** This broke in prod/staging when the disconnect timeout was widened to 1800 while the gap stayed at the 900 default — chargers reconnecting in the 15–30 min window were force-finalized `STALE_RECONNECT` instead of resuming. Fixed by raising the gap to 2100. The ordering is **not enforced at startup** today; a `validate_timing_invariants()` boot check is the proposed durable safeguard. (Historical note: the original "comfortably above the 360s startup sweep cutoff" rationale assumed the 180s disconnect default — it does not survive a widened disconnect timeout, which is why the invariant must be stated against `DISCONNECT_SUSPEND_TIMEOUT_SECONDS`, not a fixed number.)
 
 **Call sites and behavior on stale**:
 | Call site | Action when stale |
@@ -2233,7 +2242,7 @@ async def on_boot_notification(self, charge_point_vendor, charge_point_model, **
 - Sets 30-second heartbeat interval
 - Updates charger firmware_version, vendor, model from BootNotification payload
 - **Transaction Suspend/Resume**: On disconnect, `disconnect_handler.py` suspends active transactions with a 180s timeout (`DISCONNECT_SUSPEND_TIMEOUT_SECONDS`). On BootNotification, already-SUSPENDED transactions get their timeout reset (CAS guard invalidates old timeout), and a new 300s resume window starts (`SUSPEND_TIMEOUT_SECONDS`). Still-active transactions (edge case) are suspended as before. Auto-stop with billing + QR refund on timeout expiry. The per-txn loop body is extracted into `_handle_ongoing_transaction_on_boot()` for testability.
-- **Resume staleness guard**: every BootNotification per-txn handler call (and the MeterValues + GetLastMeterValue resume points) goes through `transaction_finalizer.is_resume_too_stale()` first. If the gap exceeds `MAX_RESUME_GAP_SECONDS` (default 900s), the txn is finalized with stop_reason `STALE_RECONNECT` instead of being suspended/resumed. This is defense-in-depth for the case where the disconnect handler silently failed to mark SUSPENDED — see the "Resume Staleness Guard" subsection under Transaction Finalizer above.
+- **Resume staleness guard**: every BootNotification per-txn handler call (and the MeterValues + GetLastMeterValue resume points) goes through `transaction_finalizer.is_resume_too_stale()` first. If the gap exceeds `MAX_RESUME_GAP_SECONDS` (code default 900s; staging/prod 2100s), the txn is finalized with stop_reason `STALE_RECONNECT` instead of being suspended/resumed. This is defense-in-depth for the case where the disconnect handler silently failed to mark SUSPENDED — see the "Resume Staleness Guard" subsection under Transaction Finalizer above (incl. the `MAX_RESUME_GAP_SECONDS > DISCONNECT_SUSPEND_TIMEOUT_SECONDS` invariant).
 - Resume fields tracked: `suspended_at`, `resumed_at`, `resume_count`
 - Comprehensive connection logging
 
@@ -5305,7 +5314,7 @@ CORS_ORIGINS = [
 - **Implementation**:
   - Runs every 30 minutes as asyncio background loop
   - `_process_failed_billing_transactions()` - Retries BILLING_FAILED transactions
-  - `_process_failed_qr_refunds()` - Retries REFUND_FAILED QR payments via Razorpay
+  - `_process_failed_qr_refunds()` - Retries REFUND_FAILED QR payments via Razorpay, skipping permanently-stuck rows via `is_retryable_refund_failure()` (excludes `idempotency_conflict_no_refund` and below-minimum reasons); a retry that 409s is reconciled, not re-hammered. See the "Refund idempotency contract" subsection.
   - `_cleanup_orphaned_qr_payments()` - Detects and refunds QR payments stuck in PAID status with no linked transaction
   - `_cleanup_stale_suspended_transactions()` - Auto-stops SUSPENDED transactions older than 5 hours
   - Per-item error handling (one failure doesn't block others)

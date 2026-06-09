@@ -28,6 +28,7 @@ from auth_middleware import (
 from services.invoice_service import InvoiceService
 from services import s3_service
 from services.monitoring_service import MetricsCollector
+from utils import to_ist
 
 logger = logging.getLogger("ocpp-server")
 
@@ -260,6 +261,12 @@ async def admin_export_invoices_csv(
         # Iterate the queryset; one yield per invoice keeps memory flat.
         async for inv in query:
             row = {col: _csv_value(getattr(inv, col, None)) for col in CSV_COLUMNS}
+            # GSTR-1 reconciliation is in IST: the invoice_date is the legal
+            # (IST) calendar date, and charged_on the IST wall-clock time.
+            if inv.invoice_date:
+                row["invoice_date"] = to_ist(inv.invoice_date).strftime("%Y-%m-%d")
+            if inv.charged_on:
+                row["charged_on"] = to_ist(inv.charged_on).strftime("%Y-%m-%d %H:%M:%S")
             writer.writerow(row)
             yield buf.getvalue()
             buf.seek(0)
@@ -351,7 +358,10 @@ def _invoice_to_dict(inv: GSTInvoice) -> dict:
         "invoice_number": inv.invoice_number,
         "series": inv.series,
         "financial_year": inv.financial_year,
-        "invoice_date": inv.invoice_date.isoformat() if inv.invoice_date else None,
+        # tz-aware IST ISO (e.g. 2026-04-01T07:30:00+05:30). DB stores naive
+        # UTC; emitting an explicit offset lets the client render the correct
+        # IST date without guessing the source zone. See docs/adr/0012.
+        "invoice_date": to_ist(inv.invoice_date).isoformat() if inv.invoice_date else None,
         "supplier_name": inv.supplier_name,
         "supplier_gstin": inv.supplier_gstin,
         "supplier_address": inv.supplier_address,
@@ -373,7 +383,7 @@ def _invoice_to_dict(inv: GSTInvoice) -> dict:
         "connector_type": inv.connector_type,
         "energy_consumed_kwh": inv.energy_consumed_kwh,
         "tariff_rate_incl_tax": _d(inv.tariff_rate_incl_tax),
-        "charged_on": inv.charged_on.isoformat() if inv.charged_on else None,
+        "charged_on": to_ist(inv.charged_on).isoformat() if inv.charged_on else None,
         "duration_seconds": inv.duration_seconds,
         "hsn_sac_code": inv.hsn_sac_code,
         "gst_rate_percent": _d(inv.gst_rate_percent),
