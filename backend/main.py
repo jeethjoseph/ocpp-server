@@ -878,10 +878,16 @@ class ChargePoint(OcppChargePoint):
             # Get transaction from database
             transaction = await Transaction.filter(id=transaction_id).first()
             if not transaction:
-                # Chargers legitimately send a placeholder transaction_id (e.g.
-                # -1) when they have no valid transaction to report. Responding
-                # Invalid is correct; this is expected, not an error.
-                logger.warning(f"🛑 StopTransaction for unknown transaction_id={transaction_id} — responding Invalid")
+                # A placeholder id (e.g. -1) when the charger has no valid txn
+                # to report is benign and expected — warn. But a POSITIVE id we
+                # don't have is a real anomaly: the charger expects a transaction
+                # we issued (StartTransaction returns a positive PK) and we can't
+                # find it → likely a lost/never-persisted transaction and lost
+                # billing. Keep that at error so it stays visible in Sentry.
+                if isinstance(transaction_id, int) and transaction_id > 0:
+                    logger.error(f"🛑 ❌ StopTransaction for unknown positive transaction_id={transaction_id} — possible lost transaction")
+                else:
+                    logger.warning(f"🛑 StopTransaction with placeholder transaction_id={transaction_id} — responding Invalid")
                 return call_result.StopTransaction(
                     id_tag_info={"status": "Invalid"}
                 )

@@ -367,29 +367,56 @@ async def change_availability(
 
 # ─── Transactions ────────────────────────────────────────────────────
 
+async def _transaction_summary(base_query) -> dict:
+    """Aggregate the franchisee transactions summary over the full filtered
+    set. Energy/revenue sum the stored (finalised) columns — NULL (running /
+    non-billable sessions) counts as 0; no live derivation."""
+    agg = await base_query.annotate(
+        e=Sum("energy_consumed_kwh"), r=Sum("total_billed")
+    ).values("e", "r")
+    energy = agg[0]["e"] if agg and agg[0]["e"] is not None else 0
+    revenue = agg[0]["r"] if agg and agg[0]["r"] is not None else 0
+    return {
+        "total_energy_kwh": f"{float(energy):.3f}",
+        "total_revenue": f"{float(revenue):.2f}",
+    }
+
+
 @router.get("/transactions")
 async def list_transactions(
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
     status: Optional[str] = None,
+    from_date: Optional[str] = Query(None, description="Inclusive IST date YYYY-MM-DD"),
+    to_date: Optional[str] = Query(None, description="Inclusive IST date YYYY-MM-DD"),
     auth=Depends(require_franchisee()),
 ):
     _, franchisee = auth
     charger_ids = await _get_franchisee_charger_ids(franchisee.id)
 
+    empty_summary = {"total_energy_kwh": "0.000", "total_revenue": "0.00"}
     if not charger_ids:
-        return {"data": [], "total": 0, "page": page, "limit": limit}
+        return {"summary": empty_summary, "data": [], "total": 0, "page": page, "limit": limit}
 
+    # Date filter keys on start_time (session start), interpreting from/to as
+    # inclusive IST calendar dates.
+    start_utc, end_utc = _ist_dates_to_utc_range(from_date, to_date)
     query = Transaction.filter(charger_id__in=charger_ids)
     if status:
         query = query.filter(transaction_status=status)
+    if start_utc:
+        query = query.filter(start_time__gte=start_utc)
+    if end_utc:
+        query = query.filter(start_time__lt=end_utc)
 
     total = await query.count()
+    summary = await _transaction_summary(query)
     txns = await query.offset((page - 1) * limit).limit(limit).order_by(
         "-created_at"
     ).prefetch_related("charger")
 
     return {
+        "summary": summary,
         "data": [
             {
                 "id": t.id,

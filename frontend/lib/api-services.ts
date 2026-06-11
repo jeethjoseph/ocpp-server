@@ -959,11 +959,19 @@ export const franchiseePortalService = {
       `/api/franchisee/chargers/${chargerId}/change-availability?available=${available}`
     ),
 
-  getTransactions: (params?: { page?: number; limit?: number; status?: string }) => {
+  getTransactions: (params?: {
+    page?: number;
+    limit?: number;
+    status?: string;
+    from_date?: string;
+    to_date?: string;
+  }) => {
     const searchParams = new URLSearchParams();
     if (params?.page) searchParams.set("page", params.page.toString());
     if (params?.limit) searchParams.set("limit", params.limit.toString());
     if (params?.status) searchParams.set("status", params.status);
+    if (params?.from_date) searchParams.set("from_date", params.from_date);
+    if (params?.to_date) searchParams.set("to_date", params.to_date);
     const query = searchParams.toString();
     return api.get<any>(`/api/franchisee/transactions${query ? `?${query}` : ""}`);
   },

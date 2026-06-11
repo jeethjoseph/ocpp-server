@@ -281,6 +281,78 @@ async def test_settlements_rejects_bad_date(client_franchisee, test_franchisee):
     assert resp.status_code == 400
 
 
+# ───────────────────────── transactions summary/filters ─────────────────────────
+
+
+async def _make_txn(charger, user, *, status, energy=None, billed=None, start_time=None):
+    """Create a Transaction (Charging Session) with given status/energy/billed,
+    optionally backdating start_time (the date the filter keys on)."""
+    from models import Transaction, TransactionStatusEnum
+    txn = await Transaction.create(
+        charger=charger, user=user,
+        transaction_status=getattr(TransactionStatusEnum, status),
+        energy_consumed_kwh=(Decimal(energy) if energy is not None else None),
+        total_billed=(Decimal(billed) if billed is not None else None),
+    )
+    if start_time is not None:
+        await Transaction.filter(id=txn.id).update(start_time=start_time)
+    return txn
+
+
+async def test_transactions_summary_sums_stored_figures(
+    client_franchisee, test_franchisee, franchisee_a_charger, test_user,
+):
+    """Energy/revenue sum stored columns; a RUNNING session (NULL energy/billed)
+    contributes 0 but still counts as a session."""
+    await _make_txn(franchisee_a_charger, test_user, status="COMPLETED", energy="10.500", billed="120.00")
+    await _make_txn(franchisee_a_charger, test_user, status="STOPPED", energy="4.250", billed="50.00")
+    await _make_txn(franchisee_a_charger, test_user, status="RUNNING")  # NULL energy/billed
+
+    resp = await client_franchisee.get("/api/franchisee/transactions")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 3                       # running session counts
+    assert body["summary"]["total_energy_kwh"] == "14.750"   # 10.5 + 4.25, NULL→0
+    assert body["summary"]["total_revenue"] == "170.00"      # 120 + 50, NULL→0
+
+
+async def test_transactions_summary_respects_status_filter(
+    client_franchisee, test_franchisee, franchisee_a_charger, test_user,
+):
+    """The summary reflects the status filter, not just the table rows."""
+    await _make_txn(franchisee_a_charger, test_user, status="COMPLETED", energy="10.000", billed="100.00")
+    await _make_txn(franchisee_a_charger, test_user, status="FAILED", energy="2.000", billed="20.00")
+
+    resp = await client_franchisee.get("/api/franchisee/transactions?status=COMPLETED")
+    body = resp.json()
+    assert body["total"] == 1
+    assert body["summary"]["total_energy_kwh"] == "10.000"
+    assert body["summary"]["total_revenue"] == "100.00"
+
+
+async def test_transactions_date_filter_is_ist_on_start_time(
+    client_franchisee, test_franchisee, franchisee_a_charger, test_user,
+):
+    """from/to are inclusive IST dates on start_time. 2026-06-30 20:30 UTC ==
+    2026-07-01 02:00 IST belongs to July, not June."""
+    boundary = datetime(2026, 6, 30, 20, 30, tzinfo=timezone.utc)
+    txn = await _make_txn(
+        franchisee_a_charger, test_user, status="COMPLETED",
+        energy="7.000", billed="80.00", start_time=boundary,
+    )
+
+    june = await client_franchisee.get(
+        "/api/franchisee/transactions?from_date=2026-06-01&to_date=2026-06-30"
+    )
+    july = await client_franchisee.get(
+        "/api/franchisee/transactions?from_date=2026-07-01&to_date=2026-07-31"
+    )
+    assert txn.id not in [t["id"] for t in june.json()["data"]]
+    assert june.json()["summary"]["total_energy_kwh"] == "0.000"
+    assert txn.id in [t["id"] for t in july.json()["data"]]
+    assert july.json()["summary"]["total_energy_kwh"] == "7.000"
+
+
 # ───────────────────────── profile ─────────────────────────
 
 

@@ -172,6 +172,32 @@ async def test_qr_cross_env_qr_code_not_found(client, caplog):
     assert not qr_miss_errors, "cross-env QR miss must not log at ERROR"
 
 
+@pytest.mark.asyncio
+async def test_qr_payment_on_inactive_own_qr_logs_error(client, qr_charger, caplog):
+    """A payment on a QR that IS ours but inactive (closed/regenerated) means a
+    customer paid and gets no session — must stay visible at ERROR, NOT be
+    silently folded into the cross-environment info downgrade."""
+    await ChargerQRCode.create(
+        charger=qr_charger,
+        razorpay_qr_code_id="qr_OURS_BUT_CLOSED",
+        image_url="https://razorpay.example/qr/closed.png",
+        is_active=False,
+    )
+    payload = _webhook_payload("pay_ONCLOSED", "qr_OURS_BUT_CLOSED", 10000)
+
+    with patch("services.qr_payment_service.redis_manager") as mock_redis:
+        mock_redis.is_charger_connected = AsyncMock(return_value=False)
+        with caplog.at_level("INFO", logger="services.qr_payment_service"):
+            result = await QRPaymentService.handle_qr_payment(payload)
+
+    assert result["status"] == "error"
+    inactive_errors = [
+        r for r in caplog.records
+        if r.levelname == "ERROR" and "INACTIVE ChargerQRCode" in r.message
+    ]
+    assert inactive_errors, "payment on our own inactive QR must log at ERROR"
+
+
 # ============================================================================
 # UPI guest user creation
 # ============================================================================

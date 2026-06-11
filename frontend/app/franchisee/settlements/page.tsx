@@ -17,6 +17,7 @@ import {
 import { Banknote, MinusCircle, AlertTriangle } from "lucide-react";
 import Link from "next/link";
 import { formatINR } from "@/lib/utils";
+import { type DatePreset, presetRange } from "@/lib/date-presets";
 
 const STATUS_COLORS: Record<string, string> = {
   PENDING: "bg-yellow-100 text-yellow-800",
@@ -55,38 +56,6 @@ interface SettlementSummary {
   payout_pending: string;
   total_tds: string;
   failed_count: number;
-}
-
-type Preset = "all" | "current" | "last" | "custom";
-
-const pad = (n: number) => String(n).padStart(2, "0");
-
-// "Today" as the franchisee perceives it — IST calendar date, regardless of
-// the browser's timezone. en-CA formats as YYYY-MM-DD.
-function istToday(): { y: number; m: number; d: number } {
-  const s = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Asia/Kolkata",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(new Date());
-  const [y, m, d] = s.split("-").map(Number);
-  return { y, m, d };
-}
-
-// Inclusive IST date range for a preset (backend interprets these as IST).
-function presetRange(preset: Preset): { from?: string; to?: string } {
-  const { y, m, d } = istToday();
-  if (preset === "current") {
-    return { from: `${y}-${pad(m)}-01`, to: `${y}-${pad(m)}-${pad(d)}` };
-  }
-  if (preset === "last") {
-    const py = m === 1 ? y - 1 : y;
-    const pm = m === 1 ? 12 : m - 1;
-    const lastDay = new Date(py, pm, 0).getDate();
-    return { from: `${py}-${pad(pm)}-01`, to: `${py}-${pad(pm)}-${pad(lastDay)}` };
-  }
-  return {};
 }
 
 function SummaryCards({ summary }: { summary: SettlementSummary }) {
@@ -136,7 +105,7 @@ function SummaryCards({ summary }: { summary: SettlementSummary }) {
 
 function SettlementsContent() {
   const [currentPage, setCurrentPage] = useState(1);
-  const [preset, setPreset] = useState<Preset>("all");
+  const [preset, setPreset] = useState<DatePreset>("all");
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
   const limit = 20;
@@ -153,7 +122,7 @@ function SettlementsContent() {
     to_date: toDate || undefined,
   });
 
-  const applyPreset = (p: Preset) => {
+  const applyPreset = (p: DatePreset) => {
     setPreset(p);
     if (p === "custom") return;
     const { from, to } = presetRange(p);
@@ -170,7 +139,7 @@ function SettlementsContent() {
   const summary = data?.summary as SettlementSummary | undefined;
   const totalPages = data ? Math.ceil(data.total / limit) : 0;
 
-  const PRESETS: { key: Preset; label: string }[] = [
+  const PRESETS: { key: DatePreset; label: string }[] = [
     { key: "all", label: "All time" },
     { key: "current", label: "Current month" },
     { key: "last", label: "Last month" },

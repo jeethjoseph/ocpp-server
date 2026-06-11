@@ -332,10 +332,19 @@ class QRPaymentService:
             razorpay_qr_code_id=qr_code_id, is_active=True
         ).prefetch_related("charger").first()
         if not charger_qr:
-            # Expected cross-environment case: staging and prod share the same
-            # Razorpay live account, so each receives webhooks for the other's
-            # QR codes. Skip gracefully at info level — not a Sentry error.
-            logger.info(f"No active ChargerQRCode found for qr_code_id={qr_code_id} (likely cross-environment webhook)")
+            # Two very different causes. If NO row exists for this qr_code_id,
+            # it's the other environment's QR (staging and prod share one
+            # Razorpay live account) — expected noise, log at info. But if a
+            # row DOES exist and is merely inactive, the QR is OURS (closed or
+            # regenerated) and a customer just paid on a dead QR → they get no
+            # session. That is real and customer-impacting: keep it at error.
+            exists_inactive = await ChargerQRCode.filter(
+                razorpay_qr_code_id=qr_code_id
+            ).exists()
+            if exists_inactive:
+                logger.error(f"Payment on INACTIVE ChargerQRCode qr_code_id={qr_code_id} — customer paid on a closed/regenerated QR, no session created")
+            else:
+                logger.info(f"No ChargerQRCode for qr_code_id={qr_code_id} (likely cross-environment webhook)")
             return {"status": "error", "reason": "QR code not found or inactive"}
 
         charger = charger_qr.charger
