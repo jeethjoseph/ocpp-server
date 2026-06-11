@@ -55,6 +55,9 @@ services:
       - REDIS_URL=redis://redis:6379
       - NEW_RELIC_MONITOR_MODE=false
       - SENTRY_ENABLED=false
+      # Sentry release tag (parity with staging/prod; Sentry is off in dev).
+      - GIT_COMMIT=${GIT_COMMIT:-}
+      - SENTRY_RELEASE=${SENTRY_RELEASE:-}
       # Used by Clerk invitation service to build the redirect URL that
       # Clerk's magic-link email points to after sign-up completes.
       - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3000}

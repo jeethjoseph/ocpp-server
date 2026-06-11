@@ -653,8 +653,13 @@ async def remote_start_charging(charger_id: int, connector_id: int = 1, user: Us
             "message": "Remote start command sent successfully",
             "connector_id": connector_id
         }
-    else:
-        raise HTTPException(status_code=500, detail=f"Failed to send start command: {response}")
+    # A charger that doesn't ACK in time is offline/slow — an upstream
+    # gateway condition, not a server fault. Return 504 (excluded from
+    # Sentry's failed-request reporting; see monitoring_service) instead of
+    # a 500 that would spam error tracking with expected operational noise.
+    if isinstance(response, str) and response.startswith("OCPP timeout"):
+        raise HTTPException(status_code=504, detail="Charger did not respond in time. It may be offline — please try again.")
+    raise HTTPException(status_code=500, detail=f"Failed to send start command: {response}")
 
 @router.post("/{charger_id}/remote-stop", response_model=dict)
 async def remote_stop_charging(charger_id: int, reason: Optional[str] = "Requested by operator", user: User = Depends(require_user_or_admin())):

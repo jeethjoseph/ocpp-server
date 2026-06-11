@@ -222,6 +222,48 @@ class TestChargerEndpoints:
         assert response.json()["detail"] == "Charger is not connected"
     
     @pytest.mark.asyncio
+    @patch("routers.chargers.is_charger_connected")
+    @patch("main.send_ocpp_request")
+    async def test_remote_start_timeout_returns_504(
+        self, mock_send_ocpp, mock_connected, client_admin: AsyncClient, test_charger
+    ):
+        """An OCPP timeout on remote-start is an upstream/charger-offline
+        condition → 504, not 500 (OCPP-BACKEND-9)."""
+        from models import ChargerStatusEnum
+        mock_connected.return_value = True
+        await Charger.filter(id=test_charger.id).update(
+            latest_status=ChargerStatusEnum.PREPARING
+        )
+        mock_send_ocpp.return_value = (False, "OCPP timeout: RemoteStartTransaction")
+
+        response = await client_admin.post(
+            f"/api/admin/chargers/{test_charger.id}/remote-start"
+        )
+
+        assert response.status_code == status.HTTP_504_GATEWAY_TIMEOUT
+        assert "did not respond" in response.json()["detail"].lower()
+
+    @pytest.mark.asyncio
+    @patch("routers.chargers.is_charger_connected")
+    @patch("main.send_ocpp_request")
+    async def test_remote_start_other_failure_returns_500(
+        self, mock_send_ocpp, mock_connected, client_admin: AsyncClient, test_charger
+    ):
+        """A non-timeout OCPP failure still surfaces as a 500 server error."""
+        from models import ChargerStatusEnum
+        mock_connected.return_value = True
+        await Charger.filter(id=test_charger.id).update(
+            latest_status=ChargerStatusEnum.PREPARING
+        )
+        mock_send_ocpp.return_value = (False, "Rejected")
+
+        response = await client_admin.post(
+            f"/api/admin/chargers/{test_charger.id}/remote-start"
+        )
+
+        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+
+    @pytest.mark.asyncio
     @patch('main.send_ocpp_request')
     async def test_change_availability(self, mock_send_ocpp, client_admin: AsyncClient, test_charger):
         """Test changing charger availability"""

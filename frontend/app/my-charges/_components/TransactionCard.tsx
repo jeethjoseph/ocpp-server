@@ -63,6 +63,13 @@ function formatINRBare(val: string | null): string {
 }
 
 export function TransactionCard({ txn, vpa }: { txn: QRTransactionItem; vpa: string }) {
+  // A REFUND_FAILED row whose only "failure" is the sub-₹1 Razorpay floor is a
+  // benign completed charge — show it as Completed, not a red error.
+  const belowMin = txn.refund_below_minimum;
+  const displayStatus = belowMin ? "Completed" : txn.status.replace("_", " ");
+  const badgeClass = belowMin
+    ? getStatusBadgeClass("COMPLETED")
+    : getStatusBadgeClass(txn.status);
   return (
     <Card className="border-0 shadow-md bg-card">
       <CardContent className="p-4 space-y-3">
@@ -75,8 +82,8 @@ export function TransactionCard({ txn, vpa }: { txn: QRTransactionItem; vpa: str
               {formatTime(txn.created_at)}
             </p>
           </div>
-          <Badge className={`border-0 ${getStatusBadgeClass(txn.status)}`}>
-            {txn.status.replace("_", " ")}
+          <Badge className={`border-0 ${badgeClass}`}>
+            {displayStatus}
           </Badge>
         </div>
 
@@ -149,7 +156,7 @@ export function TransactionCard({ txn, vpa }: { txn: QRTransactionItem; vpa: str
 
         <RefundLifecycle txn={txn} />
 
-        {txn.failure_reason &&
+        {txn.failure_reason && !belowMin &&
           (txn.status === "FAILED" || txn.status === "REFUND_FAILED") && (
             <div className="flex items-start gap-2 p-2 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-700 rounded-lg">
               <AlertCircle className="h-4 w-4 text-red-600 dark:text-red-400 mt-0.5 flex-shrink-0" />
@@ -159,7 +166,7 @@ export function TransactionCard({ txn, vpa }: { txn: QRTransactionItem; vpa: str
             </div>
           )}
 
-        {(txn.status === "COMPLETED" || txn.status === "REFUNDED") && (
+        {(txn.status === "COMPLETED" || txn.status === "REFUNDED" || belowMin) && (
           <Button
             variant="outline"
             size="sm"

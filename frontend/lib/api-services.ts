@@ -308,6 +308,9 @@ export interface QRTransactionItem {
   start_time: string | null;
   end_time: string | null;
   failure_reason: string | null;
+  // True when status is REFUND_FAILED only because the unused balance is below
+  // Razorpay's ₹1 floor — a benign sub-rupee forfeit, not an error. Render neutrally.
+  refund_below_minimum: boolean;
 }
 
 export interface QRTransactionListResponse {
@@ -968,10 +971,17 @@ export const franchiseePortalService = {
   getTransaction: (id: number) =>
     api.get<any>(`/api/franchisee/transactions/${id}`),
 
-  getSettlements: (params?: { page?: number; limit?: number }) => {
+  getSettlements: (params?: {
+    page?: number;
+    limit?: number;
+    from_date?: string;
+    to_date?: string;
+  }) => {
     const searchParams = new URLSearchParams();
     if (params?.page) searchParams.set("page", params.page.toString());
     if (params?.limit) searchParams.set("limit", params.limit.toString());
+    if (params?.from_date) searchParams.set("from_date", params.from_date);
+    if (params?.to_date) searchParams.set("to_date", params.to_date);
     const query = searchParams.toString();
     return api.get<any>(`/api/franchisee/settlements${query ? `?${query}` : ""}`);
   },

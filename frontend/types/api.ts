@@ -525,6 +525,9 @@ export interface QRPayment {
   razorpay_refund_speed_processed?: string | null;
   status: QRPaymentStatus;
   failure_reason?: string;
+  // True when REFUND_FAILED only because the unused balance is below Razorpay's
+  // ₹1 floor — a benign sub-rupee forfeit; render a neutral badge, not red.
+  refund_below_minimum?: boolean;
   transaction_id?: number;
   created_at: string;
 }

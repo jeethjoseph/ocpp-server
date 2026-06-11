@@ -150,3 +150,48 @@ async def test_regenerate_qr_closes_razorpay_on_db_insert_failure(client_admin, 
     assert len(rows) == 1
     assert rows[0].id == baseline_id
     assert rows[0].is_active is False
+
+
+# ── refund_below_minimum on the payments endpoint (benign sub-₹1 forfeit) ──
+
+import uuid
+from decimal import Decimal
+from models import QRPayment, QRPaymentStatusEnum, User
+
+
+async def _qr_payment(qr_code, charger, *, status, failure_reason=None, refund_amount=None):
+    user = await User.create(
+        email=f"qp_{uuid.uuid4().hex[:6]}@voltlync.test",
+        phone_number=f"9{uuid.uuid4().int % 1000000000:09d}",
+    )
+    return await QRPayment.create(
+        charger=charger, charger_qr_code=qr_code, user=user,
+        razorpay_payment_id=f"pay_{uuid.uuid4().hex[:12]}",
+        razorpay_qr_code_id=qr_code.razorpay_qr_code_id,
+        amount_paid=Decimal("20.00"), status=status,
+        failure_reason=failure_reason, refund_amount=refund_amount,
+    )
+
+
+async def test_payments_endpoint_flags_below_minimum(client_admin, test_charger):
+    qr = await ChargerQRCode.create(
+        charger=test_charger, razorpay_qr_code_id=f"qr_{uuid.uuid4().hex[:8]}",
+        image_url="https://x/qr.png", is_active=True,
+    )
+    below = await _qr_payment(
+        qr, test_charger, status=QRPaymentStatusEnum.REFUND_FAILED,
+        failure_reason="below_razorpay_minimum", refund_amount=Decimal("0.02"),
+    )
+    genuine = await _qr_payment(
+        qr, test_charger, status=QRPaymentStatusEnum.REFUND_FAILED,
+        failure_reason="HTTP 500: insufficient balance", refund_amount=Decimal("5.00"),
+    )
+    completed = await _qr_payment(qr, test_charger, status=QRPaymentStatusEnum.COMPLETED)
+
+    resp = await client_admin.get(f"/api/admin/qr-codes/{qr.id}/payments")
+    assert resp.status_code == 200
+    rows = {r["id"]: r for r in resp.json()["data"]}
+
+    assert rows[below.id]["refund_below_minimum"] is True
+    assert rows[genuine.id]["refund_below_minimum"] is False
+    assert rows[completed.id]["refund_below_minimum"] is False

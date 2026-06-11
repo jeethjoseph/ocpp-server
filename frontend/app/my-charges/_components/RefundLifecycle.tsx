@@ -19,6 +19,19 @@ export function RefundLifecycle({ txn }: { txn: QRTransactionItem }) {
 
   const amount = formatINR(txn.refund_amount);
 
+  // Sub-₹1 forfeit: Razorpay can't process amounts below ₹1, so there is no
+  // refund to track. Show a calm, factual note — not the red "failed" or the
+  // purple "initiated · awaiting confirmation" states (it never confirms).
+  if (txn.refund_below_minimum) {
+    return (
+      <div className="p-2 bg-muted/50 border border-border rounded-lg">
+        <span className="text-xs text-muted-foreground">
+          {amount} unused — below Razorpay&apos;s ₹1 minimum, so it can&apos;t be refunded.
+        </span>
+      </div>
+    );
+  }
+
   if (txn.refund_failure_reason) {
     return (
       <div className="p-2 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-700 rounded-lg space-y-1">

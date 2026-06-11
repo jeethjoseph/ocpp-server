@@ -64,8 +64,31 @@ def initialize_monitoring():
             from sentry_sdk.integrations.redis import RedisIntegration
             from sentry_sdk.integrations.logging import LoggingIntegration
 
+            from datetime import datetime, timezone
+
             # Get configuration from environment
             sentry_environment = os.getenv("SENTRY_ENVIRONMENT", environment)
+
+            # Report 5xx as failed requests EXCEPT 504: a 504 here is the
+            # expected "charger didn't respond in time" upstream-gateway case
+            # raised by the remote-start endpoint, not a server fault. The app
+            # has no other intentional 504 source. Revisit if that changes.
+            failed_request_status_codes = frozenset(range(500, 600)) - {504}
+
+            # Release: prefer an explicitly injected version (SENTRY_RELEASE or
+            # the deploy's GIT_COMMIT) so events are attributable to a deploy.
+            # Fall back to an env+timestamp marker — mirrors the frontend
+            # (next.config.ts) — so we never silently report the literal "dev".
+            sentry_release = (
+                os.getenv("SENTRY_RELEASE")
+                or os.getenv("GIT_COMMIT")
+                or f"{sentry_environment}-{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H-%M-%S')}"
+            )
+            if not (os.getenv("SENTRY_RELEASE") or os.getenv("GIT_COMMIT")) and environment != "development":
+                logger.warning(
+                    f"⚠️ Sentry release pinned to a startup timestamp ({sentry_release}); "
+                    "set GIT_COMMIT (or SENTRY_RELEASE) at deploy for stable release tracking"
+                )
             traces_sample_rate = float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.1"))
             profiles_sample_rate = float(os.getenv("SENTRY_PROFILES_SAMPLE_RATE", "0.1"))
 
@@ -75,8 +98,14 @@ def initialize_monitoring():
 
                 # Integrations
                 integrations=[
-                    FastApiIntegration(transaction_style="endpoint"),
-                    StarletteIntegration(transaction_style="endpoint"),
+                    FastApiIntegration(
+                        transaction_style="endpoint",
+                        failed_request_status_codes=failed_request_status_codes,
+                    ),
+                    StarletteIntegration(
+                        transaction_style="endpoint",
+                        failed_request_status_codes=failed_request_status_codes,
+                    ),
                     AsyncioIntegration(),
                     RedisIntegration(),
                     LoggingIntegration(
@@ -95,8 +124,8 @@ def initialize_monitoring():
                     asyncio.CancelledError,
                 ],
 
-                # Release tracking (use git commit hash in production)
-                release=os.getenv("GIT_COMMIT", "dev"),
+                # Release tracking (deploy SHA / explicit release; see above)
+                release=sentry_release,
 
                 # Additional options
                 attach_stacktrace=True,

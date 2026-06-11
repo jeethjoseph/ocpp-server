@@ -62,22 +62,31 @@ IDEMPOTENCY_CONFLICT_NO_REFUND = "idempotency_conflict_no_refund"
 BELOW_MINIMUM_REASON = "below_razorpay_minimum"
 
 
+def is_below_minimum_reason(failure_reason: Optional[str]) -> bool:
+    """True if a failure_reason marks Razorpay's sub-₹1 floor — the canonical
+    marker OR the legacy long-form text ("... below Razorpay minimum (₹1.00) ...").
+    This is a *benign* terminal state (the customer consumed all but a sub-rupee
+    remainder Razorpay cannot refund), NOT an operational failure. Substring-
+    based, not exact-match, so legacy/variant wording is still caught."""
+    if not failure_reason:
+        return False
+    fr = failure_reason.lower()
+    return fr == BELOW_MINIMUM_REASON or "below razorpay minimum" in fr
+
+
 def is_retryable_refund_failure(failure_reason: Optional[str]) -> bool:
     """Whether a REFUND_FAILED row is worth another BillingRetryService attempt.
 
     Permanently-stuck reasons return False so the sweep stops hammering them:
-      - below Razorpay's ₹1 floor — canonical marker OR legacy long-form text
-        ("... below Razorpay minimum (₹1.00) ...")
+      - below Razorpay's ₹1 floor (see is_below_minimum_reason)
       - an idempotency conflict with no existing refund to reconcile to
     Everything else (transient API/network errors, empty reason) is retryable.
-    Substring-based, not exact-match, so legacy/variant wording is still caught.
     """
     if not failure_reason:
         return True
-    fr = failure_reason.lower()
-    if fr == IDEMPOTENCY_CONFLICT_NO_REFUND:
+    if failure_reason.lower() == IDEMPOTENCY_CONFLICT_NO_REFUND:
         return False
-    if fr == BELOW_MINIMUM_REASON or "below razorpay minimum" in fr:
+    if is_below_minimum_reason(failure_reason):
         return False
     return True
 
@@ -323,7 +332,10 @@ class QRPaymentService:
             razorpay_qr_code_id=qr_code_id, is_active=True
         ).prefetch_related("charger").first()
         if not charger_qr:
-            logger.error(f"No active ChargerQRCode found for qr_code_id={qr_code_id}")
+            # Expected cross-environment case: staging and prod share the same
+            # Razorpay live account, so each receives webhooks for the other's
+            # QR codes. Skip gracefully at info level — not a Sentry error.
+            logger.info(f"No active ChargerQRCode found for qr_code_id={qr_code_id} (likely cross-environment webhook)")
             return {"status": "error", "reason": "QR code not found or inactive"}
 
         charger = charger_qr.charger

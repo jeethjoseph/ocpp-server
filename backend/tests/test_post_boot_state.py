@@ -170,6 +170,20 @@ class TestPushPostBootStateErrorHandling:
         # Should not raise
         await cp._push_post_boot_state(transaction=None)
 
+    @pytest.mark.asyncio
+    async def test_none_response(self, client, test_charger):
+        """No AttributeError when call() resolves to None (unparseable/dropped
+        reply) — regression for OCPP-BACKEND-1Q."""
+        from main import ChargePoint
+
+        cp = ChargePoint.__new__(ChargePoint)
+        cp.id = test_charger.charge_point_string_id
+        cp.call = AsyncMock(return_value=None)
+
+        # Should not raise AttributeError on response.status
+        await cp._push_post_boot_state(transaction=None)
+        cp.call.assert_called_once()
+
 
 # --- Integration Tests ---
 

@@ -259,8 +259,9 @@ prod-down:
 	$(PROD_COMPOSE) down
 
 # Rebuild and restart production (after pull)
+# Export GIT_COMMIT so compose stamps it into backend's env → Sentry release.
 prod-rebuild:
-	$(PROD_COMPOSE) up -d --build --force-recreate
+	GIT_COMMIT=$$(git rev-parse --short HEAD) $(PROD_COMPOSE) up -d --build --force-recreate
 	@echo "Waiting for services to stabilize..."
 	@sleep 5
 	@if ! $(PROD_COMPOSE) exec -T nginx test -d /etc/letsencrypt/archive 2>/dev/null; then \
@@ -484,7 +485,7 @@ staging-down:
 
 # Rebuild and restart staging (after pull)
 staging-rebuild:
-	$(STAGING_COMPOSE) up -d --build --force-recreate
+	GIT_COMMIT=$$(git rev-parse --short HEAD) $(STAGING_COMPOSE) up -d --build --force-recreate
 	@echo "Waiting for services to stabilize..."
 	@sleep 5
 	@if ! $(STAGING_COMPOSE) exec -T nginx test -d /etc/letsencrypt/archive 2>/dev/null; then \

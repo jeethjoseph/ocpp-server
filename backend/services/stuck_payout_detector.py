@@ -71,12 +71,19 @@ class StuckPayoutDetector:
         interval_seconds: int = 3600,
         threshold_hours: int = 24,
         max_transfer_retries: int = 3,
+        alert_cooldown_hours: int = 24,
     ):
         self.interval_seconds = interval_seconds
         self.threshold_hours = threshold_hours
         self.max_transfer_retries = max_transfer_retries
+        self.alert_cooldown_hours = alert_cooldown_hours
         self.is_running = False
         self._task: Optional[asyncio.Task] = None
+        # Per-franchisee dedup: franchisee_id -> (stuck entry-id set, last alert).
+        # Suppresses re-alerting an unchanged stuck set every pass; a changed
+        # set or an elapsed cooldown re-alerts. In-memory by design — a restart
+        # re-alerts once, which is the right behaviour for an ops signal.
+        self._alert_state: dict = {}
 
     async def start(self):
         if self.is_running:
@@ -120,7 +127,6 @@ class StuckPayoutDetector:
         """Run one detection pass. Returns the number of stuck entries
         found."""
         from models import CommissionLedgerEntry
-        from services.monitoring_service import SentryHelper
 
         entries = await CommissionLedgerEntry.filter(
             build_stuck_filter(
@@ -135,33 +141,56 @@ class StuckPayoutDetector:
             by_franchisee[e.franchisee_id].append(e)
 
         now = datetime.now(timezone.utc)
+        active = set(by_franchisee)
         for franchisee_id, group in by_franchisee.items():
-            oldest = min(e.created_at for e in group)
-            age_hours = max(0, int((now - oldest).total_seconds() // 3600))
-            statuses = {
-                (e.settlement_status.value if hasattr(e.settlement_status, "value") else str(e.settlement_status))
-                for e in group
-            }
-            SentryHelper.capture_message(
-                f"Stuck franchisee payouts: {len(group)} entries for franchisee {franchisee_id}",
-                level="warning",
-                tags={
-                    "franchisee_id": franchisee_id,
-                    "count": len(group),
-                    "oldest_age_hours": age_hours,
-                },
-                extra={
-                    "statuses": sorted(statuses),
-                    "entry_ids": [e.id for e in group][:50],
-                    "threshold_hours": self.threshold_hours,
-                },
-            )
-            logger.warning(
-                "Stuck payouts: franchisee=%d count=%d oldest_age_h=%d statuses=%s",
-                franchisee_id, len(group), age_hours, sorted(statuses),
-            )
-
+            if self._should_alert(franchisee_id, group, now):
+                self._emit_alert(franchisee_id, group, now)
+        # Forget franchisees that are no longer stuck so they re-alert
+        # immediately if they become stuck again later.
+        self._alert_state = {
+            fid: st for fid, st in self._alert_state.items() if fid in active
+        }
         return len(entries)
+
+    def _should_alert(self, franchisee_id: int, group: list, now) -> bool:
+        """Alert when the stuck set changed since last alert, or the cooldown
+        window has elapsed for an unchanged set (periodic still-stuck heartbeat)."""
+        entry_ids = frozenset(e.id for e in group)
+        prev = self._alert_state.get(franchisee_id)
+        if prev is None or prev[0] != entry_ids:
+            return True
+        elapsed_h = (now - prev[1]).total_seconds() / 3600
+        return elapsed_h >= self.alert_cooldown_hours
+
+    def _emit_alert(self, franchisee_id: int, group: list, now) -> None:
+        from services.monitoring_service import SentryHelper
+
+        entry_ids = frozenset(e.id for e in group)
+        oldest = min(e.created_at for e in group)
+        age_hours = max(0, int((now - oldest).total_seconds() // 3600))
+        statuses = {
+            (e.settlement_status.value if hasattr(e.settlement_status, "value") else str(e.settlement_status))
+            for e in group
+        }
+        SentryHelper.capture_message(
+            f"Stuck franchisee payouts: {len(group)} entries for franchisee {franchisee_id}",
+            level="warning",
+            tags={
+                "franchisee_id": franchisee_id,
+                "count": len(group),
+                "oldest_age_hours": age_hours,
+            },
+            extra={
+                "statuses": sorted(statuses),
+                "entry_ids": sorted(entry_ids)[:50],
+                "threshold_hours": self.threshold_hours,
+            },
+        )
+        logger.warning(
+            "Stuck payouts: franchisee=%d count=%d oldest_age_h=%d statuses=%s",
+            franchisee_id, len(group), age_hours, sorted(statuses),
+        )
+        self._alert_state[franchisee_id] = (entry_ids, now)
 
 
 _stuck_detector: Optional[StuckPayoutDetector] = None
@@ -183,12 +212,14 @@ async def start_stuck_payout_detector():
     )
     threshold = int(os.getenv("STUCK_PAYOUT_THRESHOLD_HOURS", "24"))
     max_retries = int(os.getenv("MAX_TRANSFER_RETRIES", "3"))
+    alert_cooldown = int(os.getenv("STUCK_PAYOUT_ALERT_COOLDOWN_HOURS", "24"))
 
     if _stuck_detector is None:
         _stuck_detector = StuckPayoutDetector(
             interval_seconds=interval,
             threshold_hours=threshold,
             max_transfer_retries=max_retries,
+            alert_cooldown_hours=alert_cooldown,
         )
     await _stuck_detector.start()
 

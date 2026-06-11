@@ -70,9 +70,15 @@ class RedisConnectionManager:
         try:
             connection_key = f"{self.connection_key_prefix}{charger_id}"
             await self.redis_client.delete(connection_key)
-            
+
             logger.info(f"Removed charger {charger_id} from Redis")
             return True
+        except (redis.ConnectionError, redis.TimeoutError, OSError) as e:
+            # Transient during deploy/restart: the `redis` host can be briefly
+            # unresolvable (DNS Error -2) or unreachable while the stack cycles.
+            # Expected, self-heals — warn, don't raise a Sentry error.
+            logger.warning(f"Redis unavailable while removing charger {charger_id}: {e}")
+            return False
         except Exception as e:
             logger.error(f"Failed to remove charger {charger_id} from Redis: {e}")
             return False

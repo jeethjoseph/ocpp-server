@@ -6,11 +6,12 @@ Uses require_franchisee() which returns (User, Franchisee).
 
 import logging
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel
 from tortoise.expressions import Q
+from tortoise.functions import Sum
 
 from models import (
     Franchisee,
@@ -20,10 +21,12 @@ from models import (
     Transaction,
     MeterValue,
     CommissionLedgerEntry,
+    SettlementStatusEnum,
     TransactionStatusEnum,
     ChargerQRCode,
     QRPayment,
 )
+from utils import IST
 from auth_middleware import require_franchisee
 from crud import log_audit_event
 from services.razorpay_service import (
@@ -39,6 +42,65 @@ router = APIRouter(
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────
+
+# Settlement Status buckets for the franchisee earnings summary (see CONTEXT.md).
+# REVERSED is deliberately excluded from all money totals — it was clawed back.
+_SETTLED_STATUSES = [
+    SettlementStatusEnum.SETTLED,
+    SettlementStatusEnum.TRANSFER_PROCESSED,
+]
+_PENDING_STATUSES = [
+    SettlementStatusEnum.PENDING,
+    SettlementStatusEnum.TRANSFER_INITIATED,
+    SettlementStatusEnum.ON_HOLD,
+    SettlementStatusEnum.BELOW_THRESHOLD,
+    SettlementStatusEnum.FAILED,
+]
+
+
+def _ist_dates_to_utc_range(from_date: Optional[str], to_date: Optional[str]):
+    """Parse inclusive IST calendar dates (YYYY-MM-DD) into a half-open UTC
+    range [start, end). Either bound may be omitted (open-ended). The `to`
+    bound is exclusive of the day after, so the whole `to_date` day is included.
+    Earnings view: callers filter `created_at` against this range."""
+    def _parse(s: str):
+        try:
+            return datetime.strptime(s, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid date '{s}', expected YYYY-MM-DD")
+
+    start = end = None
+    if from_date:
+        d = _parse(from_date)
+        start = datetime(d.year, d.month, d.day, tzinfo=IST).astimezone(timezone.utc)
+    if to_date:
+        d = _parse(to_date) + timedelta(days=1)
+        end = datetime(d.year, d.month, d.day, tzinfo=IST).astimezone(timezone.utc)
+    if start and end and start >= end:
+        raise HTTPException(status_code=400, detail="from_date must be on or before to_date")
+    return start, end
+
+
+async def _settlement_summary(base_query) -> dict:
+    """Aggregate the franchisee earnings summary over the full filtered set.
+    Payout is split settled vs pending; REVERSED is excluded from money totals."""
+    async def _sum(query, field: str) -> float:
+        agg = await query.annotate(s=Sum(field)).values("s")
+        return float(agg[0]["s"]) if agg and agg[0]["s"] is not None else 0.0
+
+    non_reversed = base_query.exclude(settlement_status=SettlementStatusEnum.REVERSED)
+    settled = await _sum(base_query.filter(settlement_status__in=_SETTLED_STATUSES), "franchisee_payout")
+    pending = await _sum(base_query.filter(settlement_status__in=_PENDING_STATUSES), "franchisee_payout")
+    failed_count = await base_query.filter(settlement_status=SettlementStatusEnum.FAILED).count()
+    return {
+        "total_gross": f"{await _sum(non_reversed, 'gross_amount'):.2f}",
+        "total_tds": f"{await _sum(non_reversed, 'tds_amount'):.2f}",
+        "payout_settled": f"{settled:.2f}",
+        "payout_pending": f"{pending:.2f}",
+        "total_payout": f"{settled + pending:.2f}",
+        "failed_count": failed_count,
+    }
+
 
 async def _get_franchisee_station_ids(franchisee_id: int) -> list[int]:
     stations = await ChargingStation.filter(
@@ -401,17 +463,29 @@ async def get_transaction(
 async def list_settlements(
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
+    from_date: Optional[str] = Query(None, description="Inclusive IST date YYYY-MM-DD"),
+    to_date: Optional[str] = Query(None, description="Inclusive IST date YYYY-MM-DD"),
     auth=Depends(require_franchisee()),
 ):
     _, franchisee = auth
 
+    # Earnings view: filter Settlement Entries by created_at (accrual date),
+    # interpreting from_date/to_date as inclusive IST calendar dates.
+    start_utc, end_utc = _ist_dates_to_utc_range(from_date, to_date)
     query = CommissionLedgerEntry.filter(franchisee_id=franchisee.id)
+    if start_utc:
+        query = query.filter(created_at__gte=start_utc)
+    if end_utc:
+        query = query.filter(created_at__lt=end_utc)
+
     total = await query.count()
+    summary = await _settlement_summary(query)
     entries = await query.offset((page - 1) * limit).limit(limit).order_by(
         "-created_at"
     )
 
     return {
+        "summary": summary,
         "data": [
             {
                 "id": e.id,

@@ -12,6 +12,7 @@ from models import (
 from services.razorpay_service import (
     razorpay_service, build_qr_payee_name, build_qr_description,
 )
+from services.qr_payment_service import is_below_minimum_reason
 from tortoise.functions import Count, Sum
 
 logger = logging.getLogger(__name__)
@@ -337,6 +338,12 @@ async def get_qr_payments(
             "razorpay_refund_speed_processed": p.razorpay_refund_speed_processed,
             "status": p.status.value,
             "failure_reason": p.failure_reason,
+            # Benign sub-₹1 forfeit (Razorpay's floor) — not an operational
+            # failure; lets the admin UI render a neutral badge, not red.
+            "refund_below_minimum": (
+                p.status == QRPaymentStatusEnum.REFUND_FAILED
+                and is_below_minimum_reason(p.failure_reason)
+            ),
             "transaction_id": p.transaction_id,
             "created_at": p.created_at.isoformat(),
         })

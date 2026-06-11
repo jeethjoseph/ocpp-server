@@ -86,6 +86,16 @@ _Avoid_: charging date, session-start date (these name `charged_on`, a different
 Indian fiscal year, Apr–Mar, written `2026-27`. Derived from the **Invoice Date** (the issue instant in IST), and scopes the per-(franchisee, series) invoice serial sequence.
 _Avoid_: calendar year, billing year.
 
+### Settlements and payouts
+
+**Settlement Entry**:
+The per-**Charging Session** record of what a franchisee earned, one `CommissionLedgerEntry` row per billable session, created at session finalize. Carries `franchisee_payout` (the franchisee's take) net of `platform_commission` and `tds_amount`, alongside `gross_amount` and the session's `energy_consumed_kwh`. This is the unit the franchisee Settlements page lists and aggregates over.
+_Avoid_: "settlement" unqualified (overloaded with the money-movement below), "commission" as a noun for the whole row (it's one field).
+
+**Settlement Status**:
+The lifecycle of *paying out* a **Settlement Entry** to the franchisee via Razorpay Route, tracked on `CommissionLedgerEntry.settlement_status`: `PENDING → TRANSFER_INITIATED → TRANSFER_PROCESSED → SETTLED`, with `FAILED`, `REVERSED`, `ON_HOLD`, `BELOW_THRESHOLD` as off-happy-path states. A **Settlement Entry** exists and counts as earned the moment the session finalizes; its **Settlement Status** is whether the money has reached the franchisee yet.
+_Avoid_: conflating "earned" (the entry exists) with "settled" (the status reached its terminal state).
+
 ### Observability
 
 **OCPP message log**:

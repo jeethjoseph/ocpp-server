@@ -348,6 +348,13 @@ class ChargePoint(OcppChargePoint):
             )
             response = await asyncio.wait_for(self.call(req), timeout=15)
 
+            # self.call() resolves to None when the charger's reply can't be
+            # parsed into a response (connection dropped mid-call, malformed
+            # reply). Guard before reading .status — otherwise AttributeError.
+            if response is None:
+                logger.warning(f"📡 Charger {self.id} returned no usable PostBootState response")
+                return
+
             logger.info(f"📡 PostBootState push to {self.id}: status={response.status}, data={payload_data}")
             if response.status != "Accepted":
                 logger.warning(f"📡 Charger {self.id} did not accept PostBootState: status={response.status}")
@@ -871,7 +878,10 @@ class ChargePoint(OcppChargePoint):
             # Get transaction from database
             transaction = await Transaction.filter(id=transaction_id).first()
             if not transaction:
-                logger.error(f"🛑 ❌ Transaction {transaction_id} not found")
+                # Chargers legitimately send a placeholder transaction_id (e.g.
+                # -1) when they have no valid transaction to report. Responding
+                # Invalid is correct; this is expected, not an error.
+                logger.warning(f"🛑 StopTransaction for unknown transaction_id={transaction_id} — responding Invalid")
                 return call_result.StopTransaction(
                     id_tag_info={"status": "Invalid"}
                 )

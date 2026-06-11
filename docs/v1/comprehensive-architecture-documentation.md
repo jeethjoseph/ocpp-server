@@ -4119,6 +4119,12 @@ Separate `.env` files for each environment:
 - **Structured Logging**: Timestamp-prefixed logs with correlation IDs
 - **Health Check**: `GET /health` endpoint for container orchestration
 
+#### Sentry conventions (init in `services/monitoring_service.py`)
+- **Release**: resolved as `SENTRY_RELEASE` → `GIT_COMMIT` → `{env}-{startup-timestamp}`. `GIT_COMMIT` is injected at deploy time by `make {staging,prod}-rebuild` (`git rev-parse --short HEAD`) and surfaced to the container via `backend.environment:` in all three compose files. A non-dev env that falls back to the timestamp logs a startup warning — treat that as a misconfigured deploy. (Mirrors the frontend's `next.config.ts` release logic.)
+- **Failed-request reporting**: the Starlette/FastAPI integrations report 5xx **except 504**. A 504 is the deliberate "charger didn't ACK in time" response from `routers/chargers.remote_start_charging` (an upstream/charger-offline condition, not a server fault) and is intentionally excluded from error tracking. 504 is presently the only intentional source — revisit `failed_request_status_codes` before adding another.
+- **`logger.error` is a Sentry event** (LoggingIntegration `event_level=ERROR`). Expected/operational conditions must log at `info`/`warning`, not `error`. Established downgrades: cross-environment QR webhook miss, cross-environment **Clerk webhook signature failure** (staging/prod share one Clerk app, so the other endpoint's secret occasionally hits this URL — verified the prod secret is correct via webhook-created `app_user` rows), `StopTransaction` for an unknown/placeholder `transaction_id`, and Redis charger-removal connection/DNS loss during deploy. **Caveat for the Clerk one:** the downgrade masks a genuine future `CLERK_WEBHOOK_SECRET` drift — the positive signal (successful `Received Clerk webhook` lines / new clerk-linked users) is what to watch.
+- **Alert dedup**: background detectors that fire per-sweep (e.g. `StuckPayoutDetector`) dedup on the offending entity set with a cooldown so an unchanged condition doesn't re-page every cycle.
+
 ---
 
 ## Security & Compliance

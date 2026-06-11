@@ -152,6 +152,9 @@ services:
       - SENTRY_ENVIRONMENT=staging
       - SENTRY_TRACES_SAMPLE_RATE=${SENTRY_TRACES_SAMPLE_RATE:-0.1}
       - SENTRY_PROFILES_SAMPLE_RATE=${SENTRY_PROFILES_SAMPLE_RATE:-0.1}
+      # Release tag for Sentry (deploy SHA). Injected by `make staging-rebuild`.
+      - GIT_COMMIT=${GIT_COMMIT:-}
+      - SENTRY_RELEASE=${SENTRY_RELEASE:-}
     volumes:
       - backend_firmware_staging:/app/firmware_files
     # NOTE: `postgres` removed from depends_on as part of the RDS migration.

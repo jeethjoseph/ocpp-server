@@ -148,16 +148,28 @@ async def test_qr_webhook_idempotency_same_payment_id(client, qr_charger, qr_cod
 # ============================================================================
 
 @pytest.mark.asyncio
-async def test_qr_cross_env_qr_code_not_found(client):
-    """Webhook for an unknown QR code is treated as error-but-handled, not crash."""
+async def test_qr_cross_env_qr_code_not_found(client, caplog):
+    """Webhook for an unknown QR code is treated as error-but-handled, not crash.
+
+    Staging and prod share one Razorpay live account, so each gets the
+    other's QR webhooks — the miss is expected and must NOT log at ERROR
+    (Sentry's LoggingIntegration captures ERROR). Regression for
+    OCPP-BACKEND-R (208 false alarms)."""
     payload = _webhook_payload("pay_CROSS001", "qr_UNKNOWN_ENV", 10000)
 
     with patch("services.qr_payment_service.redis_manager") as mock_redis:
         mock_redis.is_charger_connected = AsyncMock(return_value=False)
-        result = await QRPaymentService.handle_qr_payment(payload)
+        with caplog.at_level("INFO", logger="services.qr_payment_service"):
+            result = await QRPaymentService.handle_qr_payment(payload)
 
     assert result["status"] == "error"
     assert "not found" in result["reason"].lower()
+
+    qr_miss_errors = [
+        r for r in caplog.records
+        if r.levelname == "ERROR" and "No active ChargerQRCode" in r.message
+    ]
+    assert not qr_miss_errors, "cross-env QR miss must not log at ERROR"
 
 
 # ============================================================================
@@ -2031,3 +2043,27 @@ async def test_full_refund_below_minimum_sets_canonical_marker(client, qr_charge
     await qr_payment.refresh_from_db()
     assert qr_payment.status == QRPaymentStatusEnum.REFUND_FAILED
     assert qr_payment.failure_reason == BELOW_MINIMUM_REASON
+
+
+# ============================================================================
+# Below-minimum classification (benign sub-₹1 forfeit, not a failure)
+# ============================================================================
+
+from services.qr_payment_service import is_below_minimum_reason
+
+
+@pytest.mark.parametrize(
+    "reason,expected",
+    [
+        ("below_razorpay_minimum", True),
+        ("BELOW_RAZORPAY_MINIMUM", True),
+        (_LEGACY_BELOW_MIN, True),
+        ("refund for pay_x BELOW razorpay MINIMUM (₹1.00)", True),
+        (None, False),
+        ("", False),
+        ("HTTP 500: insufficient balance", False),
+        (IDEMPOTENCY_CONFLICT_NO_REFUND, False),
+    ],
+)
+def test_is_below_minimum_reason(reason, expected):
+    assert is_below_minimum_reason(reason) is expected

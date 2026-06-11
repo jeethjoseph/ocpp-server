@@ -78,7 +78,7 @@ export function usePortalTransaction(id: number) {
 }
 
 export function usePortalSettlements(
-  params: { page?: number; limit?: number } = {}
+  params: { page?: number; limit?: number; from_date?: string; to_date?: string } = {}
 ) {
   const { isAuthReady } = useAuth();
   return useQuery({
