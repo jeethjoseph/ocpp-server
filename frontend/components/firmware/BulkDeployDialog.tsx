@@ -38,7 +38,9 @@ export function BulkDeployDialog({ firmware, open, onOpenChange }: BulkDeployDia
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [result, setResult] = useState<BulkUpdateResult | null>(null);
 
-  const { data: chargersData } = useChargers({ limit: 500 });
+  // The admin chargers list endpoint caps `limit` at 100 (rejects higher with a
+  // 422). 100 covers the current fleet; revisit with pagination if it grows past that.
+  const { data: chargersData } = useChargers({ limit: 100 });
   const { data: stationsData } = useStations({ limit: 200 });
   const bulkUpdate = useBulkUpdate();
 
