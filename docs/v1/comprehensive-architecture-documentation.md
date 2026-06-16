@@ -264,9 +264,9 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 - `GET /api/admin/firmware` - List firmware files
 - `DELETE /api/admin/firmware/{id}` - Soft delete (`is_active=False`)
 - `POST /api/admin/firmware/chargers/{id}/update` - Schedule update; resets any existing row for this (charger, firmware) pair regardless of prior status.
-- `POST /api/admin/firmware/bulk-update` - Bulk schedule
+- `POST /api/admin/firmware/bulk-update` - Idempotent bulk deploy. Returns `{ success, skipped, failed }`. `skipped` = already on target version OR in-flight (PENDING `attempt_count > 0`, left untouched); `success` = fresh/reset PENDING; `failed` = charger not found. Re-running disturbs nothing already handled or rolling out. Per-charger logic in `_bulk_classify_charger`.
 - `GET /api/admin/firmware/chargers/{id}/history` - History per charger
-- `GET /api/admin/firmware/updates/status` - Dashboard (PENDING rows + counts)
+- `GET /api/admin/firmware/updates/status` - Dashboard (PENDING rows + counts; `in_progress` items include `error_message`, the last-attempt failure reason)
 - `POST /api/admin/firmware/updates/{id}/cancel` - Cancel a PENDING row that has not yet been attempted (`attempt_count == 0`)
 - `POST /api/admin/firmware/updates/{id}/mark-installed` - Admin manual close for polling chargers (also updates `Charger.firmware_version`)
 - `POST /api/admin/firmware/updates/{id}/mark-failed` - Admin manual close (does not touch `Charger.firmware_version`)

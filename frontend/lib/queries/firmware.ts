@@ -112,12 +112,18 @@ export function useBulkUpdate() {
     onSuccess: (result) => {
       queryClient.invalidateQueries({ queryKey: firmwareKeys.status() });
       const successCount = result.success.length;
+      const skippedCount = result.skipped?.length ?? 0;
       const failedCount = result.failed.length;
 
+      const parts = [`${successCount} scheduled`];
+      if (skippedCount > 0) parts.push(`${skippedCount} skipped`);
+      if (failedCount > 0) parts.push(`${failedCount} failed`);
+      const message = parts.join(" · ");
+
       if (failedCount === 0) {
-        toast.success(`Bulk update initiated for ${successCount} charger(s)`);
+        toast.success(message);
       } else {
-        toast.warning(`Updated ${successCount} charger(s), ${failedCount} failed`);
+        toast.warning(message);
       }
     },
     onError: (err) => {

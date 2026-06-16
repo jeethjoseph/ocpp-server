@@ -389,8 +389,17 @@ export interface BulkFirmwareUpdateRequest {
 export interface BulkUpdateResult {
   success: Array<{
     charger_id: number;
-    charger_name: string;
+    charger_name?: string;
     update_id: number;
+  }>;
+  // Chargers left untouched: already on the target version, or an in-flight
+  // update (PENDING with attempt_count > 0). See the hardened bulk-update
+  // endpoint (.scratch/firmware-update-hardening/issues/04).
+  skipped: Array<{
+    charger_id: number;
+    charger_name?: string;
+    update_id?: number;
+    reason: string;
   }>;
   failed: Array<{
     charger_id: number;
@@ -418,6 +427,7 @@ export interface UpdateStatusDashboard {
     next_retry_at?: string;
     started_at?: string;
     initiated_at: string;
+    error_message?: string;
   }>;
   summary: UpdateStatusSummary;
 }

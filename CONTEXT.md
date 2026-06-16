@@ -48,6 +48,16 @@ A physical plug on a `Charger` (e.g. Type2, Socket, CCS), modelled as a `Connect
 A `Connector.connector_type` value (Type2, Socket, CCS, …). Customer-facing groupings on the station map and modal are by **plug type**, but the underlying counts are charger-level — see [[ui-station-modal-chargers]] for the rendering rule.
 _Avoid_: "connector" as a customer-facing label when you mean "charger of plug type X". Renamed in the public station modal 2026-05-21 to avoid the conflation.
 
+### Firmware
+
+**Firmware deployment** / **Deploy**:
+The admin action of scheduling a firmware version onto one or more **Chargers**. A deployment creates or resets a `FirmwareUpdate` row to PENDING per charger; the background scheduler later dispatches the OCPP `UpdateFirmware`. A **bulk deployment** is the same action applied to a multi-selected set of chargers from the **Firmware Library**, scoped by the picker's current filter (e.g. one station, or "all not already on this version").
+_Avoid_: "push", "flash" as the canonical verb (fine informally; "deploy" is the term).
+
+**In-flight firmware update**:
+A `FirmwareUpdate` row that is PENDING with `attempt_count > 0` — the server has already dispatched at least one `UpdateFirmware` and the charger may be mid-download. The dividing line that makes a row untouchable by a **bulk deployment**: bulk leaves in-flight rows completely unmodified (reported as `skipped`), never resetting their attempt/retry state. A PENDING row with `attempt_count == 0` is *scheduled but not in-flight* and is safe to re-UPSERT. Force-restarting an in-flight charger is the single-charger path's job, not bulk's.
+_Avoid_: treating "PENDING" alone as "in progress" — the attempt count is what distinguishes scheduled from active.
+
 ### Tariffs and pricing
 
 **All-in tariff** / **All-inclusive tariff**:

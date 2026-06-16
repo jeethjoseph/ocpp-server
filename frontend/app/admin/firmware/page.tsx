@@ -26,8 +26,11 @@ import {
   useMarkInstalled,
   useMarkFailed,
 } from "@/lib/queries/firmware";
-import { Upload, Trash2, RefreshCw, AlertCircle, CheckCircle2, Clock, XCircle, X } from "lucide-react";
+import { Upload, RefreshCw, AlertCircle, CheckCircle2, Clock, XCircle, X } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
+import { FirmwareLibraryTable } from "@/components/firmware/FirmwareLibraryTable";
+import { BulkDeployDialog } from "@/components/firmware/BulkDeployDialog";
+import type { FirmwareFile } from "@/types/api";
 
 export default function AdminFirmwarePage() {
   const { getToken } = useAuth();
@@ -35,6 +38,7 @@ export default function AdminFirmwarePage() {
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [uploadVersion, setUploadVersion] = useState("");
   const [uploadDescription, setUploadDescription] = useState("");
+  const [deployTarget, setDeployTarget] = useState<FirmwareFile | null>(null);
 
   // Queries - they will automatically wait for auth using isAuthReady from context
   const { data: firmwareData, isLoading: isLoadingFirmware } = useFirmwareFiles({ is_active: true });
@@ -201,7 +205,16 @@ export default function AdminFirmwarePage() {
                         </div>
                       </TableCell>
                       <TableCell>{update.firmware_version}</TableCell>
-                      <TableCell>{getStatusBadge(update.status)}</TableCell>
+                      <TableCell>
+                        <div className="space-y-1">
+                          {getStatusBadge(update.status)}
+                          {update.error_message && (
+                            <p className="text-xs text-destructive max-w-[16rem] whitespace-pre-wrap break-words">
+                              {update.error_message}
+                            </p>
+                          )}
+                        </div>
+                      </TableCell>
                       <TableCell>{update.attempt_count}</TableCell>
                       <TableCell className="text-sm text-muted-foreground">
                         {formatRelative(update.last_attempt_at)}
@@ -274,46 +287,24 @@ export default function AdminFirmwarePage() {
                 <p className="text-sm">Upload your first firmware to get started</p>
               </div>
             ) : (
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>ID</TableHead>
-                    <TableHead>Version</TableHead>
-                    <TableHead>Filename</TableHead>
-                    <TableHead>Size</TableHead>
-                    <TableHead>Checksum (MD5)</TableHead>
-                    <TableHead>Uploaded</TableHead>
-                    <TableHead>Actions</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {firmwareFiles.map((firmware) => (
-                    <TableRow key={firmware.id}>
-                      <TableCell className="font-mono text-xs text-muted-foreground">
-                        #{firmware.id}
-                      </TableCell>
-                      <TableCell className="font-medium">{firmware.version}</TableCell>
-                      <TableCell>{firmware.filename}</TableCell>
-                      <TableCell>{(firmware.file_size / 1024 / 1024).toFixed(2)} MB</TableCell>
-                      <TableCell className="font-mono text-xs">{firmware.checksum.substring(0, 8)}...</TableCell>
-                      <TableCell>{new Date(firmware.created_at).toLocaleDateString()}</TableCell>
-                      <TableCell>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => handleDelete(firmware.id, firmware.version)}
-                          disabled={deleteMutation.isPending}
-                        >
-                          <Trash2 className="h-4 w-4 text-destructive" />
-                        </Button>
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
+              <FirmwareLibraryTable
+                firmwareFiles={firmwareFiles}
+                onDelete={handleDelete}
+                onDeploy={setDeployTarget}
+                isDeleting={deleteMutation.isPending}
+              />
             )}
           </CardContent>
         </Card>
+
+        {/* Bulk Deploy Dialog */}
+        <BulkDeployDialog
+          firmware={deployTarget}
+          open={deployTarget !== null}
+          onOpenChange={(open) => {
+            if (!open) setDeployTarget(null);
+          }}
+        />
 
         {/* Upload Dialog */}
         <Dialog open={showUploadDialog} onOpenChange={setShowUploadDialog}>

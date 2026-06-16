@@ -49,6 +49,7 @@ import {
   useFirmwareHistory,
   useCancelUpdate,
 } from "@/lib/queries/firmware";
+import { RecentFirmwareUpdates } from "@/components/firmware/RecentFirmwareUpdates";
 import { useQRCodeByCharger, useCreateQRCode } from "@/lib/queries/qr-codes";
 
 // Transaction data comes exclusively from transaction API
@@ -536,31 +537,7 @@ export default function ChargerDetailPage() {
               {firmwareHistoryData && firmwareHistoryData.data.length > 0 && (
                 <div className="mt-4 pt-4 border-t">
                   <p className="text-sm font-medium mb-2">Recent Updates:</p>
-                  <div className="space-y-2">
-                    {firmwareHistoryData.data.filter((u) => u.status !== "PENDING").slice(0, 3).map((update) => (
-                      <div key={update.id} className="flex items-center text-xs">
-                        <Badge
-                          variant={
-                            update.status === "INSTALLED"
-                              ? "outline"
-                              : update.status === "CANCELLED"
-                              ? "secondary"
-                              : update.status.includes("FAILED")
-                              ? "destructive"
-                              : "default"
-                          }
-                          className="text-xs">
-                          {update.status}
-                        </Badge>
-                        {update.firmware_version && (
-                          <span className="ml-2">{update.firmware_version}</span>
-                        )}
-                        <span className="ml-2 text-muted-foreground">
-                          {new Date(update.initiated_at).toLocaleDateString()}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
+                  <RecentFirmwareUpdates updates={firmwareHistoryData.data} />
                 </div>
               )}
             </CardContent>
