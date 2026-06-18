@@ -634,7 +634,8 @@ class OCPPMetrics:
         })
 
     @staticmethod
-    async def record_refund_speed(charger_id, qr_payment_id: int, speed_processed):
+    async def record_refund_speed(charger_id, qr_payment_id: int, speed_processed,
+                                  balance_before=None, refund_credits_before=None):
         """Record Razorpay refund speed outcome on full-refund flows.
 
         Only call this when `speed=optimum` was requested — a normal-speed
@@ -642,6 +643,12 @@ class OCPPMetrics:
         New Relic counters so ops can alert on a sudden fallback spike
         (rail outage, account-level rate limit, payment-method shift).
         ADR 0002 amendment (2026-05-20).
+
+        `balance_before` / `refund_credits_before` are the Razorpay funding
+        pools (in rupees) snapshotted just before the refund POST, used to
+        diagnose `optimum -> normal` fallbacks against a thin settlement float.
+        Either may be None when the balance read was unavailable (best-effort).
+        ADR 0002 amendment (2026-06-18).
         """
         if speed_processed == "instant":
             MetricsCollector.increment_counter("Custom/QR/RefundInstantSucceeded")
@@ -651,4 +658,6 @@ class OCPPMetrics:
             "charger_id": charger_id,
             "qr_payment_id": qr_payment_id,
             "speed_processed": speed_processed or "unknown",
+            "balance_before": balance_before,
+            "refund_credits_before": refund_credits_before,
         })

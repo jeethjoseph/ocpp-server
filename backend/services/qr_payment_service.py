@@ -125,6 +125,24 @@ def build_refund_call_kwargs(qr_payment: QRPayment, refund_amount: Decimal) -> D
     }
 
 
+async def _fetch_funding_pools() -> tuple:
+    """Best-effort snapshot of the Razorpay funding pools for refund diagnostics.
+
+    Returns ``(balance_before, refund_credits_before)`` in rupees, or
+    ``(None, None)`` when the balance read is unavailable. Never raises — a
+    failed read (or any error in the balance path) must not affect the refund.
+    See ADR 0002 (2026-06-18 amendment).
+    """
+    try:
+        funding = await razorpay_service.fetch_balance()
+    except Exception as e:  # diagnostic is strictly additive; never break refund
+        logger.warning("Funding-pool snapshot failed: %s", e)
+        return None, None
+    if not funding:
+        return None, None
+    return funding.get("balance"), funding.get("refund_credits")
+
+
 async def _ensure_actual_fee_captured(qr_payment: QRPayment) -> None:
     """Side-effect writer: ensure the actual Razorpay fee lives on the row.
 
@@ -1048,6 +1066,13 @@ class QRPaymentService:
             refund_kwargs = build_refund_call_kwargs(locked, refund_amount)
             refund_speed = refund_kwargs["speed"]
 
+            # Snapshot the Razorpay funding pools BEFORE the refund POST so a
+            # downgrade (optimum -> normal) can be correlated with a thin
+            # settlement float. Optimum-only; best-effort. ADR 0002 (2026-06-18).
+            balance_before = refund_credits_before = None
+            if refund_speed == "optimum":
+                balance_before, refund_credits_before = await _fetch_funding_pools()
+
             try:
                 refund_result = await razorpay_service.refund_payment(
                     locked.razorpay_payment_id,
@@ -1060,12 +1085,16 @@ class QRPaymentService:
                     locked.status = QRPaymentStatusEnum.REFUNDED
                 await locked.save()
                 logger.info(
-                    "Full refund ₹%s issued for QR payment %s: %s",
+                    "Full refund ₹%s issued for QR payment %s: %s "
+                    "(balance_before=%s refund_credits_before=%s)",
                     refund_amount, locked.id, reason,
+                    balance_before, refund_credits_before,
                 )
                 if refund_speed == "optimum":
                     await OCPPMetrics.record_refund_speed(
                         locked.charger_id, locked.id, speed_processed,
+                        balance_before=balance_before,
+                        refund_credits_before=refund_credits_before,
                     )
             except RazorpayAlreadyRefundedError as e:
                 await QRPaymentService._reconcile_conflict(

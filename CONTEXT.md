@@ -106,6 +106,14 @@ _Avoid_: "settlement" unqualified (overloaded with the money-movement below), "c
 The lifecycle of *paying out* a **Settlement Entry** to the franchisee via Razorpay Route, tracked on `CommissionLedgerEntry.settlement_status`: `PENDING → TRANSFER_INITIATED → TRANSFER_PROCESSED → SETTLED`, with `FAILED`, `REVERSED`, `ON_HOLD`, `BELOW_THRESHOLD` as off-happy-path states. A **Settlement Entry** exists and counts as earned the moment the session finalizes; its **Settlement Status** is whether the money has reached the franchisee yet.
 _Avoid_: conflating "earned" (the entry exists) with "settled" (the status reached its terminal state).
 
+**Account balance (Razorpay float)**:
+The money sitting in VoltLync's Razorpay account that has been captured but not yet swept to the bank — the spendable float Razorpay uses to fund **instant refunds** (`speed=optimum`) and Route payouts. Read live from `/v1/balance` (`balance`, in paise); the endpoint's `updated_at`/`last_fetched_at` fields are unmaintained junk but the value is real-time. **Drained by each settlement sweep**, so it trends toward zero between settlements regardless of transaction volume — a high-volume account that settles near-daily can still hold only a few hundred rupees. This is why large instant refunds intermittently downgrade to `normal`: the float is below the refund amount at that instant. Not the same as total unsettled or total transacted volume.
+_Avoid_: "balance" unqualified (collides with **Wallet** balance), "unsettled amount" (related but not identical — fees, holds, and payouts also move it).
+
+**Refund Credits**:
+A prepaid Razorpay wallet, separate from the **Account balance (Razorpay float)**, that funds refunds independently of the settlement schedule — top it up in advance and instant refunds draw from it even when the float has been swept to bank. **Must be enabled by Razorpay before use; currently disabled** on the VoltLync account (`refund_credits=0`), so it provides no cushion today. The recommended fix for instant-refund downgrades.
+_Avoid_: "refund balance", "refund wallet" (the canonical Razorpay term is Refund Credits).
+
 ### Observability
 
 **OCPP message log**:

@@ -706,6 +706,9 @@ async def test_full_refund_emits_instant_succeeded_metric(
     mock_razorpay.refund_payment.return_value = {
         "id": "rfnd_M_OK", "speed_processed": "instant",
     }
+    mock_razorpay.fetch_balance = AsyncMock(return_value={
+        "balance": 422.68, "refund_credits": 0.0,
+    })
 
     with patch("services.qr_payment_service.razorpay_service", mock_razorpay), \
          patch("services.qr_payment_service.OCPPMetrics.record_refund_speed",
@@ -714,6 +717,9 @@ async def test_full_refund_emits_instant_succeeded_metric(
 
     mock_record.assert_awaited_once()
     assert mock_record.await_args.args[2] == "instant"
+    # Funding pools snapshotted before the POST ride along to the NR event.
+    assert mock_record.await_args.kwargs["balance_before"] == 422.68
+    assert mock_record.await_args.kwargs["refund_credits_before"] == 0.0
 
 
 @pytest.mark.asyncio
@@ -736,6 +742,9 @@ async def test_full_refund_emits_fallback_metric_when_response_is_normal(
     mock_razorpay.refund_payment.return_value = {
         "id": "rfnd_M_FB", "speed_processed": "normal",
     }
+    mock_razorpay.fetch_balance = AsyncMock(return_value={
+        "balance": 422.68, "refund_credits": 0.0,
+    })
 
     with patch("services.qr_payment_service.razorpay_service", mock_razorpay), \
          patch("services.qr_payment_service.OCPPMetrics.record_refund_speed",
@@ -744,6 +753,44 @@ async def test_full_refund_emits_fallback_metric_when_response_is_normal(
 
     mock_record.assert_awaited_once()
     assert mock_record.await_args.args[2] == "normal"
+
+
+@pytest.mark.asyncio
+async def test_full_refund_completes_when_balance_fetch_unavailable(
+    client, _refund_qr_payment, monkeypatch
+):
+    """Best-effort guard: a failed balance read must not break the refund.
+    The refund still completes and the QRRefundSpeed event still fires with
+    balance_before=None. ADR 0002 (2026-06-18 amendment)."""
+    monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment = AsyncMock()
+    mock_razorpay.find_refund_for_payment = AsyncMock()
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock()
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
+    mock_razorpay.refund_payment.return_value = {
+        "id": "rfnd_M_NOBAL", "speed_processed": "normal",
+    }
+    # fetch_balance is best-effort and returns None when the read fails.
+    mock_razorpay.fetch_balance = AsyncMock(return_value=None)
+
+    with patch("services.qr_payment_service.razorpay_service", mock_razorpay), \
+         patch("services.qr_payment_service.OCPPMetrics.record_refund_speed",
+               new_callable=AsyncMock) as mock_record:
+        await QRPaymentService._full_refund(_refund_qr_payment, "Zero energy")
+
+    # Refund still issued despite the unavailable balance (re-fetch the row —
+    # _full_refund mutates a freshly locked instance, not the passed-in object).
+    updated = await QRPayment.get(id=_refund_qr_payment.id)
+    assert updated.razorpay_refund_id == "rfnd_M_NOBAL"
+    assert updated.status == QRPaymentStatusEnum.REFUNDED
+    # Event still fires, with null funding pools.
+    mock_record.assert_awaited_once()
+    assert mock_record.await_args.kwargs["balance_before"] is None
+    assert mock_record.await_args.kwargs["refund_credits_before"] is None
 
 
 @pytest.mark.asyncio
@@ -796,6 +843,9 @@ async def test_full_refund_reconciliation_emits_metric_when_speed_present(
     mock_razorpay.find_refund_for_payment.return_value = {
         "id": "rfnd_M_RECON", "speed_processed": "instant",
     }
+    mock_razorpay.fetch_balance = AsyncMock(return_value={
+        "balance": 422.68, "refund_credits": 0.0,
+    })
 
     with patch("services.qr_payment_service.razorpay_service", mock_razorpay), \
          patch("services.qr_payment_service.OCPPMetrics.record_refund_speed",

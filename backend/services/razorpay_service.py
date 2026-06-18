@@ -366,6 +366,36 @@ class RazorpayService:
             return extract_fee_from_payment(payment)
         return None
 
+    async def fetch_balance(self) -> Optional[Dict]:
+        """Fetch the Razorpay account funding pools for refund diagnostics.
+
+        Best-effort and non-blocking: returns the primary account ``balance``
+        and ``refund_credits`` converted paise->rupees, or ``None`` on any
+        timeout / HTTP error / parse failure. A failed read must never affect
+        the refund — see ADR 0002 (2026-06-18 amendment). The endpoint's
+        ``updated_at`` / ``last_fetched_at`` fields are unmaintained; only the
+        balance values are real-time.
+        """
+        if not self.is_configured():
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(
+                    "https://api.razorpay.com/v1/balance",
+                    auth=(self.api_key, self.api_secret),
+                )
+            if resp.is_error:
+                logger.warning("Balance fetch failed: HTTP %s", resp.status_code)
+                return None
+            data = resp.json()
+            return {
+                "balance": int(data.get("balance") or 0) / 100,
+                "refund_credits": int(data.get("refund_credits") or 0) / 100,
+            }
+        except (httpx.HTTPError, ValueError, TypeError) as e:
+            logger.warning("Balance fetch unavailable: %s", e)
+            return None
+
     async def fetch_order(self, order_id: str) -> Optional[Dict]:
         """
         Fetch order details from Razorpay (non-blocking via httpx).
