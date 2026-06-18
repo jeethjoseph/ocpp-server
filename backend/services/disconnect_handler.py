@@ -141,16 +141,29 @@ async def _disconnect_suspend_timeout(
         )
 
 
-async def sweep_stale_suspended_transactions() -> None:
-    """
-    Safety net for server restarts.
+def stale_suspended_cutoff_seconds() -> int:
+    """Longest legitimate suspend window + buffer.
 
-    In-memory timeout tasks die when the process restarts. This finds
-    SUSPENDED transactions older than the max timeout and stops them.
-    Called once at startup.
+    A SUSPENDED row doesn't record whether it was suspended by a disconnect
+    (DISCONNECT_SUSPEND_TIMEOUT window) or a reboot (SUSPEND_TIMEOUT window), so
+    a backstop sweep must wait the longer of the two before treating a row as
+    orphaned — otherwise it pre-empts the in-flight primary timer and kills live
+    sessions inside their reconnect grace window.
     """
-    max_timeout = max(DISCONNECT_SUSPEND_TIMEOUT, SUSPEND_TIMEOUT) + 60
-    cutoff = datetime.now(timezone.utc) - timedelta(seconds=max_timeout)
+    return max(DISCONNECT_SUSPEND_TIMEOUT, SUSPEND_TIMEOUT) + 60
+
+
+async def finalize_stale_suspended_transactions(stop_reason: str) -> int:
+    """Find SUSPENDED transactions past the longest legitimate suspend window
+    and finalize them via the canonical finalizer.
+
+    Single source of truth for the stale-suspended backstop, shared by the
+    startup sweep and the recurring billing-retry sweep so their cutoff and
+    finalize path can never drift apart. Returns the number swept.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(
+        seconds=stale_suspended_cutoff_seconds()
+    )
 
     stale_transactions = await Transaction.filter(
         transaction_status=TransactionStatusEnum.SUSPENDED,
@@ -158,21 +171,34 @@ async def sweep_stale_suspended_transactions() -> None:
     ).all()
 
     if not stale_transactions:
-        logger.info("🧹 No stale suspended transactions found at startup")
-        return
+        return 0
 
     logger.warning(
         f"🧹 Found {len(stale_transactions)} stale suspended transaction(s) "
-        f"— cleaning up"
+        f"— cleaning up ({stop_reason})"
     )
     safe_create_task(OCPPMetrics.record_stale_suspended_swept(len(stale_transactions)))
 
     from services.transaction_finalizer import finalize_stopped_transaction
     for transaction in stale_transactions:
         try:
-            await finalize_stopped_transaction(transaction, "STALE_SUSPEND_SWEEP")
+            await finalize_stopped_transaction(transaction, stop_reason)
         except Exception as e:
             logger.error(
                 f"Error sweeping stale transaction {transaction.id}: {e}",
                 exc_info=True,
             )
+    return len(stale_transactions)
+
+
+async def sweep_stale_suspended_transactions() -> None:
+    """
+    Startup safety net for server restarts.
+
+    In-memory timeout tasks die when the process restarts. This finds
+    SUSPENDED transactions older than the max window and stops them.
+    Called once at startup.
+    """
+    swept = await finalize_stale_suspended_transactions("STALE_SUSPEND_SWEEP")
+    if swept == 0:
+        logger.info("🧹 No stale suspended transactions found at startup")

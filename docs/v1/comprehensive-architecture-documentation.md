@@ -436,7 +436,7 @@ total_billed = energy_charge + gst_amount         # Wallet deducts total_billed
 - Automatic retry for BILLING_FAILED transactions
 - **QR Refund Retry**: Retries REFUND_FAILED QR payments via Razorpay
 - **Orphaned QR Cleanup**: Detects and refunds QR payments stuck in PAID status (no transaction linked)
-- **Stale Suspended Cleanup**: Auto-stops SUSPENDED transactions older than 5 hours with billing + QR refund
+- **Stale Suspended Cleanup**: Delegates to `disconnect_handler.finalize_stale_suspended_transactions("SUSPENDED_TIMEOUT")` (shared backstop; cutoff = `max(DISCONNECT_SUSPEND_TIMEOUT, SUSPEND_TIMEOUT) + 60`). Runs every cycle, so it also catches SUSPENDED txns whose in-memory timer died without a full restart. **Do not give this its own cutoff** — see the disconnect-handler section for the 2026-06-18 incident where a private 5-min cutoff here killed disconnect-suspended sessions inside their 30-min reconnect window.
 - Comprehensive error logging with per-item error handling (one failure doesn't block others)
 
 **Recent Enhancement**: Zero Charged Transaction Handling
@@ -742,11 +742,23 @@ async def suspend_transactions_on_disconnect(charge_point_id: str) -> None
     transactions (RUNNING, STARTED, PENDING_START, PENDING_STOP) and starts
     a configurable timeout for each."""
 
+def stale_suspended_cutoff_seconds() -> int
+    """Longest legitimate suspend window + buffer:
+    max(DISCONNECT_SUSPEND_TIMEOUT, SUSPEND_TIMEOUT) + 60. A backstop sweep must
+    wait this long because a SUSPENDED row doesn't record which window applies."""
+
+async def finalize_stale_suspended_transactions(stop_reason: str) -> int
+    """Shared stale-suspended backstop. Finds SUSPENDED txns older than the
+    cutoff and finalizes each via transaction_finalizer. Used by BOTH the startup
+    sweep and the recurring billing-retry sweep so their cutoff can't drift."""
+
 async def sweep_stale_suspended_transactions() -> None
-    """Safety net called once at server startup. Finds SUSPENDED transactions
-    older than the max timeout and auto-stops them (covers server restarts
-    where in-memory timeout tasks were lost)."""
+    """Safety net called once at server startup. Thin wrapper over
+    finalize_stale_suspended_transactions (stop_reason=STALE_SUSPEND_SWEEP);
+    covers server restarts where in-memory timeout tasks were lost."""
 ```
+
+> ⚠️ **Stale-suspended cutoff incident (2026-06-18)**: `billing_retry_service` once ran its own stale-suspended cleanup with a private cutoff of `SUSPEND_TIMEOUT_SECONDS` (5 min), ignoring the 30-min `DISCONNECT_SUSPEND_TIMEOUT`. On its 30-min cycle it force-stopped disconnect-suspended sessions ~5–9 min after a transient blip — inside the intended reconnect grace. Confirmed on prod txn 949: suspended 06:08:51Z, swept 06:17:36Z (8m45s), charger reconnected 06:27:27Z (18.5 min, inside the 30-min window) but already finalized+refunded. Fix: both sweeps now share `finalize_stale_suspended_transactions` with the `max(...)+60` cutoff. Regression test: `tests/test_billing_retry_stale_suspended.py`. Lesson: a backstop must always wait the LONGEST primary window, never a shorter one.
 
 **Disconnect Flow**:
 1. Heartbeat monitor detects charger silence (120s inactivity)
@@ -816,7 +828,7 @@ async def finalize_stopped_transaction(
 **Used by**:
 - `main.py:ChargePoint._suspend_timeout` (BootNotification suspend timeout, stop_reason=`SUSPENDED_TIMEOUT`)
 - `disconnect_handler._disconnect_suspend_timeout` (disconnect timeout, stop_reason=`DISCONNECT_TIMEOUT`)
-- `disconnect_handler.sweep_stale_suspended_transactions` (startup safety net, stop_reason=`STALE_SUSPEND_SWEEP`)
+- `disconnect_handler.finalize_stale_suspended_transactions` (shared backstop): startup sweep uses stop_reason=`STALE_SUSPEND_SWEEP`, recurring billing-retry sweep uses stop_reason=`SUSPENDED_TIMEOUT`
 - `main.py:ChargePoint._handle_ongoing_transaction_on_boot` (BootNotification staleness guard, stop_reason=`STALE_RECONNECT`)
 - `main.py:ChargePoint.on_meter_values` (MeterValues staleness guard, stop_reason=`STALE_RECONNECT`)
 - `main.py:ChargePoint._handle_get_last_meter_value` (GetLastMeterValue staleness guard, stop_reason=`STALE_RECONNECT`)
@@ -5323,7 +5335,7 @@ CORS_ORIGINS = [
   - `_process_failed_billing_transactions()` - Retries BILLING_FAILED transactions
   - `_process_failed_qr_refunds()` - Retries REFUND_FAILED QR payments via Razorpay, skipping permanently-stuck rows via `is_retryable_refund_failure()` (excludes `idempotency_conflict_no_refund` and below-minimum reasons); a retry that 409s is reconciled, not re-hammered. See the "Refund idempotency contract" subsection.
   - `_cleanup_orphaned_qr_payments()` - Detects and refunds QR payments stuck in PAID status with no linked transaction
-  - `_cleanup_stale_suspended_transactions()` - Auto-stops SUSPENDED transactions older than 5 hours
+  - `_cleanup_stale_suspended_transactions()` - Delegates to the shared `disconnect_handler.finalize_stale_suspended_transactions("SUSPENDED_TIMEOUT")`; cutoff = `max(DISCONNECT_SUSPEND_TIMEOUT, SUSPEND_TIMEOUT) + 60` (NOT a private 5-min cutoff — see the 2026-06-18 incident in the disconnect-handler section)
   - Per-item error handling (one failure doesn't block others)
 
 **7. Remote Start Double Prevention**
