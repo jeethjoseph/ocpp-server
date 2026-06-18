@@ -25,6 +25,7 @@ import {
 } from "@/components/ui/select";
 
 import { useAdminStuckSettlements } from "@/lib/queries/admin-settlements";
+import { SettlementTerminalActions } from "@/components/SettlementTerminalActions";
 import { formatINR } from "@/lib/utils";
 
 const STATUS_COLORS: Record<string, string> = {
@@ -158,6 +159,7 @@ export default function AdminStuckSettlementsPage() {
                     <TableHead>Created</TableHead>
                     <TableHead>Retries</TableHead>
                     <TableHead>Reason</TableHead>
+                    <TableHead>Actions</TableHead>
                     <TableHead></TableHead>
                   </TableRow>
                 </TableHeader>
@@ -195,6 +197,9 @@ export default function AdminStuckSettlementsPage() {
                         title={e.failure_reason ?? ""}
                       >
                         {e.failure_reason ?? "—"}
+                      </TableCell>
+                      <TableCell>
+                        <SettlementTerminalActions entry={e} />
                       </TableCell>
                       <TableCell>
                         <Link

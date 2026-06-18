@@ -264,9 +264,9 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 - `GET /api/admin/firmware` - List firmware files
 - `DELETE /api/admin/firmware/{id}` - Soft delete (`is_active=False`)
 - `POST /api/admin/firmware/chargers/{id}/update` - Schedule update; resets any existing row for this (charger, firmware) pair regardless of prior status.
-- `POST /api/admin/firmware/bulk-update` - Bulk schedule
+- `POST /api/admin/firmware/bulk-update` - Idempotent bulk deploy. Returns `{ success, skipped, failed }`. `skipped` = already on target version OR in-flight (PENDING `attempt_count > 0`, left untouched); `success` = fresh/reset PENDING; `failed` = charger not found. Re-running disturbs nothing already handled or rolling out. Per-charger logic in `_bulk_classify_charger`.
 - `GET /api/admin/firmware/chargers/{id}/history` - History per charger
-- `GET /api/admin/firmware/updates/status` - Dashboard (PENDING rows + counts)
+- `GET /api/admin/firmware/updates/status` - Dashboard (PENDING rows + counts; `in_progress` items include `error_message`, the last-attempt failure reason)
 - `POST /api/admin/firmware/updates/{id}/cancel` - Cancel a PENDING row that has not yet been attempted (`attempt_count == 0`)
 - `POST /api/admin/firmware/updates/{id}/mark-installed` - Admin manual close for polling chargers (also updates `Charger.firmware_version`)
 - `POST /api/admin/firmware/updates/{id}/mark-failed` - Admin manual close (does not touch `Charger.firmware_version`)
@@ -489,6 +489,20 @@ This divergence is intentional. Admins debug at the OCPP layer and want explicit
 
 The frontend's `useChangeAvailability` hook (admin) branches on the OCPP response status (Accepted → success + keep optimistic update, Scheduled → info toast + revert optimistic, Rejected → error toast + revert). Per issue 01 of the availability-toggle-fixes batch.
 
+**Two-field charger state model (post-2026-05-27, ADR 0008)**: the `charger` row carries two state-shaped columns that are intentionally NOT redundant:
+
+- `latest_status` (`ChargerStatusEnum`): what the charger reports via OCPP `StatusNotification`. Values: `Available`, `Preparing`, `Charging`, `SuspendedEVSE`, `SuspendedEV`, `Finishing`, `Reserved`, `Unavailable`, `Faulted`. Written exclusively by the `StatusNotification` handler in `main.py`. Read by the status pill, OCPP routing, billing logic, and any other consumer of "what is the charger actually doing right now."
+- `availability` (`ChargerAvailabilityEnum`): what an admin or franchisee has commanded via `ChangeAvailability`. Values: `Operative`, `Inoperative`. Written by `routers/chargers.change_charger_availability` and `routers/franchisee_portal.change_availability` on OCPP `Accepted` and `Scheduled` responses (NOT on `Rejected`). Read by the admin UI toggle.
+
+The split exists because a `Faulted` charger can still be admin-set `Operative` (the admin wants it available; the hardware is broken — orthogonal concerns), and a `Charging` charger that admin clicks `Inoperative` flips `availability=Inoperative` immediately while `latest_status` stays `Charging` until the session ends per OCPP `Scheduled` semantics. Surfaced as a bug on 2026-05-27 against charger `ffeadb01-78bc-4b6e-b5cd-1ff657cbedbc` on staging where the toggle appeared broken because the charger Accepted `ChangeAvailability:Operative` but didn't send a follow-up `StatusNotification` — `latest_status` stayed `Unavailable`, the toggle read it as a proxy for admin intent, and clicks appeared to have no effect. ADR 0008 captures the considered alternatives (optimistic latest_status update, TriggerMessage:StatusNotification, audit-log-derived intent) and why none of them survives a real-world firmware quirk.
+
+For "command pending vs applied" indicator semantics, a future UI can join the two fields:
+- `availability=Inoperative AND latest_status=Unavailable` → applied
+- `availability=Inoperative AND latest_status ∈ {Charging, Preparing, ...}` → Scheduled, awaiting session end
+- `availability=Inoperative AND latest_status ∈ {Available, Faulted, ...}` for extended period → charger ignored the command (firmware-side issue, worth surfacing)
+
+That indicator is a deliberate future enhancement; not built yet.
+
 **Charger creation atomicity (issue 05, post-2026-05-18)**: `routers/chargers.py:create_charger` wraps the three writes (`Charger.create`, `Connector.create` per connector input, `Tariff.create`) in `async with in_transaction()`. If any step raises, the whole creation rolls back — no orphan chargers with partial connector sets or no tariff. Two audit-log paths:
 - **Happy path**: `action="charger.created"` written after the transaction commits.
 - **Rollback path**: `action="charger.create_failed"` written inside the `except IntegrityError` branch with the input data + `failure_reason`. Operators can query `WHERE action IN ('charger.created', 'charger.create_failed')` to see every attempted onboarding. The audit write itself is best-effort — wrapped in its own try/except so a secondary audit failure doesn't mask the original 400.
@@ -510,7 +524,8 @@ The frontend's `useChangeAvailability` hook (admin) branches on the OCPP respons
   - `_ensure_actual_fee_captured(qr_payment)` (in `qr_payment_service`) — side-effect writer: ensures the actual Razorpay fee lives on the `QRPayment` row (`platform_fee` / `razorpay_commission` / `razorpay_gst`). Priority: webhook > API fetch > 2% estimate fallback.
 - `RAZORPAY_PLATFORM_FEE_PERCENT` itself lives in `backend/core/config.py` (project-level config). Read by `main.py` (startup validation), `routers/chargers.py` (back-derivation on POST/PATCH), and `tariff_utils.py` (synthetic-fee math). Re-exported from `qr_payment_service.py` for backwards compatibility.
 - `GSTInvoice.gateway_charges` / `gateway_gst` snapshot the synthetic 2% split at issuance, NOT the QRPayment row's actual fee. Customers see a deterministic gateway-charges line regardless of what Razorpay actually charged.
-- Variance between actual and synthetic is absorbed by VoltLync as P&L — queryable via `SUM(qr_payment.platform_fee - 0.02 × amount_paid)`.
+- **`commission_ledger_entry.pg_fee_amount` also uses the synthetic 2%** (ADR 0001 amendment, 2026-05-29). `FranchiseeSettlementService.process_settlement` calls `synthetic_platform_fee(amount_paid)` for QR sessions, so the ledger's `net_excl_gst` equals the invoice's `energy_taxable_value` exactly. Commission, TDS, and franchisee payout are now computed against a synthetic-fee revenue pool — the franchisee is shielded from Razorpay's instantaneous fee schedule, and VoltLync absorbs 100% of the actual-vs-synthetic variance (was 75/25 with franchisee). Wallet sessions unchanged (pg_fee = 0).
+- Variance between actual and synthetic is absorbed by VoltLync as P&L — queryable via `SUM(qr_payment.platform_fee - 0.02 × amount_paid)`. Drift detection reads from `qr_payment` directly; the ledger no longer surfaces it post-amendment.
 
 **Refund / over-consumption policy (effective 2026-05-13)**:
 - **Positive balance** (customer paid more than they used) → **always refunded** via Razorpay, regardless of amount. The historical `MINIMUM_REFUND_AMOUNT` threshold has been removed.
@@ -545,6 +560,13 @@ The frontend's `useChangeAvailability` hook (admin) branches on the OCPP respons
 - **Plug-in timeout**: Background task polls 10s intervals for 5 minutes, refunds on timeout
 - **RemoteStart failure**: Up to 2 retries with 5s delay, full refund if all fail
 - **Budget exceeded**: Schedules RemoteStopTransaction as asyncio.create_task (avoids deadlock)
+
+**Refund idempotency contract (cross-environment collision fix, 2026-06-09 — live on STAGING; PROD deploy pending)**:
+- Every refund (initial partial in `process_qr_session_billing`, initial full in `_full_refund`, and `BillingRetryService` retries) builds its Razorpay request via the single helper `qr_payment_service.build_refund_call_kwargs(qr_payment, refund_amount)`, which returns `amount`, `notes`, `idempotency_key`, and `speed`.
+- **Key = `f"refund_{razorpay_payment_id}"`**, derived from the globally-unique Razorpay payment id — replacing the old `f"qr_payment_{qr_payment.id}"` (the per-database PK). **Root cause it fixes**: staging and prod share one Razorpay **live** account (QR requires live mode). The PK is a separate sequence per DB, so staging payment #235 and prod payment #235 both emitted key `qr_payment_235` to the same account; whichever env refunded that id first registered the key, and the other env's later refund (different amount/notes) got **HTTP 409 "Different request with the same idempotency key has already been processed,"** permanently stranding the refund in `REFUND_FAILED`. (Razorpay idempotency keys expire ~24h, so the collision is transient — observed self-healing once the other env's key aged out.) See `[[project-refund-idempotency-cross-env-collision]]` and `.scratch/qr-refund-idempotency-fix/`.
+- **Body is deterministic and path-independent**: `notes={"qr_payment_id": str(id)}` (no variable transaction reason / "Retry:" prefix) and `speed` derived from amount (`refund_amount >= amount_paid` → `optimum` when the instant flag is on; partial → normal). This guarantees the initial attempt and every retry send a byte-identical request for the same payment, so a same-key retry **replays** the original refund (HTTP 200) instead of 409ing.
+- **409 handling**: `razorpay_service.refund_payment` maps a 409 to `RazorpayIdempotencyConflictError` (re-raised through the outer guard). Both refund call sites and the retry loop catch it and call `QRPaymentService._reconcile_conflict()`: if a refund already exists at Razorpay it persists the id and marks `REFUNDED`; otherwise it sets `failure_reason="idempotency_conflict_no_refund"`.
+- **Retry exclusion**: `BillingRetryService` filters candidates through `is_retryable_refund_failure(failure_reason)` (substring-robust), which excludes the `idempotency_conflict_no_refund` marker AND below-minimum reasons in both the canonical (`below_razorpay_minimum`) and legacy long-form (`"... below Razorpay minimum (₹1.00) ..."`) shapes — so permanently-stuck rows are never re-hammered.
 
 **Redis Session Cache**:
 ```
@@ -756,9 +778,11 @@ If the counter reaches `MAX_RESETS_WITHOUT_PROGRESS` (default 3), BootNotificati
 **Configuration**:
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `DISCONNECT_SUSPEND_TIMEOUT_SECONDS` | 180 | Seconds to wait after disconnect before auto-stopping |
+| `DISCONNECT_SUSPEND_TIMEOUT_SECONDS` | 180 (**staging & prod: 1800**) | Seconds to wait after disconnect before auto-stopping |
 | `SUSPEND_TIMEOUT_SECONDS` | 300 | Resume window after BootNotification resets the timeout |
 | `MAX_DISCONNECT_RESETS_WITHOUT_PROGRESS` | 3 | Max BootNotification resets allowed without energy progress |
+
+> ⚠️ **Timing invariant**: `MAX_RESUME_GAP_SECONDS` (resume staleness guard, below) MUST exceed `DISCONNECT_SUSPEND_TIMEOUT_SECONDS`, or chargers reconnecting between the gap and the disconnect timeout are force-finalized `STALE_RECONNECT` instead of resuming. Because staging/prod widened the disconnect timeout to **1800**, `MAX_RESUME_GAP_SECONDS` was raised to **2100** on both (2026-06-09). This ordering is documented but **not validated at startup** — a proposed `validate_timing_invariants()` would make it fail-loud.
 
 **Integration Points**:
 - `ConnectionManager.register_on_disconnect()` -- wires up the callback
@@ -814,7 +838,7 @@ Returns `(is_stale, gap_seconds)`. The gap is computed against the most recent o
 
 A txn with no signals at all returns `(False, None)` — the helper defers to the caller's existing state checks rather than refusing speculatively.
 
-**Threshold**: `MAX_RESUME_GAP_SECONDS=900` (15 min, configurable via env). Chosen to be comfortably above the existing 360s startup sweep cutoff so the guard never races with the primary finalize chain, yet small enough to prevent meaningful overcharging when it does fire.
+**Threshold**: `MAX_RESUME_GAP_SECONDS` — code default **900** (15 min); **staging & prod run 2100** (35 min) as of 2026-06-09. It must sit *above* the longest primary finalize timer so the guard never races it, yet small enough to limit overcharging when it does fire. **Invariant: `MAX_RESUME_GAP_SECONDS` MUST exceed `DISCONNECT_SUSPEND_TIMEOUT_SECONDS`.** This broke in prod/staging when the disconnect timeout was widened to 1800 while the gap stayed at the 900 default — chargers reconnecting in the 15–30 min window were force-finalized `STALE_RECONNECT` instead of resuming. Fixed by raising the gap to 2100. The ordering is **not enforced at startup** today; a `validate_timing_invariants()` boot check is the proposed durable safeguard. (Historical note: the original "comfortably above the 360s startup sweep cutoff" rationale assumed the 180s disconnect default — it does not survive a widened disconnect timeout, which is why the invariant must be stated against `DISCONNECT_SUSPEND_TIMEOUT_SECONDS`, not a fixed number.)
 
 **Call sites and behavior on stale**:
 | Call site | Action when stale |
@@ -1532,7 +1556,7 @@ The QR-based appless charging feature enables customers to charge their EV by sc
 
 - **Wallet session budget cap + RemoteStop auto-stop (Module B).** Wallet-paid charging sessions enforce the same kind of in-session budget cap as QR sessions. On StartTransaction the wallet's available balance is snapshotted into Redis as `wallet_session:{transaction_id}` (paise-int, 24 h TTL, payload includes `tariff_rate`, `gst_percent`, `start_meter_kwh`, `auto_stop_scheduled`). On every MeterValues frame, `WalletSessionService.check_balance_and_auto_stop` (`backend/services/wallet_session_service.py`) recomputes the accumulated cost `(reading_kwh − start_meter_kwh) × rate × (1 + gst%)` and compares it to the snapshot. When `cost ≥ budget_limit`, it schedules `RemoteStopTransaction` via `safe_create_task` — never awaits, because the MeterValues handler has not yet sent its CALLRESULT and awaiting an outbound CALL would deadlock the OCPP session. The `auto_stop_scheduled` flag in the payload, set *before* dispatch, makes late MeterValues frames in the same window no-ops so a charger that sends rapid-fire frames doesn't fire a second stop. After a server restart the Redis cache is empty; `_rebuild_session_from_db` reconstructs the payload by reading the live wallet balance via `WalletService.get_balance` and re-writing the cache, so restarts mid-session don't forfeit the cap. The cache key is deleted on StopTransaction. QR sessions are filtered out of the rebuild path (they're driven by their own QR budget cache); the two systems coexist cleanly side-by-side at `main.py:1108-1140`.
 
-- **Wallet balance is derived from the log (Module C, migration 33).** The `wallet.balance` column was dropped. Balance is now `SUM(amount)` over `wallet_transaction` rows where `type = 'TOP_UP' AND payment_metadata->>'status' = 'COMPLETED'` minus `SUM(amount)` over `type = 'CHARGE_DEDUCT'` rows — a single-table aggregate served by `WalletService.get_balance(wallet_id)` (`backend/services/wallet_service.py`). PENDING and FAILED top-ups are filtered out by design so unconfirmed Razorpay orders never credit the wallet. The hot read path (`/users/me`, admin user list, recharge endpoints) is fronted by a Redis cache (`wallet_balance:{wallet_id}`, paise-int, 1 h TTL) invalidated by `WalletService._invalidate_balance_cache` on every successful billing or top-up (invalidation runs **after** the outer `@atomic()` commits, so concurrent readers can't repopulate the cache with pre-commit data). The index `idx_wallet_txn_balance (wallet_id)` keeps the aggregate cheap — measured 0.18ms at N=200, 0.97ms at N=5000. **Migration 33 captured pre-existing stored-vs-derived drift as auto-generated adjustment rows** (description "Pre-ledger-migration drift correction (auto-generated by migration 33)") so derived balance post-migration matches each wallet's stored balance at migration time. The `wallet` row still exists to anchor FKs and serve as the row-level lock target for serialising concurrent top-ups / charges on the same user. To audit drift after the fact, `backend/scripts/reconcile_wallet_balance.py` reads the live ledger and prints discrepancies.
+- **Wallet balance is derived from the log (Module C, migration 33).** The `wallet.balance` column was dropped. Balance is now `SUM(amount)` over `wallet_transaction` rows where `type = 'TOP_UP' AND payment_metadata->>'status' = 'COMPLETED'` minus `SUM(amount)` over `type = 'CHARGE_DEDUCT'` rows — a single-table aggregate served by `WalletService.get_balance(wallet_id)` (`backend/services/wallet_service.py`). PENDING and FAILED top-ups are filtered out by design so unconfirmed Razorpay orders never credit the wallet. The hot read path (`/users/me`, admin user list, recharge endpoints) is fronted by a Redis cache (`wallet_balance:{wallet_id}`, paise-int, 1 h TTL) invalidated by `WalletService._invalidate_balance_cache` on every successful billing or top-up (invalidation runs **after** the outer `@atomic()` commits, so concurrent readers can't repopulate the cache with pre-commit data). The index `idx_wallet_txn_balance (wallet_id)` keeps the aggregate cheap — measured 0.18ms at N=200, 0.97ms at N=5000. **Migration 33 captured pre-existing stored-vs-derived drift as auto-generated adjustment rows** (description "Pre-ledger-migration drift correction (auto-generated by migration 33)") so derived balance post-migration matches each wallet's stored balance at migration time. On prod, 8 wallets had drift totaling ₹3604.10 — all auto-corrected. The `wallet` row still exists to anchor FKs and serve as the row-level lock target for serialising concurrent top-ups / charges on the same user. **`backend/scripts/reconcile_wallet_balance.py` is obsolete post-migration 33** (it queries the dropped `wallet.balance` column); use the runtime `Custom/Wallet/NegativeBalance` Sentry/NR event for drift detection instead.
 
 #### Wallet migration rollback runbook (32 / 33 / 34)
 
@@ -1594,24 +1618,12 @@ Always safe.
 
 #### Wallet drift alerting
 
-The reconciliation script (`backend/scripts/reconcile_wallet_balance.py`) is read-only, exits zero on no drift and non-zero on drift above the threshold. Recommended deployment as a daily cron on both staging and prod:
+The reconciliation script (`backend/scripts/reconcile_wallet_balance.py`) **is obsolete post-migration 33** and should not be deployed as-is. Its SQL queries `wallet.balance` which migration 33 dropped; running it errors with `column "w.balance" does not exist`. The script's original purpose — comparing stored `wallet.balance` against the derived SUM — is moot now that the stored balance no longer exists; the derived sum IS the balance.
 
-```cron
-# Nightly wallet ledger reconciliation @ 02:30 IST
-30 2 * * *  docker exec ocpp-backend python -m scripts.reconcile_wallet_balance --threshold 1.00 >> /var/log/voltlync/reconcile.log 2>&1
-```
-
-For AWS-managed staging/prod, the equivalent remote invocation (matches the project's standard `voltlync` profile pattern documented elsewhere in this doc):
-
-```bash
-aws ssm send-command \
-  --profile voltlync \
-  --instance-ids <ec2-id-from-Makefile> \
-  --document-name AWS-RunShellScript \
-  --parameters 'commands=["docker exec ocpp-backend python -m scripts.reconcile_wallet_balance --threshold 1.00"]'
-```
-
-**Alert wiring:** the script exits non-zero when any wallet's drift exceeds the threshold. Wire that exit code into the existing monitoring path — Sentry (if the script's stderr is forwarded), or a CloudWatch alarm on the SSM command's `Status` field, or a Slack webhook from the cron wrapper. Drift > ₹1 should page on-call; drift > 0 but < ₹1 should ticket. The `Custom/Wallet/NegativeBalance` New Relic metric (emitted by `WalletService.get_balance` whenever a derived balance comes out negative) is the runtime-side complement to this batch check.
+**Recommended replacement** (not yet implemented):
+1. **Runtime alerting** — the `Custom/Wallet/NegativeBalance` custom event is emitted by `WalletService.get_balance` whenever a derived balance comes out negative. Wire a Sentry alert rule (or NR NRQL alert) on that event with threshold "≥1 occurrence in 24h" → page on-call. This replaces the nightly cron with a continuous signal.
+2. **Periodic SQL sanity** (if needed) — a 10-line SQL query that counts wallets with negative derived balance + lists the worst offenders is sufficient. Deploy as a daily SSM `send-command` if Sentry/NR alerting isn't enough.
+3. **If the script gets rewritten** — drop the `w.balance` comparison entirely; replace `_DERIVATION_SQL` with `SELECT wallet_id, SUM(...)` and exit non-zero only when ANY wallet shows derived < 0. Keep the threshold flag for the small-paise rounding noise.
 - **Webhook retries avoided** — All Razorpay webhook handlers return HTTP 200 on application errors (logged) so Razorpay does not retry. Only infrastructure failures (DB/Redis) surface as 5xx.
 - **PII masked in logs** — `mask_vpa()`, `mask_phone()`, `mask_payment_id()`, `mask_email()` helpers in `utils.py` are applied in all QR payment log statements. Logs forwarded to New Relic contain only masked identifiers.
 
@@ -1742,6 +1754,84 @@ docker compose exec backend python scripts/test_qr_webhook.py \
 ---
 
 ## Database Schema
+
+### Database tier (post-2026-05-28 prod RDS cutover)
+
+Both staging and prod run on AWS RDS Postgres as of 2026-05-28. Local dev remains Docker postgres.
+
+**Local dev** (`docker-compose.yml`): Postgres 15 in a Docker container, network name `postgres`, no SSL. Backend connects via the Docker bridge network. Schema reset via `docker volume rm`.
+
+**Staging** (`docker-compose.staging.yml` + AWS RDS): Cutover 2026-05-27. Live database is AWS RDS Postgres at `ocpp-staging-db.c1608qm4i94k.ap-south-1.rds.amazonaws.com`.
+- Engine: Postgres 15.18
+- Instance class: `db.t4g.micro` (1 vCPU burst, 1GB RAM, ARM Graviton)
+- Storage: 20GB gp3 with auto-scaling to 100GB, storage-encrypted (AWS-managed KMS key)
+- Multi-AZ: **no** (Single-AZ in `ap-south-1c`)
+- Subnet group: spans 3 subnets across `ap-south-1a/1b/1c` for future Multi-AZ promotion (zero-downtime via `modify-db-instance --multi-az`)
+- Security: SG `ocpp-rds-staging-sg` allows TCP/5432 inbound only from staging EC2 SG; not publicly accessible
+- Backup: 14-day automated retention + 5-min PITR
+- TLS: `verify-full` required; backend uses the AWS RDS global CA bundle at `/etc/ssl/rds-ca-bundle.pem` baked during `docker build`
+- Master user `ocpp_admin` (one-time setup), app user `ocpp_staging` (runtime); both passwords in `.env.staging`
+- Performance Insights enabled (7-day retention); CloudWatch Logs export `postgresql`
+- Local Docker postgres in `docker-compose.staging.yml` is the rollback target for the 14-day validation window; backend's `depends_on` no longer references it
+
+**Prod** (`docker-compose.prod.yml` + AWS RDS): Cutover 2026-05-28 09:30Z with **4 min customer-visible downtime** (small DB post-cleanup, 117 MB custom-format dump). Live database is AWS RDS Postgres at `ocpp-prod-db.c1608qm4i94k.ap-south-1.rds.amazonaws.com`.
+- Engine: Postgres 15.18
+- Instance class: `db.t4g.small` (one size up from staging — 2 vCPU burst, 2GB RAM, ARM Graviton)
+- Storage: 50GB gp3 with auto-scaling to 200GB, storage-encrypted
+- Multi-AZ: **no initially** (Single-AZ in `ap-south-1a` — same AZ as prod EC2, sub-ms intra-AZ latency). Bump to Multi-AZ via `aws rds modify-db-instance --db-instance-identifier ocpp-prod-db --multi-az --apply-immediately` when revenue justifies (+$35/mo, zero downtime, ~5 min)
+- Subnet group `ocpp-rds-prod-subnet-group`: spans 3 subnets across `ap-south-1a/1b/1c`
+- Security: SG `ocpp-rds-prod-sg` (`sg-0769b845bc8d5ffdf`) allows TCP/5432 inbound only from prod EC2 SG `sg-047d6e32867baf900`; not publicly accessible
+- Backup: **30-day** automated retention + 5-min PITR (longer than staging for compliance)
+- Performance Insights: **31-day** retention (paid tier)
+- Deletion protection: **on**
+- TLS: `verify-full` (same CA bundle as staging)
+- Master user `ocpp_admin`, app user `ocpp_prod`; both passwords in `.env.prod`
+- Local Docker postgres in `docker-compose.prod.yml` is the rollback target for the **28-day** validation window — longer than staging's 14d because prod rollback cost is higher
+
+### SSL config contract (`backend/db_ssl.py`)
+
+A single `get_ssl_config()` helper drives all DB connection paths so that local/staging/prod can differ via env vars only. Three call sites — all must use the helper:
+
+1. `backend/database.py` — runtime DSN in the Tortoise FastAPI app
+2. `backend/tortoise_config.py` — Aerich CLI configuration (used for migrations)
+3. `backend/docker-entrypoint.sh` — pre-flight wait-for-DB loop (added in the cutover-fix PR after the initial issue 02 PR missed it)
+
+Env-var rules:
+- `DB_SSL_MODE=` (empty) → legacy heuristic: `disable` for `postgres`/`localhost`/`127.0.0.1` hosts, `require` otherwise. Local dev uses this.
+- `DB_SSL_MODE=verify-full` → TLS with hostname + chain validation against the CA bundle. Required for RDS. **Both staging and prod set this.**
+- `DB_SSL_MODE=verify-ca|require|prefer|allow|disable` → passthrough to asyncpg.
+
+### Cutover artifacts (preserved during validation windows)
+
+Per-environment safety nets on the respective EC2 host at `/home/ec2-user/ocpp-server/`:
+
+**Staging** (14-day window from 2026-05-27):
+- `backups/staging_cutover_20260527T054652Z.sql` — final `pg_dump` from Docker postgres, ~469MB plain SQL
+- `.env.staging.pre-rds-cutover`
+- Docker `postgres` service still running with its original data volume
+
+**Prod** (28-day window from 2026-05-28):
+- `backups/prod_cutover_20260528T093009Z.dump` — final `pg_dump` from Docker postgres, **117MB custom format** (`-F c`)
+- `backups/prod_pre_deploy_2026-05-28.sql` — earlier safety dump before the migration train 23-42
+- `backups/prod_pre_cleanup_2026-05-28.sql` — safety dump before the production data cleanup (admin/wallet/non-QR data purge)
+- `.env.prod.pre-rds-cutover`
+- Docker `postgres` service in `docker-compose.prod.yml` still running with original data volume (frozen in time at the pg_dump moment)
+
+Rollback in either window is a 30-second operation: `cp .env.{env}.pre-rds-cutover .env.{env} && docker compose ... up -d backend`. Both Docker postgres and the old credentials remain present.
+
+### Cutover post-mortem highlights (both migrations)
+
+The 2026-05-27 staging cutover surfaced lessons that were applied to the 2026-05-28 prod cutover, which then ran in 4 minutes vs staging's ~12. Full notes in `.scratch/rds-staging-migration/PRD.md` and `.scratch/rds-prod-migration/PRD.md`:
+
+- **The entrypoint pre-flight DB check has its own connection logic.** `database.py` and `tortoise_config.py` correctly used the new `db_ssl.get_ssl_config()` helper, but `backend/docker-entrypoint.sh` had its own inline `asyncpg.connect(..., ssl='disable')` that didn't. Caused ~5 min of bonus downtime during staging. Fixed before prod. Codified as feedback memory `feedback_check_entrypoint_during_db_config_changes`.
+- **RDS provisioning takes 20-30 min**, not the 5-10 expected. Performance Insights + CloudWatch Logs export add provisioning steps. Prod took ~26 min. Plan ≥30 min for any future migration.
+- **`DROP DATABASE` requires ownership.** RDS master user is `rds_superuser` (not real superuser); can't drop a DB owned by another user. Use `DROP OWNED BY <app_user> CASCADE` as the app user.
+- **`pg_dump -j 4` requires `-F d` (directory format)**, not `-F c`. Trying `-F c -j 4` errors with "parallel backup only supported by the directory format". For single-file output, drop `-j`.
+- **POSIX `/bin/sh` on Amazon Linux 2 doesn't tolerate parens in unquoted `echo` strings.** `echo --- step 2 (begins) ---` syntax-errors. Always quote any echo containing parens when scripting via SSM `RunShellScript`.
+- **Custom format (`-F c`) was used for prod**, plain SQL (`-F p`) for staging. Both restored cleanly. Custom format is slightly faster and supports selective restore (`pg_restore -t single_table`); use it by default for new cutovers.
+- **Reboot-instances via ACPI signal can fail on a wedged OS.** During the prod deploy event, a disk-pressure scenario wedged the OS such that `reboot-instances` had no effect. Used `stop-instances --force` + `start-instances` instead — guaranteed to work but requires an Elastic IP attached (which we have on prod EC2) to preserve DNS continuity.
+- **`prod-prune-if-needed` Makefile target was missing.** Staging had it; prod didn't. This bit us during the deploy event before the RDS migration. Added Makefile parity (`prod-prune` manual + `prod-prune-if-needed` auto at 85% disk threshold, chained into `prod-deploy`).
+- **CSP allow-list is env-driven via `CSP_CLERK_HOSTS`.** Switch Clerk environments by editing the env var only — no nginx config edit needed.
 
 ### Entity Relationship Overview
 
@@ -1927,9 +2017,10 @@ CREATE INDEX idx_firmware_update_status ON firmware_update(status);
 CREATE TABLE signal_quality (
     id SERIAL PRIMARY KEY,
     charger_id INTEGER REFERENCES charger(id) ON DELETE CASCADE,
-    rssi INTEGER NOT NULL,      -- Received Signal Strength Indicator (0-31 for GSM, 99=unknown)
-    ber INTEGER NOT NULL,        -- Bit Error Rate (0-7 for GSM, 99=unknown/not detectable)
-    timestamp VARCHAR(50) NOT NULL,  -- Timestamp from charger
+    rssi INTEGER NOT NULL,            -- Received Signal Strength Indicator (0-31 for GSM, 99=unknown)
+    ber INTEGER NOT NULL,             -- Bit Error Rate (0-7 for GSM, 99=unknown/not detectable)
+    temperature_celsius DOUBLE PRECISION,  -- Modem board temperature; nullable for legacy rows / older firmware. Added migration 43, 2026-06-01. See ADR 0009.
+    timestamp VARCHAR(50) NOT NULL,   -- Timestamp from charger
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -1937,7 +2028,9 @@ CREATE INDEX idx_signal_quality_created ON signal_quality(created_at);
 CREATE INDEX idx_signal_quality_charger ON signal_quality(charger_id);
 ```
 
-**Data Source**: OCPP DataTransfer messages from JET_EV1 chargers
+The table name is a historical misnomer — see ADR 0009. The row is the canonical home for *all* modem-emitted telemetry, not strictly signal-quality fields. A future rename (e.g. to `charger_telemetry`) is deferred.
+
+**Data Source**: OCPP DataTransfer messages from chargers (`vendorId=VoltLync`, `messageId=SignalQuality`)
 
 **Data Retention**: Records older than 90 days are automatically deleted by the data retention service
 
@@ -2149,7 +2242,7 @@ async def on_boot_notification(self, charge_point_vendor, charge_point_model, **
 - Sets 30-second heartbeat interval
 - Updates charger firmware_version, vendor, model from BootNotification payload
 - **Transaction Suspend/Resume**: On disconnect, `disconnect_handler.py` suspends active transactions with a 180s timeout (`DISCONNECT_SUSPEND_TIMEOUT_SECONDS`). On BootNotification, already-SUSPENDED transactions get their timeout reset (CAS guard invalidates old timeout), and a new 300s resume window starts (`SUSPEND_TIMEOUT_SECONDS`). Still-active transactions (edge case) are suspended as before. Auto-stop with billing + QR refund on timeout expiry. The per-txn loop body is extracted into `_handle_ongoing_transaction_on_boot()` for testability.
-- **Resume staleness guard**: every BootNotification per-txn handler call (and the MeterValues + GetLastMeterValue resume points) goes through `transaction_finalizer.is_resume_too_stale()` first. If the gap exceeds `MAX_RESUME_GAP_SECONDS` (default 900s), the txn is finalized with stop_reason `STALE_RECONNECT` instead of being suspended/resumed. This is defense-in-depth for the case where the disconnect handler silently failed to mark SUSPENDED — see the "Resume Staleness Guard" subsection under Transaction Finalizer above.
+- **Resume staleness guard**: every BootNotification per-txn handler call (and the MeterValues + GetLastMeterValue resume points) goes through `transaction_finalizer.is_resume_too_stale()` first. If the gap exceeds `MAX_RESUME_GAP_SECONDS` (code default 900s; staging/prod 2100s), the txn is finalized with stop_reason `STALE_RECONNECT` instead of being suspended/resumed. This is defense-in-depth for the case where the disconnect handler silently failed to mark SUSPENDED — see the "Resume Staleness Guard" subsection under Transaction Finalizer above (incl. the `MAX_RESUME_GAP_SECONDS > DISCONNECT_SUSPEND_TIMEOUT_SECONDS` invariant).
 - Resume fields tracked: `suspended_at`, `resumed_at`, `resume_count`
 - Comprehensive connection logging
 
@@ -2649,6 +2742,50 @@ Implementation notes:
      `RAZORPAY_ROUTE_ENABLED != "true"`. Closes the manual-retry-only
      gap that previously left `account.funds_unhold` and
      `account.activated` webhook firings without an automated trigger.
+   - **Stuck-payout detector + admin terminal-resolution actions**
+     (`services/stuck_payout_detector.py`,
+     `routers/admin_settlements.py`). The background sweep fires a
+     Sentry warning per franchisee per tick aggregating entries that
+     are either `FAILED/ON_HOLD` past `MAX_TRANSFER_RETRIES`, `PENDING`
+     past `STUCK_PAYOUT_THRESHOLD_HOURS`, or `TRANSFER_INITIATED` past
+     the same threshold (webhook never landed). The
+     `build_stuck_filter` Tortoise predicate is shared with the admin
+     list endpoint `GET /api/admin/settlements/stuck` — single source
+     of truth for "what's stuck."
+     For entries the retry sweep cannot resolve on its own, admins
+     have two terminal-resolution endpoints, both behind
+     `require_admin()` and both audit-logged:
+     - `POST /api/admin/settlements/{entry_id}/mark-below-threshold`
+       flips a sub-floor (`franchisee_payout < MIN_TRANSFER_AMOUNT`)
+       row to `BELOW_THRESHOLD`. Validates the payout-threshold
+       check server-side (422 if not below); rejects already-terminal
+       sources (409); idempotent on re-click. Audit action
+       `settlement.mark_below_threshold`.
+     - `POST /api/admin/settlements/{entry_id}/mark-settled` accepts
+       `{ note: str (min 3 chars) }` and flips the row to `SETTLED`
+       with `settled_at = now()` set on first transition only.
+       Razorpay ID fields are left untouched (manual ⇒ no Razorpay
+       transfer). Idempotent re-clicks preserve the original
+       `settled_at` and do NOT write a second audit row. Allowed
+       sources: `PENDING/TRANSFER_INITIATED/TRANSFER_PROCESSED/FAILED/ON_HOLD`.
+       Audit action `settlement.manual_settle`, with the admin's
+       free-form `note` stored in `audit_log.changes`.
+     Per **ADR 0007** (`docs/adr/0007-manual-settlement-resolution-via-audit-log.md`),
+     there is intentionally **no `MANUAL_SETTLED` enum value and no
+     `manual_resolution_note` column on `commission_ledger_entry`**.
+     Manually-resolved rows are identifiable by the join
+     `commission_ledger_entry × audit_log on entity_id` filtered to
+     the two action strings above. Do not rename those action strings
+     without a migration of historical audit rows.
+     Frontend: a shared `components/SettlementTerminalActions.tsx`
+     renders eligibility-aware icon buttons (BELOW_THRESHOLD shown
+     only when `payout < ₹1.00 AND status in {PENDING/FAILED/ON_HOLD}`;
+     SETTLED shown when status is not already terminal). Embedded
+     in `/admin/settlements/stuck` (Actions column) and in the
+     per-franchisee Settlement Ledger card (alongside the existing
+     Hold/Release buttons). Confirmation dialog with a required note
+     textarea for the SETTLED flow; the BELOW_THRESHOLD flow has a
+     plain confirm.
    - `update_stakeholder` (PUT
      `/api/admin/franchisees/{id}/stakeholders/{sid}`) PATCHes an
      existing Razorpay stakeholder so admins can backfill PAN /
@@ -3030,6 +3167,57 @@ Response:
   }
 }
 ```
+
+##### Transaction Details
+```http
+GET /api/admin/transactions/{transaction_id}
+Authorization: Bearer {jwt_token}
+
+Response: TransactionDetailResponse
+{
+  "transaction": { ... TransactionResponse fields ... },
+  "user": { ... },
+  "charger": { ... },
+  "meter_values": [ ... ],
+  "wallet_transactions": [ ... ],
+  "live_energy_kwh": 1.234,             // derived per-request, see note below
+  "funding_source": "QR",               // "WALLET" | "QR" | "NONE"
+  "qr_session": {                       // present only when funding_source=QR
+    "budget_limit": "490.00",
+    "cost_so_far": "12.34",
+    "remaining": "477.66"
+  }
+}
+```
+
+`live_energy_kwh` is computed every request as
+`latest_meter_value.reading_kwh - transaction.start_meter_kwh` and is `null`
+when either side is missing. It is the canonical live-session figure for the
+admin UI and any other surface that needs to render "kWh delivered so far"
+while a session is in progress. The stored column
+`transaction.energy_consumed_kwh` is the **finalised** value written only at
+StopTransaction (and may be lower than the raw meter delta when the QR
+budget cap truncates billable energy — see ADR 0001 / billing math). Do not
+read the column to render live UI; do not write the derived figure back to
+the column.
+
+`funding_source` classifies the session funding axis:
+- `"QR"` — a `QRPayment` row references the transaction. Wins regardless of
+  user role (per CONTEXT.md `[[qr-session]]`).
+- `"NONE"` — the initiating user has an internal role (ADMIN / FRANCHISEE in
+  `core.roles.INTERNAL_ROLES`); no Wallet is debited and no GST invoice is
+  issued. See ADR 0004.
+- `"WALLET"` — everyone else.
+
+`qr_session` carries the live budget snapshot for QR sessions. The figures
+are ₹ Decimal strings (not floats — preserves precision over the wire,
+matches the `wallet_transaction.amount` non-negative invariant style). The
+snapshot is sourced from `QRPaymentService.compute_budget_snapshot`, a pure
+helper that also backs the auto-stop dispatch in
+`check_budget_and_auto_stop`. Single source of truth: the admin UI and the
+cap-enforcement agree by construction. The block may be `null` even for QR
+sessions if the helper bails (tariff misconfigured, no QR cache row and no
+DB-derivable budget) — UI should treat as "budget temporarily unknown".
 
 ##### Transaction Meter Values
 ```http
@@ -3416,8 +3604,9 @@ Response: 200 OK
     {
       "id": 1,
       "charger_id": 5,
-      "rssi": 22,  // Received Signal Strength Indicator
-      "ber": 99,   // Bit Error Rate
+      "rssi": 22,                     // Received Signal Strength Indicator
+      "ber": 99,                      // Bit Error Rate
+      "temperature_celsius": 38.4,    // Modem board temperature; null on legacy rows
       "timestamp": "86",
       "created_at": "2025-01-22T14:00:00Z"
     }
@@ -3427,9 +3616,12 @@ Response: 200 OK
   "limit": 20,
   "charger_id": 5,
   "latest_rssi": 22,
-  "latest_ber": 99
+  "latest_ber": 99,
+  "latest_temperature_celsius": 38.4
 }
 ```
+
+The admin charger detail page renders a "Modem Temperature" card sourced from this endpoint (24h window). RSSI history has its own surface; the chart is temperature-only — dual-axis muddies both. See ADR 0009 for why modem temperature lives on `signal_quality` rather than `meter_value`.
 
 **Signal Strength Interpretation**:
 - **Good**: RSSI ≥ 10 (green badge)
@@ -3927,6 +4119,12 @@ Separate `.env` files for each environment:
 - **Structured Logging**: Timestamp-prefixed logs with correlation IDs
 - **Health Check**: `GET /health` endpoint for container orchestration
 
+#### Sentry conventions (init in `services/monitoring_service.py`)
+- **Release**: resolved as `SENTRY_RELEASE` → `GIT_COMMIT` → `{env}-{startup-timestamp}`. `GIT_COMMIT` is injected at deploy time by `make {staging,prod}-rebuild` (`git rev-parse --short HEAD`) and surfaced to the container via `backend.environment:` in all three compose files. A non-dev env that falls back to the timestamp logs a startup warning — treat that as a misconfigured deploy. (Mirrors the frontend's `next.config.ts` release logic.)
+- **Failed-request reporting**: the Starlette/FastAPI integrations report 5xx **except 504**. A 504 is the deliberate "charger didn't ACK in time" response from `routers/chargers.remote_start_charging` (an upstream/charger-offline condition, not a server fault) and is intentionally excluded from error tracking. 504 is presently the only intentional source — revisit `failed_request_status_codes` before adding another.
+- **`logger.error` is a Sentry event** (LoggingIntegration `event_level=ERROR`). Expected/operational conditions must log at `info`/`warning`, not `error`. Established downgrades: cross-environment QR webhook miss, cross-environment **Clerk webhook signature failure** (staging/prod share one Clerk app, so the other endpoint's secret occasionally hits this URL — verified the prod secret is correct via webhook-created `app_user` rows), `StopTransaction` for an unknown/placeholder `transaction_id`, and Redis charger-removal connection/DNS loss during deploy. **Caveat for the Clerk one:** the downgrade masks a genuine future `CLERK_WEBHOOK_SECRET` drift — the positive signal (successful `Received Clerk webhook` lines / new clerk-linked users) is what to watch.
+- **Alert dedup**: background detectors that fire per-sweep (e.g. `StuckPayoutDetector`) dedup on the offending entity set with a cooldown so an unchanged condition doesn't re-page every cycle.
+
 ---
 
 ## Security & Compliance
@@ -4371,31 +4569,56 @@ CREATE INDEX CONCURRENTLY idx_ocpp_log_charger_time
     ON log(charge_point_id, timestamp DESC);
 ```
 
-#### Connection Pooling Configuration (`backend/tortoise_config.py`)
+#### Connection Pooling & Resilience (`backend/db_ssl.py:get_pool_kwargs`)
+
+The pool kwargs are centralized in `get_pool_kwargs()` and spread into the `credentials`
+dict of both `database.py` (runtime) and `tortoise_config.py` (Aerich). They harden the
+asyncpg pool so an RDS restart/failover self-heals in seconds instead of wedging the
+backend indefinitely. Rationale, the triggering incident, and considered alternatives
+(RDS Proxy / PgBouncer / Pgpool-II) are in **ADR 0010**.
+
 ```python
-TORTOISE_ORM = {
-    "connections": {
-        "default": {
-            "engine": "tortoise.backends.asyncpg",
-            "credentials": {
-                "host": os.getenv("DB_HOST"),
-                "port": os.getenv("DB_PORT", 5432),
-                "user": os.getenv("DB_USER"),
-                "password": os.getenv("DB_PASSWORD"),
-                "database": os.getenv("DB_NAME"),
-                "ssl": "require" if os.getenv("ENVIRONMENT") == "production" else None,
-                # Connection pooling optimization
-                "minsize": 5,
-                "maxsize": 20,
-                "max_queries": 50000,
-                "max_inactive_connection_lifetime": 300,
-                "timeout": 60,
-                "command_timeout": 5
-            }
-        }
+# db_ssl.py
+def get_pool_kwargs(*, for_migrations: bool = False) -> dict:
+    server_settings = {
+        "statement_timeout": os.getenv(
+            "DB_STATEMENT_TIMEOUT_MS", "0" if for_migrations else "30000"),
+        "tcp_keepalives_idle": "60",
+        "tcp_keepalives_interval": "10",
+        "tcp_keepalives_count": "3",
+        "application_name": "ocpp-aerich" if for_migrations else "ocpp-backend",
     }
-}
+    kwargs = {
+        "minsize": int(os.getenv("DB_POOL_MIN_SIZE", "1")),
+        "maxsize": int(os.getenv("DB_POOL_MAX_SIZE", "10")),
+        "max_inactive_connection_lifetime": float(os.getenv("DB_POOL_RECYCLE_SECONDS", "180")),
+        "timeout": float(os.getenv("DB_CONNECT_TIMEOUT", "10")),      # connect timeout
+        "server_settings": server_settings,
+    }
+    if not for_migrations:
+        # Core fix: a query on a half-open socket raises TimeoutError instead of
+        # hanging forever. Omitted for Aerich so long DDL migrations aren't killed.
+        kwargs["command_timeout"] = float(os.getenv("DB_COMMAND_TIMEOUT", "30"))
+    return kwargs
 ```
+
+Tortoise (0.25.x) consumes `minsize`/`maxsize`/`server_settings` and forwards everything
+else (`command_timeout`, `max_inactive_connection_lifetime`, `timeout`, `ssl`) straight to
+`asyncpg.create_pool` as per-connection connect kwargs. All values are env-overridable with
+safe defaults, so no compose/`.env` wiring is required to ship.
+
+Two supporting changes share this concern:
+- `docker-entrypoint.sh` pre-flight `asyncpg.connect` passes `timeout=DB_CONNECT_TIMEOUT`
+  (the 3rd DB-connect site in the SSL contract) so the wait-for-DB loop can't hang on
+  asyncpg's 60s default during an RDS recovery.
+- `services/data_retention_service.py` deletes are batched (`_delete_old_in_batches`,
+  5000 rows/batch) so a large purge stays under `command_timeout`.
+
+> NOTE: this configuration makes RDS restarts *harmless* to the backend; it does not reduce
+> how often they happen. The recurring AWS `recovery` restarts on the single-AZ `db.t4g.micro`
+> staging instance are driven by memory pressure (see ADR 0010) and are addressed separately
+> by right-sizing to `t4g.small` and disabling Performance Insights/Enhanced Monitoring on
+> staging.
 
 ### Backend Performance Optimization
 
@@ -5063,6 +5286,7 @@ CORS_ORIGINS = [
 - Structured logging with timestamps and correlation IDs
 - Connection manager refactored to `core/connection_manager.py`
 - Monitoring service: `services/monitoring_service.py`
+- **WebSocket disconnect telemetry (2026-05-28)**: `OCPPWebSocketDisconnect` NR custom event emitted once per disconnect from `ConnectionManager.force_disconnect` (the chokepoint for every disconnect path — natural close, server error, stale-replacement, heartbeat timeout, ops-initiated). Sibling event `OCPPWebSocketRejected` covers connect-time rejects (tombstone, validation_failed) from `routers/ocpp_ws.py`. Per-category counter metrics under `Custom/OCPP/Disconnects/*` and `Custom/OCPP/Rejects/*` survive 13 months; the rich events with full forensics attrs (charger_id, duration_seconds, ws_close_code, had_active_transaction, heartbeat_seconds_since_last, messages_received, transaction_id, reason_text) live 8–30 days. Glossary boundaries between **OCPP message log** (the `log` table), **Audit event** (the `audit_log` table), and **NR custom event** are defined under `### Observability` in `CONTEXT.md`. Feature scratch: `.scratch/ws-disconnect-tracking/`.
 
 **4. Transaction Suspend/Resume + Disconnect Handling**
 - **Feature**: Charging transactions survive charger reboots and power failures instead of being lost
@@ -5096,7 +5320,7 @@ CORS_ORIGINS = [
 - **Implementation**:
   - Runs every 30 minutes as asyncio background loop
   - `_process_failed_billing_transactions()` - Retries BILLING_FAILED transactions
-  - `_process_failed_qr_refunds()` - Retries REFUND_FAILED QR payments via Razorpay
+  - `_process_failed_qr_refunds()` - Retries REFUND_FAILED QR payments via Razorpay, skipping permanently-stuck rows via `is_retryable_refund_failure()` (excludes `idempotency_conflict_no_refund` and below-minimum reasons); a retry that 409s is reconciled, not re-hammered. See the "Refund idempotency contract" subsection.
   - `_cleanup_orphaned_qr_payments()` - Detects and refunds QR payments stuck in PAID status with no linked transaction
   - `_cleanup_stale_suspended_transactions()` - Auto-stops SUSPENDED transactions older than 5 hours
   - Per-item error handling (one failure doesn't block others)

@@ -14,6 +14,7 @@ import { isSocketCharger as checkSocketCharger } from "@/lib/utils";
 import ChargerLogs from "@/components/ChargerLogs";
 import ChargerAuditLog from "@/components/ChargerAuditLog";
 import MeterValuesChart from "@/components/MeterValuesChart";
+import ModemTemperatureCard from "@/components/ModemTemperatureCard";
 import {
   Dialog,
   DialogContent,
@@ -48,6 +49,7 @@ import {
   useFirmwareHistory,
   useCancelUpdate,
 } from "@/lib/queries/firmware";
+import { RecentFirmwareUpdates } from "@/components/firmware/RecentFirmwareUpdates";
 import { useQRCodeByCharger, useCreateQRCode } from "@/lib/queries/qr-codes";
 
 // Transaction data comes exclusively from transaction API
@@ -126,7 +128,7 @@ export default function ChargerDetailPage() {
   const getTransactionId = () => transaction?.id;
   const getTransactionStatus = () =>
     transaction?.transaction_status || "Unknown";
-  const getEnergyConsumed = () => transaction?.energy_consumed_kwh;
+  const getEnergyConsumed = () => transactionData?.live_energy_kwh;
   const getStartTime = () => transaction?.start_time;
 
   // Clear transaction handler
@@ -187,11 +189,11 @@ export default function ChargerDetailPage() {
   const getStatusColor = (status: string) => {
     switch (status) {
       case "Available":
-        return "bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400";
+        return "bg-teal-100 text-teal-800 dark:bg-teal-900/20 dark:text-teal-400";
       case "Preparing":
-        return "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-400";
+        return "bg-violet-100 text-violet-800 dark:bg-violet-900/20 dark:text-violet-400";
       case "Charging":
-        return "bg-blue-100 text-blue-800 dark:bg-blue-900/20 dark:text-blue-400";
+        return "bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400";
       case "SuspendedEVSE":
       case "SuspendedEV":
         return "bg-orange-100 text-orange-800 dark:bg-orange-900/20 dark:text-orange-400";
@@ -535,31 +537,7 @@ export default function ChargerDetailPage() {
               {firmwareHistoryData && firmwareHistoryData.data.length > 0 && (
                 <div className="mt-4 pt-4 border-t">
                   <p className="text-sm font-medium mb-2">Recent Updates:</p>
-                  <div className="space-y-2">
-                    {firmwareHistoryData.data.filter((u) => u.status !== "PENDING").slice(0, 3).map((update) => (
-                      <div key={update.id} className="flex items-center text-xs">
-                        <Badge
-                          variant={
-                            update.status === "INSTALLED"
-                              ? "outline"
-                              : update.status === "CANCELLED"
-                              ? "secondary"
-                              : update.status.includes("FAILED")
-                              ? "destructive"
-                              : "default"
-                          }
-                          className="text-xs">
-                          {update.status}
-                        </Badge>
-                        {update.firmware_version && (
-                          <span className="ml-2">{update.firmware_version}</span>
-                        )}
-                        <span className="ml-2 text-muted-foreground">
-                          {new Date(update.initiated_at).toLocaleDateString()}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
+                  <RecentFirmwareUpdates updates={firmwareHistoryData.data} />
                 </div>
               )}
             </CardContent>
@@ -764,8 +742,11 @@ export default function ChargerDetailPage() {
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <div>
                   <p className="text-sm font-medium">Transaction ID</p>
-                  <p className="text-2xl font-bold">
-                    {getTransactionId() || "N/A"}
+                  <p className="text-2xl font-bold flex items-center gap-2">
+                    <span>{getTransactionId() || "N/A"}</span>
+                    {transactionData?.funding_source === "QR" && (
+                      <Badge variant="secondary" className="text-xs">QR</Badge>
+                    )}
                   </p>
                 </div>
                 <div>
@@ -783,10 +764,15 @@ export default function ChargerDetailPage() {
                 <div>
                   <p className="text-sm font-medium">Energy Consumed</p>
                   <p className="text-2xl font-bold">
-                    {(getEnergyConsumed() || 0).toFixed(2)} kWh
+                    {getEnergyConsumed() != null
+                      ? `${getEnergyConsumed()!.toFixed(2)} kWh`
+                      : "—"}
                   </p>
                 </div>
               </div>
+              {transactionData?.funding_source === "QR" && transactionData.qr_session && (
+                <QRBudgetBlock qrSession={transactionData.qr_session} />
+              )}
             </CardContent>
           </Card>
         )}
@@ -938,6 +924,9 @@ export default function ChargerDetailPage() {
             transactionId={getTransactionId()}
           />
         )}
+
+        {/* Modem Temperature — sibling of Signal Quality, see ADR 0009 */}
+        <ModemTemperatureCard chargerId={chargerId} />
 
         {/* Error History Section */}
         {errorHistoryData && errorHistoryData.data.length > 0 && (
@@ -1099,5 +1088,54 @@ function PaymentQRCard({ chargerId }: { chargerId: number; chargerName?: string 
         )}
       </CardContent>
     </Card>
+  );
+}
+
+function QRBudgetBlock({
+  qrSession,
+}: {
+  qrSession: { budget_limit: string; cost_so_far: string; remaining: string };
+}) {
+  const budget = Number(qrSession.budget_limit);
+  const spent = Number(qrSession.cost_so_far);
+  const remaining = Number(qrSession.remaining);
+  const overBudget = remaining < 0;
+  const rawPct = budget > 0 ? (spent / budget) * 100 : 0;
+  const barPct = Math.max(0, Math.min(100, rawPct));
+
+  return (
+    <div className="mt-4 pt-4 border-t">
+      <div className="grid grid-cols-3 gap-4 mb-3">
+        <div>
+          <p className="text-sm font-medium">Budget</p>
+          <p className="text-xl font-semibold">₹{qrSession.budget_limit}</p>
+        </div>
+        <div>
+          <p className="text-sm font-medium">Spent</p>
+          <p className="text-xl font-semibold">₹{qrSession.cost_so_far}</p>
+        </div>
+        <div>
+          <p className="text-sm font-medium">Remaining</p>
+          <p
+            className={`text-xl font-semibold ${
+              overBudget ? "text-red-600 dark:text-red-400" : ""
+            }`}
+          >
+            ₹{qrSession.remaining}
+          </p>
+        </div>
+      </div>
+      <div className="h-2 w-full overflow-hidden rounded bg-gray-200 dark:bg-gray-700">
+        <div
+          className={`h-full transition-all ${
+            overBudget ? "bg-red-500" : "bg-blue-500"
+          }`}
+          style={{ width: `${barPct}%` }}
+        />
+      </div>
+      <p className="text-xs text-muted-foreground mt-1">
+        {rawPct.toFixed(1)}% used{overBudget ? " — over budget" : ""}
+      </p>
+    </div>
   );
 }

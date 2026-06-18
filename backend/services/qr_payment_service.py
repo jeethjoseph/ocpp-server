@@ -5,17 +5,34 @@ import logging
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Optional, Tuple, Dict
+from typing import NamedTuple, Optional, Tuple, Dict
 
 from tortoise.transactions import in_transaction
 
 from core.config import RAZORPAY_PLATFORM_FEE_PERCENT  # noqa: F401  (re-exported for backwards compat)
 from models import (
-    User, Wallet, Charger, Transaction, QRPayment, ChargerQRCode,
+    User, Wallet, Charger, Transaction, QRPayment, ChargerQRCode, MeterValue,
     QRPaymentStatusEnum, AuthProviderEnum, ChargerStatusEnum,
     TransactionStatusEnum, UserRoleEnum
 )
-from services.razorpay_service import razorpay_service, RazorpayAlreadyRefundedError, extract_fee_from_payment
+
+
+class BudgetSnapshot(NamedTuple):
+    """Pure-read budget figures for a QR session, in ₹ (Decimal).
+
+    Returned by ``QRPaymentService.compute_budget_snapshot`` for both the
+    auto-stop dispatch path and the admin transaction-detail response.
+    """
+    budget_limit: Decimal
+    cost_so_far: Decimal
+    remaining: Decimal
+from services.razorpay_service import (
+    razorpay_service,
+    RazorpayAlreadyRefundedError,
+    RazorpayRefundBelowMinimumError,
+    RazorpayIdempotencyConflictError,
+    extract_fee_from_payment,
+)
 from services.tariff_utils import synthetic_platform_fee, synthetic_fee_split
 from services.wallet_service import WalletService
 from services.monitoring_service import MetricsCollector, OCPPMetrics
@@ -32,6 +49,81 @@ QR_PAYMENT_PENDING_TIMEOUT = int(os.getenv("QR_PAYMENT_PENDING_TIMEOUT", "300"))
 
 SYSTEM_GUEST_EMAIL = "guest@system.powerlync.com"
 
+# Canonical, non-retryable failure_reason for a refund that hit a Razorpay
+# idempotency conflict (HTTP 409) AND had no existing refund to reconcile to.
+# The BillingRetryService sweep excludes this marker — a same-key retry can
+# never clear the conflict, so hammering it just generates noise.
+IDEMPOTENCY_CONFLICT_NO_REFUND = "idempotency_conflict_no_refund"
+
+# Canonical failure_reason for a refund below Razorpay's ₹1.00 floor. Permanent
+# (the floor will not change). Older rows predate this marker and carry the
+# long-form RazorpayRefundBelowMinimumError text instead — both are matched by
+# is_retryable_refund_failure() so neither is ever retried.
+BELOW_MINIMUM_REASON = "below_razorpay_minimum"
+
+
+def is_below_minimum_reason(failure_reason: Optional[str]) -> bool:
+    """True if a failure_reason marks Razorpay's sub-₹1 floor — the canonical
+    marker OR the legacy long-form text ("... below Razorpay minimum (₹1.00) ...").
+    This is a *benign* terminal state (the customer consumed all but a sub-rupee
+    remainder Razorpay cannot refund), NOT an operational failure. Substring-
+    based, not exact-match, so legacy/variant wording is still caught."""
+    if not failure_reason:
+        return False
+    fr = failure_reason.lower()
+    return fr == BELOW_MINIMUM_REASON or "below razorpay minimum" in fr
+
+
+def is_retryable_refund_failure(failure_reason: Optional[str]) -> bool:
+    """Whether a REFUND_FAILED row is worth another BillingRetryService attempt.
+
+    Permanently-stuck reasons return False so the sweep stops hammering them:
+      - below Razorpay's ₹1 floor (see is_below_minimum_reason)
+      - an idempotency conflict with no existing refund to reconcile to
+    Everything else (transient API/network errors, empty reason) is retryable.
+    """
+    if not failure_reason:
+        return True
+    if failure_reason.lower() == IDEMPOTENCY_CONFLICT_NO_REFUND:
+        return False
+    if is_below_minimum_reason(failure_reason):
+        return False
+    return True
+
+
+def build_refund_call_kwargs(qr_payment: QRPayment, refund_amount: Decimal) -> Dict:
+    """Deterministic Razorpay refund-request kwargs for a QR payment.
+
+    Idempotency: staging and prod share ONE Razorpay LIVE account (QR needs
+    live mode). A key derived from the per-database PK (``qr_payment_{id}``)
+    collides across environments — both envs eventually refund the same
+    integer id with different bodies, so Razorpay returns HTTP 409 "Different
+    request with the same idempotency key has already been processed."
+    ``razorpay_payment_id`` is globally unique across the account, so a key
+    built from it never collides.
+
+    The body (amount + notes + speed) is built purely from the row so the
+    original attempt and every BillingRetryService retry send a byte-identical
+    request for the same payment: a same-key, same-body call replays the
+    original refund (HTTP 200) instead of returning 409. Notes are kept minimal
+    and deterministic for the same reason — variable text (transaction reason,
+    "Retry:" prefix) would change the body and re-trigger 409.
+
+    Speed: full refunds (service not rendered) request instant payout per
+    ADR 0002; partial unused-credit refunds use normal speed. Derived from the
+    amount so the retry path reproduces the original speed without extra state.
+    """
+    instant_enabled = os.getenv(
+        "RAZORPAY_INSTANT_REFUND_ENABLED", "true"
+    ).lower() == "true"
+    is_full_refund = refund_amount >= qr_payment.amount_paid
+    return {
+        "amount": refund_amount,
+        "notes": {"qr_payment_id": str(qr_payment.id)},
+        "idempotency_key": f"refund_{qr_payment.razorpay_payment_id}",
+        "speed": "optimum" if (instant_enabled and is_full_refund) else None,
+    }
+
 
 async def _ensure_actual_fee_captured(qr_payment: QRPayment) -> None:
     """Side-effect writer: ensure the actual Razorpay fee lives on the row.
@@ -45,7 +137,7 @@ async def _ensure_actual_fee_captured(qr_payment: QRPayment) -> None:
     if qr_payment.fee_source in ("webhook", "api") and qr_payment.platform_fee is not None:
         return
 
-    fee_data = razorpay_service.fetch_payment_fees(qr_payment.razorpay_payment_id)
+    fee_data = await razorpay_service.fetch_payment_fees(qr_payment.razorpay_payment_id)
     if fee_data:
         total_fee, tax = fee_data
         qr_payment.platform_fee = total_fee
@@ -240,7 +332,19 @@ class QRPaymentService:
             razorpay_qr_code_id=qr_code_id, is_active=True
         ).prefetch_related("charger").first()
         if not charger_qr:
-            logger.error(f"No active ChargerQRCode found for qr_code_id={qr_code_id}")
+            # Two very different causes. If NO row exists for this qr_code_id,
+            # it's the other environment's QR (staging and prod share one
+            # Razorpay live account) — expected noise, log at info. But if a
+            # row DOES exist and is merely inactive, the QR is OURS (closed or
+            # regenerated) and a customer just paid on a dead QR → they get no
+            # session. That is real and customer-impacting: keep it at error.
+            exists_inactive = await ChargerQRCode.filter(
+                razorpay_qr_code_id=qr_code_id
+            ).exists()
+            if exists_inactive:
+                logger.error(f"Payment on INACTIVE ChargerQRCode qr_code_id={qr_code_id} — customer paid on a closed/regenerated QR, no session created")
+            else:
+                logger.info(f"No ChargerQRCode for qr_code_id={qr_code_id} (likely cross-environment webhook)")
             return {"status": "error", "reason": "QR code not found or inactive"}
 
         charger = charger_qr.charger
@@ -505,6 +609,112 @@ class QRPaymentService:
         return qr_payment
 
     @staticmethod
+    async def _load_or_rebuild_qr_session(transaction_id: int) -> Optional[Dict]:
+        """Return the Redis ``qr_session:{txn}`` row, rebuilding from DB on
+        cache miss. Returns None when the transaction has no associated
+        ``CHARGING`` ``QRPayment`` row (i.e. not a QR session).
+
+        Extracted so both the auto-stop dispatch path and the read-only admin
+        snapshot share the same cache-miss recovery without duplicating it.
+        """
+        session = await redis_manager.get_qr_session(transaction_id)
+        if session:
+            return session
+
+        # DB fallback for cache miss (e.g., server restart). Log so ops can
+        # detect Redis blips / TTL exhaustion / operator-edits-mid-session.
+        logger.warning(
+            "qr_session cache miss for txn %s — rebuilding from DB. "
+            "If frequent, indicates Redis instability or TTL exhaustion.",
+            transaction_id,
+        )
+        MetricsCollector.increment_counter("Custom/QrSession/BudgetCheckCacheMiss")
+
+        qr_payment = await QRPayment.filter(
+            transaction_id=transaction_id,
+            status=QRPaymentStatusEnum.CHARGING,
+        ).first()
+        if not qr_payment:
+            return None
+
+        tariff = await WalletService.get_applicable_tariff(qr_payment.charger_id)
+        tariff_rate = tariff.rate_per_kwh if tariff else Decimal('0')
+        gst_percent = tariff.gst_percent if tariff else Decimal('18')
+        platform_fee = synthetic_platform_fee(qr_payment.amount_paid)
+        await _ensure_actual_fee_captured(qr_payment)
+        await qr_payment.save()
+        budget_limit_paise = int(
+            ((qr_payment.amount_paid - platform_fee) * Decimal("100"))
+            .quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        )
+
+        transaction = await Transaction.filter(id=transaction_id).first()
+        session = {
+            "qr_payment_id": qr_payment.id,
+            "amount_paid": str(qr_payment.amount_paid),
+            "platform_fee": str(platform_fee),
+            "budget_limit_paise": budget_limit_paise,
+            "tariff_rate": str(tariff_rate),
+            "gst_percent": str(gst_percent),
+            "start_meter_kwh": str(transaction.start_meter_kwh) if transaction and transaction.start_meter_kwh else "0",
+            "charger_id": qr_payment.charger_id,
+        }
+        await redis_manager.set_qr_session(transaction_id, session)
+        return session
+
+    @staticmethod
+    async def compute_budget_snapshot(
+        transaction_id: int,
+        reading_kwh: Optional[Decimal] = None,
+    ) -> Optional[BudgetSnapshot]:
+        """Pure-read budget figures for a QR session.
+
+        Returns None when the transaction is not a QR session (no CHARGING
+        QRPayment row) or when the tariff rate is non-positive (config bug —
+        the auto-stop path bails on the same condition).
+
+        ``reading_kwh`` is the meter reading to compute cost against. If None,
+        the latest ``MeterValue`` row for the transaction is used; if no
+        MeterValue exists yet, cost is zero and ``remaining == budget_limit``.
+
+        Pure: no Redis writes, no RemoteStop dispatch. Safe to call from any
+        read path (e.g., the admin transaction-detail endpoint).
+        """
+        session = await QRPaymentService._load_or_rebuild_qr_session(transaction_id)
+        if not session:
+            return None
+
+        if "budget_limit_paise" in session:
+            budget_limit = Decimal(session["budget_limit_paise"]) / Decimal("100")
+        else:
+            # Legacy float key — drains within one TTL window post-2026-05-21.
+            budget_limit = Decimal(str(session["budget_limit"]))
+        tariff_rate = Decimal(str(session["tariff_rate"]))
+        gst_percent = Decimal(str(session.get("gst_percent", 18.0)))
+        start_meter = Decimal(str(session["start_meter_kwh"]))
+
+        if tariff_rate <= 0:
+            return None
+
+        if reading_kwh is None:
+            latest = await MeterValue.filter(
+                transaction_id=transaction_id
+            ).order_by("-id").first()
+            reading_dec = Decimal(latest.reading_kwh) if latest else start_meter
+        else:
+            reading_dec = Decimal(str(reading_kwh))
+
+        energy_consumed = reading_dec - start_meter
+        gst_multiplier = Decimal("1") + (gst_percent / Decimal("100"))
+        cost = (energy_consumed * tariff_rate * gst_multiplier).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        remaining = budget_limit - cost
+        return BudgetSnapshot(
+            budget_limit=budget_limit, cost_so_far=cost, remaining=remaining,
+        )
+
+    @staticmethod
     async def check_budget_and_auto_stop(
         transaction_id: int, reading_kwh: float, power_kw: Optional[float] = None,
     ):
@@ -517,82 +727,33 @@ class QRPaymentService:
         2026-05-22). `power_kw` is optional — older callers that don't pass it
         leave the previous snapshot's value in place.
         """
-        session = await redis_manager.get_qr_session(transaction_id)
-
-        if not session:
-            # DB fallback for cache miss (e.g., server restart). Log the miss so
-            # ops can detect Redis blips / TTL exhaustion / operator-edits-mid-
-            # session in production. Counter feeds the dashboard from issue 04.
-            logger.warning(
-                "qr_session cache miss for txn %s — rebuilding from DB. "
-                "If frequent, indicates Redis instability or TTL exhaustion.",
-                transaction_id,
-            )
-            MetricsCollector.increment_counter("Custom/QrSession/BudgetCheckCacheMiss")
-
-            qr_payment = await QRPayment.filter(
-                transaction_id=transaction_id,
-                status=QRPaymentStatusEnum.CHARGING
-            ).first()
-            if not qr_payment:
-                return  # Not a QR session
-
-            # Rebuild cache (post-restart / cache miss). Synthetic fee for
-            # budget, actual fee still captured to the row — see ADR 0001.
-            tariff = await WalletService.get_applicable_tariff(qr_payment.charger_id)
-            tariff_rate = tariff.rate_per_kwh if tariff else Decimal('0')
-            gst_percent = tariff.gst_percent if tariff else Decimal('18')
-            platform_fee = synthetic_platform_fee(qr_payment.amount_paid)
-            await _ensure_actual_fee_captured(qr_payment)
-            await qr_payment.save()
-            budget_limit_paise = int(
-                ((qr_payment.amount_paid - platform_fee) * Decimal("100"))
-                .quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-            )
-
-            transaction = await Transaction.filter(id=transaction_id).first()
-            session = {
-                "qr_payment_id": qr_payment.id,
-                "amount_paid": str(qr_payment.amount_paid),
-                "platform_fee": str(platform_fee),
-                "budget_limit_paise": budget_limit_paise,
-                "tariff_rate": str(tariff_rate),
-                "gst_percent": str(gst_percent),
-                "start_meter_kwh": str(transaction.start_meter_kwh) if transaction and transaction.start_meter_kwh else "0",
-                "charger_id": qr_payment.charger_id,
-            }
-            await redis_manager.set_qr_session(transaction_id, session)
-
-        # Read paise-int (new format), fall back to legacy float "budget_limit"
-        # for one release cycle to drain in-flight Redis keys (TTL 24h).
-        if "budget_limit_paise" in session:
-            budget_limit = Decimal(session["budget_limit_paise"]) / Decimal("100")
-        else:
-            budget_limit = Decimal(str(session["budget_limit"]))
-        tariff_rate = Decimal(str(session["tariff_rate"]))
-        gst_percent = Decimal(str(session.get("gst_percent", 18.0)))
-        start_meter = Decimal(str(session["start_meter_kwh"]))
-
-        if tariff_rate <= 0:
+        snapshot = await QRPaymentService.compute_budget_snapshot(
+            transaction_id, reading_kwh=Decimal(str(reading_kwh)),
+        )
+        if snapshot is None:
             return
 
-        energy_consumed = Decimal(str(reading_kwh)) - start_meter
-        gst_multiplier = Decimal("1") + (gst_percent / Decimal("100"))
-        cost = (energy_consumed * tariff_rate * gst_multiplier).quantize(
-            Decimal("0.01"), rounding=ROUND_HALF_UP
-        )
-        remaining = budget_limit - cost
+        # Re-read the session row that the helper just populated/loaded.
+        # We need the dict to stamp the latest-meter snapshot below; the
+        # helper intentionally doesn't return it (purity over convenience).
+        session = await redis_manager.get_qr_session(transaction_id)
+        if not session:
+            return
 
         # Stamp the latest snapshot into the cache so the active-sessions
         # endpoint can render live KPIs without a per-row MeterValue lookup.
-        # Done after the budget math so a slow Redis write doesn't delay the
-        # auto-stop decision below.
         session["latest_reading_kwh"] = str(Decimal(str(reading_kwh)))
         if power_kw is not None:
             session["latest_power_kw"] = float(power_kw)
         session["latest_meter_at"] = datetime.now(timezone.utc).isoformat()
         await redis_manager.set_qr_session(transaction_id, session)
 
+        cost = snapshot.cost_so_far
+        budget_limit = snapshot.budget_limit
+        remaining = snapshot.remaining
+        gst_percent = Decimal(str(session.get("gst_percent", 18.0)))
+        start_meter = Decimal(str(session["start_meter_kwh"]))
+        energy_consumed = Decimal(str(reading_kwh)) - start_meter
         logger.info(
             f"QR budget check txn {transaction_id}: "
             f"energy={energy_consumed:.3f}kWh, cost=₹{cost:.2f} (incl GST {gst_percent}%), "
@@ -650,6 +811,18 @@ class QRPaymentService:
             return
 
         energy_kwh = transaction.energy_consumed_kwh or 0
+
+        # ADR 0002: zero-energy QR session must full-refund (amount_paid),
+        # not amount_paid - synthetic_platform_fee. The over-payment formula
+        # below is correct only when service was actually delivered. Route
+        # zero-energy cases to _full_refund so they hit the same path as the
+        # other "service not rendered" failures (RemoteStart fail, plug-in
+        # timeout, etc.) — `_full_refund` already handles the audit + the
+        # instant-refund speed=optimum amendment (ADR 0002, 2026-05-20).
+        if Decimal(str(energy_kwh)) <= 0:
+            await QRPaymentService._full_refund(qr_payment, "Zero energy delivered")
+            return
+
         tariff = await WalletService.get_applicable_tariff(qr_payment.charger_id)
         tariff_rate = tariff.rate_per_kwh if tariff else Decimal('0')
         gst_percent = tariff.gst_percent if tariff else Decimal('18')
@@ -732,15 +905,33 @@ class QRPaymentService:
         if refund > 0:
             qr_payment.refund_amount = refund
             try:
-                refund_result = razorpay_service.refund_payment(
+                refund_result = await razorpay_service.refund_payment(
                     qr_payment.razorpay_payment_id,
-                    amount=refund,
-                    notes={"transaction_id": str(transaction_id), "reason": "Unused charging credit refund"},
-                    idempotency_key=f"qr_payment_{qr_payment.id}",
+                    **build_refund_call_kwargs(qr_payment, refund),
                 )
                 qr_payment.razorpay_refund_id = refund_result.get("id")
                 qr_payment.status = QRPaymentStatusEnum.REFUNDED
                 logger.info(f"Refund of ₹{refund} issued for QR payment {qr_payment.id}")
+            except RazorpayRefundBelowMinimumError:
+                # Razorpay rejects refunds < ₹1.00. Customer effectively
+                # forfeits the sub-rupee remainder; not a real failure.
+                # Tag with a specific reason so admin/billing-retry can
+                # disambiguate from genuine refund errors.
+                qr_payment.status = QRPaymentStatusEnum.REFUND_FAILED
+                qr_payment.failure_reason = BELOW_MINIMUM_REASON
+                logger.info(
+                    "QR payment %s refund ₹%s below Razorpay minimum; not refunded",
+                    qr_payment.id, refund,
+                )
+            except RazorpayIdempotencyConflictError:
+                # HTTP 409 on the unused-credit refund (cross-env key collision
+                # or lost-response retry). Reconcile to any existing refund; if
+                # none, mark non-retryable. Partial refunds never request
+                # instant speed, so pass refund_speed=None.
+                await QRPaymentService._reconcile_conflict(
+                    qr_payment, None, "Unused charging credit refund",
+                    IDEMPOTENCY_CONFLICT_NO_REFUND,
+                )
             except Exception as e:
                 qr_payment.status = QRPaymentStatusEnum.REFUND_FAILED
                 qr_payment.failure_reason = str(e)
@@ -781,6 +972,39 @@ class QRPaymentService:
         await redis_manager.delete_qr_session(transaction_id)
 
     @staticmethod
+    async def _reconcile_conflict(
+        payment: QRPayment, refund_speed, reason: str, no_refund_failure_reason: str,
+    ) -> None:
+        """Resolve a refund that Razorpay rejected as already-handled (an
+        'already refunded' reply or an idempotency-key conflict). A refund may
+        already exist on the payment; fetch it. If found, persist its id/speed
+        and mark REFUNDED. If not, mark REFUND_FAILED with the supplied
+        (non-retryable) reason. The caller persists the row.
+        """
+        existing = await razorpay_service.find_refund_for_payment(payment.razorpay_payment_id)
+        if existing and existing.get("id"):
+            payment.razorpay_refund_id = existing["id"]
+            existing_speed = existing.get("speed_processed")
+            payment.razorpay_refund_speed_processed = existing_speed
+            if payment.status != QRPaymentStatusEnum.EXPIRED:
+                payment.status = QRPaymentStatusEnum.REFUNDED
+            logger.warning(
+                "refund_reconciled=true qr_payment=%s existing_refund=%s reason=%s",
+                payment.id, existing["id"], reason,
+            )
+            if refund_speed == "optimum" and existing_speed:
+                await OCPPMetrics.record_refund_speed(
+                    payment.charger_id, payment.id, existing_speed,
+                )
+        else:
+            payment.status = QRPaymentStatusEnum.REFUND_FAILED
+            payment.failure_reason = no_refund_failure_reason
+            logger.error(
+                "Could not reconcile refund for payment %s: no refund record found",
+                payment.razorpay_payment_id,
+            )
+
+    @staticmethod
     async def _full_refund(qr_payment: QRPayment, reason: str):
         """Issue a full refund for a QR payment, guarded by a row lock.
 
@@ -818,20 +1042,16 @@ class QRPaymentService:
             # flows so customers see the money back in minutes, not days.
             # Razorpay falls back to normal speed server-side when rails or
             # payment method don't support instant. VoltLync absorbs the
-            # per-refund instant fee. Kill-switch:
-            # RAZORPAY_INSTANT_REFUND_ENABLED (default true).
-            instant_enabled = os.getenv(
-                "RAZORPAY_INSTANT_REFUND_ENABLED", "true"
-            ).lower() == "true"
-            refund_speed = "optimum" if instant_enabled else None
+            # per-refund instant fee. The speed decision + kill-switch
+            # (RAZORPAY_INSTANT_REFUND_ENABLED, default true) live in
+            # build_refund_call_kwargs so the retry path reproduces it exactly.
+            refund_kwargs = build_refund_call_kwargs(locked, refund_amount)
+            refund_speed = refund_kwargs["speed"]
 
             try:
-                refund_result = razorpay_service.refund_payment(
+                refund_result = await razorpay_service.refund_payment(
                     locked.razorpay_payment_id,
-                    amount=refund_amount,
-                    notes={"reason": reason, "qr_payment_id": str(locked.id)},
-                    idempotency_key=f"qr_payment_{locked.id}",
-                    speed=refund_speed,
+                    **refund_kwargs,
                 )
                 locked.razorpay_refund_id = refund_result.get("id")
                 speed_processed = refund_result.get("speed_processed")
@@ -848,30 +1068,30 @@ class QRPaymentService:
                         locked.charger_id, locked.id, speed_processed,
                     )
             except RazorpayAlreadyRefundedError as e:
-                existing = razorpay_service.find_refund_for_payment(locked.razorpay_payment_id)
-                if existing and existing.get("id"):
-                    locked.razorpay_refund_id = existing["id"]
-                    existing_speed = existing.get("speed_processed")
-                    locked.razorpay_refund_speed_processed = existing_speed
-                    if locked.status != QRPaymentStatusEnum.EXPIRED:
-                        locked.status = QRPaymentStatusEnum.REFUNDED
-                    await locked.save()
-                    logger.warning(
-                        "refund_reconciled=true qr_payment=%s existing_refund=%s reason=%s",
-                        locked.id, existing["id"], reason,
-                    )
-                    if refund_speed == "optimum" and existing_speed:
-                        await OCPPMetrics.record_refund_speed(
-                            locked.charger_id, locked.id, existing_speed,
-                        )
-                else:
-                    locked.status = QRPaymentStatusEnum.REFUND_FAILED
-                    locked.failure_reason = f"Razorpay reports already refunded but no refund record found: {e}"
-                    await locked.save()
-                    logger.error(
-                        "Could not reconcile already-refunded payment %s: no refund record found",
-                        locked.razorpay_payment_id,
-                    )
+                await QRPaymentService._reconcile_conflict(
+                    locked, refund_speed, reason,
+                    f"Razorpay reports already refunded but no refund record found: {e}",
+                )
+                await locked.save()
+            except RazorpayIdempotencyConflictError:
+                # HTTP 409: the key was already used (cross-env collision or a
+                # lost-response retry). Reconcile to any existing refund; if
+                # none, mark non-retryable so the sweep stops hammering it.
+                await QRPaymentService._reconcile_conflict(
+                    locked, refund_speed, reason, IDEMPOTENCY_CONFLICT_NO_REFUND,
+                )
+                await locked.save()
+            except RazorpayRefundBelowMinimumError:
+                # Sub-₹1 full refund (rare — amount_paid is normally ≥₹1).
+                # Tag with the canonical marker so the sweep excludes it,
+                # matching the partial-refund path.
+                locked.status = QRPaymentStatusEnum.REFUND_FAILED
+                locked.failure_reason = BELOW_MINIMUM_REASON
+                await locked.save()
+                logger.info(
+                    "QR payment %s full refund below Razorpay minimum; not refunded",
+                    locked.id,
+                )
             except Exception as e:
                 logger.error(
                     "Full refund error for QR payment %s: %s", locked.id, e, exc_info=True,

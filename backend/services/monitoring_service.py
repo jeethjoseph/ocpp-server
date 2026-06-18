@@ -64,8 +64,31 @@ def initialize_monitoring():
             from sentry_sdk.integrations.redis import RedisIntegration
             from sentry_sdk.integrations.logging import LoggingIntegration
 
+            from datetime import datetime, timezone
+
             # Get configuration from environment
             sentry_environment = os.getenv("SENTRY_ENVIRONMENT", environment)
+
+            # Report 5xx as failed requests EXCEPT 504: a 504 here is the
+            # expected "charger didn't respond in time" upstream-gateway case
+            # raised by the remote-start endpoint, not a server fault. The app
+            # has no other intentional 504 source. Revisit if that changes.
+            failed_request_status_codes = frozenset(range(500, 600)) - {504}
+
+            # Release: prefer an explicitly injected version (SENTRY_RELEASE or
+            # the deploy's GIT_COMMIT) so events are attributable to a deploy.
+            # Fall back to an env+timestamp marker — mirrors the frontend
+            # (next.config.ts) — so we never silently report the literal "dev".
+            sentry_release = (
+                os.getenv("SENTRY_RELEASE")
+                or os.getenv("GIT_COMMIT")
+                or f"{sentry_environment}-{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H-%M-%S')}"
+            )
+            if not (os.getenv("SENTRY_RELEASE") or os.getenv("GIT_COMMIT")) and environment != "development":
+                logger.warning(
+                    f"⚠️ Sentry release pinned to a startup timestamp ({sentry_release}); "
+                    "set GIT_COMMIT (or SENTRY_RELEASE) at deploy for stable release tracking"
+                )
             traces_sample_rate = float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.1"))
             profiles_sample_rate = float(os.getenv("SENTRY_PROFILES_SAMPLE_RATE", "0.1"))
 
@@ -75,8 +98,14 @@ def initialize_monitoring():
 
                 # Integrations
                 integrations=[
-                    FastApiIntegration(transaction_style="endpoint"),
-                    StarletteIntegration(transaction_style="endpoint"),
+                    FastApiIntegration(
+                        transaction_style="endpoint",
+                        failed_request_status_codes=failed_request_status_codes,
+                    ),
+                    StarletteIntegration(
+                        transaction_style="endpoint",
+                        failed_request_status_codes=failed_request_status_codes,
+                    ),
                     AsyncioIntegration(),
                     RedisIntegration(),
                     LoggingIntegration(
@@ -95,8 +124,8 @@ def initialize_monitoring():
                     asyncio.CancelledError,
                 ],
 
-                # Release tracking (use git commit hash in production)
-                release=os.getenv("GIT_COMMIT", "dev"),
+                # Release tracking (deploy SHA / explicit release; see above)
+                release=sentry_release,
 
                 # Additional options
                 attach_stacktrace=True,
@@ -492,6 +521,66 @@ class OCPPMetrics:
         """Record WebSocket connection attempt"""
         metric_name = "Custom/OCPP/WebSocket/Connected" if success else "Custom/OCPP/WebSocket/Rejected"
         MetricsCollector.increment_counter(metric_name)
+
+    @staticmethod
+    async def record_websocket_disconnect(
+        charger_id: str,
+        disconnect_category: str,
+        duration_seconds: float,
+        reason_text: str,
+        ws_close_code: Optional[int] = None,
+        ws_close_reason: str = "",
+        had_active_transaction: bool = False,
+        transaction_id: Optional[int] = None,
+        heartbeat_seconds_since_last: Optional[float] = None,
+        messages_received: int = 0,
+    ):
+        """Emit one OCPPWebSocketDisconnect NR event per disconnect for baselining.
+
+        Per-category counter has 13-month retention for long-term trend; the
+        rich event has 8–30 day retention for forensics. Schema decided in
+        .scratch/ws-disconnect-tracking/issues/01.
+        """
+        MetricsCollector.increment_counter(f"Custom/OCPP/Disconnects/{disconnect_category}")
+        attrs: Dict[str, Any] = {
+            "charger_id": charger_id,
+            "disconnect_category": disconnect_category,
+            "duration_seconds": duration_seconds,
+            "reason_text": reason_text,
+            "ws_close_reason": ws_close_reason,
+            "had_active_transaction": had_active_transaction,
+            "messages_received": messages_received,
+        }
+        if ws_close_code is not None:
+            attrs["ws_close_code"] = ws_close_code
+        if transaction_id is not None:
+            attrs["transaction_id"] = transaction_id
+        if heartbeat_seconds_since_last is not None:
+            attrs["heartbeat_seconds_since_last"] = heartbeat_seconds_since_last
+        MetricsCollector.record_event("OCPPWebSocketDisconnect", attrs)
+
+    @staticmethod
+    async def record_websocket_rejected(
+        charger_id: str,
+        reject_reason: str,
+        ws_close_code: int,
+        tombstone_remaining_ms: Optional[float] = None,
+    ):
+        """Emit one OCPPWebSocketRejected NR event per connect-time reject.
+
+        Rejects never reach cp.start() so they aren't disconnects — kept as a
+        sibling event so reconnect-storm vs flapping-charger patterns stay
+        separate in NRQL.
+        """
+        MetricsCollector.increment_counter(f"Custom/OCPP/Rejects/{reject_reason}")
+        attrs: Dict[str, Any] = {
+            "charger_id": charger_id,
+            "reject_reason": reject_reason,
+            "ws_close_code": ws_close_code,
+        }
+        if tombstone_remaining_ms is not None:
+            attrs["tombstone_remaining_ms"] = tombstone_remaining_ms
+        MetricsCollector.record_event("OCPPWebSocketRejected", attrs)
 
     @staticmethod
     async def record_billing_amount(amount: float):

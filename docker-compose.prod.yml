@@ -120,12 +120,18 @@ services:
       # Razorpay instant refund kill-switch (ADR 0002). Default true.
       # Flip to false to revert to normal speed in an incident.
       - RAZORPAY_INSTANT_REFUND_ENABLED=${RAZORPAY_INSTANT_REFUND_ENABLED:-true}
+      # Wallet charging gate (ADR 0011). Default true. Set false to block new
+      # wallet sessions & top-ups until pooled multi-franchisee settlement exists.
+      - WALLET_CHARGING_ENABLED=${WALLET_CHARGING_ENABLED:-true}
       # OCPP & Server Tuning
       - DISCONNECT_SUSPEND_TIMEOUT_SECONDS=${DISCONNECT_SUSPEND_TIMEOUT_SECONDS:-180}
       - SUSPEND_TIMEOUT_SECONDS=${SUSPEND_TIMEOUT_SECONDS:-300}
+      - SOCKET_GRACE_PERIOD_SECONDS=${SOCKET_GRACE_PERIOD_SECONDS:-300}
       - ZERO_ENERGY_TIMEOUT_SECONDS=${ZERO_ENERGY_TIMEOUT_SECONDS:-7200}
       - ZERO_ENERGY_GRACE_PERIOD_SECONDS=${ZERO_ENERGY_GRACE_PERIOD_SECONDS:-60}
       - OCPP_TIMEOUT=${OCPP_TIMEOUT:-120}
+      - MAX_DISCONNECT_RESETS_WITHOUT_PROGRESS=${MAX_DISCONNECT_RESETS_WITHOUT_PROGRESS:-3}
+      - MAX_RESUME_GAP_SECONDS=${MAX_RESUME_GAP_SECONDS:-900}
       - RETENTION_DAYS=${RETENTION_DAYS:-90}
       - CLEANUP_INTERVAL_HOURS=${CLEANUP_INTERVAL_HOURS:-24}
       # New Relic
@@ -138,6 +144,11 @@ services:
       - SENTRY_ENABLED=${SENTRY_ENABLED:-true}
       - SENTRY_DSN=${SENTRY_DSN}
       - SENTRY_ENVIRONMENT=production
+      - SENTRY_TRACES_SAMPLE_RATE=${SENTRY_TRACES_SAMPLE_RATE:-0.1}
+      - SENTRY_PROFILES_SAMPLE_RATE=${SENTRY_PROFILES_SAMPLE_RATE:-0.1}
+      # Release tag for Sentry (deploy SHA). Injected by `make prod-rebuild`.
+      - GIT_COMMIT=${GIT_COMMIT:-}
+      - SENTRY_RELEASE=${SENTRY_RELEASE:-}
     volumes:
       - backend_firmware_prod:/app/firmware_files
     depends_on:
@@ -183,13 +194,20 @@ services:
         - NEXT_PUBLIC_NEW_RELIC_ACCOUNT_ID=${NEXT_PUBLIC_NEW_RELIC_ACCOUNT_ID:-}
         - NEXT_PUBLIC_NEW_RELIC_TRUST_KEY=${NEXT_PUBLIC_NEW_RELIC_TRUST_KEY:-}
         - NEXT_PUBLIC_NEW_RELIC_AGENT_ID=${NEXT_PUBLIC_NEW_RELIC_AGENT_ID:-}
+        # Wallet charging gate (ADR 0011). Default true; set false to hide wallet UI.
+        - NEXT_PUBLIC_WALLET_CHARGING_ENABLED=${NEXT_PUBLIC_WALLET_CHARGING_ENABLED:-true}
+        - NEXT_PUBLIC_SENTRY_DSN=${NEXT_PUBLIC_SENTRY_DSN:-}
+        - NEXT_PUBLIC_SENTRY_ENVIRONMENT=production
+        - SENTRY_ORG=${SENTRY_ORG:-}
+        - SENTRY_PROJECT=${SENTRY_PROJECT:-}
+        - SENTRY_AUTH_TOKEN=${SENTRY_AUTH_TOKEN:-}
     container_name: ocpp-frontend-prod
     environment:
       - CLERK_SECRET_KEY=${CLERK_SECRET_KEY}
     depends_on:
       - backend
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/api/health"]
       interval: 30s
       timeout: 10s
       start_period: 30s
@@ -220,6 +238,7 @@ services:
     environment:
       - ENVIRONMENT=production
       - DOMAIN_NAME=${DOMAIN_NAME}
+      - CSP_CLERK_HOSTS=${CSP_CLERK_HOSTS:-https://*.clerk.accounts.dev}
     ports:
       - "80:80"
       - "443:443"

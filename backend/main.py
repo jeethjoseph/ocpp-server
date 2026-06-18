@@ -348,6 +348,13 @@ class ChargePoint(OcppChargePoint):
             )
             response = await asyncio.wait_for(self.call(req), timeout=15)
 
+            # self.call() resolves to None when the charger's reply can't be
+            # parsed into a response (connection dropped mid-call, malformed
+            # reply). Guard before reading .status — otherwise AttributeError.
+            if response is None:
+                logger.warning(f"📡 Charger {self.id} returned no usable PostBootState response")
+                return
+
             logger.info(f"📡 PostBootState push to {self.id}: status={response.status}, data={payload_data}")
             if response.status != "Accepted":
                 logger.warning(f"📡 Charger {self.id} did not accept PostBootState: status={response.status}")
@@ -800,6 +807,12 @@ class ChargePoint(OcppChargePoint):
 
             logger.info(f"🔋 Created transaction {transaction.id} for charger {self.id} with status RUNNING")
 
+            # Track on in-memory connection state so OCPPWebSocketDisconnect can
+            # report had_active_transaction without a DB lookup on the hot path.
+            conn = connection_manager.connected_charge_points.get(self.id)
+            if conn is not None:
+                conn["active_transaction_id"] = transaction.id
+
             safe_create_task(log_audit_event(
                 action="transaction.status_changed",
                 entity_type="transaction",
@@ -865,7 +878,16 @@ class ChargePoint(OcppChargePoint):
             # Get transaction from database
             transaction = await Transaction.filter(id=transaction_id).first()
             if not transaction:
-                logger.error(f"🛑 ❌ Transaction {transaction_id} not found")
+                # A placeholder id (e.g. -1) when the charger has no valid txn
+                # to report is benign and expected — warn. But a POSITIVE id we
+                # don't have is a real anomaly: the charger expects a transaction
+                # we issued (StartTransaction returns a positive PK) and we can't
+                # find it → likely a lost/never-persisted transaction and lost
+                # billing. Keep that at error so it stays visible in Sentry.
+                if isinstance(transaction_id, int) and transaction_id > 0:
+                    logger.error(f"🛑 ❌ StopTransaction for unknown positive transaction_id={transaction_id} — possible lost transaction")
+                else:
+                    logger.warning(f"🛑 StopTransaction with placeholder transaction_id={transaction_id} — responding Invalid")
                 return call_result.StopTransaction(
                     id_tag_info={"status": "Invalid"}
                 )
@@ -885,6 +907,11 @@ class ChargePoint(OcppChargePoint):
             await transaction.save()
 
             logger.info(f"🛑 ✅ Transaction stopped {transaction_id}: {transaction.energy_consumed_kwh} kWh consumed")
+
+            # Clear the in-memory active_transaction_id paired with StartTransaction.
+            conn = connection_manager.connected_charge_points.get(self.id)
+            if conn is not None and conn.get("active_transaction_id") == transaction_id:
+                conn["active_transaction_id"] = None
 
             # Cancel any active socket grace period for this charger
             try:
@@ -917,7 +944,7 @@ class ChargePoint(OcppChargePoint):
 
             # Record transaction completed event
             duration_minutes = (transaction.end_time - transaction.start_time).total_seconds() / 60 if transaction.start_time and transaction.end_time else 0
-            await OCPPMetrics.record_transaction_completed(transaction_id, transaction.energy_consumed_kwh, duration_minutes)
+            await OCPPMetrics.record_transaction_completed(transaction_id, float(transaction.energy_consumed_kwh or 0), duration_minutes)
             
             # Process wallet billing asynchronously
             try:
@@ -1238,8 +1265,10 @@ class ChargePoint(OcppChargePoint):
 
     async def _handle_signal_quality(self, data: str):
         """
-        Handle SignalQuality DataTransfer messages (vendor-agnostic)
-        Data format: {"rssi":22,"ber":99,"timestamp":"86"}
+        Handle SignalQuality DataTransfer messages (vendor-agnostic).
+        Data format: {"rssi":22,"ber":99,"temperature":38.2,"timestamp":"86"}
+        ``temperature`` is optional — older firmware omits it; newer
+        firmware reports modem board temperature in Celsius. See ADR 0009.
         """
         from models import Charger, SignalQuality
         import json
@@ -1253,6 +1282,7 @@ class ChargePoint(OcppChargePoint):
             payload = json.loads(data)
             rssi = payload.get("rssi")
             ber = payload.get("ber")
+            temperature = payload.get("temperature")
             timestamp = payload.get("timestamp")
 
             # Validate required fields
@@ -1268,6 +1298,18 @@ class ChargePoint(OcppChargePoint):
             if not (0 <= ber <= 7 or ber == 99):
                 logger.warning(f"📡 ⚠️  BER value {ber} out of typical range for {self.id}")
 
+            # Coerce temperature to float; reject obviously-bad values quietly
+            # (a misbehaving firmware bug shouldn't reject the whole packet —
+            # rssi/ber are the original load-bearing fields).
+            temperature_celsius = None
+            if temperature is not None:
+                try:
+                    temperature_celsius = float(temperature)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        f"🌡️ ⚠️  Non-numeric temperature {temperature!r} from {self.id} — dropping"
+                    )
+
             # Get charger
             charger = await Charger.get(charge_point_string_id=self.id)
 
@@ -1276,12 +1318,14 @@ class ChargePoint(OcppChargePoint):
                 charger=charger,
                 rssi=rssi,
                 ber=ber,
+                temperature_celsius=temperature_celsius,
                 timestamp=str(timestamp) if timestamp is not None else ""
             )
 
             # Log success
             signal_strength = "Good" if rssi >= 10 else "Fair" if rssi >= 5 else "Poor" if rssi > 0 else "Unknown"
-            logger.info(f"📶 Stored signal quality for {self.id}: RSSI={rssi} ({signal_strength}), BER={ber}")
+            temp_log = f", Temp={temperature_celsius}°C" if temperature_celsius is not None else ""
+            logger.info(f"📶 Stored signal quality for {self.id}: RSSI={rssi} ({signal_strength}), BER={ber}{temp_log}")
 
             return call_result.DataTransfer(status="Accepted")
 
@@ -1738,6 +1782,15 @@ async def startup_event():
     else:
         logger.info("ℹ️ Razorpay Instant Refunds: DISABLED (normal speed, 5–7 working days)")
 
+    # ADR 0011 gate — wallet charging is paused until pooled multi-franchisee
+    # settlement exists. Warn loudly when disabled so a misconfigured deploy
+    # (or a forgotten re-enable) is visible in the logs.
+    from core.config import wallet_charging_enabled
+    if wallet_charging_enabled():
+        logger.info("✅ Wallet Charging: ENABLED")
+    else:
+        logger.warning("⚠️ Wallet Charging: DISABLED — new wallet sessions & top-ups blocked (ADR 0011)")
+
 @app.on_event("shutdown")
 async def shutdown_event():
     """Close database and Redis connections on shutdown"""
@@ -1768,6 +1821,16 @@ async def shutdown_event():
 
     await close_db()
     await redis_manager.disconnect()
+
+    # Drain Sentry's in-memory event queue so events buffered up to the
+    # SIGTERM aren't lost on container shutdown. No-op when the SDK was
+    # never initialized (Sentry disabled in dev).
+    try:
+        import sentry_sdk
+        sentry_sdk.flush(timeout=2)
+    except Exception as e:
+        logger.warning("Sentry flush on shutdown failed (non-fatal): %s", e)
+
     logger.info("Database and Redis connections closed")
 
 if __name__ == "__main__":

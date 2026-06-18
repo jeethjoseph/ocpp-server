@@ -222,6 +222,48 @@ class TestChargerEndpoints:
         assert response.json()["detail"] == "Charger is not connected"
     
     @pytest.mark.asyncio
+    @patch("routers.chargers.is_charger_connected")
+    @patch("main.send_ocpp_request")
+    async def test_remote_start_timeout_returns_504(
+        self, mock_send_ocpp, mock_connected, client_admin: AsyncClient, test_charger
+    ):
+        """An OCPP timeout on remote-start is an upstream/charger-offline
+        condition → 504, not 500 (OCPP-BACKEND-9)."""
+        from models import ChargerStatusEnum
+        mock_connected.return_value = True
+        await Charger.filter(id=test_charger.id).update(
+            latest_status=ChargerStatusEnum.PREPARING
+        )
+        mock_send_ocpp.return_value = (False, "OCPP timeout: RemoteStartTransaction")
+
+        response = await client_admin.post(
+            f"/api/admin/chargers/{test_charger.id}/remote-start"
+        )
+
+        assert response.status_code == status.HTTP_504_GATEWAY_TIMEOUT
+        assert "did not respond" in response.json()["detail"].lower()
+
+    @pytest.mark.asyncio
+    @patch("routers.chargers.is_charger_connected")
+    @patch("main.send_ocpp_request")
+    async def test_remote_start_other_failure_returns_500(
+        self, mock_send_ocpp, mock_connected, client_admin: AsyncClient, test_charger
+    ):
+        """A non-timeout OCPP failure still surfaces as a 500 server error."""
+        from models import ChargerStatusEnum
+        mock_connected.return_value = True
+        await Charger.filter(id=test_charger.id).update(
+            latest_status=ChargerStatusEnum.PREPARING
+        )
+        mock_send_ocpp.return_value = (False, "Rejected")
+
+        response = await client_admin.post(
+            f"/api/admin/chargers/{test_charger.id}/remote-start"
+        )
+
+        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+
+    @pytest.mark.asyncio
     @patch('main.send_ocpp_request')
     async def test_change_availability(self, mock_send_ocpp, client_admin: AsyncClient, test_charger):
         """Test changing charger availability"""
@@ -258,8 +300,134 @@ class TestChargerEndpoints:
         response = await client_admin.post(
             f"/api/admin/chargers/{test_charger.id}/change-availability?type=Invalid&connector_id=1"
         )
-        
+
         assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+    # ─── Charger.availability persistence (ADR 0008) ─────────────────────
+
+    @pytest.mark.asyncio
+    @patch("routers.chargers.is_charger_connected")
+    @patch("main.send_ocpp_request")
+    async def test_change_availability_persists_operative(
+        self, mock_send_ocpp, mock_connected, client_admin, test_charger
+    ):
+        """On OCPP Accepted, Charger.availability is set to Operative."""
+        from models import ChargerAvailabilityEnum, AuditLog
+        mock_connected.return_value = True
+        mock_send_ocpp.return_value = (True, MagicMock(status="Accepted"))
+
+        # Set a starting value different from the target so we can prove the write happened.
+        await Charger.filter(id=test_charger.id).update(
+            availability=ChargerAvailabilityEnum.INOPERATIVE,
+        )
+
+        resp = await client_admin.post(
+            f"/api/admin/chargers/{test_charger.id}/change-availability"
+            f"?type=Operative&connector_id=0"
+        )
+        assert resp.status_code == status.HTTP_200_OK
+
+        refreshed = await Charger.get(id=test_charger.id)
+        assert refreshed.availability == ChargerAvailabilityEnum.OPERATIVE
+
+        audit = await AuditLog.filter(
+            action="charger.availability_changed",
+            entity_id=test_charger.charge_point_string_id,
+        ).order_by("-created_at").first()
+        assert audit is not None
+        assert audit.changes["new_availability"] == "Operative"
+        assert audit.changes["ocpp_response"] == "Accepted"
+
+    @pytest.mark.asyncio
+    @patch("routers.chargers.is_charger_connected")
+    @patch("main.send_ocpp_request")
+    async def test_change_availability_persists_inoperative(
+        self, mock_send_ocpp, mock_connected, client_admin, test_charger
+    ):
+        """On OCPP Accepted, Charger.availability is set to Inoperative."""
+        from models import ChargerAvailabilityEnum
+        mock_connected.return_value = True
+        mock_send_ocpp.return_value = (True, MagicMock(status="Accepted"))
+
+        # Fixture default is OPERATIVE — flipping to INOPERATIVE.
+        resp = await client_admin.post(
+            f"/api/admin/chargers/{test_charger.id}/change-availability"
+            f"?type=Inoperative&connector_id=0"
+        )
+        assert resp.status_code == status.HTTP_200_OK
+
+        refreshed = await Charger.get(id=test_charger.id)
+        assert refreshed.availability == ChargerAvailabilityEnum.INOPERATIVE
+
+    @pytest.mark.asyncio
+    @patch("routers.chargers.is_charger_connected")
+    @patch("main.send_ocpp_request")
+    async def test_change_availability_scheduled_also_persists(
+        self, mock_send_ocpp, mock_connected, client_admin, test_charger
+    ):
+        """OCPP Scheduled response also counts as admin intent captured."""
+        from models import ChargerAvailabilityEnum
+        mock_connected.return_value = True
+        mock_send_ocpp.return_value = (True, MagicMock(status="Scheduled"))
+
+        resp = await client_admin.post(
+            f"/api/admin/chargers/{test_charger.id}/change-availability"
+            f"?type=Inoperative&connector_id=0"
+        )
+        assert resp.status_code == status.HTTP_200_OK
+
+        refreshed = await Charger.get(id=test_charger.id)
+        assert refreshed.availability == ChargerAvailabilityEnum.INOPERATIVE
+
+    @pytest.mark.asyncio
+    @patch("routers.chargers.is_charger_connected")
+    @patch("main.send_ocpp_request")
+    async def test_change_availability_rejected_does_not_persist(
+        self, mock_send_ocpp, mock_connected, client_admin, test_charger
+    ):
+        """OCPP Rejected response must NOT update Charger.availability."""
+        from models import ChargerAvailabilityEnum, AuditLog
+        mock_connected.return_value = True
+        mock_send_ocpp.return_value = (True, MagicMock(status="Rejected"))
+
+        # Fixture default is OPERATIVE; should stay OPERATIVE after Rejected.
+        resp = await client_admin.post(
+            f"/api/admin/chargers/{test_charger.id}/change-availability"
+            f"?type=Inoperative&connector_id=0"
+        )
+        assert resp.status_code == status.HTTP_200_OK
+
+        refreshed = await Charger.get(id=test_charger.id)
+        assert refreshed.availability == ChargerAvailabilityEnum.OPERATIVE  # unchanged
+
+        # Audit log still records the attempt with new_availability=None.
+        audit = await AuditLog.filter(
+            action="charger.availability_changed",
+            entity_id=test_charger.charge_point_string_id,
+        ).order_by("-created_at").first()
+        assert audit is not None
+        assert audit.changes["ocpp_response"] == "Rejected"
+        assert audit.changes["new_availability"] is None
+
+    @pytest.mark.asyncio
+    @patch("routers.chargers.is_charger_connected")
+    @patch("main.send_ocpp_request")
+    async def test_charger_list_response_includes_availability(
+        self, mock_send_ocpp, mock_connected, client_admin, test_charger
+    ):
+        """The ChargerResponse Pydantic model exposes availability so the frontend
+        toggle can read it. See ADR 0008."""
+        resp = await client_admin.get("/api/admin/chargers")
+        assert resp.status_code == status.HTTP_200_OK
+        data = resp.json()
+        assert "data" in data
+        found = next(
+            (c for c in data["data"] if c["id"] == test_charger.id),
+            None,
+        )
+        assert found is not None
+        assert "availability" in found
+        assert found["availability"] in ("Operative", "Inoperative")
     
     @pytest.mark.asyncio
     async def test_get_charger_logs(self, client_admin: AsyncClient, test_charger):

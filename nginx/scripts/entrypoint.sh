@@ -60,7 +60,7 @@ case "${ENVIRONMENT}" in
         if ! check_certificate; then
             generate_self_signed_cert
         fi
-        envsubst '${DOMAIN_NAME}' < /etc/nginx/templates/staging.conf.template > /etc/nginx/conf.d/default.conf
+        envsubst '${DOMAIN_NAME} ${CSP_CLERK_HOSTS}' < /etc/nginx/templates/staging.conf.template > /etc/nginx/conf.d/default.conf
         ;;
 
     production|prod)
@@ -69,7 +69,7 @@ case "${ENVIRONMENT}" in
         if ! check_certificate; then
             generate_self_signed_cert
         fi
-        envsubst '${DOMAIN_NAME}' < /etc/nginx/templates/prod.conf.template > /etc/nginx/conf.d/default.conf
+        envsubst '${DOMAIN_NAME} ${CSP_CLERK_HOSTS}' < /etc/nginx/templates/prod.conf.template > /etc/nginx/conf.d/default.conf
         ;;
 
     *)

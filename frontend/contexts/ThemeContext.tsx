@@ -12,12 +12,33 @@ interface ThemeContextType {
 
 const ThemeContext = createContext<ThemeContextType | undefined>(undefined);
 
+// Mobile Safari (private mode / ITP / "Block All Cookies") throws
+// `SecurityError: The operation is insecure.` on ANY localStorage access,
+// not just writes. Reads and writes must be guarded so the provider never
+// crashes during render — theme falls back to in-memory state when storage
+// is unavailable (it just won't persist across reloads).
+function readStoredTheme(): Theme | null {
+  try {
+    return localStorage.getItem('theme') as Theme | null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredTheme(theme: Theme): void {
+  try {
+    localStorage.setItem('theme', theme);
+  } catch {
+    // Storage blocked — keep the selection for this session only.
+  }
+}
+
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
   const [theme, setTheme] = useState<Theme>('system');
   const [actualTheme, setActualTheme] = useState<'light' | 'dark'>('light');
 
   useEffect(() => {
-    const savedTheme = localStorage.getItem('theme') as Theme;
+    const savedTheme = readStoredTheme();
     if (savedTheme) {
       setTheme(savedTheme);
     }
@@ -43,7 +64,7 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
       }
     }
 
-    localStorage.setItem('theme', theme);
+    writeStoredTheme(theme);
   }, [theme]);
 
   useEffect(() => {

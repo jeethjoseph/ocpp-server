@@ -12,6 +12,7 @@ from models import (
 from services.razorpay_service import (
     razorpay_service, build_qr_payee_name, build_qr_description,
 )
+from services.qr_payment_service import is_below_minimum_reason
 from tortoise.functions import Count, Sum
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,19 @@ async def _resolve_qr_franchisee(charger: Charger) -> Optional[Franchisee]:
     return station.franchisee
 
 
+async def _close_orphan_razorpay_qr(qr_code_id: str) -> None:
+    """Best-effort close of a Razorpay QR whose local row failed to persist.
+    Swallows close-side errors after logging so the caller can re-raise the
+    original DB exception unmasked."""
+    try:
+        await razorpay_service.close_qr_code(qr_code_id, account_id=None)
+    except Exception as close_exc:
+        logger.warning(
+            "Failed to close orphan Razorpay QR %s after local insert failure: %s",
+            qr_code_id, close_exc,
+        )
+
+
 async def _create_qr_for_charger(charger: Charger) -> dict:
     """Create a platform-owned QR code for a charger. Franchisee (if any)
     is referenced only for descriptive labeling; the QR itself is NOT
@@ -47,20 +61,25 @@ async def _create_qr_for_charger(charger: Charger) -> dict:
     business_name = franchisee.business_name if franchisee else None
     charger_name = charger.name or charger.charge_point_string_id
 
-    result = razorpay_service.create_qr_code(
+    result = await razorpay_service.create_qr_code(
         payee_name=build_qr_payee_name(business_name, charger_name),
         description=build_qr_description(business_name, charger_name),
         account_id=None,
     )
 
-    qr_code = await ChargerQRCode.create(
-        charger=charger,
-        razorpay_qr_code_id=result["id"],
-        image_url=result.get("image_url", ""),
-        short_url=result.get("short_url"),
-        is_active=True,
-        owner_razorpay_account_id=None,
-    )
+    try:
+        qr_code = await ChargerQRCode.create(
+            charger=charger,
+            razorpay_qr_code_id=result["id"],
+            image_url=result.get("image_url", ""),
+            short_url=result.get("short_url"),
+            is_active=True,
+            owner_razorpay_account_id=None,
+        )
+    except Exception:
+        await _close_orphan_razorpay_qr(result["id"])
+        raise
+
     return {
         "id": qr_code.id,
         "charger_id": charger.id,
@@ -125,7 +144,7 @@ async def regenerate_qr_code(qr_id: int, admin_user=Depends(require_admin())):
     # be closed; proceed to create the replacement regardless).
     if qr.is_active:
         try:
-            razorpay_service.close_qr_code(
+            await razorpay_service.close_qr_code(
                 qr.razorpay_qr_code_id,
                 account_id=qr.owner_razorpay_account_id,
             )
@@ -263,7 +282,7 @@ async def close_qr_code(qr_id: int, admin_user=Depends(require_admin())):
         raise HTTPException(status_code=400, detail="QR code already inactive")
 
     try:
-        razorpay_service.close_qr_code(
+        await razorpay_service.close_qr_code(
             qr.razorpay_qr_code_id,
             account_id=qr.owner_razorpay_account_id,
         )
@@ -319,6 +338,12 @@ async def get_qr_payments(
             "razorpay_refund_speed_processed": p.razorpay_refund_speed_processed,
             "status": p.status.value,
             "failure_reason": p.failure_reason,
+            # Benign sub-₹1 forfeit (Razorpay's floor) — not an operational
+            # failure; lets the admin UI render a neutral badge, not red.
+            "refund_below_minimum": (
+                p.status == QRPaymentStatusEnum.REFUND_FAILED
+                and is_below_minimum_reason(p.failure_reason)
+            ),
             "transaction_id": p.transaction_id,
             "created_at": p.created_at.isoformat(),
         })

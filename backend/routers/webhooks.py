@@ -71,8 +71,19 @@ async def handle_clerk_webhook(
                 "svix-signature": svix_signature,
             })
         except Exception as e:
-            logger.error(f"Webhook verification failed: {str(e)}")
-            raise HTTPException(status_code=400, detail="Webhook verification failed")
+            # Signature mismatch is almost always cross-environment delivery:
+            # staging and prod share one Clerk app, so a message signed by the
+            # OTHER endpoint's secret occasionally reaches this URL. Legitimate
+            # prod webhooks still verify and sync (confirmed 2026-06-11 — driver
+            # app_user rows were created via this handler throughout the failure
+            # window). Log at warning (not error → no Sentry event) and ack 200
+            # so Svix stops retrying an un-verifiable message. Returning here
+            # also keeps it out of the generic error handler below.
+            # NOTE: if successful "Received Clerk webhook" log lines ever stop
+            # while these warnings continue, suspect real CLERK_WEBHOOK_SECRET
+            # drift — that is the one scenario this downgrade would mask.
+            logger.warning(f"Clerk webhook signature verification failed (likely cross-environment delivery): {str(e)}")
+            return {"status": "verification_failed"}
         
         # Parse the payload
         event_type = payload.get("type")
@@ -590,7 +601,7 @@ async def handle_order_paid(event_data: dict):
         # Get payment details from Razorpay to find payment_id
         payment_id = None
         try:
-            order_details = razorpay_service.fetch_order(order_id)
+            order_details = await razorpay_service.fetch_order(order_id)
             if order_details:
                 # Get payments for this order
                 # Note: This is a simplified version, you might need to fetch payments separately

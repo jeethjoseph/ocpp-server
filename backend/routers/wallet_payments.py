@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import logging
 
 from auth_middleware import require_user
+from core.config import wallet_charging_enabled
 from models import User, Wallet, WalletTransaction, TransactionTypeEnum, PaymentStatusEnum
 from services.razorpay_service import razorpay_service
 from services.wallet_service import WalletService
@@ -113,6 +114,11 @@ async def create_recharge_order(
     3. Creates pending wallet transaction
     4. Returns order details for frontend to open Razorpay checkout
     """
+    # Wallet top-up is gated off until pooled multi-franchisee settlement
+    # exists — see ADR 0011. Block new money entering frozen wallets.
+    if not wallet_charging_enabled():
+        raise HTTPException(status_code=403, detail="Wallet recharge is temporarily disabled")
+
     try:
         # Check if Razorpay is configured
         if not razorpay_service.is_configured():
@@ -135,7 +141,7 @@ async def create_recharge_order(
         receipt_id = f"wallet_recharge_{current_user.id}_{int(datetime.now(tz=timezone.utc).timestamp())}"
 
         # Create Razorpay order
-        order = razorpay_service.create_order(
+        order = await razorpay_service.create_order(
             amount=amount,
             currency="INR",
             receipt=receipt_id,

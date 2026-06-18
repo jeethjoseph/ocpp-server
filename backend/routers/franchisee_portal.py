@@ -6,11 +6,12 @@ Uses require_franchisee() which returns (User, Franchisee).
 
 import logging
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel
 from tortoise.expressions import Q
+from tortoise.functions import Sum
 
 from models import (
     Franchisee,
@@ -20,10 +21,12 @@ from models import (
     Transaction,
     MeterValue,
     CommissionLedgerEntry,
+    SettlementStatusEnum,
     TransactionStatusEnum,
     ChargerQRCode,
     QRPayment,
 )
+from utils import IST
 from auth_middleware import require_franchisee
 from crud import log_audit_event
 from services.razorpay_service import (
@@ -39,6 +42,65 @@ router = APIRouter(
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────
+
+# Settlement Status buckets for the franchisee earnings summary (see CONTEXT.md).
+# REVERSED is deliberately excluded from all money totals — it was clawed back.
+_SETTLED_STATUSES = [
+    SettlementStatusEnum.SETTLED,
+    SettlementStatusEnum.TRANSFER_PROCESSED,
+]
+_PENDING_STATUSES = [
+    SettlementStatusEnum.PENDING,
+    SettlementStatusEnum.TRANSFER_INITIATED,
+    SettlementStatusEnum.ON_HOLD,
+    SettlementStatusEnum.BELOW_THRESHOLD,
+    SettlementStatusEnum.FAILED,
+]
+
+
+def _ist_dates_to_utc_range(from_date: Optional[str], to_date: Optional[str]):
+    """Parse inclusive IST calendar dates (YYYY-MM-DD) into a half-open UTC
+    range [start, end). Either bound may be omitted (open-ended). The `to`
+    bound is exclusive of the day after, so the whole `to_date` day is included.
+    Earnings view: callers filter `created_at` against this range."""
+    def _parse(s: str):
+        try:
+            return datetime.strptime(s, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid date '{s}', expected YYYY-MM-DD")
+
+    start = end = None
+    if from_date:
+        d = _parse(from_date)
+        start = datetime(d.year, d.month, d.day, tzinfo=IST).astimezone(timezone.utc)
+    if to_date:
+        d = _parse(to_date) + timedelta(days=1)
+        end = datetime(d.year, d.month, d.day, tzinfo=IST).astimezone(timezone.utc)
+    if start and end and start >= end:
+        raise HTTPException(status_code=400, detail="from_date must be on or before to_date")
+    return start, end
+
+
+async def _settlement_summary(base_query) -> dict:
+    """Aggregate the franchisee earnings summary over the full filtered set.
+    Payout is split settled vs pending; REVERSED is excluded from money totals."""
+    async def _sum(query, field: str) -> float:
+        agg = await query.annotate(s=Sum(field)).values("s")
+        return float(agg[0]["s"]) if agg and agg[0]["s"] is not None else 0.0
+
+    non_reversed = base_query.exclude(settlement_status=SettlementStatusEnum.REVERSED)
+    settled = await _sum(base_query.filter(settlement_status__in=_SETTLED_STATUSES), "franchisee_payout")
+    pending = await _sum(base_query.filter(settlement_status__in=_PENDING_STATUSES), "franchisee_payout")
+    failed_count = await base_query.filter(settlement_status=SettlementStatusEnum.FAILED).count()
+    return {
+        "total_gross": f"{await _sum(non_reversed, 'gross_amount'):.2f}",
+        "total_tds": f"{await _sum(non_reversed, 'tds_amount'):.2f}",
+        "payout_settled": f"{settled:.2f}",
+        "payout_pending": f"{pending:.2f}",
+        "total_payout": f"{settled + pending:.2f}",
+        "failed_count": failed_count,
+    }
+
 
 async def _get_franchisee_station_ids(franchisee_id: int) -> list[int]:
     stations = await ChargingStation.filter(
@@ -166,6 +228,9 @@ async def get_station(station_id: int, auth=Depends(require_franchisee())):
                 "model": c.model,
                 "vendor": c.vendor,
                 "latest_status": c.latest_status,
+                "availability": (
+                    c.availability.value if hasattr(c.availability, "value") else str(c.availability)
+                ),
                 "last_heart_beat_time": c.last_heart_beat_time.isoformat() if c.last_heart_beat_time else None,
             }
             for c in chargers
@@ -189,6 +254,9 @@ async def get_charger(charger_id: int, auth=Depends(require_franchisee())):
         "serial_number": charger.serial_number,
         "firmware_version": charger.firmware_version,
         "latest_status": charger.latest_status,
+        "availability": (
+            charger.availability.value if hasattr(charger.availability, "value") else str(charger.availability)
+        ),
         "last_heart_beat_time": charger.last_heart_beat_time.isoformat() if charger.last_heart_beat_time else None,
         "station_id": charger.station_id,
         "station_name": charger.station.name,
@@ -267,35 +335,88 @@ async def change_availability(
         },
     )
     if success:
+        ocpp_status = getattr(response, "status", str(response))
+
+        # Persist admin intent when the charger acknowledged the command.
+        # See ADR 0008 for why availability is separate from latest_status.
+        from models import ChargerAvailabilityEnum
+        new_availability = None
+        if ocpp_status in ("Accepted", "Scheduled"):
+            new_availability = (
+                ChargerAvailabilityEnum.OPERATIVE if available
+                else ChargerAvailabilityEnum.INOPERATIVE
+            )
+            await Charger.filter(id=charger_id).update(availability=new_availability)
+
+        await log_audit_event(
+            action="charger.availability_changed",
+            entity_type="charger",
+            entity_id=charger.charge_point_string_id,
+            actor_type="franchisee",
+            actor=franchisee,
+            changes={
+                "available": available,
+                "ocpp_response": ocpp_status,
+                "new_availability": new_availability.value if new_availability else None,
+            },
+        )
+
         return {"success": True, "message": "Availability changed"}
     raise HTTPException(status_code=500, detail=f"Failed: {response}")
 
 
 # ─── Transactions ────────────────────────────────────────────────────
 
+async def _transaction_summary(base_query) -> dict:
+    """Aggregate the franchisee transactions summary over the full filtered
+    set. Energy/revenue sum the stored (finalised) columns — NULL (running /
+    non-billable sessions) counts as 0; no live derivation."""
+    agg = await base_query.annotate(
+        e=Sum("energy_consumed_kwh"), r=Sum("total_billed")
+    ).values("e", "r")
+    energy = agg[0]["e"] if agg and agg[0]["e"] is not None else 0
+    revenue = agg[0]["r"] if agg and agg[0]["r"] is not None else 0
+    return {
+        "total_energy_kwh": f"{float(energy):.3f}",
+        "total_revenue": f"{float(revenue):.2f}",
+    }
+
+
 @router.get("/transactions")
 async def list_transactions(
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
     status: Optional[str] = None,
+    from_date: Optional[str] = Query(None, description="Inclusive IST date YYYY-MM-DD"),
+    to_date: Optional[str] = Query(None, description="Inclusive IST date YYYY-MM-DD"),
     auth=Depends(require_franchisee()),
 ):
     _, franchisee = auth
     charger_ids = await _get_franchisee_charger_ids(franchisee.id)
 
+    empty_summary = {"total_energy_kwh": "0.000", "total_revenue": "0.00"}
     if not charger_ids:
-        return {"data": [], "total": 0, "page": page, "limit": limit}
+        return {"summary": empty_summary, "data": [], "total": 0, "page": page, "limit": limit}
 
+    # Date filter keys on start_time (session start), interpreting from/to as
+    # inclusive IST calendar dates.
+    start_utc, end_utc = _ist_dates_to_utc_range(from_date, to_date)
     query = Transaction.filter(charger_id__in=charger_ids)
     if status:
         query = query.filter(transaction_status=status)
+    if start_utc:
+        query = query.filter(start_time__gte=start_utc)
+    if end_utc:
+        query = query.filter(start_time__lt=end_utc)
 
     total = await query.count()
+    summary = await _transaction_summary(query)
     txns = await query.offset((page - 1) * limit).limit(limit).order_by(
         "-created_at"
     ).prefetch_related("charger")
 
     return {
+        "summary": summary,
         "data": [
             {
                 "id": t.id,
@@ -369,17 +490,29 @@ async def get_transaction(
 async def list_settlements(
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
+    from_date: Optional[str] = Query(None, description="Inclusive IST date YYYY-MM-DD"),
+    to_date: Optional[str] = Query(None, description="Inclusive IST date YYYY-MM-DD"),
     auth=Depends(require_franchisee()),
 ):
     _, franchisee = auth
 
+    # Earnings view: filter Settlement Entries by created_at (accrual date),
+    # interpreting from_date/to_date as inclusive IST calendar dates.
+    start_utc, end_utc = _ist_dates_to_utc_range(from_date, to_date)
     query = CommissionLedgerEntry.filter(franchisee_id=franchisee.id)
+    if start_utc:
+        query = query.filter(created_at__gte=start_utc)
+    if end_utc:
+        query = query.filter(created_at__lt=end_utc)
+
     total = await query.count()
+    summary = await _settlement_summary(query)
     entries = await query.offset((page - 1) * limit).limit(limit).order_by(
         "-created_at"
     )
 
     return {
+        "summary": summary,
         "data": [
             {
                 "id": e.id,
@@ -506,7 +639,7 @@ async def _create_franchisee_qr(
     business_name = franchisee.business_name
     charger_name = charger.name or charger.charge_point_string_id
 
-    result = razorpay_service.create_qr_code(
+    result = await razorpay_service.create_qr_code(
         payee_name=build_qr_payee_name(business_name, charger_name),
         description=build_qr_description(business_name, charger_name),
         account_id=None,
@@ -623,7 +756,7 @@ async def regenerate_portal_qr_code(
 
     if qr.is_active:
         try:
-            razorpay_service.close_qr_code(
+            await razorpay_service.close_qr_code(
                 qr.razorpay_qr_code_id,
                 account_id=qr.owner_razorpay_account_id,
             )
@@ -670,7 +803,7 @@ async def close_portal_qr_code(
         raise HTTPException(status_code=400, detail="QR code already inactive")
 
     try:
-        razorpay_service.close_qr_code(
+        await razorpay_service.close_qr_code(
             qr.razorpay_qr_code_id,
             account_id=qr.owner_razorpay_account_id,
         )

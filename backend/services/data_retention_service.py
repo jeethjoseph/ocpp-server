@@ -1,6 +1,7 @@
 # Background service for cleaning up old telemetry and log data
 import asyncio
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 
 from utils import safe_create_task
@@ -8,6 +9,25 @@ from utils import safe_create_task
 from models import SignalQuality, OCPPLog
 
 logger = logging.getLogger(__name__)
+
+# Delete old rows in bounded batches so each DELETE stays well under the pool
+# command_timeout and holds shorter locks / produces less bloat than one big delete.
+DELETE_BATCH_SIZE = int(os.getenv("RETENTION_DELETE_BATCH_SIZE", "5000"))
+
+
+async def _delete_old_in_batches(model, cutoff_date: datetime) -> int:
+    """Delete rows of ``model`` older than ``cutoff_date`` in batches of ids."""
+    total = 0
+    while True:
+        ids = await model.filter(created_at__lt=cutoff_date).limit(
+            DELETE_BATCH_SIZE
+        ).values_list("id", flat=True)
+        if not ids:
+            break
+        await model.filter(id__in=ids).delete()
+        total += len(ids)
+        await asyncio.sleep(0)  # yield between batches
+    return total
 
 class DataRetentionService:
     """
@@ -93,19 +113,13 @@ class DataRetentionService:
             logger.error(f"❌ Error during data cleanup: {e}", exc_info=True)
 
     async def _cleanup_signal_quality(self, cutoff_date: datetime) -> int:
-        """Delete signal quality records older than cutoff date"""
+        """Delete signal quality records older than cutoff date (batched)"""
         try:
-            # Count records to be deleted
-            count = await SignalQuality.filter(created_at__lt=cutoff_date).count()
-
+            count = await _delete_old_in_batches(SignalQuality, cutoff_date)
             if count == 0:
                 logger.info("🗑️  No old signal quality data to delete")
-                return 0
-
-            # Delete old records
-            await SignalQuality.filter(created_at__lt=cutoff_date).delete()
-            logger.info(f"🗑️  Deleted {count} signal quality records older than {self.retention_days} days")
-
+            else:
+                logger.info(f"🗑️  Deleted {count} signal quality records older than {self.retention_days} days")
             return count
 
         except Exception as e:
@@ -113,19 +127,13 @@ class DataRetentionService:
             return 0
 
     async def _cleanup_ocpp_logs(self, cutoff_date: datetime) -> int:
-        """Delete OCPP log records older than cutoff date"""
+        """Delete OCPP log records older than cutoff date (batched)"""
         try:
-            # Count records to be deleted
-            count = await OCPPLog.filter(created_at__lt=cutoff_date).count()
-
+            count = await _delete_old_in_batches(OCPPLog, cutoff_date)
             if count == 0:
                 logger.info("🗑️  No old OCPP logs to delete")
-                return 0
-
-            # Delete old records
-            await OCPPLog.filter(created_at__lt=cutoff_date).delete()
-            logger.info(f"🗑️  Deleted {count} OCPP log records older than {self.retention_days} days")
-
+            else:
+                logger.info(f"🗑️  Deleted {count} OCPP log records older than {self.retention_days} days")
             return count
 
         except Exception as e:

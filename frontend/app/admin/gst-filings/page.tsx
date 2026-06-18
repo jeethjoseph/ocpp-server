@@ -45,14 +45,17 @@ import { formatINR } from "@/lib/utils";
 const SERIES_OPTIONS = ["ALL", "WAL", "QR"] as const;
 const FY_OPTIONS = ["ALL", "2026-27", "2025-26"];
 
+// Invoice dates are Indian-local (IST). The picked calendar date is an IST
+// day boundary; send it with the +05:30 offset so the backend compares the
+// correct absolute instant against the UTC-stored invoice_date. See ADR 0012.
 function toIsoStart(dateStr: string): string | undefined {
   if (!dateStr) return undefined;
-  return `${dateStr}T00:00:00Z`;
+  return `${dateStr}T00:00:00+05:30`;
 }
 
 function toIsoEnd(dateStr: string): string | undefined {
   if (!dateStr) return undefined;
-  return `${dateStr}T23:59:59Z`;
+  return `${dateStr}T23:59:59+05:30`;
 }
 
 function formatDuration(seconds: number | null): string {
@@ -68,7 +71,12 @@ function formatDuration(seconds: number | null): string {
 function formatDateTime(iso: string | null): string {
   if (!iso) return "—";
   const d = new Date(iso);
-  return `${d.toLocaleDateString("en-IN")} ${d.toLocaleTimeString("en-IN", {
+  // Force IST so the rendered date/time matches the invoice's legal (Indian)
+  // local time regardless of the admin's browser timezone. See ADR 0012.
+  return `${d.toLocaleDateString("en-IN", {
+    timeZone: "Asia/Kolkata",
+  })} ${d.toLocaleTimeString("en-IN", {
+    timeZone: "Asia/Kolkata",
     hour: "2-digit",
     minute: "2-digit",
   })}`;
@@ -346,7 +354,9 @@ export default function AdminGSTFilingsPage() {
                             </TableCell>
                             <TableCell className="text-xs">
                               {inv.invoice_date
-                                ? new Date(inv.invoice_date).toLocaleDateString("en-IN")
+                                ? new Date(inv.invoice_date).toLocaleDateString("en-IN", {
+                                    timeZone: "Asia/Kolkata",
+                                  })
                                 : "—"}
                             </TableCell>
                             <TableCell>

@@ -21,6 +21,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gosu \
     && rm -rf /var/lib/apt/lists/*
 
+# AWS RDS global CA bundle for verify-full TLS to managed Postgres.
+# Activated only when DB_SSL_MODE=verify-full|verify-ca is set in env.
+# Unused on local dev and any other connection path.
+RUN curl -fsSL https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+        -o /etc/ssl/rds-ca-bundle.pem \
+    && chmod 644 /etc/ssl/rds-ca-bundle.pem
+
 # ============================================
 # Stage 2: Builder - Install Python dependencies
 # ============================================

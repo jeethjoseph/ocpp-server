@@ -43,7 +43,7 @@ jsonschema-specifications==2025.4.1
 markdown-it-py==3.0.0
 MarkupSafe==3.0.2
 mdurl==0.1.2
-newrelic==10.6.0
+newrelic==13.0.1
 num2words==0.5.14
 ocpp==2.0.0
 packaging==25.0

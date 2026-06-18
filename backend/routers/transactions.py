@@ -5,10 +5,12 @@ from pydantic import BaseModel
 from datetime import datetime, timezone
 import logging
 
-from models import Transaction, MeterValue, User, Charger, WalletTransaction
+from models import Transaction, MeterValue, User, Charger, WalletTransaction, QRPayment
 from tortoise.exceptions import IntegrityError
 from auth_middleware import require_admin
+from core.roles import INTERNAL_ROLES
 from crud import log_audit_event
+from services.qr_payment_service import QRPaymentService
 
 logger = logging.getLogger(__name__)
 
@@ -78,12 +80,29 @@ class TransactionListResponse(BaseModel):
     limit: int
     summary: Dict
 
+class QRSessionBudget(BaseModel):
+    # ₹ figures as Decimal-encoded strings to preserve precision over the wire.
+    budget_limit: str
+    cost_so_far: str
+    remaining: str
+
+
 class TransactionDetailResponse(BaseModel):
     transaction: TransactionResponse
     user: UserBasicInfo
     charger: ChargerBasicInfo
     meter_values: List[MeterValueResponse]
     wallet_transactions: List[WalletTransactionResponse]
+    # Derived per-request from the latest MeterValue, not stored. Kept separate
+    # from Transaction.energy_consumed_kwh, which is only populated at
+    # StopTransaction and would otherwise read as 0 during an active session.
+    live_energy_kwh: Optional[float] = None
+    # "QR" when a QRPayment row references this transaction; "NONE" for
+    # Internal-role Sessions (ADMIN/FRANCHISEE — see ADR 0004); "WALLET"
+    # for everyone else. Matches the CONTEXT.md funding-source axis.
+    funding_source: str = "WALLET"
+    # Present only when funding_source == "QR".
+    qr_session: Optional[QRSessionBudget] = None
 
 class MeterValuesListResponse(BaseModel):
     meter_values: List[MeterValueResponse]
@@ -172,14 +191,50 @@ async def get_transaction_details(transaction_id: int):
     
     if not user or not charger:
         raise HTTPException(status_code=500, detail="Related data not found")
-    
+
+    live_energy_kwh: Optional[float] = None
+    if transaction.start_meter_kwh is not None and meter_values:
+        latest_reading = meter_values[-1].reading_kwh
+        live_energy_kwh = float(latest_reading - transaction.start_meter_kwh)
+
+    funding_source, qr_session = await _resolve_funding(transaction_id, user)
+
     return TransactionDetailResponse(
         transaction=TransactionResponse.model_validate(transaction, from_attributes=True),
         user=UserBasicInfo.model_validate(user, from_attributes=True),
         charger=ChargerBasicInfo.model_validate(charger, from_attributes=True),
         meter_values=[MeterValueResponse.model_validate(mv, from_attributes=True) for mv in meter_values],
-        wallet_transactions=[WalletTransactionResponse.model_validate(wt, from_attributes=True) for wt in wallet_transactions]
+        wallet_transactions=[WalletTransactionResponse.model_validate(wt, from_attributes=True) for wt in wallet_transactions],
+        live_energy_kwh=live_energy_kwh,
+        funding_source=funding_source,
+        qr_session=qr_session,
     )
+
+
+async def _resolve_funding(transaction_id: int, user: User) -> tuple[str, Optional[QRSessionBudget]]:
+    """Classify the funding source for a Transaction and, for QR sessions,
+    fetch the live budget snapshot.
+
+    Decision order: a present QRPayment row wins (matches CONTEXT.md
+    [[qr-session]]); otherwise an internal-role user is "NONE" per ADR 0004;
+    otherwise "WALLET". The QR snapshot is None when the session has no
+    cached/derivable budget row (e.g. the QR session was already finalised).
+    """
+    qr_payment_exists = await QRPayment.filter(transaction_id=transaction_id).exists()
+    if qr_payment_exists:
+        snapshot = await QRPaymentService.compute_budget_snapshot(transaction_id)
+        qr_session = None
+        if snapshot is not None:
+            qr_session = QRSessionBudget(
+                budget_limit=f"{snapshot.budget_limit:.2f}",
+                cost_so_far=f"{snapshot.cost_so_far:.2f}",
+                remaining=f"{snapshot.remaining:.2f}",
+            )
+        return "QR", qr_session
+
+    if user.role in INTERNAL_ROLES:
+        return "NONE", None
+    return "WALLET", None
 
 @router.post("/{transaction_id}/stop", response_model=dict)
 async def force_stop_transaction(transaction_id: int, request: StopTransactionRequest, admin_user: User = Depends(require_admin())):

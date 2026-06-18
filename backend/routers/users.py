@@ -4,6 +4,7 @@ from tortoise.exceptions import DoesNotExist
 from decimal import Decimal
 
 from auth_middleware import require_admin, require_user_or_admin, require_user
+from core.config import wallet_charging_enabled
 from models import User, Transaction, WalletTransaction, Wallet, UserRoleEnum, TransactionStatusEnum
 from schemas import BaseModel
 import logging
@@ -810,6 +811,11 @@ async def remote_start_by_string_id(
     """Start charging remotely using charge_point_string_id (for customer-facing apps)"""
     from models import Charger, Transaction
     from redis_manager import redis_manager
+
+    # Wallet charging is gated off until pooled multi-franchisee settlement
+    # exists — see ADR 0011. Remote start is the wallet-session entry point.
+    if not wallet_charging_enabled():
+        raise HTTPException(status_code=403, detail="Wallet charging is temporarily disabled")
 
     try:
         # Look up charger by charge_point_string_id

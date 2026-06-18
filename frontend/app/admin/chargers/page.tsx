@@ -101,23 +101,25 @@ export default function AdminChargersPage() {
     return connectionStatus;
   };
 
-  const getAvailabilityToggleState = (status: string) => {
-    // Toggle reflects OCPP availability only. Per OCPP 1.6, `Faulted` is a
-    // hardware/error state ORTHOGONAL to availability — a Faulted charger
-    // can still be Operative. Only `Unavailable` flips the toggle off.
-    // (Faulted is communicated separately in the status pill.)
-    return status !== "Unavailable";
+  const getAvailabilityToggleState = (availability: string) => {
+    // Toggle reflects ADMIN-SET availability intent (Charger.availability),
+    // NOT what the charger currently reports (Charger.latest_status). Per
+    // OCPP 1.6 + ADR 0008, these are orthogonal: a Faulted charger can be
+    // admin-set Operative, a Charging charger can be admin-set Inoperative
+    // (will transition after the session ends per OCPP Scheduled semantics).
+    return availability === "Operative";
   };
 
   const handleChangeAvailability = async (
     chargerId: number,
-    currentStatus: string
+    currentAvailability: string
   ) => {
-    // OCPP 1.6: ChangeAvailability can be sent at any time. Use the same
-    // operational-state check the UI uses, so the two never drift. The
-    // charger surfaces the real outcome via the OCPP response (Accepted /
-    // Scheduled / Rejected), which the hook branches on.
-    const isCurrentlyOperational = getAvailabilityToggleState(currentStatus);
+    // OCPP 1.6: ChangeAvailability can be sent at any time. The toggle's
+    // visual state and the new requested type are both derived from the
+    // admin-set availability field so they can't drift. The charger
+    // surfaces the OCPP-side outcome (Accepted / Scheduled / Rejected) and
+    // the backend persists the intent only on Accepted/Scheduled (ADR 0008).
+    const isCurrentlyOperational = getAvailabilityToggleState(currentAvailability);
     const newType: "Inoperative" | "Operative" = isCurrentlyOperational ? "Inoperative" : "Operative";
 
     // Add charger to loading set
@@ -141,11 +143,11 @@ export default function AdminChargersPage() {
   const getStatusColor = (status: string) => {
     switch (status) {
       case "Available":
-        return "bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400";
+        return "bg-teal-100 text-teal-800 dark:bg-teal-900/20 dark:text-teal-400";
       case "Preparing":
-        return "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-400";
+        return "bg-violet-100 text-violet-800 dark:bg-violet-900/20 dark:text-violet-400";
       case "Charging":
-        return "bg-blue-100 text-blue-800 dark:bg-blue-900/20 dark:text-blue-400";
+        return "bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400";
       case "SuspendedEVSE":
         return "bg-orange-100 text-orange-800 dark:bg-orange-900/20 dark:text-orange-400";
       case "SuspendedEV":
@@ -371,7 +373,7 @@ export default function AdminChargersPage() {
                             onClick={() =>
                               handleChangeAvailability(
                                 charger.id,
-                                charger.latest_status
+                                charger.availability
                               )
                             }
                             disabled={
@@ -379,7 +381,7 @@ export default function AdminChargersPage() {
                               !canChangeAvailability(charger.latest_status, charger.connection_status)
                             }
                             className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed ${
-                              getAvailabilityToggleState(charger.latest_status)
+                              getAvailabilityToggleState(charger.availability)
                                 ? "bg-green-600"
                                 : "bg-muted"
                             }`}
@@ -388,14 +390,14 @@ export default function AdminChargersPage() {
                                 ? "Changing availability..."
                                 : !charger.connection_status
                                 ? "Charger must be connected to change availability"
-                                : `Toggle availability (${getAvailabilityToggleState(charger.latest_status) ? "Operative → Inoperative" : "Inoperative → Operative"})`
+                                : `Toggle availability (${getAvailabilityToggleState(charger.availability) ? "Operative → Inoperative" : "Inoperative → Operative"})`
                             }>
                             {toggleLoadingChargers.has(charger.id) ? (
                               <div className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-background border-t-transparent mx-auto" />
                             ) : (
                               <span
                                 className={`inline-block h-4 w-4 transform rounded-full bg-background transition-transform ${
-                                  getAvailabilityToggleState(charger.latest_status)
+                                  getAvailabilityToggleState(charger.availability)
                                     ? "translate-x-6"
                                     : "translate-x-1"
                                 }`}

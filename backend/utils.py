@@ -14,6 +14,23 @@ def get_utc_now():
     """Return current UTC time with timezone info."""
     return datetime.datetime.now(datetime.timezone.utc)
 
+# India Standard Time. Fixed +5:30 offset — India observes no DST, so a fixed
+# offset is correct and simpler than a zoneinfo lookup. This is the SINGLE
+# conversion point for rendering/deriving Indian-local dates (GST invoice date,
+# financial year, GSTR-1 period). See docs/adr/0012 and CONTEXT.md "Invoice Date".
+IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+
+
+def to_ist(dt):
+    """Convert a datetime to IST. Naive datetimes are assumed UTC (Tortoise
+    runs use_tz=False, so DB timestamps come back as naive UTC). Returns a
+    tz-aware IST datetime, or None if given None."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.astimezone(IST)
+
 def generate_uuid():
     """Generate a new UUID4 as string."""
     return str(uuid.uuid4())

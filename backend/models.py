@@ -27,6 +27,10 @@ class ChargerStatusEnum(str, enum.Enum):
     UNAVAILABLE = "Unavailable"
     FAULTED = "Faulted"
 
+class ChargerAvailabilityEnum(str, enum.Enum):
+    OPERATIVE = "Operative"
+    INOPERATIVE = "Inoperative"
+
 class TransactionStatusEnum(str, enum.Enum):
     STARTED = "STARTED"
     PENDING_START = "PENDING_START"
@@ -309,12 +313,19 @@ class Charger(Model):
     meter_type = fields.CharField(max_length=100, null=True)
     meter_serial_number = fields.CharField(max_length=100, null=True)
     latest_status = fields.CharEnumField(ChargerStatusEnum)
+    # Admin-set availability intent — orthogonal to latest_status which
+    # reflects what the charger reports. The toggle in the admin UI reads
+    # THIS field, not latest_status. See ADR 0008.
+    availability = fields.CharEnumField(
+        ChargerAvailabilityEnum,
+        default=ChargerAvailabilityEnum.OPERATIVE,
+    )
     last_heart_beat_time = fields.DatetimeField(null=True)
-    
+
     # Relationships
     tariffs: fields.ReverseRelation["Tariff"]
     connectors: fields.ReverseRelation["Connector"]
-    
+
     class Meta:
         table = "charger"
 
@@ -451,8 +462,11 @@ class FirmwareUpdate(Model):
 
 class SignalQuality(Model):
     """
-    Stores cellular signal quality metrics from charge points.
-    Data received via OCPP DataTransfer messages from JET_EV1 chargers.
+    Stores cellular signal quality + modem telemetry from charge points.
+    Data received via OCPP DataTransfer messages (vendorId=VoltLync,
+    messageId=SignalQuality). The "signal_quality" table name is a
+    historical misnomer — see ADR 0009 — the row also carries modem
+    board temperature.
     """
     id = fields.IntField(pk=True)
     created_at = fields.DatetimeField(auto_now_add=True, index=True)
@@ -460,6 +474,7 @@ class SignalQuality(Model):
     charger = fields.ForeignKeyField("models.Charger", related_name="signal_quality_data", index=True)
     rssi = fields.IntField()  # Received Signal Strength Indicator (0-31 typical for GSM, 99=unknown)
     ber = fields.IntField()   # Bit Error Rate (0-7 for GSM, 99=unknown/not detectable)
+    temperature_celsius = fields.FloatField(null=True)  # Modem board temperature; optional — older firmware omits it
     timestamp = fields.CharField(max_length=50)  # Timestamp from charger
 
     class Meta:

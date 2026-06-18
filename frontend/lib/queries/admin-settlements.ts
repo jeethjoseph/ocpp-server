@@ -1,6 +1,12 @@
-import { useQuery } from "@tanstack/react-query";
+import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { toast } from "sonner";
 import { api } from "@/lib/api-client";
 import { useAuth } from "@/contexts/AuthContext";
+import { franchiseeKeys } from "@/lib/queries/franchisees";
 
 export interface StuckSettlementEntry {
   id: number;
@@ -57,5 +63,67 @@ export function useAdminStuckSettlements(params: UseStuckSettlementsParams = {})
       ),
     staleTime: 1000 * 30,
     enabled: isAuthReady,
+  });
+}
+
+interface SettlementResolutionResponse {
+  message: string;
+  settlement_status: string;
+}
+
+function invalidateSettlementCaches(
+  queryClient: ReturnType<typeof useQueryClient>,
+  franchiseeId?: number,
+) {
+  queryClient.invalidateQueries({ queryKey: adminSettlementsKeys.all });
+  if (franchiseeId) {
+    queryClient.invalidateQueries({
+      queryKey: [...franchiseeKeys.detail(franchiseeId), "settlements"],
+    });
+  }
+}
+
+export function useMarkSettlementBelowThreshold() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ entryId }: { entryId: number; franchiseeId?: number }) =>
+      api.post<SettlementResolutionResponse>(
+        `/api/admin/settlements/${entryId}/mark-below-threshold`,
+        {},
+      ),
+    onSuccess: (_res, vars) => {
+      invalidateSettlementCaches(queryClient, vars.franchiseeId);
+      toast.success("Marked BELOW_THRESHOLD");
+    },
+    onError: (err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error(`Mark BELOW_THRESHOLD failed: ${msg}`);
+    },
+  });
+}
+
+export function useMarkSettlementSettled() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      entryId,
+      note,
+    }: {
+      entryId: number;
+      note: string;
+      franchiseeId?: number;
+    }) =>
+      api.post<SettlementResolutionResponse>(
+        `/api/admin/settlements/${entryId}/mark-settled`,
+        { note },
+      ),
+    onSuccess: (_res, vars) => {
+      invalidateSettlementCaches(queryClient, vars.franchiseeId);
+      toast.success("Marked SETTLED");
+    },
+    onError: (err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error(`Mark SETTLED failed: ${msg}`);
+    },
   });
 }

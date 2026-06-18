@@ -7,6 +7,7 @@ from core.validators import VPA_PATTERN
 from models import GSTInvoice, QRPayment, QRPaymentStatusEnum
 from redis_manager import redis_manager
 from routers.invoices import serve_invoice_pdf
+from services.qr_payment_service import is_below_minimum_reason
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/public/qr-transactions", tags=["Public QR Transactions"])
@@ -95,6 +96,12 @@ async def get_transactions_by_vpa(
             "start_time": txn.start_time.isoformat() if txn and txn.start_time else None,
             "end_time": txn.end_time.isoformat() if txn and txn.end_time else None,
             "failure_reason": p.failure_reason,
+            # Benign sub-₹1 forfeit (Razorpay's floor) — not an operational
+            # failure. Lets the UI render it neutrally instead of as an error.
+            "refund_below_minimum": (
+                p.status == QRPaymentStatusEnum.REFUND_FAILED
+                and is_below_minimum_reason(p.failure_reason)
+            ),
         })
 
     masked_vpa = f"***{vpa[-6:]}" if len(vpa) > 6 else "***"

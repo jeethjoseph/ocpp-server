@@ -23,8 +23,8 @@ SCRIPTS_DIR=$(BACKEND_DIR)/scripts
 
 .PHONY: help db-reset db-reset-cloud db-first-time db-drop-user db-create-user db-drop db-create migrate seed setup-dev truncate-tables
 .PHONY: docker-dev docker-dev-detach docker-staging docker-staging-detach docker-prod docker-prod-detach docker-down docker-down-staging docker-down-prod docker-logs docker-logs-backend docker-logs-frontend docker-build docker-build-staging docker-build-prod docker-clean docker-migrate docker-staging-cert docker-prod-cert docker-cert-renew
-.PHONY: prod-push prod-pull prod-up prod-down prod-deploy prod-rebuild prod-rebuild-service prod-rebuild-clean prod-nuke prod-restart prod-logs prod-logs-backend prod-logs-frontend prod-logs-nginx prod-ps prod-cert prod-migrate prod-backup-db prod-restore-db prod-cache-clear prod-health prod-stats prod-shell prod-bash prod-db-reset prod-seed
-.PHONY: staging-push staging-pull staging-up staging-down staging-deploy staging-rebuild staging-rebuild-service staging-rebuild-clean staging-nuke staging-restart staging-logs staging-logs-backend staging-logs-frontend staging-logs-nginx staging-ps staging-cert staging-migrate staging-backup-db staging-restore-db staging-cache-clear staging-health staging-stats staging-shell staging-bash staging-ssm staging-db-reset staging-seed
+.PHONY: prod-push prod-pull prod-up prod-down prod-deploy prod-rebuild prod-rebuild-service prod-rebuild-clean prod-nuke prod-restart prod-prune prod-prune-if-needed prod-logs prod-logs-backend prod-logs-frontend prod-logs-nginx prod-ps prod-cert prod-migrate prod-backup-db prod-restore-db prod-cache-clear prod-health prod-stats prod-shell prod-bash prod-ssm prod-db-reset prod-seed
+.PHONY: staging-push staging-pull staging-up staging-down staging-deploy staging-rebuild staging-rebuild-service staging-rebuild-clean staging-nuke staging-restart staging-logs staging-logs-backend staging-logs-frontend staging-logs-nginx staging-ps staging-cert staging-migrate staging-backup-db staging-restore-db staging-cache-clear staging-health staging-stats staging-shell staging-bash staging-ssm staging-db-reset staging-seed staging-rds-shell
 
 help:
 	@echo "OCPP Server - Available Commands"
@@ -64,10 +64,14 @@ help:
 	@echo "  make prod-seed           Run seed script"
 	@echo "  make prod-cache-clear    Clear all Redis cache"
 	@echo ""
+	@echo "Disk maintenance:"
+	@echo "  make prod-prune          Prune build cache + dangling images (safe; volumes untouched)"
+	@echo ""
 	@echo "SSL & Shell:"
 	@echo "  make prod-cert           Obtain/renew SSL certificate"
 	@echo "  make prod-shell          Open Python shell in backend"
 	@echo "  make prod-bash           Open bash in backend"
+	@echo "  make prod-ssm            Start SSM shell on the prod EC2 host"
 	@echo ""
 	@echo "=============== STAGING (EC2 via SSM) ==============="
 	@echo ""
@@ -104,10 +108,15 @@ help:
 	@echo "  make staging-seed           Run seed script"
 	@echo "  make staging-cache-clear    Clear all Redis cache"
 	@echo ""
+	@echo "Disk maintenance:"
+	@echo "  make staging-prune          Prune build cache + dangling images (safe; volumes untouched)"
+	@echo ""
 	@echo "SSL & Shell:"
 	@echo "  make staging-cert           Obtain/renew SSL certificate"
 	@echo "  make staging-shell          Open Python shell in backend"
 	@echo "  make staging-bash           Open bash in backend"
+	@echo "  make staging-ssm            Start SSM shell on the staging EC2 host"
+	@echo "  make staging-rds-shell      Open psql shell against staging RDS"
 	@echo ""
 	@echo "=============== DEVELOPMENT (local) ==============="
 	@echo ""
@@ -250,8 +259,9 @@ prod-down:
 	$(PROD_COMPOSE) down
 
 # Rebuild and restart production (after pull)
+# Export GIT_COMMIT so compose stamps it into backend's env → Sentry release.
 prod-rebuild:
-	$(PROD_COMPOSE) up -d --build --force-recreate
+	GIT_COMMIT=$$(git rev-parse --short HEAD) $(PROD_COMPOSE) up -d --build --force-recreate
 	@echo "Waiting for services to stabilize..."
 	@sleep 5
 	@if ! $(PROD_COMPOSE) exec -T nginx test -d /etc/letsencrypt/archive 2>/dev/null; then \
@@ -265,9 +275,47 @@ prod-rebuild:
 		echo "Let's Encrypt certificate found."; \
 	fi
 
-# Full deploy sequence (run on EC2 after SSM)
-prod-deploy: prod-pull prod-rebuild
+# Full deploy sequence (run on EC2 after SSM).
+# `prod-prune-if-needed` runs between pull and rebuild: it's a no-op when
+# disk is healthy, and self-heals when the build cache has bloated past
+# 85% root-volume usage. Mirrors the staging routine — keeps deploys fast
+# in the common case, never fails on ENOSPC mid-build.
+prod-deploy: prod-pull prod-prune-if-needed prod-rebuild
 	@echo "Production deployment complete!"
+
+# Manual disk cleanup. Safe by construction:
+#   - builder prune: drops build cache only (not images, not containers, not volumes)
+#   - image prune: drops dangling images (NOT in use by running containers)
+# Volumes are untouched, so postgres/redis/firmware data are safe.
+# Run when you see `df -h /` getting tight or want a deliberate cleanup.
+.PHONY: prod-prune
+prod-prune:
+	@echo "Pruning Docker build cache..."
+	sudo docker builder prune -af
+	@echo "Pruning dangling images..."
+	sudo docker image prune -af
+	@echo "Disk usage after prune:"
+	@df -h / | tail -2
+
+# Conditional version used by prod-deploy. Prunes only when root-volume
+# Prunes when root-volume usage exceeds 40%. Tuned down from 85% on
+# 2026-06-01 in lockstep with staging-prune-if-needed — same wedge-mode
+# can happen here, and prod's larger EBS (50GB → 200GB auto-scale) means
+# 40% still leaves comfortable headroom. See staging-prune-if-needed for
+# the failure analysis.
+# The shell logic must be on one line (Make runs each recipe line in its
+# own subshell) — kept readable via backslash continuations.
+.PHONY: prod-prune-if-needed
+prod-prune-if-needed:
+	@USAGE=$$(df / | tail -1 | awk '{print $$5}' | tr -d %); \
+	if [ "$$USAGE" -gt 40 ]; then \
+		echo "Disk at $$USAGE%, pruning build cache + dangling images..."; \
+		sudo docker builder prune -af; \
+		sudo docker image prune -af; \
+		df -h / | tail -2; \
+	else \
+		echo "Disk at $$USAGE%, no prune needed (threshold 40%)"; \
+	fi
 
 # Restart all services without rebuilding
 prod-restart:
@@ -293,19 +341,20 @@ prod-nuke:
 	$(PROD_COMPOSE) down -v --rmi local
 	@echo "All containers, volumes, and images removed."
 
-# View production logs (all services)
+# View production logs — last 100 lines + live tail.
+# For full history pipe `$(PROD_COMPOSE) logs > prod.log` (no -f) and grep.
 prod-logs:
-	$(PROD_COMPOSE) logs -f
+	$(PROD_COMPOSE) logs --tail=100 -f
 
-# View specific service logs
+# View specific service logs — last 100 lines + live tail.
 prod-logs-backend:
-	$(PROD_COMPOSE) logs -f backend
+	$(PROD_COMPOSE) logs --tail=100 -f backend
 
 prod-logs-frontend:
-	$(PROD_COMPOSE) logs -f frontend
+	$(PROD_COMPOSE) logs --tail=100 -f frontend
 
 prod-logs-nginx:
-	$(PROD_COMPOSE) logs -f nginx
+	$(PROD_COMPOSE) logs --tail=100 -f nginx
 
 # Run migrations on production
 prod-migrate:
@@ -319,6 +368,10 @@ prod-shell:
 # Open bash on production backend container
 prod-bash:
 	$(PROD_COMPOSE) exec backend bash
+
+# SSH into the production EC2 instance via AWS SSM (no inbound SSH required)
+prod-ssm:
+	aws ssm start-session --target i-0df24c96c4d5e890a --profile voltlync
 
 # Show production container status
 prod-ps:
@@ -432,7 +485,7 @@ staging-down:
 
 # Rebuild and restart staging (after pull)
 staging-rebuild:
-	$(STAGING_COMPOSE) up -d --build --force-recreate
+	GIT_COMMIT=$$(git rev-parse --short HEAD) $(STAGING_COMPOSE) up -d --build --force-recreate
 	@echo "Waiting for services to stabilize..."
 	@sleep 5
 	@if ! $(STAGING_COMPOSE) exec -T nginx test -d /etc/letsencrypt/archive 2>/dev/null; then \
@@ -446,9 +499,50 @@ staging-rebuild:
 		echo "Let's Encrypt certificate found."; \
 	fi
 
-# Full deploy sequence (run on staging EC2 after SSM)
-staging-deploy: staging-pull staging-rebuild
+# Full deploy sequence (run on staging EC2 after SSM).
+# `staging-prune-if-needed` runs between pull and rebuild: it's a no-op
+# when disk is healthy, and self-heals when the build cache has bloated
+# past 85% root-volume usage. This is the trade-off documented in
+# CLAUDE.md — keep deploys fast in the common case, never fail on
+# ENOSPC mid-build.
+staging-deploy: staging-pull staging-prune-if-needed staging-rebuild
 	@echo "Staging deployment complete!"
+
+# Manual disk cleanup. Safe by construction:
+#   - builder prune: drops build cache only (not images, not containers, not volumes)
+#   - image prune: drops dangling images (NOT in use by running containers)
+# Volumes are untouched, so postgres/redis/firmware data are safe.
+# Run when you see `df -h /` getting tight or want a deliberate cleanup.
+.PHONY: staging-prune
+staging-prune:
+	@echo "Pruning Docker build cache..."
+	sudo docker builder prune -af
+	@echo "Pruning dangling images..."
+	sudo docker image prune -af
+	@echo "Disk usage after prune:"
+	@df -h / | tail -2
+
+# Conditional version used by staging-deploy. Prunes when root-volume usage
+# exceeds 40%. Tuned down from 85% on 2026-06-01 after a staging deploy
+# wedged dockerd at 65% disk (94% of which was reclaimable docker garbage:
+# 12GB unused images + 7GB build cache). The previous 85% gate was a no-op
+# while docker storage was bloated enough to thrash overlay2 during builds.
+# `df /` is a proxy for docker bloat here because docker is the dominant
+# disk user on this box; if that changes, switch the check to inspect
+# `docker system df` reclaimable size directly.
+# The shell logic must be on one line (Make runs each recipe line in its
+# own subshell) — kept readable via backslash continuations.
+.PHONY: staging-prune-if-needed
+staging-prune-if-needed:
+	@USAGE=$$(df / | tail -1 | awk '{print $$5}' | tr -d %); \
+	if [ "$$USAGE" -gt 40 ]; then \
+		echo "Disk at $$USAGE%, pruning build cache + dangling images..."; \
+		sudo docker builder prune -af; \
+		sudo docker image prune -af; \
+		df -h / | tail -2; \
+	else \
+		echo "Disk at $$USAGE%, no prune needed (threshold 40%)"; \
+	fi
 
 # Restart all services without rebuilding
 staging-restart:
@@ -474,19 +568,20 @@ staging-nuke:
 	$(STAGING_COMPOSE) down -v --rmi local
 	@echo "All staging containers, volumes, and images removed."
 
-# View staging logs (all services)
+# View staging logs — last 100 lines + live tail.
+# For full history pipe `$(STAGING_COMPOSE) logs > staging.log` (no -f) and grep.
 staging-logs:
-	$(STAGING_COMPOSE) logs -f
+	$(STAGING_COMPOSE) logs --tail=100 -f
 
-# View specific service logs
+# View specific service logs — last 100 lines + live tail.
 staging-logs-backend:
-	$(STAGING_COMPOSE) logs -f backend
+	$(STAGING_COMPOSE) logs --tail=100 -f backend
 
 staging-logs-frontend:
-	$(STAGING_COMPOSE) logs -f frontend
+	$(STAGING_COMPOSE) logs --tail=100 -f frontend
 
 staging-logs-nginx:
-	$(STAGING_COMPOSE) logs -f nginx
+	$(STAGING_COMPOSE) logs --tail=100 -f nginx
 
 # Run migrations on staging
 staging-migrate:
@@ -538,44 +633,77 @@ staging-cache-clear:
 	$(STAGING_COMPOSE) exec redis redis-cli FLUSHALL
 	@echo "Staging cache cleared!"
 
-# Backup staging database (saves to host filesystem)
-staging-backup-db:
-	@echo "Backing up staging database..."
-	@mkdir -p backups
-	$(STAGING_COMPOSE) exec -T postgres sh -c 'pg_dump -U $$POSTGRES_USER $$POSTGRES_DB' > backups/staging_backup_$$(date +%Y%m%d_%H%M%S).sql
-	@echo "Backup saved to backups/"
-	@ls -lh backups/staging_backup_*.sql | tail -1
-
-# Restore staging database from a backup file.
-# Usage:   make staging-restore-db                      (uses newest backups/staging_backup_*.sql)
-#          make staging-restore-db DUMP=backups/x.sql   (use a specific file)
-# WARNING: Drops and recreates the staging DB before restore — destroys current state.
-staging-restore-db:
-	@echo "WARNING: Restoring staging DB will DROP all current data."
-	@echo "Press Ctrl+C in 5s to cancel..."
-	@sleep 5
-	$(eval DUMP ?= $(shell ls -t backups/staging_backup_*.sql 2>/dev/null | head -1))
-	@if [ -z "$(DUMP)" ] || [ ! -f "$(DUMP)" ]; then \
-		echo "ERROR: no dump file found. Pass DUMP=path/to/file.sql or run staging-backup-db first."; \
+# Open a psql shell against the staging RDS instance.
+# Reads connection params from the backend container's env so the secret
+# doesn't have to leave .env.staging. Works equally for pre-cutover Docker
+# postgres (DB_HOST=postgres) and post-cutover RDS.
+staging-rds-shell:
+	@if [ -z "$$($(STAGING_COMPOSE) ps -q backend)" ]; then \
+		echo "ERROR: backend container not running. Run 'make staging-up' first."; \
 		exit 1; \
 	fi
-	@echo "Restoring from $(DUMP)..."
-	$(STAGING_COMPOSE) stop backend frontend
-	$(STAGING_COMPOSE) exec -T postgres sh -c 'psql -U $$POSTGRES_USER -d postgres -c "DROP DATABASE IF EXISTS $$POSTGRES_DB;"'
-	$(STAGING_COMPOSE) exec -T postgres sh -c 'psql -U $$POSTGRES_USER -d postgres -c "CREATE DATABASE $$POSTGRES_DB OWNER $$POSTGRES_USER;"'
-	$(STAGING_COMPOSE) exec -T postgres sh -c 'psql -U $$POSTGRES_USER -d $$POSTGRES_DB' < $(DUMP)
-	$(STAGING_COMPOSE) start backend frontend
-	@echo "Restore complete from $(DUMP). Backend + frontend restarted."
+	$(STAGING_COMPOSE) exec backend sh -c \
+		'PGPASSWORD=$$DB_PASSWORD psql -h $$DB_HOST -p $$DB_PORT -U $$DB_USER -d $$DB_NAME'
 
-# Reset staging database (DANGEROUS - requires confirmation)
+# Backups: post-RDS-migration this is handled by RDS automated snapshots + PITR.
+# Pre-migration this still wrote a pg_dump from Docker postgres to backups/.
+# We keep the target name as a discoverability anchor but redirect the user
+# to the new model instead of silently doing the wrong thing.
+staging-backup-db:
+	@echo "============================================================"
+	@echo "Staging now uses RDS — automated backups are managed by AWS:"
+	@echo "  - Daily automated snapshots (14-day retention)"
+	@echo "  - Point-in-time recovery to any second in the window"
+	@echo ""
+	@echo "View snapshots:"
+	@echo "  AWS Console -> RDS -> ocpp-staging-db -> Maintenance & backups"
+	@echo "  aws rds describe-db-snapshots --profile voltlync \\"
+	@echo "    --db-instance-identifier ocpp-staging-db"
+	@echo ""
+	@echo "Trigger an on-demand snapshot:"
+	@echo "  aws rds create-db-snapshot --profile voltlync \\"
+	@echo "    --db-instance-identifier ocpp-staging-db \\"
+	@echo "    --db-snapshot-identifier ocpp-staging-manual-\$$(date +%Y%m%d-%H%M%S)"
+	@echo ""
+	@echo "For ad-hoc psql access:    make staging-rds-shell"
+	@echo "============================================================"
+	@exit 1
+
+staging-restore-db:
+	@echo "============================================================"
+	@echo "Staging now uses RDS — restores go through the RDS console:"
+	@echo "  - Point-in-time: AWS Console -> RDS -> ocpp-staging-db ->"
+	@echo "                   Actions -> Restore to point in time"
+	@echo "  - From snapshot: AWS Console -> RDS -> Snapshots ->"
+	@echo "                   <snapshot> -> Actions -> Restore snapshot"
+	@echo ""
+	@echo "Either path creates a NEW RDS instance; you then either"
+	@echo "swap DB_HOST in .env.staging or use the new endpoint directly."
+	@echo "============================================================"
+	@exit 1
+
+# Reset staging database (DANGEROUS).
+# Post-RDS-migration this targets the RDS instance, not a Docker volume.
+# Requires typing the exact phrase to confirm — no muscle-memory drops.
 staging-db-reset:
-	@echo "WARNING: This will delete the staging database!"
-	@echo "Press Ctrl+C to cancel, or wait 3 seconds to continue..."
-	@sleep 3
+	@HOST=$$(grep -E '^DB_HOST=' .env.staging | cut -d= -f2); \
+	echo "==========================================================="; \
+	echo "WARNING: This will DROP and recreate the staging database."; \
+	echo "Target host: $$HOST"; \
+	echo ""; \
+	echo "If the host above is an RDS endpoint, this destroys data"; \
+	echo "that RDS automated backups can still recover, but it WILL"; \
+	echo "take staging down until migrations re-run."; \
+	echo ""; \
+	echo "Type 'reset staging db' to confirm, anything else aborts:"; \
+	echo "==========================================================="; \
+	read confirm; [ "$$confirm" = "reset staging db" ] || (echo "Aborted."; exit 1)
 	@echo "Stopping backend to release DB connections..."
 	$(STAGING_COMPOSE) stop backend
-	$(STAGING_COMPOSE) exec postgres sh -c 'psql -U $$POSTGRES_USER -d postgres -c "DROP DATABASE IF EXISTS $$POSTGRES_DB;"'
-	$(STAGING_COMPOSE) exec postgres sh -c 'psql -U $$POSTGRES_USER -d postgres -c "CREATE DATABASE $$POSTGRES_DB OWNER $$POSTGRES_USER;"'
+	$(STAGING_COMPOSE) exec backend sh -c \
+		'PGPASSWORD=$$DB_PASSWORD psql -h $$DB_HOST -p $$DB_PORT -U $$DB_USER -d postgres \
+		 -c "DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME OWNER $$DB_USER;"' \
+		2>/dev/null || true
 	@echo "Database reset. Rebuilding backend (entrypoint runs migrations)..."
 	$(STAGING_COMPOSE) up -d --build backend
 	@echo "Staging database reset complete!"

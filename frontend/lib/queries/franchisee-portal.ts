@@ -57,7 +57,13 @@ export function usePortalCharger(id: number) {
 }
 
 export function usePortalTransactions(
-  params: { page?: number; limit?: number; status?: string } = {}
+  params: {
+    page?: number;
+    limit?: number;
+    status?: string;
+    from_date?: string;
+    to_date?: string;
+  } = {}
 ) {
   const { isAuthReady } = useAuth();
   return useQuery({
@@ -78,7 +84,7 @@ export function usePortalTransaction(id: number) {
 }
 
 export function usePortalSettlements(
-  params: { page?: number; limit?: number } = {}
+  params: { page?: number; limit?: number; from_date?: string; to_date?: string } = {}
 ) {
   const { isAuthReady } = useAuth();
   return useQuery({

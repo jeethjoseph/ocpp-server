@@ -10,7 +10,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from services.franchisee_settlement_service import FranchiseeSettlementService
+from services.franchisee_settlement_service import (
+    FranchiseeSettlementService,
+    MAX_TRANSFER_RETRIES,
+)
 from models import CommissionLedgerEntry, SettlementStatusEnum
 
 
@@ -173,7 +176,7 @@ async def test_initiate_transfer_uses_payment_endpoint_for_qr(
         mock_rzp.create_payment_transfer = AsyncMock(
             return_value={"id": "trf_via_payment", "fees": 2, "tax": 0}
         )
-        mock_rzp.create_transfer = MagicMock(
+        mock_rzp.create_transfer = AsyncMock(
             return_value={"id": "trf_direct"}
         )
 
@@ -183,7 +186,7 @@ async def test_initiate_transfer_uses_payment_endpoint_for_qr(
 
     assert ok is True
     mock_rzp.create_payment_transfer.assert_awaited_once()
-    mock_rzp.create_transfer.assert_not_called()
+    mock_rzp.create_transfer.assert_not_awaited()
     call_kwargs = mock_rzp.create_payment_transfer.await_args.kwargs
     assert call_kwargs["payment_id"] == "pay_qr_test"
     assert call_kwargs["account_id"] == test_franchisee.razorpay_account_id
@@ -213,7 +216,7 @@ async def test_initiate_transfer_uses_direct_endpoint_for_wallet(
         mock_rzp.create_payment_transfer = AsyncMock(
             return_value={"id": "trf_via_payment"}
         )
-        mock_rzp.create_transfer = MagicMock(
+        mock_rzp.create_transfer = AsyncMock(
             return_value={"id": "trf_direct"}
         )
 
@@ -222,7 +225,7 @@ async def test_initiate_transfer_uses_direct_endpoint_for_wallet(
         )
 
     assert ok is True
-    mock_rzp.create_transfer.assert_called_once()
+    mock_rzp.create_transfer.assert_awaited_once()
     mock_rzp.create_payment_transfer.assert_not_awaited()
 
     refreshed = await CommissionLedgerEntry.get(id=test_commission_ledger_entry.id)
@@ -245,7 +248,7 @@ async def test_initiate_transfer_holds_wallet_when_flag_disabled(
     ), patch("services.razorpay_service.razorpay_service") as mock_rzp:
         mock_rzp.is_route_enabled.return_value = True
         mock_rzp.create_payment_transfer = AsyncMock()
-        mock_rzp.create_transfer = MagicMock()
+        mock_rzp.create_transfer = AsyncMock()
 
         ok = await FranchiseeSettlementService.initiate_transfer(
             test_commission_ledger_entry
@@ -253,7 +256,7 @@ async def test_initiate_transfer_holds_wallet_when_flag_disabled(
 
     assert ok is False
     mock_rzp.create_payment_transfer.assert_not_awaited()
-    mock_rzp.create_transfer.assert_not_called()
+    mock_rzp.create_transfer.assert_not_awaited()
 
     refreshed = await CommissionLedgerEntry.get(id=test_commission_ledger_entry.id)
     assert refreshed.settlement_status == SettlementStatusEnum.ON_HOLD
@@ -321,3 +324,52 @@ async def test_initiate_transfer_skips_when_status_changed_mid_flight(
         id=test_commission_ledger_entry.id
     )
     assert refreshed.settlement_status == SettlementStatusEnum.TRANSFER_PROCESSED
+
+
+async def test_initiate_transfer_saturates_retry_count_on_validation_failure(
+    client, test_commission_ledger_entry, test_franchisee
+):
+    """When the pre-flight validator rejects an entry, retry_count must
+    saturate to MAX_TRANSFER_RETRIES so the retry sweep stops re-picking
+    it. Pre-fix the entry stayed at retry_count=0 forever; the sweep
+    re-evaluated it every interval and the rejection log fired every
+    tick — 18 Sentry events in 3h on staging 2026-05-26 from a single
+    ledger entry. Detector still surfaces these via FAILED+retry_count
+    >=max branch, so admin visibility is preserved.
+    """
+    test_commission_ledger_entry.franchisee_payout = Decimal("0.00")
+    await test_commission_ledger_entry.save()
+
+    with patch("services.razorpay_service.razorpay_service") as mock_rzp:
+        mock_rzp.is_route_enabled.return_value = True
+        mock_rzp.create_payment_transfer = AsyncMock()
+        mock_rzp.create_transfer = MagicMock()
+
+        ok = await FranchiseeSettlementService.initiate_transfer(
+            test_commission_ledger_entry
+        )
+
+    assert ok is False
+    mock_rzp.create_payment_transfer.assert_not_awaited()
+    mock_rzp.create_transfer.assert_not_called()
+
+    refreshed = await CommissionLedgerEntry.get(
+        id=test_commission_ledger_entry.id
+    )
+    assert refreshed.settlement_status == SettlementStatusEnum.FAILED
+    assert refreshed.failure_reason == "validation_payout_not_positive"
+    assert refreshed.retry_count == MAX_TRANSFER_RETRIES
+
+    # The retry sweep query is `status IN (FAILED, ON_HOLD) AND
+    # retry_count < MAX_TRANSFER_RETRIES`. Saturating retry_count to the
+    # threshold pushes the entry out of the sweep net immediately.
+    with patch("services.razorpay_service.razorpay_service") as mock_rzp2:
+        mock_rzp2.is_route_enabled.return_value = True
+        mock_rzp2.create_payment_transfer = AsyncMock()
+        mock_rzp2.create_transfer = MagicMock()
+        success, total = (
+            await FranchiseeSettlementService.retry_failed_transfers()
+        )
+    assert (success, total) == (0, 0)
+    mock_rzp2.create_payment_transfer.assert_not_awaited()
+    mock_rzp2.create_transfer.assert_not_called()

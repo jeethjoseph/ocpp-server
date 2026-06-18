@@ -29,6 +29,7 @@ import {
 } from "@/lib/queries/transactions";
 import { toast } from "sonner";
 import { isSocketCharger as checkSocketCharger } from "@/lib/utils";
+import { walletChargingEnabled } from "@/lib/feature-flags";
 
 export default function UserChargePage() {
   const params = useParams();
@@ -123,11 +124,11 @@ export default function UserChargePage() {
   const getStatusColor = (status: string) => {
     switch (status) {
       case "Available":
-        return "bg-green-500 dark:bg-green-600";
+        return "bg-teal-500 dark:bg-teal-600";
       case "Preparing":
-        return "bg-yellow-500 dark:bg-yellow-600";
+        return "bg-violet-500 dark:bg-violet-600";
       case "Charging":
-        return "bg-blue-500 dark:bg-blue-600";
+        return "bg-green-500 dark:bg-green-600";
       case "SuspendedEVSE":
       case "SuspendedEV":
         return "bg-orange-500 dark:bg-orange-600";
@@ -146,11 +147,11 @@ export default function UserChargePage() {
   const getStatusBadgeColor = (status: string) => {
     switch (status) {
       case "Available":
-        return "bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400";
+        return "bg-teal-100 text-teal-800 dark:bg-teal-900/20 dark:text-teal-400";
       case "Preparing":
-        return "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-400";
+        return "bg-violet-100 text-violet-800 dark:bg-violet-900/20 dark:text-violet-400";
       case "Charging":
-        return "bg-blue-100 text-blue-800 dark:bg-blue-900/20 dark:text-blue-400";
+        return "bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400";
       case "SuspendedEVSE":
       case "SuspendedEV":
         return "bg-orange-100 text-orange-800 dark:bg-orange-900/20 dark:text-orange-400";
@@ -166,7 +167,10 @@ export default function UserChargePage() {
     }
   };
 
-  const walletDisabled = !!station?.wallet_payment_disabled;
+  // Wallet charging is gated off globally until pooled multi-franchisee
+  // settlement exists (ADR 0011). Folds into the existing per-station disable so
+  // the same "scan the QR code instead" messaging and disabled state apply.
+  const walletDisabled = !!station?.wallet_payment_disabled || !walletChargingEnabled();
 
   const canStartCharging = () => {
     const statusReady = charger?.latest_status === "Preparing" ||

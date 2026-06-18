@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import { api } from "@/lib/api-client";
 import { WalletRechargeModal } from "@/components/WalletRechargeModal";
+import { walletChargingEnabled } from "@/lib/feature-flags";
 
 interface WalletTransactionDetail {
   id: number;
@@ -177,14 +178,18 @@ export default function MySessionsPage() {
                 </p>
               </div>
             </div>
-            <Button
-              onClick={() => setShowRechargeModal(true)}
-              size="lg"
-              className="bg-green-600 hover:bg-green-700"
-            >
-              <Plus className="h-5 w-5 mr-2" />
-              Recharge Wallet
-            </Button>
+            {/* Recharge is hidden while wallet charging is paused (ADR 0011);
+                the balance above stays visible so users can see funds they keep. */}
+            {walletChargingEnabled() && (
+              <Button
+                onClick={() => setShowRechargeModal(true)}
+                size="lg"
+                className="bg-green-600 hover:bg-green-700"
+              >
+                <Plus className="h-5 w-5 mr-2" />
+                Recharge Wallet
+              </Button>
+            )}
           </div>
         </CardContent>
       </Card>

@@ -16,7 +16,19 @@ class RedisConnectionManager:
         """Initialize Redis connection"""
         try:
             redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
-            self.redis_client = redis.from_url(redis_url, decode_responses=True)
+            # Explicit timeouts so a half-dead TCP connection doesn't block
+            # awaits indefinitely (Linux default TCP keepalive is ~2h).
+            # health_check_interval periodically pings to detect dead conns
+            # before a real call hits one. retry_on_timeout retries a single
+            # transient timeout before raising.
+            self.redis_client = redis.from_url(
+                redis_url,
+                decode_responses=True,
+                socket_timeout=5,
+                socket_connect_timeout=2,
+                health_check_interval=30,
+                retry_on_timeout=True,
+            )
             # Test connection
             await self.redis_client.ping()
             logger.info("Connected to Redis successfully")
@@ -58,9 +70,15 @@ class RedisConnectionManager:
         try:
             connection_key = f"{self.connection_key_prefix}{charger_id}"
             await self.redis_client.delete(connection_key)
-            
+
             logger.info(f"Removed charger {charger_id} from Redis")
             return True
+        except (redis.ConnectionError, redis.TimeoutError, OSError) as e:
+            # Transient during deploy/restart: the `redis` host can be briefly
+            # unresolvable (DNS Error -2) or unreachable while the stack cycles.
+            # Expected, self-heals — warn, don't raise a Sentry error.
+            logger.warning(f"Redis unavailable while removing charger {charger_id}: {e}")
+            return False
         except Exception as e:
             logger.error(f"Failed to remove charger {charger_id} from Redis: {e}")
             return False

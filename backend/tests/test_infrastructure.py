@@ -128,6 +128,39 @@ class TestInfrastructure:
             assert is_connected is False
             
             await redis_manager.disconnect()
-            
+
         except Exception:
             pytest.skip("Redis not available for manager testing")
+
+    @pytest.mark.asyncio
+    async def test_remove_connected_charger_survives_connection_loss(self):
+        """A DNS/connection failure during removal (deploy/restart) must not
+        raise — it warns and returns False (OCPP-BACKEND-7). No live Redis
+        needed: inject a client whose delete() raises ConnectionError."""
+        from unittest.mock import AsyncMock
+        from redis_manager import RedisConnectionManager
+
+        mgr = RedisConnectionManager()
+        mgr.redis_client = AsyncMock()
+        mgr.redis_client.delete = AsyncMock(
+            side_effect=redis.ConnectionError(
+                "Error -2 connecting to redis:6379. Name or service not known."
+            )
+        )
+
+        result = await mgr.remove_connected_charger("charger-during-deploy")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_remove_connected_charger_reraises_unexpected_as_handled(self):
+        """A genuinely unexpected (non-connection) error still returns False
+        but goes through the error branch, preserving the investigate signal."""
+        from unittest.mock import AsyncMock
+        from redis_manager import RedisConnectionManager
+
+        mgr = RedisConnectionManager()
+        mgr.redis_client = AsyncMock()
+        mgr.redis_client.delete = AsyncMock(side_effect=ValueError("boom"))
+
+        result = await mgr.remove_connected_charger("charger-x")
+        assert result is False

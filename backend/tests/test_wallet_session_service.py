@@ -284,3 +284,35 @@ async def test_cache_session_on_start_skips_internal_role(client, role):
     )
     metric_calls = [c.args[0] for c in mock_metric.call_args_list]
     assert "Custom/WalletSession/InternalRoleSkipped" in metric_calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", [UserRoleEnum.ADMIN, UserRoleEnum.FRANCHISEE])
+async def test_rebuild_session_skips_internal_role(client, role):
+    """The rebuild-after-cache-miss path must apply the same ADR 0004 policy
+    that cache_session_on_start does. Otherwise a server restart between
+    StartTransaction and the first MeterValues would reconstitute a ₹0
+    budget for an admin with an empty wallet, and the very next frame
+    would fire RemoteStop — breaking admin test-charges that the start
+    path correctly excluded.
+    """
+    wallet, charger, tariff, txn = await _make_wallet_session_fixture(
+        initial_balance=Decimal("0.00")  # zero balance to make the bug catastrophic
+    )
+    user = await User.get(id=wallet.user_id)
+    user.role = role
+    await user.save()
+
+    with patch("services.wallet_session_service.redis_manager") as mock_redis, \
+         patch("services.wallet_session_service.safe_create_task") as mock_task:
+        mock_redis.get_wallet_session = AsyncMock(return_value=None)  # cache miss
+        mock_redis.set_wallet_session = AsyncMock(return_value=True)
+
+        await WalletSessionService.check_balance_and_auto_stop(txn.id, 1.0)
+
+    mock_task.assert_not_called(), (
+        "Internal-role rebuild must not dispatch RemoteStopTransaction"
+    )
+    mock_redis.set_wallet_session.assert_not_awaited(), (
+        "Internal-role rebuild must not write a Redis snapshot"
+    )

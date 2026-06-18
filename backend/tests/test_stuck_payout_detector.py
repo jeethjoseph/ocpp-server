@@ -164,6 +164,63 @@ async def test_sweep_aggregates_per_franchisee(
     assert kwargs["tags"]["count"] == 2
 
 
+async def test_unchanged_stuck_set_does_not_realert_each_pass(
+    client, test_franchisee, test_charger, test_user
+):
+    """A stable stuck set alerts once, then is suppressed on subsequent passes
+    within the cooldown window — no more one-warning-per-tick spam."""
+    for _ in range(2):
+        await _make_ledger(
+            test_franchisee, test_charger, test_user,
+            settlement_status=SettlementStatusEnum.FAILED,
+            retry_count=3,
+        )
+
+    detector = StuckPayoutDetector(
+        interval_seconds=999, threshold_hours=24, max_transfer_retries=3,
+        alert_cooldown_hours=24,
+    )
+    with patch(
+        "services.monitoring_service.SentryHelper.capture_message"
+    ) as mock_capture:
+        await detector._sweep_once()
+        await detector._sweep_once()
+        await detector._sweep_once()
+
+    assert mock_capture.call_count == 1
+
+
+async def test_changed_stuck_set_realerts_within_one_cycle(
+    client, test_franchisee, test_charger, test_user
+):
+    """When the stuck set changes (a new entry becomes stuck), the franchisee
+    re-alerts on the very next pass even though the cooldown hasn't elapsed."""
+    await _make_ledger(
+        test_franchisee, test_charger, test_user,
+        settlement_status=SettlementStatusEnum.FAILED,
+        retry_count=3,
+    )
+
+    detector = StuckPayoutDetector(
+        interval_seconds=999, threshold_hours=24, max_transfer_retries=3,
+        alert_cooldown_hours=24,
+    )
+    with patch(
+        "services.monitoring_service.SentryHelper.capture_message"
+    ) as mock_capture:
+        await detector._sweep_once()          # alert #1
+        await detector._sweep_once()          # suppressed (unchanged)
+        await _make_ledger(
+            test_franchisee, test_charger, test_user,
+            settlement_status=SettlementStatusEnum.FAILED,
+            retry_count=3,
+        )
+        await detector._sweep_once()          # alert #2 (set changed)
+
+    assert mock_capture.call_count == 2
+    assert mock_capture.call_args.kwargs["tags"]["count"] == 2
+
+
 async def test_sweep_with_no_stuck_entries_does_not_alert(
     client, test_commission_ledger_entry, test_franchisee
 ):

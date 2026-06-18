@@ -17,6 +17,50 @@ from models import (
 logger = logging.getLogger("ocpp-server")
 
 
+async def _promote_on_activated_response(
+    franchisee_id: int, product_config: Dict, source: str
+) -> bool:
+    """Reconcile franchisee state from a Razorpay product-config payload.
+
+    Razorpay activates Route accounts via two channels: the documented
+    ``account.activated`` webhook AND — when activation happens as a
+    direct consequence of one of our own PATCH calls — the synchronous
+    API response carrying ``activation_status='activated'``. The webhook
+    is not always fired in the latter case (verified 2026-05-30 on
+    franchisee R Shyam Shankar / acc_Sum1WSDEGbyNL1: ledger entries
+    stuck PENDING for ~16 hours despite the product PATCH response
+    showing activated + requirements=[]).
+
+    Mirrors the promotion in ``handle_account_webhook`` for the
+    ``account.activated`` branch. Idempotent: skips if the franchisee
+    is already ACTIVE.
+
+    Returns True iff a state change was written.
+    """
+    if (product_config or {}).get("activation_status") != "activated":
+        return False
+    if (product_config or {}).get("requirements"):
+        return False
+
+    franchisee = await Franchisee.filter(id=franchisee_id).first()
+    if not franchisee or franchisee.status == FranchiseeStatusEnum.ACTIVE:
+        return False
+
+    now = datetime.utcnow()
+    await Franchisee.filter(id=franchisee_id).update(
+        status=FranchiseeStatusEnum.ACTIVE,
+        transfers_enabled=True,
+        kyc_verified_at=now,
+        activated_at=franchisee.activated_at or now,
+    )
+    logger.info(
+        "Franchisee %s promoted to ACTIVE via %s (inline API response, "
+        "no webhook required)",
+        franchisee_id, source,
+    )
+    return True
+
+
 def _split_street(address: str, fallback: str) -> Dict[str, str]:
     """Split a freeform address into Razorpay Route's street1 + street2.
 
@@ -369,7 +413,7 @@ class FranchiseeOnboardingService:
         if not franchisee or not franchisee.razorpay_account_id:
             raise ValueError("No Razorpay account linked")
 
-        account = razorpay_service.fetch_linked_account(
+        account = await razorpay_service.fetch_linked_account(
             franchisee.razorpay_account_id
         )
 
@@ -474,6 +518,9 @@ class FranchiseeOnboardingService:
         logger.info(
             "Bank details submitted for franchisee %s: activation_status=%s",
             franchisee_id, result.get("activation_status"),
+        )
+        await _promote_on_activated_response(
+            franchisee_id, result, source="submit_bank_details"
         )
         return result
 
@@ -726,8 +773,15 @@ class FranchiseeOnboardingService:
             franchisee_id
         )
         await FranchiseeOnboardingService.submit_bank_details(franchisee_id)
-        final = razorpay_service.fetch_product_configuration(
+        final = await razorpay_service.fetch_product_configuration(
             franchisee.razorpay_account_id, product_id
+        )
+        # Belt-and-braces: submit_bank_details already promotes on its own
+        # response, but the fresh refetch is the more authoritative source
+        # if anything changed between the PATCH and now (e.g. concurrent
+        # admin action). Idempotent — no-op if already ACTIVE.
+        await _promote_on_activated_response(
+            franchisee_id, final, source="submit_kyc/refetch"
         )
 
         return {
@@ -769,7 +823,7 @@ class FranchiseeOnboardingService:
             # faithfully. Cheap GET; skip on failure.
             from services.razorpay_service import razorpay_service
             try:
-                remote = razorpay_service.fetch_stakeholder(
+                remote = await razorpay_service.fetch_stakeholder(
                     franchisee.razorpay_account_id, sid
                 )
             except Exception as e:

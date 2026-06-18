@@ -18,7 +18,12 @@ import Link from "next/link";
 import { useQRCode, useQRPayments, useCloseQRCode } from "@/lib/queries/qr-codes";
 import type { QRPaymentStatus } from "@/types/api";
 
-function getStatusBadge(status: QRPaymentStatus) {
+function getStatusBadge(status: QRPaymentStatus, belowMinimum?: boolean) {
+  // A REFUND_FAILED row that only failed Razorpay's sub-₹1 floor is benign —
+  // show a neutral badge so it doesn't read as an operational failure.
+  if (status === "REFUND_FAILED" && belowMinimum) {
+    return <Badge variant="secondary">No refund · below ₹1</Badge>;
+  }
   const variants: Record<QRPaymentStatus, "default" | "secondary" | "destructive" | "outline"> = {
     PAID: "default",
     CHARGING: "default",
@@ -318,7 +323,7 @@ export default function QRCodeDetailPage() {
                           )}
                         </td>
                         <td className="py-3 px-2">
-                          {getStatusBadge(payment.status)}
+                          {getStatusBadge(payment.status, payment.refund_below_minimum)}
                         </td>
                       </tr>
                     ))}

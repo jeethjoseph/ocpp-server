@@ -1,7 +1,11 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 
-@custom-variant dark (&:is(.dark *));
+/* The theme is applied via `data-theme="dark"` on <html> (see ThemeContext);
+   the `.dark *` form is kept for any legacy class-based usage. Without the
+   data-theme selector here, every `dark:` utility silently no-ops even though
+   the CSS-variable theming below still darkens the page. */
+@custom-variant dark (&:is([data-theme="dark"] *, .dark *));
 
 :root {
   --card: oklch(1 0 0);
@@ -58,20 +62,14 @@
   --destructive-foreground: #ffffff;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --card: #111111;
-    --card-foreground: #f8fafc;
-    --border: #374151;
-    --input: #1f2937;
-    --secondary: #1f2937;
-    --secondary-foreground: #f8fafc;
-    --muted: #1f2937;
-    --muted-foreground: #d1d5db;
-    --accent: #1f2937;
-    --accent-foreground: #f8fafc;
-  }
-}
+/* NOTE: there used to be an `@media (prefers-color-scheme: dark) { :root { … } }`
+   block here that forced card/border/input/muted/accent to dark values. It
+   broke explicit LIGHT mode on dark-OS machines (white page, black cards,
+   white-on-white outline buttons) because it overrode the :root light tokens
+   whenever the OS was dark, ignoring the app's theme toggle. The app's theme is
+   controlled solely by `data-theme` on <html> — ThemeContext already maps the
+   system preference onto that attribute — so this media block was redundant and
+   harmful. Do not reintroduce it. */
 
 @theme inline {
   --color-background: var(--background);

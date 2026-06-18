@@ -27,6 +27,7 @@ from models import (
     WalletTransaction,
     TransactionTypeEnum,
 )
+from services.tariff_utils import synthetic_platform_fee
 
 logger = logging.getLogger("ocpp-server")
 
@@ -166,10 +167,11 @@ class FranchiseeSettlementService:
             payment_method = "QR_UPI"
             gross_amount = qr_payment.amount_paid
             refund_amount = qr_payment.refund_amount or Decimal("0")
-            pg_fee = (
-                (qr_payment.razorpay_commission or Decimal("0"))
-                + (qr_payment.razorpay_gst or Decimal("0"))
-            )
+            # Ledger uses synthetic 2% so net_excl_gst matches the customer's
+            # invoice energy_taxable line. The actual Razorpay commission/GST
+            # stays on `qr_payment` for ops reconciliation; VoltLync absorbs
+            # 100% of the actual-vs-synthetic variance. ADR 0001 amendment.
+            pg_fee = synthetic_platform_fee(gross_amount)
             gst_collected = qr_payment.gst_amount or Decimal("0")
             razorpay_payment_id = qr_payment.razorpay_payment_id
             tariff_rate = qr_payment.energy_cost / Decimal(str(energy)) if qr_payment.energy_cost and energy else Decimal("0")
@@ -384,11 +386,19 @@ class FranchiseeSettlementService:
             )
         )
         if validation_failure:
+            # Saturate retry_count so the retry sweep
+            # (settlement_status=FAILED AND retry_count<MAX_TRANSFER_RETRIES)
+            # stops re-picking the entry. The validator's contract is
+            # "admin must investigate"; without this the entry cycles
+            # through the sweep every interval and the Sentry log fires
+            # on every tick. Stuck-payout detector still surfaces these
+            # via its FAILED+retry_count>=max branch.
             await CommissionLedgerEntry.filter(id=entry.id).update(
                 settlement_status=SettlementStatusEnum.FAILED,
                 failure_reason=validation_failure,
+                retry_count=MAX_TRANSFER_RETRIES,
             )
-            logger.error(
+            logger.warning(
                 "Transfer rejected for entry %s by validator: %s",
                 entry.id, validation_failure,
             )
@@ -447,7 +457,7 @@ class FranchiseeSettlementService:
             else:
                 # Wallet session — direct transfer from platform balance.
                 # Requires Razorpay support to activate ``POST /v1/transfers``.
-                result = razorpay_service.create_transfer(
+                result = await razorpay_service.create_transfer(
                     account_id=franchisee.razorpay_account_id,
                     amount_paise=amount_paise,
                     notes=notes,

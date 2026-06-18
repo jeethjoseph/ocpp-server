@@ -23,6 +23,40 @@ class RazorpayAlreadyRefundedError(Exception):
         super().__init__(f"Payment {payment_id} is already refunded: {original_error}")
 
 
+class RazorpayRefundBelowMinimumError(Exception):
+    """Raised when Razorpay rejects a refund because the amount is below
+    its ₹1.00 (100 paise) minimum. Common business edge case: a QR session
+    bills almost the entire pre-paid amount, leaving a sub-rupee unused
+    balance the customer is contractually owed but that Razorpay won't
+    process. Callers should treat as 'no refund issued' rather than a
+    fault — log at info, do not alert.
+    """
+
+    def __init__(self, payment_id: str, original_error: Exception):
+        self.payment_id = payment_id
+        self.original_error = original_error
+        super().__init__(
+            f"Refund for {payment_id} below Razorpay minimum (₹1.00): "
+            f"{original_error}"
+        )
+
+
+class RazorpayIdempotencyConflictError(Exception):
+    """Raised on Razorpay HTTP 409 'Different request with the same idempotency
+    key has already been processed.' A prior request reused this key with a
+    different body. The original refund may or may not have been created, so a
+    same-key retry can never clear the conflict — callers must reconcile via
+    find_refund_for_payment instead of blindly retrying.
+    """
+
+    def __init__(self, payment_id: str, original_error: Exception):
+        self.payment_id = payment_id
+        self.original_error = original_error
+        super().__init__(
+            f"Idempotency conflict refunding {payment_id}: {original_error}"
+        )
+
+
 def extract_fee_from_payment(payment_data: dict) -> Optional[Tuple[Decimal, Decimal]]:
     """Extract actual Razorpay fee and tax from a payment object.
 
@@ -46,6 +80,22 @@ def _is_already_refunded_error(err: Exception) -> bool:
     """Detect Razorpay 'already refunded' / 'fully refunded' responses."""
     msg = str(err).lower()
     return any(token in msg for token in ("already refund", "fully refund", "refunded fully"))
+
+
+def _is_amount_below_minimum_error(err: Exception) -> bool:
+    """Detect Razorpay 'amount must be at least INR 1.00' rejections.
+    Razorpay accepts both spellings ('at least' / 'atleast'). The check
+    is intentionally narrow — only this exact rejection class — so other
+    amount-related errors still escalate normally."""
+    msg = str(err).lower()
+    return ("amount must be atleast" in msg) or ("amount must be at least" in msg)
+
+
+def _is_idempotency_conflict_error(err: Exception) -> bool:
+    """Detect Razorpay's idempotency-key conflict response ('Different request
+    with the same idempotency key has already been processed.'). Matched on the
+    message as a fallback to the HTTP 409 status code."""
+    return "idempotency key" in str(err).lower()
 
 
 # Sensitive field names that get masked before being persisted to
@@ -131,7 +181,7 @@ class RazorpayService:
         """Check if Razorpay is properly configured"""
         return self.client is not None
 
-    def create_order(
+    async def create_order(
         self,
         amount: Decimal,
         currency: str = "INR",
@@ -139,7 +189,7 @@ class RazorpayService:
         notes: Optional[Dict] = None
     ) -> Dict:
         """
-        Create a Razorpay order for wallet recharge
+        Create a Razorpay order for wallet recharge (non-blocking via httpx).
 
         Args:
             amount: Amount in rupees (will be converted to paise)
@@ -156,29 +206,38 @@ class RazorpayService:
         if not self.is_configured():
             raise Exception("Razorpay is not configured. Please set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET")
 
+        amount_in_paise = int(amount * 100)
+        order_data = {
+            "amount": amount_in_paise,
+            "currency": currency,
+            "payment_capture": 1,
+        }
+        if receipt:
+            order_data["receipt"] = receipt
+        if notes:
+            order_data["notes"] = notes
+
         try:
-            # Convert amount to paise (1 rupee = 100 paise)
-            amount_in_paise = int(amount * 100)
-
-            order_data = {
-                "amount": amount_in_paise,
-                "currency": currency,
-                "payment_capture": 1  # Auto-capture payment
-            }
-
-            if receipt:
-                order_data["receipt"] = receipt
-
-            if notes:
-                order_data["notes"] = notes
-
             logger.info(f"Creating Razorpay order: ₹{amount} ({amount_in_paise} paise)")
-            order = self.client.order.create(data=order_data)
-            logger.info(f"Razorpay order created: {order['id']}")
-
-            return order
-
-        except Exception as e:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    "https://api.razorpay.com/v1/orders",
+                    json=order_data,
+                    auth=(self.api_key, self.api_secret),
+                )
+            try:
+                parsed = resp.json()
+            except Exception:
+                parsed = {"raw": resp.text}
+            if resp.is_error:
+                description = ""
+                if isinstance(parsed, dict):
+                    description = parsed.get("error", {}).get("description") or ""
+                description = description or f"HTTP {resp.status_code}"
+                raise Exception(description)
+            logger.info(f"Razorpay order created: {parsed.get('id')}")
+            return parsed
+        except httpx.HTTPError as e:
             logger.error(f"Failed to create Razorpay order: {e}", exc_info=True)
             raise Exception(f"Failed to create payment order: {str(e)}")
 
@@ -259,64 +318,92 @@ class RazorpayService:
             logger.error(f"Error verifying webhook signature: {e}", exc_info=True)
             return False
 
-    def fetch_payment(self, payment_id: str) -> Optional[Dict]:
+    async def fetch_payment(self, payment_id: str) -> Optional[Dict]:
         """
-        Fetch payment details from Razorpay
+        Fetch payment details from Razorpay (non-blocking via httpx).
 
         Args:
             payment_id: Razorpay payment ID
 
         Returns:
-            Payment details or None if not found
+            Payment details or None if not found / error.
         """
         if not self.is_configured():
             logger.error("Cannot fetch payment - Razorpay not configured")
             return None
 
         try:
-            payment = self.client.payment.fetch(payment_id)
-            logger.info(f"Fetched payment details for {payment_id}")
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    f"https://api.razorpay.com/v1/payments/{payment_id}",
+                    auth=(self.api_key, self.api_secret),
+                )
+            if resp.is_error:
+                logger.error(
+                    "Failed to fetch payment %s: HTTP %s",
+                    payment_id, resp.status_code,
+                )
+                return None
+            try:
+                payment = resp.json()
+            except Exception:
+                payment = None
+            if payment:
+                logger.info(f"Fetched payment details for {payment_id}")
             return payment
-
-        except Exception as e:
+        except httpx.HTTPError as e:
             logger.error(f"Failed to fetch payment {payment_id}: {e}")
             return None
 
-    def fetch_payment_fees(self, payment_id: str) -> Optional[Tuple[Decimal, Decimal]]:
+    async def fetch_payment_fees(self, payment_id: str) -> Optional[Tuple[Decimal, Decimal]]:
         """Fetch payment from Razorpay and extract fee/tax.
 
         Returns:
             (total_fee_rupees, tax_rupees) or None if unavailable.
         """
-        payment = self.fetch_payment(payment_id)
+        payment = await self.fetch_payment(payment_id)
         if payment:
             return extract_fee_from_payment(payment)
         return None
 
-    def fetch_order(self, order_id: str) -> Optional[Dict]:
+    async def fetch_order(self, order_id: str) -> Optional[Dict]:
         """
-        Fetch order details from Razorpay
+        Fetch order details from Razorpay (non-blocking via httpx).
 
         Args:
             order_id: Razorpay order ID
 
         Returns:
-            Order details or None if not found
+            Order details or None if not found / error.
         """
         if not self.is_configured():
             logger.error("Cannot fetch order - Razorpay not configured")
             return None
 
         try:
-            order = self.client.order.fetch(order_id)
-            logger.info(f"Fetched order details for {order_id}")
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    f"https://api.razorpay.com/v1/orders/{order_id}",
+                    auth=(self.api_key, self.api_secret),
+                )
+            if resp.is_error:
+                logger.error(
+                    "Failed to fetch order %s: HTTP %s",
+                    order_id, resp.status_code,
+                )
+                return None
+            try:
+                order = resp.json()
+            except Exception:
+                order = None
+            if order:
+                logger.info(f"Fetched order details for {order_id}")
             return order
-
-        except Exception as e:
+        except httpx.HTTPError as e:
             logger.error(f"Failed to fetch order {order_id}: {e}")
             return None
 
-    def create_qr_code(
+    async def create_qr_code(
         self,
         payee_name: str,
         description: str,
@@ -338,28 +425,44 @@ class RazorpayService:
         """
         if not self.is_configured():
             raise Exception("Razorpay is not configured")
+        qr_data = {
+            "type": "upi_qr",
+            "name": payee_name,
+            "usage": "multiple_use",
+            "fixed_amount": False,
+            "description": description,
+        }
+        headers: Dict[str, str] = {}
+        if account_id:
+            headers["X-Razorpay-Account"] = account_id
         try:
-            qr_data = {
-                "type": "upi_qr",
-                "name": payee_name,
-                "usage": "multiple_use",
-                "fixed_amount": False,
-                "description": description,
-            }
-            options = {}
-            if account_id:
-                options["headers"] = {"X-Razorpay-Account": account_id}
-            qr_code = self.client.qrcode.create(data=qr_data, **options)
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    "https://api.razorpay.com/v1/payments/qr_codes",
+                    json=qr_data,
+                    headers=headers or None,
+                    auth=(self.api_key, self.api_secret),
+                )
+            try:
+                parsed = resp.json()
+            except Exception:
+                parsed = {"raw": resp.text}
+            if resp.is_error:
+                description_err = ""
+                if isinstance(parsed, dict):
+                    description_err = parsed.get("error", {}).get("description") or ""
+                description_err = description_err or f"HTTP {resp.status_code}"
+                raise Exception(description_err)
             logger.info(
                 "Razorpay QR code created: %s payee=%s account=%s",
-                qr_code.get("id"), payee_name, account_id or "platform",
+                parsed.get("id"), payee_name, account_id or "platform",
             )
-            return qr_code
-        except Exception as e:
+            return parsed
+        except httpx.HTTPError as e:
             logger.error(f"Failed to create Razorpay QR code: {e}", exc_info=True)
             raise Exception(f"Failed to create QR code: {str(e)}")
 
-    def close_qr_code(
+    async def close_qr_code(
         self, qr_code_id: str, account_id: Optional[str] = None
     ) -> Optional[Dict]:
         """Close a Razorpay QR code. Pass ``account_id`` if the QR was
@@ -367,59 +470,107 @@ class RazorpayService:
         against the same context."""
         if not self.is_configured():
             raise Exception("Razorpay is not configured")
+        headers: Dict[str, str] = {}
+        if account_id:
+            headers["X-Razorpay-Account"] = account_id
         try:
-            options = {}
-            if account_id:
-                options["headers"] = {"X-Razorpay-Account": account_id}
-            result = self.client.qrcode.close(qr_code_id, **options)
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    f"https://api.razorpay.com/v1/payments/qr_codes/{qr_code_id}/close",
+                    headers=headers or None,
+                    auth=(self.api_key, self.api_secret),
+                )
+            if resp.is_error:
+                logger.error(
+                    "Failed to close Razorpay QR code %s: HTTP %s",
+                    qr_code_id, resp.status_code,
+                )
+                return None
+            try:
+                parsed = resp.json()
+            except Exception:
+                parsed = None
             logger.info(
                 "Razorpay QR code closed: %s account=%s",
                 qr_code_id, account_id or "platform",
             )
-            return result
-        except Exception as e:
+            return parsed
+        except httpx.HTTPError as e:
             logger.error(f"Failed to close Razorpay QR code {qr_code_id}: {e}")
             return None
 
-    def fetch_qr_code(
+    async def fetch_qr_code(
         self, qr_code_id: str, account_id: Optional[str] = None
     ) -> Optional[Dict]:
         """Fetch QR code details from Razorpay."""
         if not self.is_configured():
             return None
+        headers: Dict[str, str] = {}
+        if account_id:
+            headers["X-Razorpay-Account"] = account_id
         try:
-            options = {}
-            if account_id:
-                options["headers"] = {"X-Razorpay-Account": account_id}
-            return self.client.qrcode.fetch(qr_code_id, **options)
-        except Exception as e:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    f"https://api.razorpay.com/v1/payments/qr_codes/{qr_code_id}",
+                    headers=headers or None,
+                    auth=(self.api_key, self.api_secret),
+                )
+            if resp.is_error:
+                return None
+            try:
+                return resp.json()
+            except Exception:
+                return None
+        except httpx.HTTPError as e:
             logger.error(f"Failed to fetch QR code {qr_code_id}: {e}")
             return None
 
-    def fetch_qr_payments(self, qr_code_id: str, options: Optional[Dict] = None) -> Optional[Dict]:
-        """Fetch payments for a QR code"""
+    async def fetch_qr_payments(self, qr_code_id: str, options: Optional[Dict] = None) -> Optional[Dict]:
+        """Fetch payments for a QR code. ``options`` is treated as query params."""
         if not self.is_configured():
             return None
         try:
-            return self.client.qrcode.fetch_all_payments(qr_code_id, options or {})
-        except Exception as e:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    f"https://api.razorpay.com/v1/payments/qr_codes/{qr_code_id}/payments",
+                    params=options or None,
+                    auth=(self.api_key, self.api_secret),
+                )
+            if resp.is_error:
+                return None
+            try:
+                return resp.json()
+            except Exception:
+                return None
+        except httpx.HTTPError as e:
             logger.error(f"Failed to fetch payments for QR code {qr_code_id}: {e}")
             return None
 
-    def validate_vpa(self, vpa: str) -> Optional[Dict]:
+    async def validate_vpa(self, vpa: str) -> Optional[Dict]:
         """Validate a UPI VPA and return account holder name."""
         if not self.is_configured():
             logger.error("Cannot validate VPA - Razorpay not configured")
             return None
         try:
-            result = self.client.payment.validateVpa({"vpa": vpa})
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    "https://api.razorpay.com/v1/payments/validate/vpa",
+                    json={"vpa": vpa},
+                    auth=(self.api_key, self.api_secret),
+                )
+            if resp.is_error:
+                return None
+            try:
+                result = resp.json()
+            except Exception:
+                return None
             logger.info(f"VPA validation for {mask_vpa(vpa)}: success={result.get('success')}")
             return result
-        except Exception as e:
+        except httpx.HTTPError as e:
             logger.error(f"Failed to validate VPA {mask_vpa(vpa)}: {e}")
             return None
 
-    def refund_payment(
+    async def refund_payment(
         self,
         payment_id: str,
         amount: Optional[Decimal] = None,
@@ -428,7 +579,11 @@ class RazorpayService:
         speed: Optional[str] = None,
     ) -> Optional[Dict]:
         """
-        Create a refund for a payment
+        Create a refund for a payment.
+
+        Uses ``httpx.AsyncClient`` directly (not the sync ``razorpay`` SDK)
+        so the call doesn't block the asyncio event loop. Mirrors the
+        migration done on ``create_payment_transfer``.
 
         Args:
             payment_id: Razorpay payment ID
@@ -445,61 +600,130 @@ class RazorpayService:
                 See ADR 0002 for the policy.
 
         Returns:
-            Refund details or None if failed
+            Refund details or None if not configured.
         """
         if not self.is_configured():
             logger.error("Cannot create refund - Razorpay not configured")
             return None
 
+        url = f"https://api.razorpay.com/v1/payments/{payment_id}/refund"
+        body: Dict = {}
+        if amount is not None:
+            # Convert to paise
+            body["amount"] = int(amount * 100)
+        if notes:
+            body["notes"] = notes
+        if speed:
+            body["speed"] = speed
+
+        headers: Dict[str, str] = {}
+        if idempotency_key:
+            headers["X-Refund-Idempotency"] = idempotency_key
+
         try:
-            refund_data = {}
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    url,
+                    json=body,
+                    headers=headers or None,
+                    auth=(self.api_key, self.api_secret),
+                )
+            try:
+                parsed = resp.json()
+            except Exception:
+                parsed = {"raw": resp.text}
 
-            if amount is not None:
-                # Convert to paise
-                refund_data["amount"] = int(amount * 100)
+            if resp.is_error:
+                description = ""
+                if isinstance(parsed, dict):
+                    description = parsed.get("error", {}).get("description") or ""
+                description = description or f"HTTP {resp.status_code}"
+                http_error = Exception(description)
+                if _is_already_refunded_error(http_error):
+                    raise RazorpayAlreadyRefundedError(payment_id, http_error)
+                if _is_amount_below_minimum_error(http_error):
+                    logger.info(
+                        "Refund for %s skipped: amount below Razorpay ₹1.00 minimum",
+                        payment_id,
+                    )
+                    raise RazorpayRefundBelowMinimumError(payment_id, http_error)
+                if resp.status_code == 409 or _is_idempotency_conflict_error(http_error):
+                    logger.warning(
+                        "Refund for %s hit idempotency conflict (HTTP %s): %s",
+                        payment_id, resp.status_code, description,
+                    )
+                    raise RazorpayIdempotencyConflictError(payment_id, http_error)
+                logger.error(f"Failed to create refund for payment {payment_id}: {description}")
+                if resp.status_code == 400:
+                    raise razorpay.errors.BadRequestError(description)
+                if resp.status_code in (502, 503, 504):
+                    raise razorpay.errors.GatewayError(description)
+                raise Exception(f"HTTP {resp.status_code}: {description}")
 
-            if notes:
-                refund_data["notes"] = notes
-
-            if speed:
-                refund_data["speed"] = speed
-
-            options = {}
-            if idempotency_key:
-                options["headers"] = {"X-Refund-Idempotency": idempotency_key}
-
-            refund = self.client.payment.refund(payment_id, refund_data, **options)
             logger.info(
                 "Refund created: %s for payment %s idempotency_key=%s "
                 "speed_requested=%s speed_processed=%s",
-                refund.get("id"), payment_id, idempotency_key or "none",
-                speed or "default", refund.get("speed_processed") or "unknown",
+                parsed.get("id"), payment_id, idempotency_key or "none",
+                speed or "default", parsed.get("speed_processed") or "unknown",
             )
-            return refund
+            return parsed
 
-        except Exception as e:
-            if _is_already_refunded_error(e):
-                raise RazorpayAlreadyRefundedError(payment_id, e)
+        except (
+            RazorpayAlreadyRefundedError,
+            RazorpayRefundBelowMinimumError,
+            RazorpayIdempotencyConflictError,
+        ):
+            raise
+        except httpx.HTTPError as e:
             logger.error(f"Failed to create refund for payment {payment_id}: {e}")
             raise
 
-    def find_refund_for_payment(self, payment_id: str) -> Optional[Dict]:
-        """Fetch existing refund(s) for a payment. Returns the first refund dict or None."""
+    async def find_refund_for_payment(self, payment_id: str) -> Optional[Dict]:
+        """Fetch existing refund(s) for a payment. Returns the first refund dict or None.
+
+        Two requests: payment fetch (may include inline refunds), then refunds
+        subresource as a fallback. Both run on ``httpx.AsyncClient`` so the
+        call doesn't block the event loop.
+        """
         if not self.is_configured():
             return None
         try:
-            payment = self.client.payment.fetch(payment_id)
-            # SDK may expose `refunds` as list directly or via a subresource call
-            refunds = payment.get("refunds") if isinstance(payment, dict) else None
-            if not refunds:
-                refunds_response = self.client.payment.refunds(payment_id)
-                if isinstance(refunds_response, dict):
-                    refunds = refunds_response.get("items") or []
-                else:
-                    refunds = refunds_response or []
+            async with httpx.AsyncClient(timeout=10) as client:
+                pay_resp = await client.get(
+                    f"https://api.razorpay.com/v1/payments/{payment_id}",
+                    auth=(self.api_key, self.api_secret),
+                )
+                if pay_resp.is_error:
+                    logger.error(
+                        "Failed to fetch payment %s for refund lookup: HTTP %s",
+                        payment_id, pay_resp.status_code,
+                    )
+                    return None
+                try:
+                    payment = pay_resp.json()
+                except Exception:
+                    payment = {}
+                refunds = payment.get("refunds") if isinstance(payment, dict) else None
+
+                if not refunds:
+                    ref_resp = await client.get(
+                        f"https://api.razorpay.com/v1/payments/{payment_id}/refunds",
+                        auth=(self.api_key, self.api_secret),
+                    )
+                    if ref_resp.is_error:
+                        return None
+                    try:
+                        refunds_response = ref_resp.json()
+                    except Exception:
+                        refunds_response = {}
+                    if isinstance(refunds_response, dict):
+                        refunds = refunds_response.get("items") or []
+                    else:
+                        refunds = refunds_response or []
+
             if refunds:
                 return refunds[0]
-        except Exception as e:
+        except httpx.HTTPError as e:
             logger.error(f"Failed to fetch refunds for payment {payment_id}: {e}")
         return None
 
@@ -615,13 +839,26 @@ class RazorpayService:
         logger.info("Linked account created: %s", result.get("id"))
         return result
 
-    def fetch_linked_account(self, account_id: str) -> Dict:
-        """Fetch linked account details (GET /v2/accounts/{id})."""
+    async def fetch_linked_account(self, account_id: str) -> Dict:
+        """Fetch linked account details (GET /v2/accounts/{id}) — non-blocking."""
         if not self.is_configured():
             raise Exception("Razorpay not configured")
         try:
-            return self.client.account.fetch(account_id)
-        except Exception as e:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    f"https://api.razorpay.com/v2/accounts/{account_id}",
+                    auth=(self.api_key, self.api_secret),
+                )
+            if resp.is_error:
+                description = ""
+                try:
+                    description = resp.json().get("error", {}).get("description") or ""
+                except Exception:
+                    pass
+                description = description or f"HTTP {resp.status_code}"
+                raise Exception(description)
+            return resp.json()
+        except httpx.HTTPError as e:
             logger.error("Failed to fetch account %s: %s", account_id, e)
             raise
 
@@ -715,16 +952,29 @@ class RazorpayService:
             account_id=account_id,
         )
 
-    def fetch_product_configuration(
+    async def fetch_product_configuration(
         self, account_id: str, product_id: str
     ) -> Dict:
         """GET /v2/accounts/{id}/products/{product_id} — read
-        ``activation_status`` and outstanding ``requirements[]``."""
+        ``activation_status`` and outstanding ``requirements[]``. Non-blocking."""
         if not self.is_configured():
             raise Exception("Razorpay not configured")
         try:
-            return self.client.product.fetch(account_id, product_id)
-        except Exception as e:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    f"https://api.razorpay.com/v2/accounts/{account_id}/products/{product_id}",
+                    auth=(self.api_key, self.api_secret),
+                )
+            if resp.is_error:
+                description = ""
+                try:
+                    description = resp.json().get("error", {}).get("description") or ""
+                except Exception:
+                    pass
+                description = description or f"HTTP {resp.status_code}"
+                raise Exception(description)
+            return resp.json()
+        except httpx.HTTPError as e:
             logger.error(
                 "Failed to fetch product %s for %s: %s",
                 product_id, account_id, e,
@@ -751,25 +1001,51 @@ class RazorpayService:
             account_id=account_id,
         )
 
-    def list_stakeholders(self, account_id: str) -> Dict:
-        """GET /v2/accounts/{id}/stakeholders — list all."""
+    async def list_stakeholders(self, account_id: str) -> Dict:
+        """GET /v2/accounts/{id}/stakeholders — list all. Non-blocking."""
         if not self.is_configured():
             raise Exception("Razorpay not configured")
         try:
-            return self.client.stakeholder.all(account_id)
-        except Exception as e:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    f"https://api.razorpay.com/v2/accounts/{account_id}/stakeholders",
+                    auth=(self.api_key, self.api_secret),
+                )
+            if resp.is_error:
+                description = ""
+                try:
+                    description = resp.json().get("error", {}).get("description") or ""
+                except Exception:
+                    pass
+                description = description or f"HTTP {resp.status_code}"
+                raise Exception(description)
+            return resp.json()
+        except httpx.HTTPError as e:
             logger.error(
                 "Failed to list stakeholders on %s: %s", account_id, e
             )
             raise
 
-    def fetch_stakeholder(self, account_id: str, stakeholder_id: str) -> Dict:
-        """GET /v2/accounts/{id}/stakeholders/{sid} — read single stakeholder."""
+    async def fetch_stakeholder(self, account_id: str, stakeholder_id: str) -> Dict:
+        """GET /v2/accounts/{id}/stakeholders/{sid} — read single stakeholder. Non-blocking."""
         if not self.is_configured():
             raise Exception("Razorpay not configured")
         try:
-            return self.client.stakeholder.fetch(account_id, stakeholder_id)
-        except Exception as e:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    f"https://api.razorpay.com/v2/accounts/{account_id}/stakeholders/{stakeholder_id}",
+                    auth=(self.api_key, self.api_secret),
+                )
+            if resp.is_error:
+                description = ""
+                try:
+                    description = resp.json().get("error", {}).get("description") or ""
+                except Exception:
+                    pass
+                description = description or f"HTTP {resp.status_code}"
+                raise Exception(description)
+            return resp.json()
+        except httpx.HTTPError as e:
             logger.error(
                 "Failed to fetch stakeholder %s on %s: %s",
                 stakeholder_id, account_id, e,
@@ -803,14 +1079,14 @@ class RazorpayService:
         )
         return result
 
-    def create_transfer(
+    async def create_transfer(
         self,
         account_id: str,
         amount_paise: int,
         notes: Optional[Dict] = None,
         idempotency_key: Optional[str] = None,
     ) -> Dict:
-        """Create a Route transfer to a linked account.
+        """Create a Route transfer to a linked account (non-blocking via httpx).
 
         When ``idempotency_key`` is set, Razorpay deduplicates retries via the
         ``X-Transfer-Idempotency`` header: same key + same body returns the
@@ -818,27 +1094,52 @@ class RazorpayService:
         """
         if not self.is_configured():
             raise Exception("Razorpay not configured")
+
+        data = {
+            "account": account_id,
+            "amount": amount_paise,
+            "currency": "INR",
+        }
+        if notes:
+            data["notes"] = notes
+
+        headers: Dict[str, str] = {}
+        if idempotency_key:
+            headers["X-Transfer-Idempotency"] = idempotency_key
+
         try:
-            data = {
-                "account": account_id,
-                "amount": amount_paise,
-                "currency": "INR",
-            }
-            if notes:
-                data["notes"] = notes
-
-            options = {}
-            if idempotency_key:
-                options["headers"] = {"X-Transfer-Idempotency": idempotency_key}
-
-            result = self.client.transfer.create(data=data, **options)
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    "https://api.razorpay.com/v1/transfers",
+                    json=data,
+                    headers=headers or None,
+                    auth=(self.api_key, self.api_secret),
+                )
+            try:
+                parsed = resp.json()
+            except Exception:
+                parsed = {"raw": resp.text}
+            if resp.is_error:
+                description = ""
+                if isinstance(parsed, dict):
+                    description = parsed.get("error", {}).get("description") or ""
+                description = description or f"HTTP {resp.status_code}"
+                logger.error(
+                    "Transfer failed to %s (%d paise): %s",
+                    account_id, amount_paise, description,
+                )
+                if resp.status_code == 400:
+                    raise razorpay.errors.BadRequestError(description)
+                if resp.status_code in (502, 503, 504):
+                    raise razorpay.errors.GatewayError(description)
+                raise Exception(f"HTTP {resp.status_code}: {description}")
             logger.info(
                 "Transfer created: %s -> %s (%d paise) idempotency_key=%s",
-                result.get("id"), account_id, amount_paise,
+                parsed.get("id"), account_id, amount_paise,
                 idempotency_key or "none",
             )
-            return result
-        except Exception as e:
+            return parsed
+        except httpx.HTTPError as e:
             logger.error(
                 "Transfer failed to %s (%d paise): %s",
                 account_id, amount_paise, e,
@@ -946,30 +1247,57 @@ class RazorpayService:
         )
         return transfer
 
-    def fetch_transfer(self, transfer_id: str) -> Dict:
-        """Fetch transfer status."""
+    async def fetch_transfer(self, transfer_id: str) -> Dict:
+        """Fetch transfer status. Non-blocking."""
         if not self.is_configured():
             raise Exception("Razorpay not configured")
         try:
-            return self.client.transfer.fetch(transfer_id)
-        except Exception as e:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    f"https://api.razorpay.com/v1/transfers/{transfer_id}",
+                    auth=(self.api_key, self.api_secret),
+                )
+            if resp.is_error:
+                description = ""
+                try:
+                    description = resp.json().get("error", {}).get("description") or ""
+                except Exception:
+                    pass
+                description = description or f"HTTP {resp.status_code}"
+                raise Exception(description)
+            return resp.json()
+        except httpx.HTTPError as e:
             logger.error("Failed to fetch transfer %s: %s", transfer_id, e)
             raise
 
-    def reverse_transfer(
+    async def reverse_transfer(
         self, transfer_id: str, amount_paise: Optional[int] = None
     ) -> Dict:
-        """Reverse a transfer (full or partial)."""
+        """Reverse a transfer (full or partial). Non-blocking."""
         if not self.is_configured():
             raise Exception("Razorpay not configured")
+        data = {}
+        if amount_paise is not None:
+            data["amount"] = amount_paise
         try:
-            data = {}
-            if amount_paise is not None:
-                data["amount"] = amount_paise
-            result = self.client.transfer.reverse(transfer_id, data=data)
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    f"https://api.razorpay.com/v1/transfers/{transfer_id}/reversals",
+                    json=data,
+                    auth=(self.api_key, self.api_secret),
+                )
+            if resp.is_error:
+                description = ""
+                try:
+                    description = resp.json().get("error", {}).get("description") or ""
+                except Exception:
+                    pass
+                description = description or f"HTTP {resp.status_code}"
+                raise Exception(description)
+            result = resp.json()
             logger.info("Transfer %s reversed", transfer_id)
             return result
-        except Exception as e:
+        except httpx.HTTPError as e:
             logger.error("Failed to reverse transfer %s: %s", transfer_id, e)
             raise
 

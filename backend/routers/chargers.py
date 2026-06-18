@@ -7,7 +7,8 @@ from datetime import datetime, timedelta, timezone
 import uuid
 import logging
 
-from core.config import RAZORPAY_PLATFORM_FEE_PERCENT
+from core.config import RAZORPAY_PLATFORM_FEE_PERCENT, wallet_charging_enabled
+from core.roles import INTERNAL_ROLES
 from models import Charger, ChargingStation, Connector, Transaction, OCPPLog, User, ChargerError, Tariff
 from tortoise.exceptions import IntegrityError
 from tortoise.transactions import in_transaction
@@ -74,6 +75,9 @@ class ChargerResponse(BaseModel):
     serial_number: Optional[str]
     firmware_version: Optional[str]
     latest_status: str
+    # Admin-set availability ("Operative" | "Inoperative"). Distinct from
+    # latest_status — the UI toggle reads THIS field. See ADR 0008.
+    availability: str
     last_heart_beat_time: Optional[datetime]
     connection_status: bool
     created_at: datetime
@@ -207,6 +211,11 @@ def charger_to_response(
         serial_number=charger.serial_number,
         firmware_version=charger.firmware_version,
         latest_status=charger.latest_status,
+        availability=(
+            charger.availability.value
+            if hasattr(charger.availability, "value")
+            else str(charger.availability)
+        ),
         last_heart_beat_time=charger.last_heart_beat_time,
         created_at=charger.created_at,
         updated_at=charger.updated_at,
@@ -579,7 +588,13 @@ async def delete_charger(charger_id: int, admin_user: User = Depends(require_adm
 @router.post("/{charger_id}/remote-start", response_model=dict)
 async def remote_start_charging(charger_id: int, connector_id: int = 1, user: User = Depends(require_user_or_admin())):
     """Start charging remotely"""
-    
+
+    # Wallet gate (ADR 0011) applies only to wallet-funded customer sessions.
+    # Internal-role (ADMIN/FRANCHISEE) sessions are operational and decoupled
+    # from wallets (ADR 0004), so they are never gated.
+    if not wallet_charging_enabled() and user.role not in INTERNAL_ROLES:
+        raise HTTPException(status_code=403, detail="Wallet charging is temporarily disabled")
+
     # Use the user's RFID card ID as idTag for OCPP identification
     if not user.rfid_card_id:
         raise HTTPException(status_code=409, detail="User does not have an RFID card ID assigned")
@@ -638,8 +653,13 @@ async def remote_start_charging(charger_id: int, connector_id: int = 1, user: Us
             "message": "Remote start command sent successfully",
             "connector_id": connector_id
         }
-    else:
-        raise HTTPException(status_code=500, detail=f"Failed to send start command: {response}")
+    # A charger that doesn't ACK in time is offline/slow — an upstream
+    # gateway condition, not a server fault. Return 504 (excluded from
+    # Sentry's failed-request reporting; see monitoring_service) instead of
+    # a 500 that would spam error tracking with expected operational noise.
+    if isinstance(response, str) and response.startswith("OCPP timeout"):
+        raise HTTPException(status_code=504, detail="Charger did not respond in time. It may be offline — please try again.")
+    raise HTTPException(status_code=500, detail=f"Failed to send start command: {response}")
 
 @router.post("/{charger_id}/remote-stop", response_model=dict)
 async def remote_stop_charging(charger_id: int, reason: Optional[str] = "Requested by operator", user: User = Depends(require_user_or_admin())):
@@ -783,13 +803,31 @@ async def change_charger_availability(
         # Get the OCPP response status (Accepted/Scheduled/Rejected)
         ocpp_status = getattr(response, 'status', str(response))
 
+        # Persist admin intent when the charger acknowledged the command.
+        # See ADR 0008 for why availability is separate from latest_status.
+        from models import ChargerAvailabilityEnum
+        new_availability = None
+        if ocpp_status in ("Accepted", "Scheduled"):
+            new_availability = (
+                ChargerAvailabilityEnum.OPERATIVE
+                if type == "Operative"
+                else ChargerAvailabilityEnum.INOPERATIVE
+            )
+            await Charger.filter(id=charger_id).update(availability=new_availability)
+
         await log_audit_event(
             action="charger.availability_changed",
             entity_type="charger",
             entity_id=charger.charge_point_string_id,
             actor_type="admin",
             actor=admin_user,
-            changes={"type": type, "connector_id": connector_id, "ocpp_response": ocpp_status, "previous_status": current_status},
+            changes={
+                "type": type,
+                "connector_id": connector_id,
+                "ocpp_response": ocpp_status,
+                "previous_status": current_status,
+                "new_availability": new_availability.value if new_availability else None,
+            },
         )
 
         return {
@@ -912,11 +950,18 @@ async def get_charger_logs(
 # ============ Signal Quality Endpoints ============
 
 class SignalQualityResponse(BaseModel):
-    """Response schema for signal quality data point"""
+    """Response schema for a signal-quality / modem-telemetry data point.
+
+    Despite the legacy ``signal_quality`` table name, the row also carries
+    modem board temperature (see ADR 0009). ``temperature_celsius`` is null
+    for rows captured before the temperature column was added (migration 43)
+    or for chargers on firmware that doesn't yet emit the field.
+    """
     id: int
     charger_id: int
     rssi: int  # Received Signal Strength Indicator (0-31 for GSM, 99=unknown)
     ber: int   # Bit Error Rate (0-7 for GSM, 99=unknown/not detectable)
+    temperature_celsius: Optional[float] = None  # Modem board temperature
     timestamp: str
     created_at: datetime
 
@@ -924,7 +969,7 @@ class SignalQualityResponse(BaseModel):
         from_attributes = True
 
 class SignalQualityListResponse(BaseModel):
-    """Response schema for list of signal quality data"""
+    """Response schema for list of signal quality / modem telemetry data."""
     data: List[SignalQualityResponse]
     total: int
     page: int
@@ -932,6 +977,7 @@ class SignalQualityListResponse(BaseModel):
     charger_id: int
     latest_rssi: Optional[int] = None
     latest_ber: Optional[int] = None
+    latest_temperature_celsius: Optional[float] = None
 
 @router.get("/{charger_id}/signal-quality", response_model=SignalQualityListResponse)
 async def get_charger_signal_quality(
@@ -974,6 +1020,7 @@ async def get_charger_signal_quality(
     latest = await SignalQuality.filter(charger_id=charger_id).order_by("-created_at").first()
     latest_rssi = latest.rssi if latest else None
     latest_ber = latest.ber if latest else None
+    latest_temperature_celsius = latest.temperature_celsius if latest else None
 
     # Convert to response models
     data_responses = [SignalQualityResponse.model_validate(d, from_attributes=True) for d in signal_data]
@@ -985,7 +1032,8 @@ async def get_charger_signal_quality(
         limit=limit,
         charger_id=charger_id,
         latest_rssi=latest_rssi,
-        latest_ber=latest_ber
+        latest_ber=latest_ber,
+        latest_temperature_celsius=latest_temperature_celsius,
     )
 
 @router.get("/{charger_id}/signal-quality/latest", response_model=Optional[SignalQualityResponse])

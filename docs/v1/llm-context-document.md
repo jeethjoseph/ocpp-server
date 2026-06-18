@@ -50,7 +50,7 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
 **Protocol**: OCPP 1.6 via WebSocket with full message support
 **Authentication**: Clerk (6.29.0 web, 5.56.1 mobile) JWT with role-based access control + UPI_GUEST for appless users
 **Payments**: Razorpay SDK 2.0.0 for wallet recharge + UPI QR code generation + refunds
-**Deployment**: AWS EC2 with Docker Compose (backend, frontend, nginx, redis, postgres)
+**Deployment**: AWS EC2 with Docker Compose (backend, frontend, nginx, redis). **Both staging and prod postgres are AWS RDS** as of 2026-05-28 — see Database tier section below.
 **Monitoring**: Sentry (error tracking) + New Relic (APM) + structured logging
 **Testing**: Pytest 8.3.4 with async support
 
@@ -76,6 +76,7 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
   - Admin: Trigger OCPP firmware updates (single/bulk)
   - Admin: Monitor update progress with real-time dashboard
   - Public: `/api/firmware/latest` for non-OCPP charge points
+  - **Bulk deploy is idempotent and hardened (2026-06-16)**: `POST /api/admin/firmware/bulk-update` classifies every charger into `success` / `skipped` / `failed`. `skipped` = already on the target version, OR an **in-flight firmware update** (PENDING with `attempt_count > 0`) which is left byte-for-byte untouched. Only re-deployable rows (PENDING attempt 0 / INSTALLED / FAILED / CANCELLED) are reset to a fresh PENDING. Re-running the same deploy disturbs nothing already handled or rolling out. Per-charger classification lives in `_bulk_classify_charger`; the in-flight rule mirrors the **In-flight firmware update** glossary term in `CONTEXT.md`. Force-restarting a stuck in-flight charger stays the single-charger path's job. The dashboard `in_progress` items now also carry `error_message` (last-attempt failure reason).
 - **`public_stations.py`** - Public unauthenticated station/charger discovery (`/api/public/stations/*`) for user-facing pages. **`ConnectorInfo` (2026-05-21)** carries per-plug-type `ready_count`/`in_use_count`/`out_of_service_count` (3-bucket mapping from `ChargerStatusEnum` via `_status_bucket`) plus per-plug-type `min_tariff_all_in`/`max_tariff_all_in`. Legacy `available_count`/`total_count` are still emitted (=`ready_count`/total) for `/stations` and the map popup.
 - **`public_qr_transactions.py`** - Public QR transaction history lookup by UPI VPA (`/api/public/qr-transactions`) — no auth, paginated, minimal data exposure. **Refund lifecycle (2026-05-21, ADR 0005)**: response carries `razorpay_refund_id`, `razorpay_refund_speed_processed`, `refund_processed_at`, `refund_failure_reason` so the customer-facing card can render Initiated / Sent to bank / Failed without ever claiming "credited to source account" for normal-speed refunds (which Razorpay genuinely can't confirm).
 - **`public_qr_active_sessions.py`** - Public no-auth endpoint (`GET /api/public/qr-active-sessions?vpa=X`, 2026-05-21) returning in-progress QR sessions for a VPA, classified into 4 customer-facing sub-states (`waiting` / `charging` / `paused` / `stopping`) by the **canonical classifier in `services/qr_session_state.py`** which is the single source of truth for "is this QR session active?" — `customer_sub_state(qr_payment, transaction, stale_threshold_seconds=...)`. **Live KPIs come entirely from the `qr_session:{txn_id}` Redis row** (2026-05-22, Option 1 of review item #4): `check_budget_and_auto_stop` stamps `latest_reading_kwh` / `latest_power_kw` / `latest_meter_at` on every MeterValues frame, and the endpoint reads these without an additional DB query. Pre-first-frame / cache-rebuild falls back to a one-row MeterValue query. Computes `energy_kwh`, `spent_so_far`, `refund_if_stopped_now` (no longer a duplicate `budget_remaining` — issue 06). `waiting` entries also carry `stale_threshold_seconds` so the frontend can render specific auto-refund-window copy. Same 20 req/60s/IP rate limit as the history endpoint. **Hardening (2026-05-21):** per-session `try/except` so one bad row doesn't 500 the request; emits `Custom/ActiveSession/Request|CacheMiss|SessionComputeError|SubState/<state>` counters. VPA pattern lives in shared `core/validators.py` (imported by both QR routers). **Read-only by design — see ADR 0006**: no remote-stop action is exposed behind the VPA check because VPAs aren't credentials.
@@ -83,8 +84,11 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
   - Create/list/close/regenerate QR codes linked to chargers
   - Payment history and revenue stats per QR code
   - All QRs are platform-owned: payments land in VoltLync's nodal balance, never scoped to a franchisee's linked account. The franchisee's share is disbursed via a Route transfer *after* the session settles (see `franchisee_settlement_service`). Legacy rows with `ChargerQRCode.owner_razorpay_account_id IS NOT NULL` must be regenerated via the close-and-recreate endpoint before new payments flow correctly.
+  - Multiple `ChargerQRCode` rows per charger are permitted (one active + many closed). Migration 41 (2026-05-25) dropped the stale Postgres-default `charger_qr_code_charger_id_key` UNIQUE constraint that migration 12 had failed to remove (wrong name in `DROP INDEX IF EXISTS`). Without 41, close-then-recreate raises 500 with `asyncpg.UniqueViolationError`. The create endpoint enforces the at-most-one-*active* rule at the application layer (`backend/routers/qr_codes.py`).
 - **`franchisee_portal.py`** - Franchisee-facing portal API (`/api/franchisee/*`)
   - Dashboard, stations, chargers, transactions, settlements, profile, QR codes
+  - `/transactions` lists **Charging Sessions** on the franchisee's chargers (operational view, all statuses). Optional `from_date`/`to_date` are **inclusive IST dates** filtered on `start_time` (session start, ≡ `created_at`); existing `status` param filters by `TransactionStatusEnum`. Response carries a `summary` (`_transaction_summary`) over the **full filtered set** reflecting **both** date and status filters: `total_energy_kwh` and `total_revenue` are `SUM`s of the **stored** (finalised) `energy_consumed_kwh` / `total_billed` columns with **NULL→0** (running/non-billable sessions contribute 0; no live-energy derivation); "Total Sessions" is the existing `total` count. Totals deliberately match the table (incl. internal/test + failed sessions) — narrowing is via the status filter. Frontend reuses the shared IST presets in `lib/date-presets.ts`.
+  - `/settlements` is an **earnings view** over **Settlement Entries** (`CommissionLedgerEntry`; see CONTEXT.md). Optional `from_date`/`to_date` query params are **inclusive IST calendar dates** (YYYY-MM-DD) filtered on `created_at` (accrual date, NOT cash-received `settled_at`); the backend converts them to a half-open UTC range via `_ist_dates_to_utc_range`. Frontend presets "Current month"/"Last month" compute the IST range client-side; default is all-time. Response carries a `summary` block (`_settlement_summary`) computed server-side over the **full filtered set**: `total_gross`, `total_tds`, and payout split into `payout_settled` (`SETTLED`+`TRANSFER_PROCESSED`) vs `payout_pending` (`PENDING`+`TRANSFER_INITIATED`+`ON_HOLD`+`BELOW_THRESHOLD`+`FAILED`), plus `failed_count`. `REVERSED` is excluded from all money totals (clawed back). The per-row Commission % column and any platform-commission total are intentionally **not** surfaced to franchisees — commission is VoltLync's revenue, not franchisee-facing.
   - `/qr-codes` endpoints support full CRUD on the franchisee's own chargers' QRs (list with `can_create_direct` / `payee_display_name`, create, regenerate, close). Regenerate is the retroactive compliance path: once Razorpay KYC completes, the franchisee clicks it to upgrade each platform-owned QR into a franchisee-owned one. All mutations audit-log with `actor_type=franchisee`.
 - **`webhooks.py`** - Clerk webhook processing for user lifecycle (`/webhooks/clerk`) + Razorpay webhook handler (`/webhooks/razorpay`). **`handle_refund_event` (2026-05-21)** now handles three event types — `refund.processed` stamps `refund_processed_at` AND captures `speed_processed`; `refund.failed` records `refund_failure_reason`; **`refund.speed_changed`** updates `razorpay_refund_speed_processed` when Razorpay silently downgrades instant→normal (or upgrades), keeping the customer-facing ETA honest per ADR 0005.
   - Routes `qr_code.credited` events to `QRPaymentService.handle_qr_payment()`
@@ -128,10 +132,10 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
   - `_disconnect_suspend_timeout()` - Auto-stops SUSPENDED transactions after timeout with CAS guard, delegates to `transaction_finalizer.finalize_stopped_transaction`
   - `sweep_stale_suspended_transactions()` - Startup safety net for orphaned SUSPENDED transactions after server restart, delegates to `transaction_finalizer`
   - `_disconnect_reset_count` - In-memory dict tracking *consecutive disconnects without energy progress* per transaction. Pathological-flap detector — counter is checked in main.py BootNotification handler and zeroed in `zero_energy_watchdog.check_zero_energy` when MeterValues show real charging progress
-  - Config: `DISCONNECT_SUSPEND_TIMEOUT_SECONDS=180`, `MAX_DISCONNECT_RESETS_WITHOUT_PROGRESS=3`
+  - Config: `DISCONNECT_SUSPEND_TIMEOUT_SECONDS=180` (code/compose default; **staging & prod run `1800`** — widened reconnect tolerance), `MAX_DISCONNECT_RESETS_WITHOUT_PROGRESS=3`
 - **`transaction_finalizer.py`** - **NEW**: Single source of truth for stopping transactions on timeout
   - `finalize_stopped_transaction(transaction, stop_reason)` - Idempotent: calculates final energy from latest MeterValue, marks STOPPED, audit-logs, processes wallet billing, processes QR billing/refund, cleans up zero-energy redis state and flap counter
-  - `is_resume_too_stale(transaction)` - **Defense-in-depth resume staleness guard.** Returns `(is_stale, gap_seconds)` based on the most recent of `suspended_at`, latest MeterValue.created_at, or `start_time`. Threshold `MAX_RESUME_GAP_SECONDS=900` (configurable). Called at all three resume points in `main.py` so a txn whose primary suspend/timeout chain failed cannot be silently resumed and overcharged. Stop reason on stale finalize: `STALE_RECONNECT`. Audit action: `transaction.resume_blocked` (with `trigger`, `gap_seconds`, `previous_status` in changes payload).
+  - `is_resume_too_stale(transaction)` - **Defense-in-depth resume staleness guard.** Returns `(is_stale, gap_seconds)` based on the most recent of `suspended_at`, latest MeterValue.created_at, or `start_time`. Threshold `MAX_RESUME_GAP_SECONDS` (code default 900; **staging & prod run `2100` as of 2026-06-09**). Called at all three resume points in `main.py` so a txn whose primary suspend/timeout chain failed cannot be silently resumed and overcharged. Stop reason on stale finalize: `STALE_RECONNECT`. Audit action: `transaction.resume_blocked` (with `trigger`, `gap_seconds`, `previous_status` in changes payload). **Invariant (`transaction_finalizer.py:35-41`): `MAX_RESUME_GAP_SECONDS` MUST exceed `DISCONNECT_SUSPEND_TIMEOUT_SECONDS` and `SUSPEND_TIMEOUT_SECONDS`** so the guard is a backstop, not a pre-emptor. It is *not* validated at startup — staging/prod once shipped `900 < 1800`, which silently force-finalized chargers reconnecting in the 15–30 min window; fixed 2026-06-09 by raising the gap to 2100. A startup `validate_timing_invariants()` is the proposed durable fix.
   - Replaces duplicated stop-and-bill logic that previously lived in both `main.py:_suspend_timeout` and `disconnect_handler._stop_and_bill_transaction`
   - Used by: `main.py` BootNotification suspend timeout, `disconnect_handler` disconnect timeout, `disconnect_handler` startup sweep, all three resume points (MeterValues auto-resume, BootNotification per-txn handler, GetLastMeterValue DataTransfer)
 - **`zero_energy_watchdog.py`** - Auto-stop for stalled charging sessions
@@ -152,7 +156,7 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
   - Webhook signature verification (HMAC SHA256)
   - **QR code creation**: `create_qr_code(payee_name, description, account_id=None)`, `close_qr_code(id, account_id=None)`, `fetch_qr_code(id, account_id=None)`. `account_id` is still accepted for backward-compatible close/fetch on legacy franchisee-scoped QRs but NEW QRs are always created with `account_id=None` (platform-owned); the franchisee's share is transferred post-settlement via Route.
   - **Helpers**: `build_qr_payee_name(business_name, charger_name)` composes the `name` metadata (50-char cap; falls back to "VoltLync" when no franchisee). `build_qr_description(...)` composes the rendered descriptor line.
-  - **Refunds**: `refund_payment(payment_id, amount, notes, idempotency_key)` — `idempotency_key` is sent as `X-Refund-Idempotency` so retries dedupe server-side. Callers use `f"qr_payment_{id}"` as the stable key.
+  - **Refunds**: `refund_payment(payment_id, amount, notes, idempotency_key, speed)` — `idempotency_key` is sent as `X-Refund-Idempotency` so retries dedupe server-side. **Idempotency key + body are built by `qr_payment_service.build_refund_call_kwargs(qr_payment, refund_amount)`** (single source of truth for original *and* retry paths). Key = `f"refund_{razorpay_payment_id}"` — derived from the globally-unique Razorpay payment id, **NOT** the old per-database PK `f"qr_payment_{id}"`. **Why**: staging+prod share one Razorpay LIVE account, so a PK-based key collided across environments (same integer id, different bodies → HTTP 409 "Different request with the same idempotency key"), permanently stranding refunds in `REFUND_FAILED`. Notes are minimal/deterministic (`{"qr_payment_id": id}`) and speed is derived from the amount (full refund → `optimum` when enabled, partial → normal) so a retry replays the original request byte-for-byte instead of 409ing. See [[project-refund-idempotency-cross-env-collision]] and `.scratch/qr-refund-idempotency-fix/`. **Deploy status: live on STAGING (2026-06-09); PROD still runs the old `qr_payment_{id}` key (pending deploy).** A 409 is now mapped to `RazorpayIdempotencyConflictError` and reconciled via `find_refund_for_payment` (→ REFUNDED if a refund already exists, else `failure_reason="idempotency_conflict_no_refund"`, a non-retryable marker the billing-retry sweep excludes alongside below-minimum reasons via `is_retryable_refund_failure()`).
   - **Known issue — webhook fees vs settled fees**: `qr_code.credited` webhook delivers Razorpay's *plan-rate* fee, which gets zeroed for UPI P2M ≤ ₹2000 by settlement time without notification. `_resolve_platform_fee` trusts the webhook value. Causes small under-refunds and under-payouts. Documented at `docs/known-issues.md#1`.
   - **Route transfers**: two endpoints, picked in `franchisee_settlement_service.initiate_transfer` based on whether the ledger entry has a source `razorpay_payment_id`:
     - **Payment-based** (QR sessions): `create_payment_transfer(payment_id, account_id, amount_paise, notes, franchisee_id)` → `POST /v1/payments/{id}/transfers`. No on-demand activation required. Wraps `requests.post` directly (not the SDK) and writes a `RazorpayApiLog` audit row via `_audit_call`. Razorpay's only constraint is `sum(transfers) ≤ captured_amount`; refunds reduce the effective transferable amount. App-level idempotency comes from `_validate_ledger_for_transfer`'s `razorpay_payment_id` collision check (no `X-Transfer-Idempotency` header is sent).
@@ -164,6 +168,7 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
   - `@trace_transaction` decorator for OCPP message tracing
   - `MetricsCollector`, `OCPPMetrics`, `SentryHelper` classes
   - **W6 metrics for failure-mode alerting**: `record_disconnect_suspended`, `record_disconnect_stopped`, `record_zero_energy_stopped`, `record_billing_failed`, `record_stale_suspended_swept` — all paired with `Custom/OCPP/...` counters and structured events. Linked from runbooks in `docs/runbooks/`.
+  - **WebSocket lifecycle events (2026-05-28)**: `record_websocket_disconnect` emits `OCPPWebSocketDisconnect` from `core/connection_manager.force_disconnect` (the single chokepoint — every disconnect path flows through it). Attributes: `charger_id`, `disconnect_category` (one of `client_close`, `server_error`, `stale_replaced`, `heartbeat_timeout`, `ops_initiated`), `duration_seconds`, `ws_close_code`, `ws_close_reason`, `had_active_transaction`, `transaction_id`, `heartbeat_seconds_since_last`, `messages_received`, `reason_text`. `record_websocket_rejected` emits `OCPPWebSocketRejected` from the tombstone (`code=1013`) and validation_failed (`code=1008`) reject paths in `routers/ocpp_ws.py` — connect-time rejections that never reach `cp.start()`. Per-category counters (`Custom/OCPP/Disconnects/{category}`, `Custom/OCPP/Rejects/{reason}`) have 13-month retention; the rich events have 8–30 day retention. Shipped as an **investigative campaign** to baseline disconnect frequency and decide whether `OCPP_TIMEOUT=120s` needs tuning — see `.scratch/ws-disconnect-tracking/`.
 - **`storage_service.py`** - **Firmware file storage**
   - **Primary storage**: S3 with presigned GET URLs. Bucket: `AWS_S3_FIRMWARE_BUCKET`. Region: `AWS_REGION` (default `ap-south-1`). Same boto3 client pattern as `s3_service.py` (invoice PDFs).
   - **Presigned URL TTL**: `max(FIRMWARE_MAX_ELAPSED_SECONDS, 24h) + 1h` — sized to outlive the 6h retry window so a URL handed out at attempt 1 is still valid at attempt 5.
@@ -371,6 +376,17 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
     = franchisee_earning − tds_amount`. `transfer_fee` is NOT deducted
     at calc time — it's populated after the fact from the
     `settlement.processed` webhook (Razorpay's actual per-transfer fee).
+  - **`pg_fee_amount` uses synthetic 2% (ADR 0001 amendment, 2026-05-29)**:
+    For QR sessions, `pg_fee` passed into `calculate_settlement` is
+    `synthetic_platform_fee(amount_paid)`, not the actual
+    `razorpay_commission + razorpay_gst` on the QRPayment row. This makes
+    `commission_ledger_entry.net_excl_gst` exactly equal to
+    `gst_invoice.energy_taxable_value` — invoice and ledger now agree
+    on the revenue pool. VoltLync absorbs 100% of the actual-vs-synthetic
+    variance (was 75/25 with franchisee). Drift detection must now read
+    from `qr_payment` (actual) vs `synthetic_platform_fee(amount_paid)`
+    directly; the ledger no longer surfaces it. Wallet sessions unchanged
+    (pg_fee = 0).
   - `initiate_transfer(entry)` enforces a **24-hour cooling period**
     after `franchisee.activated_at` (Razorpay rejects transfers within
     24h of activation). Within the window the entry is parked as
@@ -401,25 +417,34 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
     `RAZORPAY_TRANSFER_FEE_PERCENT` is **removed** — was double-charging
     the franchisee on top of Razorpay's own fee.
 
+- **`routers/admin_settlements.py`** — admin operations across all franchisees' settlements.
+  - `GET /api/admin/settlements/stuck` — paginated list of entries the `StuckPayoutDetector` flags (predicate shared via `build_stuck_filter`).
+  - `POST /api/admin/settlements/{entry_id}/mark-below-threshold` — terminal-resolves a sub-floor `PENDING/FAILED/ON_HOLD` row to `BELOW_THRESHOLD`. Server validates `franchisee_payout < MIN_TRANSFER_AMOUNT` (422 otherwise). Idempotent.
+  - `POST /api/admin/settlements/{entry_id}/mark-settled` — terminal-resolves to `SETTLED` for out-of-band resolutions (e.g. bank-transferred manually). Body: `{ note: str, min_length=3 }`. Sets `settled_at = now()` on first call only — idempotent re-clicks preserve the original timestamp; Razorpay ID fields untouched. Allowed source statuses: `PENDING/TRANSFER_INITIATED/TRANSFER_PROCESSED/FAILED/ON_HOLD`.
+  - Both actions log a distinct `audit_log` `action` (`settlement.mark_below_threshold` / `settlement.manual_settle`). Per **ADR 0007**, there is no `MANUAL_SETTLED` enum value or `manual_resolution_note` column — the audit log is the system of record for who-resolved-what-when-and-why.
+  - Frontend: `/admin/settlements/stuck` and the per-franchisee Settlement Ledger card both render the shared `components/SettlementTerminalActions.tsx` per row (eligibility-aware icon buttons + confirmation dialog with note textarea for the SETTLED action).
+
 ### Frontend Core (`/frontend/`)
 - **`app/page.tsx`** - Role-based dashboard (different for ADMIN vs USER)
 - **`app/admin/`** - Complete admin interface for station/charger/user management
   - **`app/admin/qr-codes/page.tsx`** - **NEW** QR code list with create/close actions, revenue stats
   - **`app/admin/qr-codes/[id]/page.tsx`** - **NEW** QR detail with payment history, refund tracking, QR image
 - **`app/my-charges/page.tsx`** + **`app/my-charges/_components/`** - Public (no auth) page with charger map + transaction history. **Component split (2026-05-21)**: `page.tsx` is the composition shell (~455 lines); the active-session card, transaction card, refund-lifecycle pill, and charger-row are extracted into `_components/`. Top section: Leaflet map showing all stations with real-time availability (color-coded markers), user location, popup details, "Get Directions" to Google Maps. **Station detail modal** renders one row per **plug type** under a "Chargers" heading, each row showing 3-bucket status (Ready / In use / Out of service) and per-plug-type all-in tariff, with one "all prices include GST & fees" footnote. Faulted/Unavailable/Reserved collapse into "Out of service". Bottom section: UPI ID lookup for paginated QR transactions; refund pill renders the **3-state lifecycle from ADR 0005** (Initiated / Sent to bank / Failed) with speed-conditional wording derived from `razorpay_refund_speed_processed`. **Active session card (ADR 0006)**: above the status filter, a live-polled `ActiveSessionCard` stack renders the customer's in-progress QR sessions in one of 4 sub-states (Waiting / Charging / Paused / Stopping) with energy delivered, spent so far, refund-if-stopped-now, power draw, duration (client-side 1s tick via the shared `useNowTick` singleton clock in `lib/hooks/useNowTick.ts` — N cards = 1 timer), and a budget bar. **First-load skeleton + retry-able error banner** for the active-sessions query. **Adaptive polling**: 15s when at least one session is active, 60s when empty, paused entirely when the tab is hidden. Read-only — no remote-stop button (VPA is not a credential). **VPA persistence**: pre-fills from `localStorage["voltlync.myCharges.lastVpa"]` on mount (with one-time migration from the pre-namespacing `voltlync.lastVpa` key) but does NOT auto-search; persists on successful search; cleared on `Change`. **Waiting-state copy** reads `stale_threshold_seconds` from the API to render a specific auto-refund-window message.
-- **`components/StationMap.tsx`** - Shared Leaflet map component (moved from `app/stations/`), used by both `/stations` and `/my-charges` pages
+- **`components/StationMap.tsx`** - Shared Leaflet map component (moved from `app/stations/`), used by both `/stations` and `/my-charges` pages. **Two-phase camera (2026-06-16)**: `MapController` first fits ALL pins instantly (phase 1), then after a ~900ms hold animates `flyToBounds` to the nearest few — user + up to `NEAREST_COUNT=4` stations within `NEAREST_RADIUS_KM=15` (named in-file constants, alongside `ALL_PINS_HOLD_MS`). One-shot per load; cancels on user pan/zoom during the hold; self-disables (stays fit-all) when there's no geolocation, when no station is within radius, or when the nearest set equals all stations. Always respects `maxZoom: 15`.
   - **`app/admin/users/[id]/transactions/page.tsx`** - User charging transaction history
   - **`app/admin/users/[id]/wallet/page.tsx`** - Wallet transaction history with running balance
   - **`app/admin/firmware/page.tsx`** - Firmware management dashboard
     - Upload firmware files with version and description
     - Real-time update status monitoring (10s auto-refresh)
     - Summary cards (pending, downloading, installing, completed, failed)
-    - Firmware library with delete capability
+    - Active Updates table surfaces `error_message` inline under the status (last-attempt failure reason on retrying PENDING rows)
+    - Firmware library (component `components/firmware/FirmwareLibraryTable.tsx`) with delete + an expandable per-row **Release notes** row (surfaces `FirmwareFile.description`; no expand affordance when empty)
+    - **Bulk "Deploy to chargers"** per firmware row (`components/firmware/BulkDeployDialog.tsx`): station-filterable charger picker (`ChargerDeployList`) with select-all-within-filter and same-version auto-exclusion (offline chargers are valid targets) → review step (count + station count) → result view (`BulkDeployResult`: `scheduled · skipped · failed` summary + per-charger reasons). Selection logic is in pure helpers `lib/firmware-deploy.ts`.
   - **`app/admin/chargers/[id]/page.tsx`** - Charger detail with **firmware update, reset, signal quality & error history**
     - Current firmware version display
     - Update firmware button (disabled if offline)
     - Firmware version selection dialog
-    - Recent update history (last 3 updates)
+    - Recent update history (last 3 updates; component `components/firmware/RecentFirmwareUpdates.tsx` surfaces `error_message` inline on FAILED updates)
     - **Reset charger button** with Hard/Soft selection dialog
     - Visual warning for Hard reset during active charging
     - Reset button disabled if charger offline
@@ -551,6 +576,7 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
     - `usePublicStation()` - Single station detail
 - **`csv-export.ts`** - CSV export utility for transaction data
 - **`newrelic-browser.ts`** - New Relic browser agent configuration
+- **Frontend Sentry** — `@sentry/nextjs` 10.x, errors-only setup (no perf, no Replay) added 2026-05-25 to complement NR Browser. Configs: `instrumentation-client.ts` (browser SDK init), `sentry.server.config.ts` (Node SSR / Server Actions), `sentry.edge.config.ts` (middleware.ts runtime), `instrumentation.ts` (per-runtime loader + `onRequestError`), `app/global-error.tsx` (React render-error capture for App Router). `next.config.ts` wraps via `withSentryConfig` for source-map upload — uploads occur at build time when `SENTRY_AUTH_TOKEN` is set, otherwise silently skipped. Runtime guard: each `Sentry.init` is wrapped in `if (dsn)` so missing `NEXT_PUBLIC_SENTRY_DSN` no-ops cleanly in dev. Required env vars (all build-time, baked into client bundle): `NEXT_PUBLIC_SENTRY_DSN`, `NEXT_PUBLIC_SENTRY_ENVIRONMENT`, and the source-map upload trio `SENTRY_ORG` / `SENTRY_PROJECT` / `SENTRY_AUTH_TOKEN`. Two separate Sentry projects exist in the `idofthings` org: `ocpp-backend` (FastAPI, environment tag separates staging vs prod) and `ocpp-frontend` (Next.js, same pattern). NR Browser still captures errors + Web Vitals + distributed traces back to backend NR app; Sentry is the better-triage layer on top.
 - **`contexts/AuthContext.tsx`** - Clerk auth wrapper with `isAuthReady`, `getToken`, global token access
 - **`contexts/QueryClientProvider.tsx`** - TanStack Query setup
 - **`contexts/ThemeContext.tsx`** - Light/dark/system theme management
@@ -559,6 +585,62 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
 - **`backend/requirements.txt`** - Python dependencies (FastAPI, python-ocpp, Tortoise ORM, etc.)
 - **`frontend/package.json`** - Node dependencies (Next.js 15, React 19, Clerk, TanStack Query, etc.)
 - **`backend/pyproject.toml`** - pytest configuration and Aerich migration settings
+
+---
+
+## Database tier (post-2026-05-28 prod RDS cutover)
+
+Both staging and prod are on AWS RDS Postgres in `ap-south-1` as of 2026-05-28. Local dev remains Docker postgres.
+
+- **Local dev**: Docker postgres in `docker-compose.yml`. No SSL. `make local-db-reset` is the canonical fresh-start path.
+- **Staging**: **AWS RDS Postgres at `ocpp-staging-db.c1608qm4i94k.ap-south-1.rds.amazonaws.com`**. Single-AZ `db.t4g.micro` in `ap-south-1c` (EC2 is in `ap-south-1a` — cross-AZ ~1ms per query). 20GB gp3 with auto-scaling to 100GB. 14-day automated backups + 5-min PITR. TLS `verify-full`. The local Docker postgres in `docker-compose.staging.yml` is the rollback target for the 14-day validation window. Cutover via `.scratch/rds-staging-migration/`.
+- **Prod**: **AWS RDS Postgres at `ocpp-prod-db.c1608qm4i94k.ap-south-1.rds.amazonaws.com`**. Single-AZ `db.t4g.small` in `ap-south-1a` (same-AZ as prod EC2 — sub-ms latency). 50GB gp3 with auto-scaling to 200GB. **30-day** automated backups + 5-min PITR. Performance Insights enabled (31-day retention). Deletion-protection on. TLS `verify-full`. Cutover via `.scratch/rds-prod-migration/` on 2026-05-28 09:30Z with **4 min customer-visible downtime** (well under the 10-15 min PRD budget — DB was small post-cleanup at 117 MB custom-format dump). Docker postgres in `docker-compose.prod.yml` remains the rollback target through the **28-day** validation window (longer than staging because prod rollback cost is higher). Decommission triggers + checklist live in `.scratch/rds-prod-migration/PRD.md`.
+
+Both RDS instances started single-AZ for cost (-$35/mo vs Multi-AZ). Upgrade either to Multi-AZ via `aws rds modify-db-instance --db-instance-identifier ocpp-{env}-db --multi-az --apply-immediately` — zero downtime, ~5 min.
+
+### SSL config (`backend/db_ssl.py`)
+
+Single `get_ssl_config()` helper drives all three DB-connect call sites — runtime (`database.py`), Aerich (`tortoise_config.py`), and the entrypoint pre-flight loop (`docker-entrypoint.sh`). Don't add a 4th call site without using this helper. Env-var contract:
+
+- `DB_SSL_MODE=` (empty) → legacy fallback: `disable` for local/Docker hosts, `require` otherwise. Local dev uses this.
+- `DB_SSL_MODE=verify-full` → TLS with CA validation. Required for RDS. **Both staging and prod use this.**
+- `DB_SSL_MODE=verify-ca|require|prefer|allow|disable` → passthrough to asyncpg.
+
+The AWS RDS global CA bundle is baked into the backend image at `/etc/ssl/rds-ca-bundle.pem` during `docker build` — no code or compose change when adding a new RDS instance, only `DB_HOST` + `DB_SSL_MODE` in the env file.
+
+### Connection pool resilience (`backend/db_ssl.py:get_pool_kwargs`)
+
+`get_pool_kwargs(for_migrations=False)` returns asyncpg pool kwargs spread into the `credentials` dict of both `database.py` (runtime) and `tortoise_config.py` (Aerich). It hardens the pool against RDS restarts/failovers so the backend self-heals instead of wedging. Added 2026-06-02 after a staging incident — see **ADR 0010**.
+
+- `command_timeout=30` (app only) — the core fix: a query on a half-open socket raises `TimeoutError` instead of hanging forever (asyncpg has no client-side keepalive knob). Aerich path omits it so long DDL isn't killed.
+- `max_inactive_connection_lifetime=180` — recycle idle connections so post-restart stale ones are dropped.
+- `timeout=10` — bounded connect; `server_settings.statement_timeout=30000` (app; `0`/disabled for migrations); `tcp_keepalives_*` so the server reclaims dead-backend connections in ~90s.
+- All env-overridable (`DB_COMMAND_TIMEOUT`, `DB_POOL_RECYCLE_SECONDS`, `DB_CONNECT_TIMEOUT`, `DB_POOL_MIN_SIZE`, `DB_POOL_MAX_SIZE`, `DB_STATEMENT_TIMEOUT_MS`) with safe defaults — no compose/`.env` wiring required.
+
+**Why it was needed**: the single-AZ `db.t4g.micro` staging instance is memory-starved (1 GiB; chronic low free memory, swap creeping ~150 MB/day) and gets **AWS-`recovery`-restarted ~daily** (not a user/API action — absent from CloudTrail). Each restart left the pool with half-open `ESTAB` sockets; with no `command_timeout`, the first query on one hung forever → loop looked "idle" in `py-spy` (suspended coroutines aren't on any thread stack), DB sat idle, `/health` stayed `200` while DB-backed endpoints `504`'d. Symptom signature + diagnostic recipe live in the auto-memory note `rds-reboot-stale-asyncpg-pool`.
+
+Pool resilience makes the reboots *harmless*; it does **not** reduce their frequency — that needs right-sizing to `t4g.small` (prod is already `t4g.small`) + disabling Performance Insights/Enhanced Monitoring on staging. Supporting changes: `docker-entrypoint.sh` pre-flight `asyncpg.connect` now passes `timeout=DB_CONNECT_TIMEOUT` (the 3rd connect site); `data_retention_service` deletes are batched (`_delete_old_in_batches`, 5000/batch) to stay under `command_timeout`.
+
+### Cutover learnings (feedback memory + applied to prod)
+
+The prod cutover ran in 4 minutes because the staging cutover learnings were already absorbed:
+
+- **The entrypoint pre-flight check has its own DB connection logic.** It hardcoded `ssl='disable'` and was missed in the initial staging issue 02 PR. Caused ~5 min of bonus downtime during the staging cutover. Already fixed before prod cutover. Always grep for ALL `asyncpg.connect` / `psycopg.connect` / `pg_isready` / `psql -h` call sites when changing DB connection config. See [[feedback-check-entrypoint-during-db-config-changes]].
+- **RDS provisioning took ~26 min for prod** vs ~20 min for staging — likely due to Performance Insights enabled (deferred on staging). Plan ≥30 min for provisioning in any maintenance window.
+- **`DROP DATABASE` requires ownership.** RDS master user is `rds_superuser`, not real superuser — can't drop a DB owned by another user. Use `DROP OWNED BY <app_user> CASCADE` as the app user instead.
+- **Custom format (`-F c`) was used for prod**, plain SQL for staging. Both restored cleanly. Custom format is slightly faster and supports selective restore later (e.g., `pg_restore -t single_table`); use it for new cutovers by default.
+- **`pg_dump -j 4` requires `-F d` (directory format), not `-F c`.** Trying `-F c -j 4` errors with "parallel backup only supported by the directory format". For single-file custom format, drop `-j`.
+- **POSIX `/bin/sh` on Amazon Linux 2 doesn't tolerate parens in unquoted `echo` strings.** `echo --- step 2 (begins) ---` syntax-errors. Quote any echo containing parens. Bit us multiple times during prod cutover SSM scripts.
+- **CSP allow-list is env-driven.** `CSP_CLERK_HOSTS` env var is read by nginx entrypoint envsubst — switch Clerk environments without editing nginx conf. See `nginx/prod.conf` + `nginx/staging.conf`. Worker-src + js-agent.newrelic.com are also explicitly allowed.
+
+### Charger state — two orthogonal fields (post-2026-05-27)
+
+The `charger` row carries **two state-shaped columns by design**, captured in **ADR 0008**:
+
+- `latest_status` (`ChargerStatusEnum`): what the charger reports via OCPP `StatusNotification`. Written only by the `StatusNotification` handler in `main.py`. Read by the status pill, OCPP routing, billing logic.
+- `availability` (`ChargerAvailabilityEnum`): what an admin or franchisee has commanded via `ChangeAvailability`. Written by the admin/franchisee endpoints on OCPP `Accepted`/`Scheduled`. Read by the admin UI toggle.
+
+The two are independent — a `Faulted` charger can be admin-set `Operative`; a `Charging` charger that admin clicks `Inoperative` stays `Charging` (per OCPP `Scheduled` semantics) but flips `availability=Inoperative` immediately. The toggle was previously broken because it read `latest_status` as a proxy for both concerns; this stopped working any time a charger Accepted ChangeAvailability without sending a follow-up StatusNotification. See ADR 0008 for the full rationale and considered alternatives.
 
 ---
 
@@ -595,8 +677,8 @@ meter_value (id, transaction_id, reading_kwh, current, voltage, power_kw)
 firmware_file (id, version, filename, file_path, file_size, checksum, description, uploaded_by, is_active)
 firmware_update (id, charger_id, firmware_file_id, status, download_url, started_at, completed_at, error_message)
 
--- Signal Quality Monitoring
-signal_quality (id, charger_id, rssi, ber, timestamp, created_at) -- Cellular signal metrics via DataTransfer
+-- Signal Quality / Modem Telemetry (table name is a historical misnomer — see ADR 0009)
+signal_quality (id, charger_id, rssi, ber, temperature_celsius, timestamp, created_at) -- Modem telemetry via OCPP DataTransfer (vendorId=VoltLync, messageId=SignalQuality). `temperature_celsius` nullable (added migration 43, 2026-06-01) — older firmware that omits the field stores NULL.
 
 -- Charger Error Tracking
 charger_error (id, charger_id, connector_id, status, error_code, vendor_error_code, vendor_id, info, error_timestamp, is_resolved, resolved_at) -- OCPP StatusNotification errors
@@ -668,7 +750,7 @@ log (id, charge_point_id, direction, payload, correlation_id) -- All OCPP messag
    - Complete audit logging for compliance
 8. **DataTransfer** - **Vendor-specific data messages**
    - Handles custom data from charge points (vendor-specific extensions)
-   - **JET_EV1 Signal Quality data**: Validates and stores RSSI (0-31, 99=unknown) and BER (0-7, 99=unknown) in `signal_quality` table
+   - **SignalQuality / Modem telemetry**: Validates and stores RSSI (0-31, 99=unknown), BER (0-7, 99=unknown), and modem-board `temperature` (Celsius, optional) in `signal_quality` table. Non-numeric `temperature` values are dropped to NULL but the rest of the packet is still accepted — rssi/ber are load-bearing. See ADR 0009 for why temperature lives here and not on `meter_value`.
    - **GetLastMeterValue**: Transaction resume support — charger requests last meter reading for a transaction ID, server responds with the last known kWh reading so the charger can resume from the correct point
    - **PostBootState (server→charger)**: After BootNotification, pushes `{hasPendingTransaction, lastMeterValueWh, transactionId}` via `@after` hook. Charger resumes by sending MeterValues or StopTransaction.
 
@@ -801,7 +883,7 @@ GET /chargers/{id}/errors/latest - **NEW** Latest unresolved error for charger
 
 Transactions:
 GET /transactions - List transactions with filtering and analytics summary
-GET /transactions/{id} - Transaction details
+GET /transactions/{id} - Transaction details. Response carries: (1) a derived `live_energy_kwh` field (`latest_meter_value.reading_kwh − transaction.start_meter_kwh`, `null` if `start_meter_kwh` is NULL or no MeterValues exist) — always computed from MeterValues, never switches to reading the stored `transaction.energy_consumed_kwh` after StopTransaction; (2) `funding_source: "WALLET" | "QR" | "NONE"` — QR wins when a `QRPayment` row references the transaction, NONE for internal-role sessions (ADR 0004), WALLET otherwise; (3) `qr_session: {budget_limit, cost_so_far, remaining}` block (₹ Decimal strings) when `funding_source == "QR"`, sourced from the pure `QRPaymentService.compute_budget_snapshot` helper. The same helper drives the auto-stop dispatch in `check_budget_and_auto_stop` post-2026-06-01 — single source of truth for budget math so the admin UI and the cap-enforcement agree by construction.
 GET /transactions/{id}/meter-values - Energy consumption data with chart data
 
 GST Filings (admin window at /admin/gst-filings):
@@ -944,6 +1026,10 @@ GET /api/logs/{charge_point_id} - Logs for specific charger
 ---
 
 ## Current State & Recent Updates
+
+### Refund idempotency + resume-timing fixes (2026-06-09)
+- **QR refund idempotency** (`.scratch/qr-refund-idempotency-fix/`, **live on STAGING; PROD pending**): refund idempotency key moved from per-DB PK `qr_payment_{id}` to globally-unique `refund_{razorpay_payment_id}` (built by `qr_payment_service.build_refund_call_kwargs`), fixing a cross-environment HTTP 409 collision that stranded refunds in `REFUND_FAILED` (staging+prod share one Razorpay live account). Adds `RazorpayIdempotencyConflictError` + `_reconcile_conflict()`, the `idempotency_conflict_no_refund` non-retryable marker, and a substring-robust `is_retryable_refund_failure()` retry filter (also excludes legacy long-form below-minimum reasons). See the QR refund "Error Handling Summary" and `[[project-refund-idempotency-cross-env-collision]]`.
+- **Resume-staleness config fix** (deployed staging+prod): `MAX_RESUME_GAP_SECONDS` raised 900 → **2100** to restore the `> DISCONNECT_SUSPEND_TIMEOUT_SECONDS` (1800) invariant — chargers reconnecting in the 15–30 min window were being force-finalized `STALE_RECONNECT` instead of resuming. See `transaction_finalizer.is_resume_too_stale` above.
 
 ### voltNOW rebrand (2026-05-15)
 - Navbar: `frontend/components/Navbar.tsx` renders the voltNOW logo image instead of the "OCPP Admin/User" text. Two assets are shipped under `frontend/public/`: `voltnow-logo.png` (black, for light theme) and `voltnow-logo-light.png` (grey, for dark theme); swapped at runtime via Tailwind's `dark:` modifier (`block dark:hidden` / `hidden dark:block`). The right-side role chip stays as the source of truth for ADMIN/USER/FRANCHISEE.
@@ -1316,6 +1402,14 @@ pytest -m infrastructure # Database/Redis tests (~5 seconds) - external dependen
 ✅ **Decimal Precision** - Fixed in commit 38816d3 (shows 0.01 kWh accuracy)
 ✅ **Chart Scaling** - Fixed in commit 38816d3 (improved readability)
 ✅ **Ghost Sessions** - Fixed in commits b385b61, 9fe8f2f (improved cleanup)
+
+#### Sentry triage batch (June 2026, `.scratch/sentry-triage-2026-06-11/`)
+A last-24h Sentry sweep produced fixes for the noisiest groups. Operationally non-obvious behaviors introduced:
+- **Sentry release tagging**: backend release is now `SENTRY_RELEASE` → `GIT_COMMIT` → `{env}-{startup-timestamp}` (was the literal `"dev"`). `GIT_COMMIT` is injected at deploy by `make {staging,prod}-rebuild` (`git rev-parse --short HEAD`) and passed through `backend.environment:` in all three compose files. Startup logs a warning if it falls back to the timestamp in a non-dev env.
+- **Sentry 504 suppression**: `failed_request_status_codes` excludes 504. `remote-start` returns **504** (not 500) when the charger doesn't ACK `RemoteStartTransaction` — an expected charger-offline condition, intentionally kept out of error tracking. 504 is currently the app's only intentional source; revisit the exclusion if that changes.
+- **Log-hygiene downgrades** (were error-level Sentry noise): cross-environment QR webhook miss (`No active ChargerQRCode`), `StopTransaction` with unknown/placeholder `transaction_id` (e.g. -1), and Redis charger-removal `ConnectionError`/DNS loss during deploy are now `info`/`warning`.
+- **Stuck-payout alert dedup**: `StuckPayoutDetector` no longer re-alerts an unchanged stuck set every sweep — it dedups per franchisee on the stuck entry-id set with a cooldown (`STUCK_PAYOUT_ALERT_COOLDOWN_HOURS`, default 24h). A changed/new set still alerts within one cycle.
+- **ThemeContext localStorage** access is guarded against Safari `SecurityError` (private mode / ITP).
 
 ### Performance Optimization Opportunities
 1. **N+1 Queries**: Some charger list operations could use bulk Redis operations

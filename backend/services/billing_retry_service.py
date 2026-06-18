@@ -106,12 +106,28 @@ class BillingRetryService:
     
     async def _process_failed_qr_refunds(self):
         """Retry failed QR payment refunds (e.g. insufficient Razorpay balance)"""
+        # Imported here (not at module top) to avoid a circular import with
+        # qr_payment_service, matching the QRPaymentService imports below.
+        from services.qr_payment_service import (
+            QRPaymentService, build_refund_call_kwargs,
+            IDEMPOTENCY_CONFLICT_NO_REFUND, is_retryable_refund_failure,
+        )
+        from services.razorpay_service import RazorpayIdempotencyConflictError
+
         cutoff_time = datetime.now(timezone.utc) - timedelta(hours=self.max_retry_age_hours)
 
-        failed_refunds = await QRPayment.filter(
+        # Drop permanently-stuck rows (below Razorpay's ₹1 floor — canonical or
+        # legacy long-form text — and unreconcilable idempotency conflicts).
+        # Filtered in Python via a substring-robust predicate so legacy/variant
+        # wording is excluded too; skipped rows aren't re-saved, so their
+        # updated_at ages them out of the window within max_retry_age_hours.
+        candidates = await QRPayment.filter(
             status=QRPaymentStatusEnum.REFUND_FAILED,
             updated_at__gte=cutoff_time,
         ).all()
+        failed_refunds = [
+            p for p in candidates if is_retryable_refund_failure(p.failure_reason)
+        ]
 
         if not failed_refunds:
             logger.debug("No failed QR refunds to retry")
@@ -129,11 +145,9 @@ class BillingRetryService:
                     logger.warning(f"QR payment {qr_payment.id} has no refund_amount, skipping")
                     continue
 
-                refund_result = razorpay_service.refund_payment(
+                refund_result = await razorpay_service.refund_payment(
                     qr_payment.razorpay_payment_id,
-                    amount=refund_amount,
-                    notes={"qr_payment_id": str(qr_payment.id), "reason": "Retry: " + (qr_payment.failure_reason or "unknown")},
-                    idempotency_key=f"qr_payment_{qr_payment.id}",
+                    **build_refund_call_kwargs(qr_payment, refund_amount),
                 )
                 qr_payment.razorpay_refund_id = refund_result.get("id")
                 qr_payment.status = QRPaymentStatusEnum.REFUNDED
@@ -141,6 +155,21 @@ class BillingRetryService:
                 await qr_payment.save()
                 success_count += 1
                 logger.info(f"✅ QR refund retry successful: payment {qr_payment.id}, ₹{refund_amount}")
+
+            except RazorpayIdempotencyConflictError:
+                # Reconcile to any existing refund; if none, the row is marked
+                # non-retryable (IDEMPOTENCY_CONFLICT_NO_REFUND) and the next
+                # sweep excludes it instead of hammering the same key.
+                await QRPaymentService._reconcile_conflict(
+                    qr_payment, None, "billing-retry", IDEMPOTENCY_CONFLICT_NO_REFUND,
+                )
+                await qr_payment.save()
+                if qr_payment.status == QRPaymentStatusEnum.REFUNDED:
+                    success_count += 1
+                    logger.info(f"✅ QR refund retry reconciled existing refund: payment {qr_payment.id}")
+                else:
+                    failure_count += 1
+                    logger.warning(f"⚠️ QR refund retry idempotency conflict, no refund found (non-retryable): payment {qr_payment.id}")
 
             except Exception as e:
                 failure_count += 1

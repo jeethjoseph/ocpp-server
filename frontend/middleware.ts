@@ -75,6 +75,13 @@ function handleRoleBasedRouting(req: any, role: string) {
 }
 
 export default clerkMiddleware(async (auth, req) => {
+  // Liveness probe — the Docker healthcheck hits this with no session.
+  // Must short-circuit before isProtectedRoute (which includes /api(.*))
+  // so the container is not flagged unhealthy.
+  if (req.nextUrl.pathname === "/api/health") {
+    return NextResponse.next();
+  }
+
   // Skip processing for public routes
   if (isPublicRoute(req)) {
     return NextResponse.next();

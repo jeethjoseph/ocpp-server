@@ -34,6 +34,17 @@ ARG NEXT_PUBLIC_NEW_RELIC_APPLICATION_ID
 ARG NEXT_PUBLIC_NEW_RELIC_ACCOUNT_ID
 ARG NEXT_PUBLIC_NEW_RELIC_TRUST_KEY
 ARG NEXT_PUBLIC_NEW_RELIC_AGENT_ID
+# Wallet charging gate (ADR 0011) — only "false" disables; unset/empty = enabled.
+ARG NEXT_PUBLIC_WALLET_CHARGING_ENABLED
+# Sentry: NEXT_PUBLIC_SENTRY_DSN is baked into the client bundle. SENTRY_ORG /
+# SENTRY_PROJECT / SENTRY_AUTH_TOKEN are consumed by `withSentryConfig` during
+# the build for source-map upload only — they never need to be ENV-promoted
+# and AUTH_TOKEN must not be persisted into any image layer.
+ARG NEXT_PUBLIC_SENTRY_DSN
+ARG NEXT_PUBLIC_SENTRY_ENVIRONMENT
+ARG SENTRY_ORG
+ARG SENTRY_PROJECT
+ARG SENTRY_AUTH_TOKEN
 
 ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 ENV NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=$NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY
@@ -43,9 +54,17 @@ ENV NEXT_PUBLIC_NEW_RELIC_APPLICATION_ID=$NEXT_PUBLIC_NEW_RELIC_APPLICATION_ID
 ENV NEXT_PUBLIC_NEW_RELIC_ACCOUNT_ID=$NEXT_PUBLIC_NEW_RELIC_ACCOUNT_ID
 ENV NEXT_PUBLIC_NEW_RELIC_TRUST_KEY=$NEXT_PUBLIC_NEW_RELIC_TRUST_KEY
 ENV NEXT_PUBLIC_NEW_RELIC_AGENT_ID=$NEXT_PUBLIC_NEW_RELIC_AGENT_ID
+ENV NEXT_PUBLIC_WALLET_CHARGING_ENABLED=$NEXT_PUBLIC_WALLET_CHARGING_ENABLED
+ENV NEXT_PUBLIC_SENTRY_DSN=$NEXT_PUBLIC_SENTRY_DSN
+ENV NEXT_PUBLIC_SENTRY_ENVIRONMENT=$NEXT_PUBLIC_SENTRY_ENVIRONMENT
 
-# Build the application
-RUN npm run build
+# Build the application. SENTRY_* vars injected inline so AUTH_TOKEN
+# (secret) is not retained in any later image layer; ORG/PROJECT inlined
+# alongside for consistency.
+RUN SENTRY_AUTH_TOKEN=$SENTRY_AUTH_TOKEN \
+    SENTRY_ORG=$SENTRY_ORG \
+    SENTRY_PROJECT=$SENTRY_PROJECT \
+    npm run build
 
 # ============================================
 # Stage 3: Development
@@ -90,9 +109,11 @@ RUN chown -R nextjs:nodejs /app
 
 USER nextjs
 
-# Health check
+# Health check — hits a public liveness route (see app/api/health/route.ts).
+# Earlier versions probed `/` which is Clerk-protected and returns 404 for
+# unauthenticated probes, marking healthy containers as unhealthy.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:3000/ || exit 1
+    CMD wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1
 
 EXPOSE 3000
 

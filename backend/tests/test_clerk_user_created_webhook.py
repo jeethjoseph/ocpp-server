@@ -67,6 +67,32 @@ async def test_internal_role_skips_wallet_creation(client, role_str, role_enum):
 
 
 @pytest.mark.asyncio
+async def test_bad_signature_is_warning_not_error(client, caplog):
+    """A signature mismatch (cross-environment Clerk delivery — staging/prod
+    share one Clerk app) must ack 200, not raise, and NOT log at ERROR so it
+    stops creating Sentry events. Regression for OCPP-BACKEND-P / -N."""
+    import json
+    body = json.dumps({"type": "user.created", "data": {"id": "user_xenv"}})
+
+    with caplog.at_level("WARNING", logger="webhooks"):
+        resp = await client.post(
+            "/webhooks/clerk",
+            content=body,
+            headers={
+                "svix-id": "msg_crossenv",
+                "svix-timestamp": "1700000000",
+                "svix-signature": "v1,deadbeefnotarealsignature=",
+                "content-type": "application/json",
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "verification_failed"
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert not errors, "cross-environment signature failure must not log at ERROR"
+
+
+@pytest.mark.asyncio
 async def test_missing_role_defaults_to_user_and_gets_wallet(client):
     """Webhook payloads without `public_metadata.role` default to USER →
     wallet is created. Guards against an accidental skip caused by the

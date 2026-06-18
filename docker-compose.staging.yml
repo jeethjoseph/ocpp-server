@@ -1,3 +1,12 @@
+# Cap each container's log file growth. 5 × 50 MB = 250 MB max per container
+# before the oldest file rotates out. `docker logs` still reads across the
+# rotated files transparently. Referenced from every service below.
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
 services:
   # PostgreSQL Database
   postgres:
@@ -17,6 +26,7 @@ services:
     networks:
       - ocpp-network-staging
     restart: unless-stopped
+    logging: *default-logging
     deploy:
       resources:
         limits:
@@ -41,6 +51,7 @@ services:
     networks:
       - ocpp-network-staging
     restart: unless-stopped
+    logging: *default-logging
     deploy:
       resources:
         limits:
@@ -60,11 +71,16 @@ services:
       - CLERK_JWKS_URL=${CLERK_JWKS_URL:-}
       - CLERK_ISSUER=${CLERK_ISSUER:-}
       # Database & Redis
-      - DB_HOST=postgres
-      - DB_PORT=5432
+      # DB_HOST defaults to 'postgres' (Docker network name) for pre-RDS-migration.
+      # At cutover, .env.staging overrides this with the RDS endpoint hostname
+      # and DB_SSL_MODE flips to verify-full. See backend/db_ssl.py for the
+      # SSL contract; the CA bundle is baked into the backend image at build time.
+      - DB_HOST=${DB_HOST:-postgres}
+      - DB_PORT=${DB_PORT:-5432}
       - DB_USER=${DB_USER}
       - DB_PASSWORD=${DB_PASSWORD}
       - DB_NAME=${DB_NAME}
+      - DB_SSL_MODE=${DB_SSL_MODE:-}
       - REDIS_URL=redis://redis:6379
       # Server
       - HOST=0.0.0.0
@@ -110,28 +126,42 @@ services:
       # Razorpay instant refund kill-switch (ADR 0002). Default true.
       # Flip to false to revert to normal speed in an incident.
       - RAZORPAY_INSTANT_REFUND_ENABLED=${RAZORPAY_INSTANT_REFUND_ENABLED:-true}
+      # Wallet charging gate (ADR 0011). Default true. Set false to block new
+      # wallet sessions & top-ups until pooled multi-franchisee settlement exists.
+      - WALLET_CHARGING_ENABLED=${WALLET_CHARGING_ENABLED:-true}
       # OCPP & Server Tuning
       - DISCONNECT_SUSPEND_TIMEOUT_SECONDS=${DISCONNECT_SUSPEND_TIMEOUT_SECONDS:-180}
       - SUSPEND_TIMEOUT_SECONDS=${SUSPEND_TIMEOUT_SECONDS:-300}
+      - SOCKET_GRACE_PERIOD_SECONDS=${SOCKET_GRACE_PERIOD_SECONDS:-300}
       - ZERO_ENERGY_TIMEOUT_SECONDS=${ZERO_ENERGY_TIMEOUT_SECONDS:-7200}
       - ZERO_ENERGY_GRACE_PERIOD_SECONDS=${ZERO_ENERGY_GRACE_PERIOD_SECONDS:-60}
       - OCPP_TIMEOUT=${OCPP_TIMEOUT:-120}
+      - MAX_DISCONNECT_RESETS_WITHOUT_PROGRESS=${MAX_DISCONNECT_RESETS_WITHOUT_PROGRESS:-3}
+      - MAX_RESUME_GAP_SECONDS=${MAX_RESUME_GAP_SECONDS:-900}
       - RETENTION_DAYS=${RETENTION_DAYS:-90}
       - CLEANUP_INTERVAL_HOURS=${CLEANUP_INTERVAL_HOURS:-24}
-      # New Relic (optional for staging)
-      - NEW_RELIC_MONITOR_MODE=${NEW_RELIC_MONITOR_MODE:-false}
+      # New Relic
+      - NEW_RELIC_MONITOR_MODE=${NEW_RELIC_MONITOR_MODE:-true}
       - NEW_RELIC_LICENSE_KEY=${NEW_RELIC_LICENSE_KEY:-}
       - NEW_RELIC_APP_NAME=${NEW_RELIC_APP_NAME:-OCPP-Backend-Staging}
       - NEW_RELIC_DISTRIBUTED_TRACING_ENABLED=true
+      - NEW_RELIC_APPLICATION_LOGGING_FORWARDING_ENABLED=true
       # Sentry
-      - SENTRY_ENABLED=${SENTRY_ENABLED:-false}
+      - SENTRY_ENABLED=${SENTRY_ENABLED:-true}
       - SENTRY_DSN=${SENTRY_DSN:-}
       - SENTRY_ENVIRONMENT=staging
+      - SENTRY_TRACES_SAMPLE_RATE=${SENTRY_TRACES_SAMPLE_RATE:-0.1}
+      - SENTRY_PROFILES_SAMPLE_RATE=${SENTRY_PROFILES_SAMPLE_RATE:-0.1}
+      # Release tag for Sentry (deploy SHA). Injected by `make staging-rebuild`.
+      - GIT_COMMIT=${GIT_COMMIT:-}
+      - SENTRY_RELEASE=${SENTRY_RELEASE:-}
     volumes:
       - backend_firmware_staging:/app/firmware_files
+    # NOTE: `postgres` removed from depends_on as part of the RDS migration.
+    # Backend now connects to either Docker postgres or RDS based on DB_HOST
+    # in .env.staging; the local Docker postgres service is retained as a
+    # rollback target during the 14-day validation window post-cutover.
     depends_on:
-      postgres:
-        condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
@@ -143,6 +173,7 @@ services:
     networks:
       - ocpp-network-staging
     restart: unless-stopped
+    logging: *default-logging
     deploy:
       resources:
         limits:
@@ -165,13 +196,22 @@ services:
         - NEXT_PUBLIC_NEW_RELIC_BROWSER_LICENSE_KEY=${NEXT_PUBLIC_NEW_RELIC_BROWSER_LICENSE_KEY:-}
         - NEXT_PUBLIC_NEW_RELIC_APPLICATION_ID=${NEXT_PUBLIC_NEW_RELIC_APPLICATION_ID:-}
         - NEXT_PUBLIC_NEW_RELIC_ACCOUNT_ID=${NEXT_PUBLIC_NEW_RELIC_ACCOUNT_ID:-}
+        - NEXT_PUBLIC_NEW_RELIC_TRUST_KEY=${NEXT_PUBLIC_NEW_RELIC_TRUST_KEY:-}
+        - NEXT_PUBLIC_NEW_RELIC_AGENT_ID=${NEXT_PUBLIC_NEW_RELIC_AGENT_ID:-}
+        # Wallet charging gate (ADR 0011). Default true; set false to hide wallet UI.
+        - NEXT_PUBLIC_WALLET_CHARGING_ENABLED=${NEXT_PUBLIC_WALLET_CHARGING_ENABLED:-true}
+        - NEXT_PUBLIC_SENTRY_DSN=${NEXT_PUBLIC_SENTRY_DSN:-}
+        - NEXT_PUBLIC_SENTRY_ENVIRONMENT=staging
+        - SENTRY_ORG=${SENTRY_ORG:-}
+        - SENTRY_PROJECT=${SENTRY_PROJECT:-}
+        - SENTRY_AUTH_TOKEN=${SENTRY_AUTH_TOKEN:-}
     container_name: ocpp-frontend-staging
     environment:
       - CLERK_SECRET_KEY=${CLERK_SECRET_KEY}
     depends_on:
       - backend
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/api/health"]
       interval: 30s
       timeout: 10s
       start_period: 30s
@@ -179,6 +219,7 @@ services:
     networks:
       - ocpp-network-staging
     restart: unless-stopped
+    logging: *default-logging
     deploy:
       resources:
         limits:
@@ -197,6 +238,7 @@ services:
     environment:
       - ENVIRONMENT=staging
       - DOMAIN_NAME=${DOMAIN_NAME}
+      - CSP_CLERK_HOSTS=${CSP_CLERK_HOSTS:-https://*.clerk.accounts.dev}
     ports:
       - "80:80"
       - "443:443"
@@ -215,6 +257,7 @@ services:
     networks:
       - ocpp-network-staging
     restart: unless-stopped
+    logging: *default-logging
 
   # Certbot for SSL certificate management
   certbot:
@@ -227,6 +270,7 @@ services:
     networks:
       - ocpp-network-staging
     restart: unless-stopped
+    logging: *default-logging
 
 volumes:
   postgres_data_staging:

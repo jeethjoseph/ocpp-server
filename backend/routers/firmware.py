@@ -1,4 +1,5 @@
 # routers/firmware.py
+import asyncio
 from typing import List, Optional
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends, Request
 from pydantic import BaseModel
@@ -16,6 +17,7 @@ from models import (
 )
 from auth_middleware import require_admin, require_user_or_admin
 from services import storage_service
+from services.firmware_update_service import FIRMWARE_MAX_ATTEMPTS
 from crud import log_audit_event
 
 logger = logging.getLogger(__name__)
@@ -77,6 +79,7 @@ class FirmwareHistoryResponse(BaseModel):
 
 class BulkUpdateResult(BaseModel):
     success: List[dict]
+    skipped: List[dict]
     failed: List[dict]
 
 class UpdateStatusSummary(BaseModel):
@@ -156,7 +159,7 @@ async def upload_firmware(
         # download location until the device-side parser is patched.
         if os.getenv("AWS_S3_FIRMWARE_BUCKET"):
             s3_key = storage_service.build_firmware_s3_key(version, safe_filename)
-            storage_service.upload_firmware_to_s3(s3_key, file_content)
+            await asyncio.to_thread(storage_service.upload_firmware_to_s3, s3_key, file_content)
             file_path = ""
             storage_backend = "s3"
         else:
@@ -410,6 +413,50 @@ async def update_charger_firmware(
     return FirmwareUpdateResponse.from_orm(firmware_update)
 
 
+async def _bulk_classify_charger(charger, firmware_file, download_url, user):
+    """Classify one charger for a bulk deploy and (re)schedule if eligible.
+
+    Returns (bucket, entry) where bucket is "success" | "skipped". Idempotent
+    and safe to re-run: chargers already on the target version, and in-flight
+    rows (PENDING with attempt_count > 0), are skipped untouched. Only
+    re-deployable rows (PENDING attempt 0 / INSTALLED / FAILED / CANCELLED) are
+    reset to a fresh PENDING. See [[in-flight-firmware-update]] in CONTEXT.md.
+    """
+    base = {"charger_id": charger.id, "charger_name": charger.name}
+    if charger.firmware_version == firmware_file.version:
+        return "skipped", {**base, "reason": f"already on {firmware_file.version}"}
+
+    existing = await FirmwareUpdate.get_or_none(charger_id=charger.id, firmware_file_id=firmware_file.id)
+    if existing and existing.status == FirmwareUpdateStatusEnum.PENDING and existing.attempt_count > 0:
+        return "skipped", {
+            **base,
+            "update_id": existing.id,
+            "reason": f"in-flight, attempt {existing.attempt_count}/{FIRMWARE_MAX_ATTEMPTS}",
+        }
+
+    if existing:
+        existing.status = FirmwareUpdateStatusEnum.PENDING
+        existing.initiated_by_id = user.id
+        existing.download_url = download_url
+        existing.started_at = None
+        existing.completed_at = None
+        existing.error_message = None
+        existing.attempt_count = 0
+        existing.last_attempt_at = None
+        existing.next_retry_at = None
+        await existing.save()
+    else:
+        existing = await FirmwareUpdate.create(
+            charger_id=charger.id,
+            firmware_file_id=firmware_file.id,
+            status=FirmwareUpdateStatusEnum.PENDING,
+            initiated_by_id=user.id,
+            download_url=download_url,
+            attempt_count=0,
+        )
+    return "success", {**base, "update_id": existing.id}
+
+
 @router.post("/bulk-update", response_model=BulkUpdateResult)
 async def bulk_update_firmware(
     bulk_request: BulkFirmwareUpdateRequest,
@@ -419,68 +466,36 @@ async def bulk_update_firmware(
     """
     Schedule firmware updates for multiple chargers (Admin only)
 
-    Creates or updates firmware_update records with PENDING status for all chargers.
-    Background service will automatically trigger updates when each charger is ready.
+    Idempotent bulk deploy. Each charger lands in exactly one bucket:
+    - **success**: a fresh PENDING row was created or a re-deployable row reset.
+    - **skipped**: already on the target version, or an in-flight update
+      (PENDING, attempt_count > 0) left completely untouched.
+    - **failed**: charger not found.
 
-    Can be scheduled even when chargers are offline - updates will trigger when ready.
-    Returns list of successfully scheduled and failed chargers.
+    Chargers can be offline — the background service triggers when each is ready.
+    Re-running the same deploy disturbs nothing already handled or in-flight.
     """
-    # Get firmware file
     firmware_file = await FirmwareFile.get_or_none(id=bulk_request.firmware_file_id, is_active=True)
     if not firmware_file:
         raise HTTPException(status_code=404, detail="Firmware file not found or inactive")
 
-    success_list = []
-    failed_list = []
+    # One presigned URL for the whole batch — same firmware_file for every charger.
+    base_url = str(request.base_url).rstrip('/')
+    download_url = storage_service.get_firmware_download_url_for_file(firmware_file, base_url)
 
+    buckets = {"success": [], "skipped": [], "failed": []}
     for charger_id in bulk_request.charger_ids:
         charger = await Charger.get_or_none(id=charger_id)
         if not charger:
-            failed_list.append({
-                "charger_id": charger_id,
-                "reason": "Charger not found"
-            })
+            buckets["failed"].append({"charger_id": charger_id, "reason": "Charger not found"})
             continue
+        bucket, entry = await _bulk_classify_charger(charger, firmware_file, download_url, user)
+        buckets[bucket].append(entry)
 
-        # No validation checks - background service will validate when triggering
-        # This allows scheduling updates for offline chargers
-
-        base_url = str(request.base_url).rstrip('/')
-        download_url = storage_service.get_firmware_download_url_for_file(firmware_file, base_url)
-
-        firmware_update = await FirmwareUpdate.get_or_none(
-            charger_id=charger.id,
-            firmware_file_id=firmware_file.id
-        )
-
-        if firmware_update:
-            firmware_update.status = FirmwareUpdateStatusEnum.PENDING
-            firmware_update.initiated_by_id = user.id
-            firmware_update.download_url = download_url
-            firmware_update.started_at = None
-            firmware_update.completed_at = None
-            firmware_update.error_message = None
-            firmware_update.attempt_count = 0
-            firmware_update.last_attempt_at = None
-            firmware_update.next_retry_at = None
-            await firmware_update.save()
-        else:
-            firmware_update = await FirmwareUpdate.create(
-                charger_id=charger.id,
-                firmware_file_id=firmware_file.id,
-                status=FirmwareUpdateStatusEnum.PENDING,
-                initiated_by_id=user.id,
-                download_url=download_url,
-                attempt_count=0,
-            )
-
-        success_list.append({
-            "charger_id": charger_id,
-            "charger_name": charger.name,
-            "update_id": firmware_update.id
-        })
-
-    logger.info(f"📦 Bulk update completed: {len(success_list)} succeeded, {len(failed_list)} failed")
+    logger.info(
+        f"📦 Bulk deploy {firmware_file.version}: {len(buckets['success'])} scheduled, "
+        f"{len(buckets['skipped'])} skipped, {len(buckets['failed'])} failed"
+    )
 
     await log_audit_event(
         action="firmware.bulk_update_initiated",
@@ -488,13 +503,15 @@ async def bulk_update_firmware(
         entity_id=firmware_file.id,
         actor_type="admin",
         actor=user,
-        changes={"firmware_version": firmware_file.version, "charger_count": len(success_list), "failed_count": len(failed_list)},
+        changes={
+            "firmware_version": firmware_file.version,
+            "scheduled_count": len(buckets["success"]),
+            "skipped_count": len(buckets["skipped"]),
+            "failed_count": len(buckets["failed"]),
+        },
     )
 
-    return BulkUpdateResult(
-        success=success_list,
-        failed=failed_list
-    )
+    return BulkUpdateResult(**buckets)
 
 
 @router.get("/chargers/{charger_id}/history", response_model=FirmwareHistoryResponse)
@@ -563,7 +580,11 @@ async def get_update_status_dashboard(
             "last_attempt_at": update.last_attempt_at.isoformat() if update.last_attempt_at else None,
             "next_retry_at": update.next_retry_at.isoformat() if update.next_retry_at else None,
             "started_at": update.started_at.isoformat() if update.started_at else None,
-            "initiated_at": update.initiated_at.isoformat()
+            "initiated_at": update.initiated_at.isoformat(),
+            # Last-attempt failure reason for retrying PENDING rows (attempt_count > 0).
+            # Surfaced inline in the admin Active Updates table so a stalled/failing
+            # rollout shows *why* without an API/log dive.
+            "error_message": update.error_message,
         })
 
     today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)

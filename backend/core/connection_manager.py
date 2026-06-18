@@ -9,6 +9,7 @@ import datetime
 import json
 import logging
 import os
+import weakref
 from datetime import timedelta
 from typing import Dict, Optional
 
@@ -26,6 +27,27 @@ logger = logging.getLogger("ocpp-server")
 OCPP_TIMEOUT = int(os.environ.get("OCPP_TIMEOUT", "120"))
 
 
+# Prefix-match order matters — list more-specific prefixes first.
+_DISCONNECT_CATEGORY_PREFIXES = (
+    ("Natural WebSocket disconnect", "client_close"),
+    ("New connection attempt", "stale_replaced"),
+    ("OCPP activity timeout", "heartbeat_timeout"),
+    ("Dead connection detected", "heartbeat_timeout"),
+    ("Heartbeat monitor error", "server_error"),
+    ("Server error in cp.start", "server_error"),
+)
+
+
+def _disconnect_category_for(reason: str) -> str:
+    """Map the free-text reason passed to force_disconnect onto a canonical
+    category. Unmapped strings fall through to ops_initiated.
+    """
+    for prefix, category in _DISCONNECT_CATEGORY_PREFIXES:
+        if reason.startswith(prefix):
+            return category
+    return "ops_initiated"
+
+
 class ConnectionManager:
     """
     Singleton that owns all charge point connection state.
@@ -37,7 +59,11 @@ class ConnectionManager:
 
     def __init__(self):
         self.connected_charge_points: Dict[str, Dict] = {}
-        self._cleanup_locks: Dict[str, asyncio.Lock] = {}
+        # WeakValueDictionary so locks auto-clear when no caller holds them.
+        # A strong local reference inside force_disconnect pins the Lock for
+        # the duration of `async with`; concurrent callers for the same
+        # charge_point_id see the live Lock and serialise correctly.
+        self._cleanup_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = weakref.WeakValueDictionary()
         self._recently_disconnected: Dict[str, datetime.datetime] = {}
         self._cleanup_task: Optional[asyncio.Task] = None
         self._on_disconnect_callbacks: list = []
@@ -73,12 +99,28 @@ class ConnectionManager:
 
     # --- core lifecycle ---
 
-    async def force_disconnect(self, charge_point_id: str, reason: str):
-        """Force complete disconnection of a charge point with proper cleanup."""
-        if charge_point_id not in self._cleanup_locks:
-            self._cleanup_locks[charge_point_id] = asyncio.Lock()
+    async def force_disconnect(
+        self,
+        charge_point_id: str,
+        reason: str,
+        ws_close_code: Optional[int] = None,
+        ws_close_reason: str = "",
+    ):
+        """Force complete disconnection of a charge point with proper cleanup.
 
-        async with self._cleanup_locks[charge_point_id]:
+        ws_close_code/ws_close_reason are populated when the caller observed a
+        WebSocketDisconnect (natural client close); on server-initiated paths
+        they remain None/"" and the close code emitted on the WS itself is 1001.
+        """
+        # Strong local reference pins the Lock in the WeakValueDictionary
+        # for the duration of `async with` — concurrent callers for this
+        # charge_point_id will see and serialise on the same Lock.
+        lock = self._cleanup_locks.get(charge_point_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._cleanup_locks[charge_point_id] = lock
+
+        async with lock:
             logger.info(f"[DISCONNECT] Starting force disconnect for {charge_point_id}: {reason}")
 
             connection_data = self.connected_charge_points.get(charge_point_id)
@@ -121,8 +163,8 @@ class ConnectionManager:
             for cp_id in expired:
                 del self._recently_disconnected[cp_id]
 
-            # 6. Clean up the lock for this connection to prevent memory leak
-            self._cleanup_locks.pop(charge_point_id, None)
+            # The Lock auto-clears from _cleanup_locks (WeakValueDictionary)
+            # once this `async with` exits and no other caller still holds it.
 
             logger.warning(f"[DISCONNECT] Force disconnected {charge_point_id}: {reason}")
 
@@ -139,6 +181,24 @@ class ConnectionManager:
             ))
 
             await OCPPMetrics.record_active_connections(len(self.connected_charge_points))
+
+            if connection_data is not None:
+                now = datetime.datetime.now(datetime.timezone.utc)
+                connected_at = connection_data.get("connected_at") or now
+                last_seen = connection_data.get("last_seen") or connected_at
+                active_txn_id = connection_data.get("active_transaction_id")
+                await OCPPMetrics.record_websocket_disconnect(
+                    charger_id=charge_point_id,
+                    disconnect_category=_disconnect_category_for(reason),
+                    duration_seconds=(now - connected_at).total_seconds(),
+                    reason_text=reason,
+                    ws_close_code=ws_close_code,
+                    ws_close_reason=ws_close_reason or "",
+                    had_active_transaction=active_txn_id is not None,
+                    transaction_id=active_txn_id,
+                    heartbeat_seconds_since_last=(now - last_seen).total_seconds(),
+                    messages_received=connection_data.get("messages_received", 0),
+                )
 
     async def cleanup_dead_connection(self, charge_point_id: str):
         """Legacy cleanup function - redirects to force_disconnect."""
@@ -214,10 +274,8 @@ class ConnectionManager:
                     logger.warning(f"Cleaning up stale connection: {charge_point_id}")
                     await self.force_disconnect(charge_point_id, f"Stale connection (inactive for {inactive_seconds:.1f}s)")
 
-                # Prune cleanup locks for charge points no longer connected
-                stale_locks = [cp_id for cp_id in self._cleanup_locks if cp_id not in self.connected_charge_points]
-                for cp_id in stale_locks:
-                    del self._cleanup_locks[cp_id]
+                # _cleanup_locks is a WeakValueDictionary — locks auto-clear
+                # when no caller holds a strong reference. No manual prune.
 
                 # Prune expired tombstones
                 expired_tombstones = [cp_id for cp_id, exp in self._recently_disconnected.items() if current_time > exp]
@@ -504,6 +562,9 @@ class LoggingWebSocketAdapter(FastAPIWebSocketAdapter):
                 status="received",
                 correlation_id=correlation_id
             ))
+            conn = connection_manager.connected_charge_points.get(self.charge_point_id)
+            if conn is not None:
+                conn["messages_received"] = conn.get("messages_received", 0) + 1
             logger.debug(f"[OCPP][IN] {msg}")
             return msg
 
