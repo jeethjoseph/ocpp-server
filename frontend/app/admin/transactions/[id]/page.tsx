@@ -132,6 +132,29 @@ export default function AdminTransactionDetailPage() {
                       {transactionData?.settlement_status ?? "—"}
                     </p>
                   </div>
+                  {(transactionData?.refund_amount != null ||
+                    transactionData?.refund_speed != null) && (
+                    <>
+                      <div>
+                        <p className="text-sm font-medium">Refund Amount</p>
+                        <p className="text-sm">
+                          {transactionData?.refund_amount != null
+                            ? `₹${Number(transactionData.refund_amount).toFixed(2)}`
+                            : "—"}
+                        </p>
+                      </div>
+                      <div>
+                        <p className="text-sm font-medium">Refund Speed</p>
+                        <p className="text-sm">
+                          {transactionData?.refund_speed === "instant"
+                            ? "Instant"
+                            : transactionData?.refund_speed === "normal"
+                            ? "Normal"
+                            : "—"}
+                        </p>
+                      </div>
+                    </>
+                  )}
                 </div>
               </CardContent>
             </Card>

@@ -50,6 +50,11 @@ class TransactionResponse(BaseModel):
     # wallet/internal (CHARGE_DEDUCT carries no status — not derived to fill it).
     funding_source: str = "WALLET"
     payment_status: Optional[str] = None
+    # Refund drill-down (QR sessions only). refund_speed is Razorpay's processed
+    # speed: "instant" / "normal" / None. A refund requested instant but showing
+    # "normal" is the float-too-low downgrade (see CONTEXT.md Razorpay float).
+    refund_speed: Optional[str] = None
+    refund_amount: Optional[float] = None
 
     class Config:
         from_attributes = True
@@ -117,6 +122,9 @@ class TransactionDetailResponse(BaseModel):
     # only, intentionally NOT a list filter axis (payout triage lives elsewhere).
     payment_status: Optional[str] = None
     settlement_status: Optional[str] = None
+    # Refund drill-down (QR sessions only). See TransactionResponse.refund_speed.
+    refund_speed: Optional[str] = None
+    refund_amount: Optional[float] = None
 
 class MeterValuesListResponse(BaseModel):
     meter_values: List[MeterValueResponse]
@@ -163,17 +171,22 @@ async def _enrich_funding_payment(transactions) -> Dict[int, tuple]:
         return {}
     txn_ids = [t.id for t in transactions]
     user_ids = {t.user_id for t in transactions}
-    qr_rows = await QRPayment.filter(transaction_id__in=txn_ids).values("transaction_id", "status")
-    qr_status = {r["transaction_id"]: r["status"] for r in qr_rows}
+    qr_rows = await QRPayment.filter(transaction_id__in=txn_ids).values(
+        "transaction_id", "status", "razorpay_refund_speed_processed", "refund_amount"
+    )
+    qr_by_txn = {r["transaction_id"]: r for r in qr_rows}
     internal_ids = set(await User.filter(id__in=user_ids, role__in=INTERNAL_ROLES).values_list("id", flat=True))
     out = {}
     for t in transactions:
-        if t.id in qr_status:
-            out[t.id] = ("QR", qr_status[t.id])
+        if t.id in qr_by_txn:
+            r = qr_by_txn[t.id]
+            amt = r["refund_amount"]
+            out[t.id] = ("QR", r["status"], r["razorpay_refund_speed_processed"],
+                         float(amt) if amt is not None else None)
         elif t.user_id in internal_ids:
-            out[t.id] = ("NONE", None)
+            out[t.id] = ("NONE", None, None, None)
         else:
-            out[t.id] = ("WALLET", None)
+            out[t.id] = ("WALLET", None, None, None)
     return out
 
 
@@ -237,7 +250,8 @@ async def list_transactions(
     transaction_responses = []
     for t in transactions:
         resp = TransactionResponse.model_validate(t, from_attributes=True)
-        resp.funding_source, resp.payment_status = enrichment.get(t.id, ("WALLET", None))
+        resp.funding_source, resp.payment_status, resp.refund_speed, resp.refund_amount = enrichment.get(
+            t.id, ("WALLET", None, None, None))
         transaction_responses.append(resp)
 
     return TransactionListResponse(
@@ -276,9 +290,14 @@ async def get_transaction_details(transaction_id: int):
     # is the verbatim QR native value (None for wallet/internal). Settlement
     # status is the franchisee-payout state, shown here only — never a filter.
     payment_status = None
+    refund_speed = None
+    refund_amount = None
     if funding_source == "QR":
         qrp = await QRPayment.filter(transaction_id=transaction_id).first()
-        payment_status = qrp.status if qrp else None
+        if qrp:
+            payment_status = qrp.status
+            refund_speed = qrp.razorpay_refund_speed_processed
+            refund_amount = float(qrp.refund_amount) if qrp.refund_amount is not None else None
     settlement = await CommissionLedgerEntry.filter(transaction_id=transaction_id).first()
     settlement_status = settlement.settlement_status if settlement else None
 
@@ -293,6 +312,8 @@ async def get_transaction_details(transaction_id: int):
         qr_session=qr_session,
         payment_status=payment_status,
         settlement_status=settlement_status,
+        refund_speed=refund_speed,
+        refund_amount=refund_amount,
     )
 
 

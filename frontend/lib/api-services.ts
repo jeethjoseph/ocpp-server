@@ -178,6 +178,10 @@ export interface TransactionListItem {
   transaction_status: string;
   funding_source: string;
   payment_status: string | null;
+  // Razorpay processed refund speed ("instant" | "normal" | null) + amount;
+  // QR sessions only, null when no refund.
+  refund_speed?: string | null;
+  refund_amount?: number | null;
   created_at: string;
 }
 

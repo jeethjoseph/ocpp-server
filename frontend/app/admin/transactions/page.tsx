@@ -369,6 +369,18 @@ function TransactionsConsole() {
                       ) : (
                         <span className="text-gray-400">—</span>
                       )}
+                      {(tx.refund_speed != null || tx.refund_amount != null) && (
+                        <div className="mt-1 text-xs text-gray-400">
+                          {tx.refund_speed === "instant"
+                            ? "Instant"
+                            : tx.refund_speed === "normal"
+                            ? "Normal"
+                            : "—"}
+                          {tx.refund_amount != null
+                            ? ` · ₹${Number(tx.refund_amount).toFixed(2)}`
+                            : ""}
+                        </div>
+                      )}
                     </TableCell>
                     <TableCell>
                       {tx.energy_consumed_kwh != null ? (
