@@ -12,6 +12,32 @@ export const transactionKeys = {
   meterValues: (id: number) => [...transactionKeys.detail(id), "meter-values"] as const,
 };
 
+// Admin Transactions List Query Hook (Admin-only)
+export interface AdminTransactionsParams {
+  page?: number;
+  limit?: number;
+  status?: string;
+  user_id?: number;
+  charger_id?: number;
+  start_date?: string;
+  end_date?: string;
+  sort?: string;
+  funding_source?: string[];
+  payment_status?: string;
+}
+
+export function useAdminTransactions(params: AdminTransactionsParams) {
+  const { isAuthReady } = useAuth();
+
+  return useQuery({
+    queryKey: transactionKeys.list(params as Record<string, unknown>),
+    queryFn: () => transactionService.getAll(params),
+    enabled: isAuthReady,
+    staleTime: 1000 * 5, // 5 seconds
+    refetchInterval: 1000 * 10, // Auto-refresh every 10 seconds — sessions are live
+  });
+}
+
 // Transaction Detail Query Hook (User-accessible)
 export function useTransaction(transactionId: number) {
   const { isAuthReady } = useAuth();

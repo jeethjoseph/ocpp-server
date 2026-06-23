@@ -9,30 +9,12 @@ import { Button } from '@/components/ui/button';
 import { useUserRole } from './RoleWrapper';
 import { Menu, X } from 'lucide-react';
 
+// Customer/public navigation only. Operator sections (admin/franchisee) use
+// the sidebar shell (per-section layouts), not this top navbar.
 const userNavigation = [
   { name: 'Scanner', href: '/scanner' },
   { name: 'Stations', href: '/stations' },
   { name: 'My Sessions', href: '/my-sessions' },
-];
-
-const adminNavigation = [
-  { name: 'Admin Dashboard', href: '/admin' },
-  { name: 'Stations', href: '/admin/stations' },
-  { name: 'Chargers', href: '/admin/chargers' },
-  { name: 'QR Codes', href: '/admin/qr-codes' },
-  { name: 'Franchisees', href: '/admin/franchisees' },
-  { name: 'GST Filings', href: '/admin/gst-filings' },
-  { name: 'Firmware', href: '/admin/firmware' },
-  { name: 'Users', href: '/admin/users' },
-];
-
-const franchiseeNavigation = [
-  { name: 'Dashboard', href: '/franchisee' },
-  { name: 'Stations', href: '/franchisee/stations' },
-  { name: 'Transactions', href: '/franchisee/transactions' },
-  { name: 'Settlements', href: '/franchisee/settlements' },
-  { name: 'QR Codes', href: '/franchisee/qr-codes' },
-  { name: 'Profile', href: '/franchisee/profile' },
 ];
 
 export default function Navbar() {
@@ -56,12 +38,8 @@ export default function Navbar() {
 
   const currentIcon = themeIcons[theme];
 
-  // Determine which navigation to show
-  const navigation = isAdmin
-    ? adminNavigation
-    : isFranchisee
-      ? franchiseeNavigation
-      : userNavigation;
+  // Operator sections use the sidebar; the top navbar only serves customer/public links.
+  const navigation = userNavigation;
 
   return (
     <nav className="bg-card shadow border-b border-border transition-colors duration-300">

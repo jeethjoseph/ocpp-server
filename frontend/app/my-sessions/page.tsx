@@ -95,7 +95,7 @@ export default function MySessionsPage() {
   };
 
   const formatCurrency = (amount: number) => {
-    return `₹${amount.toFixed(2)}`;
+    return `₹${Number(amount).toFixed(2)}`;
   };
 
   const getStatusColor = (status: string) => {
@@ -246,7 +246,7 @@ export default function MySessionsPage() {
                           {transaction.energy_consumed_kwh && (
                             <div className="flex items-center space-x-1">
                               <Battery className="h-3 w-3" />
-                              <span>{transaction.energy_consumed_kwh.toFixed(2)} kWh consumed</span>
+                              <span>{Number(transaction.energy_consumed_kwh).toFixed(2)} kWh consumed</span>
                             </div>
                           )}
                           <div className="flex items-center space-x-1">

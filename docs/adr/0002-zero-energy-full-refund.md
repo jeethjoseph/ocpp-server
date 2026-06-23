@@ -14,16 +14,26 @@ Partial unused-credit refunds in `process_qr_session_billing` stay on Razorpay's
 
 Kill-switch: `RAZORPAY_INSTANT_REFUND_ENABLED` (default `true`). Flip to `false` and redeploy to revert all full refunds to normal speed without a code change — useful if Razorpay raises fees or instant rails get flaky.
 
-## Instant-refund fallback diagnostics (2026-06-18 amendment)
+## Instant-refund fallback diagnostics — float hypothesis disproven (2026-06-22 amendment)
 
-Production showed `optimum` refunds silently downgrading to `normal` (e.g. QR payments #367/#368, two ₹500 full refunds, both `speed_requested=optimum` / `speed_processed=normal`). Razorpay does not expose a downgrade reason on the refund object, so to diagnose it the `QRRefundSpeed` New Relic event (itself the 2026-05-20 amendment) is enriched with two fields captured **before** the refund POST, on `speed=optimum` refunds only:
+Production showed `optimum` refunds silently downgrading to `normal` (e.g. QR payments #367/#368, two ₹500 full refunds). The **2026-06-18 amendment** added a best-effort funding-pool snapshot (`balance_before` / `refund_credits_before`, the Razorpay Account float and Refund Credits wallet) to the `QRRefundSpeed` event to test the working hypothesis that a thin settlement float was forcing the downgrade.
 
-- `balance_before` — the Razorpay primary **Account balance (Razorpay float)** in rupees.
-- `refund_credits_before` — the **Refund Credits** wallet balance in rupees.
+**The data refuted that hypothesis.** Across the captured snapshots, downgrades happened at the *highest* balances (₹1034–₹1231) while instant *succeeded* at the *lowest* (₹416–₹447); `refund_credits` was `0` in every case, including the instant successes. Balance is not the lever. The discriminator is the **customer's destination bank/VPA and its IMPS instant-refund support at that moment** — Razorpay's `optimum` is contractually "instant if the rail supports it, else fall back to normal", and the fallback is per-transaction. This was confirmed against Razorpay's own API: all sampled downgrades show `speed_requested=optimum` / `speed_processed=normal`, and the server logs show Razorpay returning `instant` synchronously then downgrading via the `refund.processed` webhook seconds-to-minutes later. Switching payment gateways would not help — every Indian gateway routes instant refunds over the same IMPS/UPI rails to the same banks, and the ~30–50% instant success rate proves the feature is enabled and working when the bank cooperates.
 
-Working diagnosis: instant refunds are funded from the account float (or Refund Credits, if enabled). The account settles to bank frequently (near-daily), draining the float toward zero between sweeps, so a ₹300–₹500 refund often finds the float below the refund amount and Razorpay falls back to `normal`. Smaller refunds (≤₹100) clear because they fit the residual float. Refund Credits — a prepaid wallet that would decouple refunds from the settlement schedule — is **not enabled** on the account (`refund_credits=0`), so it currently provides no cushion. The fix is operational (enable + fund Refund Credits, or hold a settlement buffer), not a code change; this logging is to confirm the float hypothesis per-refund over time.
+**Consequences for the code (2026-06-22):**
+- The funding-pool snapshot (`RazorpayService.fetch_balance`, `_fetch_funding_pools`, `balance_before`/`refund_credits_before`) is **removed** — it answered its question.
+- The creation-time `QRRefundSpeed` event and the `Custom/QR/RefundInstant{Succeeded,Fallback}` counters are **retired**. They were emitted at refund creation and captured Razorpay's *optimistic* synchronous `speed_processed` (≈always `instant`), so they under-counted the async downgrades.
+- The instant-fulfilment ratio is now tracked from the authoritative terminal event: `OCPPMetrics.record_refund_final_speed`, called in `handle_refund_event` on `refund.processed`, emits the **`QRRefundFinalSpeed`** New Relic event with `speed_requested` + the final `speed_processed`. Track over time with:
+  ```
+  SELECT percentage(count(*), WHERE speed_processed = 'instant')
+  FROM QRRefundFinalSpeed WHERE speed_requested = 'optimum'
+  FACET appName TIMESERIES 1 day SINCE 30 days ago
+  ```
+- The remaining levers are product, not engineering: stop promising "instant" in customer copy (show "usually instant, up to 5–7 days depending on your bank"), and reconsider requesting `optimum` for sub-threshold refunds where the instant fee exceeds the benefit (ties into ADR 0013).
 
-The balance fetch (`RazorpayService.fetch_balance`) is strictly best-effort: a 5s timeout, all errors swallowed to `None`, and the `QRRefundSpeed` event still fires with `balance_before=null` — the diagnostic must never degrade the refund itself. Note: `/v1/balance` returns a stale `updated_at`/null `last_fetched_at`, but the `balance`/`refund_credits` *values* are real-time (verified 2026-06-18 — the value moved ₹1,185 → ₹423 across a 25-min window); log the numbers, ignore those timestamp fields.
+## Threshold widened to a half-unit (2026-06-20 — see ADR 0013)
+
+The `energy ≤ 0` full-refund path is now reached by the broader `energy < 0.5 kWh` cliff (ADR 0013, **De-minimis Session**). **The "no taxable supply occurred" rationale below applies ONLY to the `energy ≤ 0` band and does not extend to the new `0 < energy < 0.5` band** — that band waives a *real* tiny supply as goodwill. Do not copy the non-supply reasoning onto de-minimis sessions; the audit/refund reason string is band-accurate for exactly this reason. The single `< 0.5` check subsumes the `≤ 0` check this ADR introduced.
 
 ## Considered alternatives
 

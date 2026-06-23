@@ -152,6 +152,8 @@ export interface Transaction {
   end_time?: string;
   stop_reason?: string;
   transaction_status: string;
+  funding_source?: FundingSource;
+  payment_status?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -187,6 +189,8 @@ export interface TransactionDetail {
   }>;
   live_energy_kwh?: number | null;
   funding_source?: FundingSource;
+  payment_status?: string | null;
+  settlement_status?: string | null;
   qr_session?: QRSessionBudget | null;
 }
 

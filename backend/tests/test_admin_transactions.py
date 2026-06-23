@@ -265,3 +265,94 @@ async def test_compute_budget_snapshot_does_not_stamp_meter_or_dispatch(
     assert snapshot is not None
     set_mock.assert_not_called()
     safe_task.assert_not_called()
+
+
+# ============================================================================
+# Transactions Console — list enrichment + filters (slice 2.2) and detail
+# drill-down fields (slice 2.3). CONTEXT.md "Transactions Console".
+# ============================================================================
+
+def _row_by_id(payload, txn_id):
+    return next((r for r in payload["data"] if r["id"] == txn_id), None)
+
+
+async def test_list_enriches_qr_session_funding_and_native_payment_status(
+    client_admin, test_charger, test_user
+):
+    """A QR session reports funding_source=QR and the verbatim native
+    QRPaymentStatusEnum value as payment_status."""
+    txn = await _make_transaction(test_charger, test_user, start_meter_kwh=Decimal("0"))
+    await _make_qr_payment(test_charger, test_user, txn)  # status CHARGING
+
+    resp = await client_admin.get(f"/api/admin/transactions?user_id={test_user.id}")
+    assert resp.status_code == 200, resp.text
+    row = _row_by_id(resp.json(), txn.id)
+    assert row["funding_source"] == "QR"
+    assert row["payment_status"] == "CHARGING"
+
+
+async def test_list_wallet_session_has_blank_payment_status(
+    client_admin, test_charger, test_user
+):
+    """A wallet session shows funding_source=WALLET and a null payment_status
+    — wallet CHARGE_DEDUCT carries no native status, and we do NOT derive one."""
+    txn = await _make_transaction(test_charger, test_user, start_meter_kwh=Decimal("0"))
+
+    resp = await client_admin.get(f"/api/admin/transactions?user_id={test_user.id}")
+    assert resp.status_code == 200, resp.text
+    row = _row_by_id(resp.json(), txn.id)
+    assert row["funding_source"] == "WALLET"
+    assert row["payment_status"] is None
+
+
+async def test_list_filter_by_funding_source_qr_only(
+    client_admin, test_charger, test_user
+):
+    """funding_source=QR returns only QR sessions; the wallet session is excluded."""
+    qr_txn = await _make_transaction(test_charger, test_user, start_meter_kwh=Decimal("0"))
+    await _make_qr_payment(test_charger, test_user, qr_txn)
+    wallet_txn = await _make_transaction(test_charger, test_user, start_meter_kwh=Decimal("0"))
+
+    resp = await client_admin.get(
+        f"/api/admin/transactions?user_id={test_user.id}&funding_source=QR"
+    )
+    assert resp.status_code == 200, resp.text
+    ids = {r["id"] for r in resp.json()["data"]}
+    assert qr_txn.id in ids
+    assert wallet_txn.id not in ids
+
+
+async def test_list_filter_by_payment_status(
+    client_admin, test_charger, test_user
+):
+    """payment_status=REFUND_FAILED returns only the matching QR session."""
+    stuck = await _make_transaction(test_charger, test_user, start_meter_kwh=Decimal("0"))
+    stuck_qr = await _make_qr_payment(test_charger, test_user, stuck)
+    stuck_qr.status = QRPaymentStatusEnum.REFUND_FAILED
+    await stuck_qr.save()
+    ok = await _make_transaction(test_charger, test_user, start_meter_kwh=Decimal("0"))
+    await _make_qr_payment(test_charger, test_user, ok)  # CHARGING
+
+    resp = await client_admin.get(
+        f"/api/admin/transactions?user_id={test_user.id}&payment_status=REFUND_FAILED"
+    )
+    assert resp.status_code == 200, resp.text
+    ids = {r["id"] for r in resp.json()["data"]}
+    assert ids == {stuck.id}
+
+
+async def test_detail_exposes_payment_and_settlement_status(
+    client_admin, test_charger, test_user
+):
+    """Detail drill-down surfaces verbatim payment_status (QR) and a
+    settlement_status key (None when no CommissionLedgerEntry exists)."""
+    txn = await _make_transaction(test_charger, test_user, start_meter_kwh=Decimal("0"))
+    qrp = await _make_qr_payment(test_charger, test_user, txn)
+    qrp.status = QRPaymentStatusEnum.REFUNDED
+    await qrp.save()
+
+    resp = await client_admin.get(f"/api/admin/transactions/{txn.id}")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["payment_status"] == "REFUNDED"
+    assert body["settlement_status"] is None

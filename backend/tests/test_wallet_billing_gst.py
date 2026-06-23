@@ -207,6 +207,61 @@ class TestProcessTransactionBillingAtomicity:
         assert refreshed.gst_amount is None
         assert refreshed.total_billed is None
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("energy", [0.3, 0.499])
+    async def test_de_minimis_energy_skips_debit_no_breakdown(
+        self, client, test_charger, test_user, test_tariff, test_wallet, energy
+    ):
+        """ADR 0013: a sub-0.5 kWh wallet session is waived — no debit, no
+        breakdown, symmetric with the QR full-refund waiver."""
+        txn = await Transaction.create(
+            charger=test_charger,
+            user=test_user,
+            transaction_status=TransactionStatusEnum.STOPPED,
+            start_meter_kwh=10.0,
+            end_meter_kwh=10.0 + energy,
+            energy_consumed_kwh=energy,
+        )
+
+        success, message, amount = await WalletService.process_transaction_billing(txn.id)
+
+        assert success is True
+        assert amount == Decimal("0.00")
+        refreshed = await Transaction.get(id=txn.id)
+        assert refreshed.energy_charge is None
+        assert refreshed.total_billed is None
+        # No debit row, balance untouched.
+        wallet = await Wallet.get(user_id=test_user.id)
+        assert await WalletTransaction.filter(
+            wallet_id=wallet.id, type=TransactionTypeEnum.CHARGE_DEDUCT
+        ).count() == 0
+        assert await WalletService.get_balance(wallet.id) == Decimal("500.00")
+
+    @pytest.mark.asyncio
+    async def test_billing_at_cliff_debits_total(
+        self, client, test_charger, test_user, test_tariff, test_wallet
+    ):
+        """Cliff boundary (strict <): a session at exactly 0.5 kWh is billable
+        and debits its TOTAL energy — the half-unit is not carved off the top."""
+        txn = await Transaction.create(
+            charger=test_charger,
+            user=test_user,
+            transaction_status=TransactionStatusEnum.STOPPED,
+            start_meter_kwh=0.0,
+            end_meter_kwh=0.5,
+            energy_consumed_kwh=0.5,
+        )
+
+        success, message, amount = await WalletService.process_transaction_billing(txn.id)
+
+        assert success is True
+        # 0.5 kWh × ₹15 = ₹7.50 + 18% GST ₹1.35 = ₹8.85 (full energy, no free slab)
+        assert amount == Decimal("8.85")
+        refreshed = await Transaction.get(id=txn.id)
+        assert refreshed.energy_charge == Decimal("7.50")
+        wallet = await Wallet.get(user_id=test_user.id)
+        assert await WalletService.get_balance(wallet.id) == Decimal("500.00") - Decimal("8.85")
+
 
 # ============================================================================
 # Internal-role skip (ADR 0004) — admin/franchisee sessions skip billing

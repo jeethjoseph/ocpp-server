@@ -215,7 +215,7 @@ export default function UserWalletPage() {
                 </p>
                 <div className="flex items-center gap-4 mt-2">
                   <div className="text-lg font-semibold text-green-600">
-                    Current Balance: ₹{user.wallet_balance?.toFixed(2) || '0.00'}
+                    Current Balance: ₹{Number(user.wallet_balance ?? 0).toFixed(2)}
                   </div>
                   <Badge variant="outline">
                     {user.total_wallet_transactions} total transactions
@@ -260,7 +260,7 @@ export default function UserWalletPage() {
             <Card className="p-4">
               <h3 className="font-semibold text-blue-600">Current Balance</h3>
               <p className="text-2xl font-bold">
-                ₹{user.wallet_balance?.toFixed(2) || '0.00'}
+                ₹{Number(user.wallet_balance ?? 0).toFixed(2)}
               </p>
               <p className="text-sm text-gray-600">Available funds</p>
             </Card>

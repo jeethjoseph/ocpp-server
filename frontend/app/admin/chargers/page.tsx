@@ -353,7 +353,7 @@ export default function AdminChargersPage() {
                           {charger.tariff_per_kwh_all_in != null ? (
                             <div className="flex flex-col">
                               <span className="text-card-foreground font-medium">
-                                ₹{charger.tariff_per_kwh_all_in.toFixed(2)}/kWh
+                                ₹{Number(charger.tariff_per_kwh_all_in).toFixed(2)}/kWh
                               </span>
                               <span className="text-xs text-muted-foreground">(all-inclusive)</span>
                             </div>
@@ -786,7 +786,7 @@ function EditChargerModal({ charger, onSubmit, onClose }: EditChargerModalProps)
     external_charger_id: charger.external_charger_id || "",
     tariff_per_kwh_all_in:
       charger.tariff_per_kwh_all_in != null
-        ? charger.tariff_per_kwh_all_in.toFixed(2)
+        ? Number(charger.tariff_per_kwh_all_in).toFixed(2)
         : "",
   });
 

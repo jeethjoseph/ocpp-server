@@ -11,7 +11,6 @@ import { AdminOnly } from "@/components/RoleWrapper";
 import Link from "next/link";
 import { toast } from "sonner";
 import { isSocketCharger as checkSocketCharger } from "@/lib/utils";
-import ChargerLogs from "@/components/ChargerLogs";
 import ChargerAuditLog from "@/components/ChargerAuditLog";
 import MeterValuesChart from "@/components/MeterValuesChart";
 import ModemTemperatureCard from "@/components/ModemTemperatureCard";
@@ -382,7 +381,7 @@ export default function ChargerDetailPage() {
                 {charger.tariff_per_kwh_all_in != null ? (
                   <Badge variant="outline" className="flex flex-col items-end gap-0.5 py-1 h-auto">
                     <span className="font-medium">
-                      ₹{charger.tariff_per_kwh_all_in.toFixed(2)}/kWh
+                      ₹{Number(charger.tariff_per_kwh_all_in).toFixed(2)}/kWh
                     </span>
                     <span className="text-[10px] text-muted-foreground">(all-inclusive)</span>
                   </Badge>
@@ -850,7 +849,7 @@ export default function ChargerDetailPage() {
                     <div>
                       <p className="text-sm font-medium">Energy Reading</p>
                       <p className="text-xl font-bold">
-                        {mv.reading_kwh.toFixed(5)} kWh
+                        {Number(mv.reading_kwh).toFixed(5)} kWh
                       </p>
                     </div>
                     {mv.power_kw && (
@@ -902,7 +901,7 @@ export default function ChargerDetailPage() {
                           <td className="p-2">
                             {new Date(mv.created_at).toLocaleTimeString()}
                           </td>
-                          <td className="p-2">{mv.reading_kwh.toFixed(2)}</td>
+                          <td className="p-2">{Number(mv.reading_kwh).toFixed(2)}</td>
                           <td className="p-2">
                             {mv.power_kw?.toFixed(2) || "-"}
                           </td>
@@ -1013,12 +1012,22 @@ export default function ChargerDetailPage() {
           </Card>
         )}
 
-        {/* OCPP Logs Section */}
+        {/* OCPP Logs — now lives in the fleet-wide Logs Console (deep-linked) */}
         {charger && (
-          <ChargerLogs
-            chargePointId={charger.charge_point_string_id}
-            chargerName={charger.name}
-          />
+          <div className="flex items-center justify-between rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-4">
+            <div className="flex items-center gap-2">
+              <Activity className="w-5 h-5 text-muted-foreground" />
+              <span className="text-sm text-gray-700 dark:text-gray-300">
+                OCPP message logs for this charger
+              </span>
+            </div>
+            <Link
+              href={`/admin/logs?charger=${encodeURIComponent(charger.charge_point_string_id)}`}
+              className="inline-flex items-center gap-1 text-sm font-medium text-blue-600 hover:text-blue-800 dark:text-blue-400"
+            >
+              View OCPP logs →
+            </Link>
+          </div>
         )}
 
         {/* Audit Log Section */}

@@ -388,7 +388,7 @@ Chargers using Quectel cellular modems (BG95/BG96, EC25, EG21/25 family) cannot 
 - Routes `qr_code.credited` events to `QRPaymentService.handle_qr_payment()` for appless charging
 - **Refund lifecycle (`handle_refund_event`)** handles three Razorpay events: `refund.processed` stamps `refund_processed_at` and captures `speed_processed` onto the row; `refund.failed` records the bank/error reason into `refund_failure_reason`; **`refund.speed_changed` (added 2026-05-21)** updates `razorpay_refund_speed_processed` when Razorpay silently downgrades instant→normal (or upgrades), so the customer-facing `/my-charges` ETA stays honest per ADR 0005. Razorpay does NOT emit any event confirming the refund has actually credited the customer's source bank account — `refund.processed` is the terminal Razorpay-side signal and for normal-speed refunds the 5–10 working-day issuing-bank settlement is outside Razorpay's visibility.
 - **Cross-environment handling**: All handlers gracefully skip "not found" transactions (return 200, log warning) since production and staging share the same Razorpay live keys and both receive all webhook events. Only real errors (DB, API) return 500 for Razorpay retry.
-- **Refund funding-pool diagnostics (2026-06-18, ADR 0002 amendment)**: `optimum` (instant) refunds silently downgrade to `normal` when Razorpay can't fund the instant payout. Razorpay exposes no downgrade reason on the refund object, so on every `speed=optimum` full refund the **`QRRefundSpeed`** New Relic event carries `balance_before` and `refund_credits_before` (rupees) — the **Account balance (Razorpay float)** and **Refund Credits** wallet snapshotted *before* the refund POST. Captured by best-effort `RazorpayService.fetch_balance()` (5s timeout, errors → `None`; wrapped by `_fetch_funding_pools` so it can never break the refund — the event still fires with `balance_before=null`). The float is drained toward zero by near-daily settlement sweeps, so large refunds (₹300–₹500) often find it below the refund amount and downgrade, while ≤₹100 refunds clear; Refund Credits (a prepaid wallet that would decouple refunds from the settlement schedule) is **not enabled** on the account. The remedy is operational (enable + fund Refund Credits, or hold a settlement buffer), not code. The `/v1/balance` `updated_at`/`last_fetched_at` fields are unmaintained, but the `balance`/`refund_credits` values are real-time. See `docs/adr/0002` and CONTEXT.md *Settlements and payouts*.
+- **Refund instant-fulfilment ratio metric (2026-06-22, ADR 0002 amendment)**: `optimum` (instant) refunds silently downgrade to `normal` per-transaction. The ratio is tracked from the authoritative terminal event — `handle_refund_event` on `refund.processed` calls `OCPPMetrics.record_refund_final_speed`, emitting the **`QRRefundFinalSpeed`** New Relic event with `charger_id`, `qr_payment_id`, `speed_requested`, and the final `speed_processed`. Chart with `SELECT percentage(count(*), WHERE speed_processed = 'instant') FROM QRRefundFinalSpeed WHERE speed_requested = 'optimum' FACET appName TIMESERIES 1 day`. This **replaced** the 2026-06-18 funding-pool diagnostics (the `QRRefundSpeed` event enriched with `balance_before`/`refund_credits_before` via `RazorpayService.fetch_balance` / `_fetch_funding_pools`), which were **removed** after the data disproved the thin-float hypothesis: downgrades occurred at the *highest* float (₹1034–₹1231) while instant *succeeded* at the lowest (₹416–₹447), with `refund_credits=0` throughout. The real cause is the customer's destination-bank IMPS instant-refund support, not the settlement float — confirmed via Razorpay's refund API (`speed_requested=optimum`/`speed_processed=normal`) and the synchronous-instant-then-async-downgrade pattern in the logs. A gateway switch would not help (same IMPS/UPI rails; ~30–50% instant success proves the feature works when the bank cooperates). The remaining levers are product, not code (customer-facing ETA copy; skip `optimum` on sub-threshold refunds). See `docs/adr/0002` and CONTEXT.md *Settlements and payouts*.
 
 ### Business Logic Services (`backend/services/`)
 
@@ -540,6 +540,12 @@ That indicator is a deliberate future enhancement; not built yet.
 - Idempotency preserved: `razorpay_refund_id` guard prevents duplicate refunds on webhook retries.
 - See `docs/adr/0002-zero-energy-full-refund.md` for the policy rationale and rejected alternatives.
 
+**De-minimis energy waiver (effective 2026-06-20, ADR 0013)**:
+- The zero-energy full-refund path is widened from `≤ 0` to a **Minimum billable energy** cliff: a session delivering `0 < energy_consumed_kwh < 0.5 kWh` is **Non-billable**. The single constant `MIN_BILLABLE_ENERGY_KWH = Decimal("0.5")` lives in `services/wallet_service.py` and is imported by `qr_payment_service.py` — one source of truth.
+- **Symmetric across funding**: QR sessions (`process_qr_session_billing`) route to `_full_refund` (full `amount_paid`, instant speed); wallet sessions (`process_transaction_billing`) skip the debit. Neither issues a `GSTInvoice` or a `CommissionLedgerEntry` (Settlement Entry). The single `< MIN_BILLABLE_ENERGY_KWH` check subsumes the old `≤ 0` (and negative meter-rollback) case.
+- **Cliff, not allowance**: a session at or above 0.5 kWh bills its TOTAL energy from the first Wh (strict `<`). The half-unit is never carved off the top — this avoids per-session revenue bleed and stop/restart gaming.
+- **Justification differs from zero-energy and must not be conflated**: zero-energy = *no taxable supply*; de-minimis = a *real tiny supply waived as goodwill* (collecting ≤ ~₹12 costs more in invoice/settlement/partial-refund friction than the revenue). The QR refund/audit reason string is band-accurate (`"Zero energy delivered"` only for `≤ 0`, else a de-minimis reason naming the kWh). The franchisee absorbs the trivial delivered kWh (no settlement). See `docs/adr/0013-de-minimis-energy-waiver.md` and CONTEXT.md "Non-billable Session".
+
 **Razorpay instant refunds for full-refund flows (effective 2026-05-20, ADR 0002 amendment)**:
 - All six `_full_refund` call sites — zero-energy at StopTransaction, stale payment, concurrent rejection on busy charger, charger not connected at start, RemoteStart failure, plug-in timeout — request Razorpay's `speed=optimum` mode. Customers see refunds in minutes instead of the default 5–7 working days.
 - VoltLync absorbs Razorpay's per-refund instant fee (~₹5–₹6 + 18% GST per UPI refund) **in addition to** the original gateway fee. Same philosophy as the gateway-fee absorption: the customer experiencing a failure should not feel the cost of the failure.
@@ -547,11 +553,7 @@ That indicator is a deliberate future enhancement; not built yet.
 - `speed=optimum` is best-effort. Razorpay falls back to `normal` server-side when rails or payment method don't support instant. The actual outcome is exposed in `speed_processed`, which `RazorpayService.refund_payment` logs on every refund.
 - **Kill-switch env var**: `RAZORPAY_INSTANT_REFUND_ENABLED` (default `true`). Wired into `docker-compose.yml`, `docker-compose.staging.yml`, `docker-compose.prod.yml`, and the three `.env.*.example` files. Logged at startup in `backend/main.py`. Set to `false` and redeploy to revert all full refunds to normal speed without a code change.
 - **Outcome persisted on the QRPayment row**: column `razorpay_refund_speed_processed` (VARCHAR(20), nullable; migration 40) holds Razorpay's reported `speed_processed` value (`"instant"` or `"normal"`) for every full-refund call — including the `RazorpayAlreadyRefundedError` reconciliation path when the existing-refund dict carries the field. NULL on partial refunds and on all pre-feature rows. The admin QR detail page (`/admin/qr-codes/[id]`) renders an `Instant` (green) or `Normal (5-7 days)` (gray) badge next to the refund amount when the column is non-null; customer-facing `/my-charges` is unchanged.
-- **Monitoring counters** (emitted from `OCPPMetrics.record_refund_speed`, gated on `speed=optimum` actually being requested):
-  - `Custom/QR/RefundInstantSucceeded` — `speed_processed == "instant"`.
-  - `Custom/QR/RefundInstantFallback` — `speed_processed` came back as anything other than `"instant"` (typically `"normal"`).
-  - Neither counter fires when `RAZORPAY_INSTANT_REFUND_ENABLED=false` (a normal-speed refund under the kill-switch is intentional, not a Razorpay-side fallback). A sudden spike in `RefundInstantFallback` is the operational alert for rail outages, account-level rate limits, or payment-method shifts.
-  - A `QRRefundSpeed` New Relic event is also emitted with `charger_id`, `qr_payment_id`, and `speed_processed` for ad-hoc querying.
+- **Monitoring (2026-06-22)**: the instant-fulfilment ratio is emitted from the **webhook**, not refund creation, because Razorpay returns `speed_processed=instant` optimistically at creation and downgrades to `normal` asynchronously. `handle_refund_event` on `refund.processed` calls `OCPPMetrics.record_refund_final_speed`, emitting the **`QRRefundFinalSpeed`** event with `charger_id`, `qr_payment_id`, `speed_requested`, and the final `speed_processed`. The instant ratio is `percentage(count(*), WHERE speed_processed = 'instant')` over `WHERE speed_requested = 'optimum'`, faceted by `appName`. The earlier creation-time `Custom/QR/RefundInstant{Succeeded,Fallback}` counters and `QRRefundSpeed` event were retired — they measured the optimistic synchronous value and under-counted downgrades.
 
 **Error Handling**:
 - **Idempotency**: Checks `razorpay_payment_id` uniqueness before processing
@@ -724,8 +726,8 @@ await start_data_retention_service(
 ```
 
 **Cleanup Targets**:
-1. **Signal Quality Data**: Deletes `signal_quality` records older than retention period
-2. **OCPP Logs**: Deletes `log` (OCPPLog) records older than retention period
+1. **Signal Quality Data**: Deletes `signal_quality` records older than retention period (keyed on `created_at`)
+2. **OCPP Logs**: Deletes `log` (OCPPLog) records older than retention period, keyed on the indexed `timestamp` column so the batched delete rides the same index the Logs Console uses (see ADR 0014)
 
 **Monitoring**:
 - Logs cleanup operations with record counts
@@ -2979,6 +2981,31 @@ export const AuthenticatedOnly = ({ children }) => {
 **Error Format**: Standardized HTTP status codes with detailed JSON responses  
 
 ### Admin Management APIs
+
+#### Logs Console (`backend/routers/logs.py`)
+
+The **Logs Console** (`/admin/logs`) is the fleet-wide, filterable view over OCPP
+message logs — a triage view over the `log` table, parallel to the Transactions
+Console. It replaced the per-charger embedded log viewer; the charger detail page
+now deep-links here (`/admin/logs?charger=<id>`). The old `GET /api/admin/logs/charger/{id}`
+and `/summary` endpoints were retired.
+
+```http
+GET /api/admin/logs
+Authorization: Bearer {jwt_token}
+Query Parameters:
+  - charge_point_id: string (optional)        # single charger, server-side filter
+  - message_type: string (repeatable)         # OCPP action(s), server-side `IN (...)`
+  - start_date / end_date: ISO 8601 w/ tz     # always-bounded; defaults to last 24h
+  - limit: int = 100 (max 100,000)
+Response: { data: LogResponse[], total, limit, has_more, message? }   # newest first
+```
+
+**Query-safety guard (ADR 0014)**: the date window is never unbounded (defaults to
+the last 24h), and three indexes on `log` back the access paths — `(timestamp)` for
+the default/date-only window, `(charge_point_id, timestamp)` and `(message_type, timestamp)`
+for the filtered cases. Direction (IN/OUT) and status (errors-only) are refined client-side
+over the fetched window. Filter state is URL-shareable.
 
 #### Station Management (`backend/routers/stations.py`)
 

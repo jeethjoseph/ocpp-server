@@ -5,8 +5,9 @@ from pydantic import BaseModel
 from datetime import datetime, timezone
 import logging
 
-from models import Transaction, MeterValue, User, Charger, WalletTransaction, QRPayment
+from models import Transaction, MeterValue, User, Charger, WalletTransaction, QRPayment, CommissionLedgerEntry
 from tortoise.exceptions import IntegrityError
+from tortoise.expressions import Q
 from auth_middleware import require_admin
 from core.roles import INTERNAL_ROLES
 from crud import log_audit_event
@@ -42,6 +43,12 @@ class TransactionResponse(BaseModel):
     resume_count: int = 0
     created_at: datetime
     updated_at: datetime
+    # Transactions Console enrichment (CONTEXT.md "Transactions Console").
+    # funding_source: "QR" / "WALLET" / "NONE" (internal-role). payment_status:
+    # the verbatim native QRPaymentStatusEnum value for QR sessions; None for
+    # wallet/internal (CHARGE_DEDUCT carries no status — not derived to fill it).
+    funding_source: str = "WALLET"
+    payment_status: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -103,6 +110,12 @@ class TransactionDetailResponse(BaseModel):
     funding_source: str = "WALLET"
     # Present only when funding_source == "QR".
     qr_session: Optional[QRSessionBudget] = None
+    # Read-only Transactions Console drill-down fields. payment_status: verbatim
+    # QRPaymentStatusEnum for QR sessions, else None. settlement_status: the
+    # franchisee-payout SettlementStatusEnum (CommissionLedgerEntry) — detail
+    # only, intentionally NOT a list filter axis (payout triage lives elsewhere).
+    payment_status: Optional[str] = None
+    settlement_status: Optional[str] = None
 
 class MeterValuesListResponse(BaseModel):
     meter_values: List[MeterValueResponse]
@@ -117,6 +130,52 @@ router = APIRouter(
     tags=["Transaction Management"]
 )
 
+async def _apply_funding_filters(query, funding_source: Optional[List[str]], payment_status: Optional[str]):
+    """Constrain a Transaction query by the derived Funding Source / Payment
+    Status axes (Transactions Console). Both are computed, not columns, so we
+    translate them to id/user-id constraints. payment_status is QR-only —
+    filtering by it implies QR funding."""
+    if payment_status:
+        qr_ids = await QRPayment.filter(status=payment_status).values_list("transaction_id", flat=True)
+        query = query.filter(id__in=[i for i in qr_ids if i is not None])
+
+    if funding_source:
+        wanted = {s.upper() for s in funding_source}
+        qr_ids = set(i for i in await QRPayment.all().values_list("transaction_id", flat=True) if i is not None)
+        internal_ids = set(await User.filter(role__in=INTERNAL_ROLES).values_list("id", flat=True))
+        clause = Q()
+        if "QR" in wanted:
+            clause |= Q(id__in=qr_ids)
+        if "WALLET" in wanted:
+            clause |= (~Q(id__in=qr_ids) & ~Q(user_id__in=internal_ids))
+        if "NONE" in wanted:
+            clause |= (~Q(id__in=qr_ids) & Q(user_id__in=internal_ids))
+        query = query.filter(clause)
+    return query
+
+
+async def _enrich_funding_payment(transactions) -> Dict[int, tuple]:
+    """Batch-resolve (funding_source, payment_status) for a page of sessions —
+    one QRPayment query + one User query, stitched in memory (no N+1).
+    Native QR status shown verbatim; wallet/internal carry no payment status."""
+    if not transactions:
+        return {}
+    txn_ids = [t.id for t in transactions]
+    user_ids = {t.user_id for t in transactions}
+    qr_rows = await QRPayment.filter(transaction_id__in=txn_ids).values("transaction_id", "status")
+    qr_status = {r["transaction_id"]: r["status"] for r in qr_rows}
+    internal_ids = set(await User.filter(id__in=user_ids, role__in=INTERNAL_ROLES).values_list("id", flat=True))
+    out = {}
+    for t in transactions:
+        if t.id in qr_status:
+            out[t.id] = ("QR", qr_status[t.id])
+        elif t.user_id in internal_ids:
+            out[t.id] = ("NONE", None)
+        else:
+            out[t.id] = ("WALLET", None)
+    return out
+
+
 @router.get("", response_model=TransactionListResponse)
 async def list_transactions(
     page: int = Query(1, ge=1),
@@ -124,14 +183,16 @@ async def list_transactions(
     status: Optional[str] = None,
     user_id: Optional[int] = None,
     charger_id: Optional[int] = None,
+    funding_source: Optional[List[str]] = Query(None),
+    payment_status: Optional[str] = None,
     start_date: Optional[datetime] = None,
     end_date: Optional[datetime] = None,
     sort: Optional[str] = Query("created_at", regex="^(created_at|updated_at|start_time|end_time)$")
 ):
     """List all transactions with filtering options"""
-    
+
     query = Transaction.all()
-    
+
     # Apply filters
     if status:
         query = query.filter(transaction_status=status)
@@ -143,20 +204,21 @@ async def list_transactions(
         query = query.filter(start_time__gte=start_date)
     if end_date:
         query = query.filter(start_time__lte=end_date)
-    
+    query = await _apply_funding_filters(query, funding_source, payment_status)
+
     # Get total count
     total = await query.count()
-    
+
     # Apply sorting
     if sort.startswith("-"):
         query = query.order_by(f"-{sort[1:]}")
     else:
         query = query.order_by(sort)
-    
+
     # Apply pagination
     offset = (page - 1) * limit
     transactions = await query.offset(offset).limit(limit)
-    
+
     # Build summary statistics
     summary = {
         "total_energy_consumed": sum(t.energy_consumed_kwh or 0 for t in transactions),
@@ -164,9 +226,14 @@ async def list_transactions(
         "suspended_sessions": await Transaction.filter(transaction_status="SUSPENDED").count(),
         "completed_sessions": await Transaction.filter(transaction_status="COMPLETED").count()
     }
-    
-    transaction_responses = [TransactionResponse.model_validate(t, from_attributes=True) for t in transactions]
-    
+
+    enrichment = await _enrich_funding_payment(transactions)
+    transaction_responses = []
+    for t in transactions:
+        resp = TransactionResponse.model_validate(t, from_attributes=True)
+        resp.funding_source, resp.payment_status = enrichment.get(t.id, ("WALLET", None))
+        transaction_responses.append(resp)
+
     return TransactionListResponse(
         data=transaction_responses,
         total=total,
@@ -199,6 +266,16 @@ async def get_transaction_details(transaction_id: int):
 
     funding_source, qr_session = await _resolve_funding(transaction_id, user)
 
+    # Read-only money/payout drill-down (Transactions Console). Payment status
+    # is the verbatim QR native value (None for wallet/internal). Settlement
+    # status is the franchisee-payout state, shown here only — never a filter.
+    payment_status = None
+    if funding_source == "QR":
+        qrp = await QRPayment.filter(transaction_id=transaction_id).first()
+        payment_status = qrp.status if qrp else None
+    settlement = await CommissionLedgerEntry.filter(transaction_id=transaction_id).first()
+    settlement_status = settlement.settlement_status if settlement else None
+
     return TransactionDetailResponse(
         transaction=TransactionResponse.model_validate(transaction, from_attributes=True),
         user=UserBasicInfo.model_validate(user, from_attributes=True),
@@ -208,6 +285,8 @@ async def get_transaction_details(transaction_id: int):
         live_energy_kwh=live_energy_kwh,
         funding_source=funding_source,
         qr_session=qr_session,
+        payment_status=payment_status,
+        settlement_status=settlement_status,
     )
 
 

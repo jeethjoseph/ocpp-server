@@ -253,7 +253,7 @@ export default function StationsPage() {
                             </div>
                             <div className="mt-1 text-xs text-gray-700 text-right">
                               {charger.tariff_per_kwh_all_in != null
-                                ? `₹${charger.tariff_per_kwh_all_in.toFixed(2)}/kWh (all-inclusive)`
+                                ? `₹${Number(charger.tariff_per_kwh_all_in).toFixed(2)}/kWh (all-inclusive)`
                                 : 'Tariff: N/A'}
                             </div>
                           </div>

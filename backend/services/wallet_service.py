@@ -51,6 +51,19 @@ _BALANCE_SQL = """
     WHERE wallet_id = $1
 """
 
+# Minimum billable energy: the half-unit (0.5 kWh) cliff below which a
+# Charging Session is Non-billable (ADR 0013, CONTEXT.md "Non-billable
+# Session"). A session delivering `0 < energy < MIN_BILLABLE_ENERGY_KWH` is
+# waived as de-minimis goodwill — QR sessions full-refund, wallet sessions
+# skip the debit, and neither issues a GST Invoice or Settlement Entry.
+# This is a *cliff*, not an allowance: a session at or above the threshold
+# bills for its TOTAL energy from the first Wh (strict `<`).
+#
+# A hardcoded policy constant on purpose — NOT an env var. Changing it goes
+# through code review + an ADR amendment, not a per-environment deploy edit.
+# Single source of truth; imported by qr_payment_service for the QR path.
+MIN_BILLABLE_ENERGY_KWH = Decimal("0.5")
+
 
 class WalletService:
     """Service for handling wallet operations with proper locking and transactions"""
@@ -242,10 +255,19 @@ class WalletService:
                 logger.info(f"Transaction {transaction_id} already billed (wallet_txn={existing_charge.id}), skipping")
                 return True, f"Already billed ₹{abs(existing_charge.amount)}", abs(existing_charge.amount), None
 
-            # Validate transaction state
-            if not transaction.energy_consumed_kwh or transaction.energy_consumed_kwh <= 0:
-                logger.info(f"Transaction {transaction_id} has no energy consumption, skipping billing")
-                return True, "No energy consumed - no billing required", Decimal('0.00'), None
+            # Non-billable Session (ADR 0013): a wallet session below the
+            # Minimum billable energy cliff skips the debit and issues no GST
+            # invoice / settlement entry — symmetric with the QR full-refund
+            # waiver. `< MIN_BILLABLE_ENERGY_KWH` subsumes the old `<= 0` (and
+            # negative meter-rollback) zero-energy case. Cliff, not allowance:
+            # a session at or above the threshold bills its TOTAL energy.
+            energy = transaction.energy_consumed_kwh
+            if not energy or Decimal(str(energy)) < MIN_BILLABLE_ENERGY_KWH:
+                logger.info(
+                    f"Transaction {transaction_id} below minimum billable energy "
+                    f"({energy or 0} kWh < {MIN_BILLABLE_ENERGY_KWH}), waiving — no debit"
+                )
+                return True, "Below minimum billable energy - no billing required", Decimal('0.00'), None
             
             # Get applicable tariff
             tariff = await WalletService.get_applicable_tariff(transaction.charger_id)

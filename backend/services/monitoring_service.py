@@ -634,30 +634,28 @@ class OCPPMetrics:
         })
 
     @staticmethod
-    async def record_refund_speed(charger_id, qr_payment_id: int, speed_processed,
-                                  balance_before=None, refund_credits_before=None):
-        """Record Razorpay refund speed outcome on full-refund flows.
+    def record_refund_final_speed(charger_id, qr_payment_id: int,
+                                  speed_requested, speed_processed):
+        """Record the FINAL Razorpay refund speed, emitted from the
+        ``refund.processed`` webhook where the outcome is authoritative.
 
-        Only call this when `speed=optimum` was requested — a normal-speed
-        refund (kill-switch off) is not a fallback. Increments one of two
-        New Relic counters so ops can alert on a sudden fallback spike
-        (rail outage, account-level rate limit, payment-method shift).
-        ADR 0002 amendment (2026-05-20).
+        Razorpay returns ``speed_processed='instant'`` optimistically at refund
+        creation, then may downgrade to ``normal`` asynchronously (per-bank IMPS
+        support, not our settlement float — confirmed 2026-06-22). Measuring at
+        creation under-counts downgrades, so the instant-success ratio is tracked
+        here from the terminal webhook instead.
 
-        `balance_before` / `refund_credits_before` are the Razorpay funding
-        pools (in rupees) snapshotted just before the refund POST, used to
-        diagnose `optimum -> normal` fallbacks against a thin settlement float.
-        Either may be None when the balance read was unavailable (best-effort).
-        ADR 0002 amendment (2026-06-18).
+        Charted in New Relic as the instant fulfilment ratio over time::
+
+            SELECT percentage(count(*), WHERE speed_processed = 'instant')
+            FROM QRRefundFinalSpeed WHERE speed_requested = 'optimum'
+            FACET appName TIMESERIES 1 day SINCE 30 days ago
+
+        ADR 0002 amendment (2026-06-22).
         """
-        if speed_processed == "instant":
-            MetricsCollector.increment_counter("Custom/QR/RefundInstantSucceeded")
-        else:
-            MetricsCollector.increment_counter("Custom/QR/RefundInstantFallback")
-        MetricsCollector.record_event("QRRefundSpeed", {
+        MetricsCollector.record_event("QRRefundFinalSpeed", {
             "charger_id": charger_id,
             "qr_payment_id": qr_payment_id,
+            "speed_requested": speed_requested or "unknown",
             "speed_processed": speed_processed or "unknown",
-            "balance_before": balance_before,
-            "refund_credits_before": refund_credits_before,
         })

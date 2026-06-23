@@ -168,6 +168,34 @@ export const chargerService = {
     ),
 };
 
+export interface TransactionListItem {
+  id: number;
+  user_id: number;
+  charger_id: number;
+  energy_consumed_kwh?: number | null;
+  start_time: string;
+  end_time?: string | null;
+  transaction_status: string;
+  funding_source: string;
+  payment_status: string | null;
+  created_at: string;
+}
+
+export interface TransactionListSummary {
+  total_energy_consumed: number;
+  active_sessions: number;
+  suspended_sessions: number;
+  completed_sessions: number;
+}
+
+export interface TransactionListResponse {
+  data: TransactionListItem[];
+  total: number;
+  page: number;
+  limit: number;
+  summary: TransactionListSummary;
+}
+
 export const transactionService = {
   getAll: (params?: {
     page?: number;
@@ -178,6 +206,8 @@ export const transactionService = {
     start_date?: string;
     end_date?: string;
     sort?: string;
+    funding_source?: string[];
+    payment_status?: string;
   }) => {
     const searchParams = new URLSearchParams();
     if (params?.page) searchParams.set("page", params.page.toString());
@@ -189,15 +219,18 @@ export const transactionService = {
     if (params?.start_date) searchParams.set("start_date", params.start_date);
     if (params?.end_date) searchParams.set("end_date", params.end_date);
     if (params?.sort) searchParams.set("sort", params.sort);
+    if (params?.funding_source) {
+      params.funding_source.forEach((fs) =>
+        searchParams.append("funding_source", fs)
+      );
+    }
+    if (params?.payment_status)
+      searchParams.set("payment_status", params.payment_status);
 
     const query = searchParams.toString();
-    return api.get<{
-      data: unknown[];
-      total: number;
-      page: number;
-      limit: number;
-      summary: Record<string, unknown>;
-    }>(`/api/admin/transactions${query ? `?${query}` : ""}`);
+    return api.get<TransactionListResponse>(
+      `/api/admin/transactions${query ? `?${query}` : ""}`
+    );
   },
 
   getById: (id: number) =>
@@ -386,37 +419,26 @@ export interface LogsResponse {
   message?: string;
 }
 
-export interface LogSummary {
-  charge_point_id: string;
-  total_logs: number;
-  inbound_logs: number;
-  outbound_logs: number;
-  oldest_log_date: string | null;
-  newest_log_date: string | null;
-}
-
 export const logService = {
-  getChargerLogs: (
-    chargePointId: string,
-    params?: {
-      start_date?: string;
-      end_date?: string;
-      limit?: number;
-    }
-  ) => {
-    const searchParams = new URLSearchParams();
-    if (params?.start_date) searchParams.set("start_date", params.start_date);
-    if (params?.end_date) searchParams.set("end_date", params.end_date);
-    if (params?.limit) searchParams.set("limit", params.limit.toString());
+  // Fleet-wide Logs Console query. Charger + action are filtered server-side;
+  // the date window is always bounded (defaults to last 24h on the backend).
+  getLogs: (params?: {
+    charge_point_id?: string;
+    message_type?: string[];
+    start_date?: string;
+    end_date?: string;
+    limit?: number;
+  }) => {
+    const sp = new URLSearchParams();
+    if (params?.charge_point_id) sp.set("charge_point_id", params.charge_point_id);
+    (params?.message_type ?? []).forEach((m) => sp.append("message_type", m));
+    if (params?.start_date) sp.set("start_date", params.start_date);
+    if (params?.end_date) sp.set("end_date", params.end_date);
+    if (params?.limit) sp.set("limit", params.limit.toString());
 
-    const query = searchParams.toString();
-    return api.get<LogsResponse>(
-      `/api/admin/logs/charger/${chargePointId}${query ? `?${query}` : ""}`
-    );
+    const query = sp.toString();
+    return api.get<LogsResponse>(`/api/admin/logs${query ? `?${query}` : ""}`);
   },
-
-  getChargerLogSummary: (chargePointId: string) =>
-    api.get<LogSummary>(`/api/admin/logs/charger/${chargePointId}/summary`),
 };
 
 // Audit Log Service

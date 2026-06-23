@@ -5,6 +5,7 @@ test_settlement_webhook_idempotent_on_replay exercises its handler.
 """
 import uuid
 from decimal import Decimal
+from unittest.mock import patch
 
 import pytest
 
@@ -84,6 +85,29 @@ async def test_refund_processed_marks_processed_at_and_speed(
     assert qrp.refund_processed_at is not None
     assert qrp.razorpay_refund_speed_processed == "instant"
     assert qrp.refund_failure_reason is None
+
+
+async def test_refund_processed_emits_final_speed_metric(
+    client, refund_charger, refund_qr_code,
+):
+    """refund.processed is the terminal event — it emits QRRefundFinalSpeed with
+    the authoritative speed_requested/processed, the source of the instant-ratio
+    metric (creation-time speed is optimistic). ADR 0002 (2026-06-22)."""
+    refund_id = f"rfnd_{uuid.uuid4().hex[:10]}"
+    qrp = await _make_qr_payment(refund_charger, refund_qr_code, refund_id=refund_id)
+
+    with patch(
+        "services.monitoring_service.OCPPMetrics.record_refund_final_speed"
+    ) as rec:
+        await handle_refund_event(
+            event_type="refund.processed",
+            event_data={"refund": {"entity": {
+                "id": refund_id,
+                "speed_requested": "optimum",
+                "speed_processed": "normal",
+            }}},
+        )
+    rec.assert_called_once_with(qrp.charger_id, qrp.id, "optimum", "normal")
 
 
 async def test_refund_failed_records_reason(client, refund_charger, refund_qr_code):

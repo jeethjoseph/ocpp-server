@@ -2,7 +2,7 @@
 from typing import List, Optional
 from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import logging
 
 from models import OCPPLog, User, AuditLog, Charger, Transaction
@@ -56,88 +56,58 @@ class LogsResponse(BaseModel):
 # Create router
 router = APIRouter(prefix="/api/admin/logs", tags=["admin-logs"])
 
-@router.get("/charger/{charge_point_id}", response_model=LogsResponse)
-async def get_charger_logs(
-    charge_point_id: str,
-    start_date: Optional[str] = Query(None, description="Start date in ISO format with timezone (e.g. 2026-03-10T00:00:00Z)"),
-    end_date: Optional[str] = Query(None, description="End date in ISO format with timezone (e.g. 2026-03-10T23:59:59Z)"),
+# Default bounded window for the Logs Console — see ADR 0014. The date range is
+# never unbounded; absent an explicit range we look back this many hours.
+DEFAULT_WINDOW_HOURS = 24
+
+
+@router.get("", response_model=LogsResponse)
+async def get_logs(
+    charge_point_id: Optional[str] = Query(None, description="Filter to a single charger (charge_point_string_id)"),
+    message_type: Optional[List[str]] = Query(None, description="Filter by one or more OCPP actions (repeat the param)"),
+    start_date: Optional[str] = Query(None, description="Start date ISO 8601 w/ tz. Defaults to 24h ago."),
+    end_date: Optional[str] = Query(None, description="End date ISO 8601 w/ tz. Defaults to now."),
     limit: int = Query(100, ge=1, le=100000, description="Number of logs to return (max 100,000)"),
-    admin_user: User = Depends(require_admin())
+    admin_user: User = Depends(require_admin()),
 ):
     """
-    Get OCPP logs for a specific charger with optional date filtering.
-    Limited to 100,000 rows maximum. Results ordered by most recent first.
+    Fleet-wide OCPP message log query for the Logs Console. The date window is
+    always bounded (defaults to the last 24h) to keep the query off a full
+    sequential scan of the log table — see ADR 0014. Newest first.
     """
     try:
-        # Build query
-        query = OCPPLog.filter(charge_point_id=charge_point_id)
+        # Always-bounded window: default to the last 24h when unspecified.
+        now = datetime.now(tz=timezone.utc)
+        start_dt = _parse_date(start_date, "start_date") if start_date else now - timedelta(hours=DEFAULT_WINDOW_HOURS)
+        end_dt = _parse_date(end_date, "end_date") if end_date else now
 
-        if start_date:
-            start_dt = _parse_date(start_date, "start_date")
-            query = query.filter(timestamp__gte=start_dt)
+        query = OCPPLog.filter(timestamp__gte=start_dt, timestamp__lte=end_dt)
+        if charge_point_id:
+            query = query.filter(charge_point_id=charge_point_id)
+        if message_type:
+            query = query.filter(message_type__in=message_type)
 
-        if end_date:
-            end_dt = _parse_date(end_date, "end_date")
-            query = query.filter(timestamp__lte=end_dt)
-
-        # Get total count before limiting
         total = await query.count()
-
-        # Check if we're hitting the limit
         has_more = total > limit
         message = None
         if total > 100000:
-            message = "This query returns more than 100,000 logs. Please use more specific date filters to narrow results."
-            limit = min(limit, 100000)  # Enforce 100,000 row limit
+            message = "This query returns more than 100,000 logs. Narrow the date range or filters."
+            limit = min(limit, 100000)
 
-        # Get logs ordered by most recent first
         logs = await query.order_by('-timestamp').limit(limit)
-
         return LogsResponse(
             data=[LogResponse.model_validate(log) for log in logs],
             total=total,
             limit=limit,
             has_more=has_more,
-            message=message
+            message=message,
         )
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching logs for charger {charge_point_id}: {str(e)}")
+        logger.error(f"Error fetching logs: {str(e)}")
         raise HTTPException(status_code=500, detail="Error fetching logs")
-
-@router.get("/charger/{charge_point_id}/summary")
-async def get_charger_log_summary(
-    charge_point_id: str,
-    admin_user: User = Depends(require_admin())
-):
-    """
-    Get summary statistics for charger logs (useful for the frontend to show total counts)
-    """
-    try:
-        total_logs = await OCPPLog.filter(charge_point_id=charge_point_id).count()
-
-        # Get date range
-        oldest_log = await OCPPLog.filter(charge_point_id=charge_point_id).order_by('timestamp').first()
-        newest_log = await OCPPLog.filter(charge_point_id=charge_point_id).order_by('-timestamp').first()
-
-        # Count by direction
-        inbound_count = await OCPPLog.filter(charge_point_id=charge_point_id, direction="IN").count()
-        outbound_count = await OCPPLog.filter(charge_point_id=charge_point_id, direction="OUT").count()
-
-        return {
-            "charge_point_id": charge_point_id,
-            "total_logs": total_logs,
-            "inbound_logs": inbound_count,
-            "outbound_logs": outbound_count,
-            "oldest_log_date": oldest_log.timestamp if oldest_log else None,
-            "newest_log_date": newest_log.timestamp if newest_log else None,
-        }
-
-    except Exception as e:
-        logger.error(f"Error fetching log summary for charger {charge_point_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail="Error fetching log summary")
 
 
 # ============ Audit Log Endpoints ============

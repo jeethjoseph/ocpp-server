@@ -346,8 +346,8 @@ export default function UserChargePage() {
                   {currentTransactionId ? "Live Energy Reading" : "Energy Consumed"}
                 </p>
                 <p className="text-4xl font-bold text-green-600">
-                  {currentTransactionId && latestMeterValue?.reading_kwh 
-                    ? latestMeterValue.reading_kwh.toFixed(2)
+                  {currentTransactionId && latestMeterValue?.reading_kwh
+                    ? Number(latestMeterValue.reading_kwh).toFixed(2)
                     : (getEnergyConsumed() || 0).toFixed(2)
                   }
                 </p>

@@ -100,7 +100,7 @@ function UserProfileCard({ user }: { user: UserDetail }) {
         <div className="flex items-center justify-between mb-3">
           <h3 className="font-semibold text-foreground">Wallet & Usage</h3>
           <div className="text-2xl font-bold text-green-400">
-            ₹{user.wallet_balance?.toFixed(2) || '0.00'}
+            ₹{Number(user.wallet_balance ?? 0).toFixed(2)}
           </div>
         </div>
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">

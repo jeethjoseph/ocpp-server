@@ -113,7 +113,7 @@ export default function FranchiseeTransactionDetailPage() {
                     </p>
                     <p className="font-medium">
                       {txn.energy_consumed_kwh != null
-                        ? `${txn.energy_consumed_kwh.toFixed(3)} kWh`
+                        ? `${Number(txn.energy_consumed_kwh).toFixed(3)} kWh`
                         : "--"}
                     </p>
                   </div>
@@ -213,7 +213,7 @@ export default function FranchiseeTransactionDetailPage() {
                           <TableRow key={index}>
                             <TableCell>
                               {mv.reading_kwh != null
-                                ? mv.reading_kwh.toFixed(3)
+                                ? Number(mv.reading_kwh).toFixed(3)
                                 : "--"}
                             </TableCell>
                             <TableCell>

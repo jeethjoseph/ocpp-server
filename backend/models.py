@@ -414,10 +414,18 @@ class OCPPLog(Model):
     payload = fields.JSONField(null=True)
     status = fields.CharField(max_length=50, null=True)
     correlation_id = fields.CharField(max_length=100, null=True)
-    timestamp = fields.DatetimeField(auto_now_add=True)
-    
+    timestamp = fields.DatetimeField(auto_now_add=True, index=True)
+
     class Meta:
         table = "log"
+        # Logs Console query surface — see ADR 0014. The standalone `timestamp`
+        # index (above) backs the default all-chargers/all-actions date window
+        # and the retention cleanup's `timestamp`-keyed deletes; the composites
+        # back charger- and action-filtered queries.
+        indexes = [
+            ("charge_point_id", "timestamp"),
+            ("message_type", "timestamp"),
+        ]
 
 class FirmwareFile(Model):
     id = fields.IntField(pk=True)

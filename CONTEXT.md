@@ -18,9 +18,17 @@ _Avoid_: app session.
 A session funded by a one-time UPI payment scanned from the charger's QR sticker; the user is a `UPI_GUEST` or a pre-existing user matched by phone/VPA.
 _Avoid_: guest session, anonymous session.
 
-**Zero-energy Session**:
-A session that ended with `energy_consumed_kwh ≤ 0`. For **QR Sessions** this triggers a full refund and no GST invoice; for **Wallet Sessions** no debit occurs.
-_Avoid_: failed session (charger faults are a separate category).
+**Non-billable Session**:
+A session that ended with `energy_consumed_kwh < 0.5 kWh` (the **Minimum billable energy**). For **QR Sessions** this triggers a full refund of `amount_paid`; for **Wallet Sessions** no debit occurs. Either way: **no GST invoice, no Settlement Entry**. The threshold is a *cliff*, not an allowance — a session at or above 0.5 kWh bills for its **total** energy from the first Wh; the half-unit is never carved off the top. Two sub-cases with the same mechanical outcome but distinct legal justification:
+
+- **Zero-energy Session** (`energy ≤ 0`): no taxable supply occurred — nothing was delivered. See [[adr-0002-zero-energy-full-refund]].
+- **De-minimis Session** (`0 < energy < 0.5 kWh`): a real (tiny) supply occurred and is **waived as goodwill** — collecting ≤ ~₹12 of revenue costs more in invoice/settlement/partial-refund friction than it's worth. The franchisee absorbs the trivial delivered kWh (no settlement). See [[adr-0013-de-minimis-energy-waiver]].
+
+_Avoid_: calling a **De-minimis Session** "zero-energy" — they have different legal bases (waived supply vs non-supply) even though the code routes both through one `< 0.5` check. _Avoid_: "failed session" (charger faults are a separate category).
+
+**Minimum billable energy**:
+The 0.5 kWh (half-unit) cliff below which a **Charging Session** is **Non-billable**. A hardcoded `Decimal` policy constant (`MIN_BILLABLE_ENERGY_KWH`), not an env var — changing it goes through code review + ADR, not a deploy-config edit. Keyed on **energy** (`energy_consumed_kwh`), never power.
+_Avoid_: "minimum charge", "free allowance" (it is not an allowance — see the cliff note above).
 
 **Internal-role Session**:
 A **Charging Session** initiated by an ADMIN or FRANCHISEE user, regardless of funding source. Purely operational — VoltLync staff testing a charger or a franchisee charging their own car at their own station. No **GST Invoice** is issued, no **Wallet** is debited, no **Budget cap** is enforced. The OCPP audit trail and meter values are still recorded so ops can see "this admin burned X kWh testing." If a FRANCHISEE wants to be billed for charging, they register a separate USER account.
@@ -117,8 +125,12 @@ _Avoid_: "refund balance", "refund wallet" (the canonical Razorpay term is Refun
 ### Observability
 
 **OCPP message log**:
-A row in the `log` table (`OCPPLog` model) capturing one inbound OCPP RPC call — BootNotification, Heartbeat, MeterValues, StatusNotification, etc. Direction, payload, correlation ID. Retained indefinitely for protocol-level audit.
+A row in the `log` table (`OCPPLog` model) capturing one inbound OCPP RPC call — BootNotification, Heartbeat, MeterValues, StatusNotification, etc. Direction, payload, correlation ID. Retained ~90 days (`RETENTION_DAYS`, default 90), then batch-deleted by the `DataRetentionService` cleanup job — a rolling protocol-level audit window, **not** a permanent archive.
 _Avoid_: "log entry" (ambiguous with audit log), "OCPP event" (collides with NR event below).
+
+**OCPP Action**:
+The OCPP RPC name on an **OCPP message log** row — `BootNotification`, `StatusNotification`, `MeterValues`, `Heartbeat`, `StartTransaction`, etc. Stored as the first-class `OCPPLog.message_type` column. The primary filter dimension on the **Logs Console**.
+_Avoid_: "message type" for the action name — it collides with the OCPP spec's own *message type* (the `messageTypeId` at `payload[0]`: `2 = Call`, `3 = CallResult`, `4 = CallError`), a separate orthogonal facet that pairs with **direction**, not the action filter. UI labels say "Action", never "Type".
 
 **Audit event**:
 A row in the `audit_log` table written via `log_audit_event(...)` capturing a domain action — `charger.connected`, `charger.disconnected`, `charger.connection_rejected`, etc. The supplier-of-record for "what did the system do" questions older than NR's retention window.
@@ -134,12 +146,32 @@ A charger-emitted OCPP `DataTransfer` with `vendorId=VoltLync`, `messageId=Signa
 **Known ambiguity**: the table name is a misnomer post-temperature. A future rename to `charger_telemetry` (or similar) is on the table but not blocking. Until then, treat `signal_quality` as the canonical home for any modem-emitted telemetry, not strictly signal-quality fields.
 _Avoid_: confusing **Modem telemetry** with the (currently hypothetical) OCPP `Temperature` measurand sent inside `MeterValues.sampledValue`. The latter, if/when it appears, is per-transaction cable/socket/EV temperature and belongs on `meter_value` — see ADR 0009 "Consequences" for the orthogonality argument.
 
+### Admin transactions console
+
+**Transactions Console**:
+The unified admin page at `/admin/transactions` listing **Charging Sessions** across *all funding sources and all statuses* in one place (the page the long-dead "Transaction Monitoring" landing-card link finally points to). It is a **convenience/triage view over Charging Sessions** — the `Transaction` model is the spine — not a new ledger or abstraction. Backed by the pre-existing `GET /transactions` endpoint, enriched per row with funding source and the backing payment record's status.
+_Avoid_: treating it as a money ledger or a unified super-feed of payments/refunds/settlements — that was explicitly *not* chosen (see below).
+
+**Two truthful status axes** (deliberately NOT collapsed into one derived status):
+
+- **Session Status**: the native `TransactionStatusEnum` (STARTED…RUNNING…COMPLETED, CANCELLED, FAILED, BILLING_FAILED) — the session lifecycle.
+- **Payment Status**: the **actual, native** status of the session's backing payment record — the real `QRPaymentStatusEnum` value (PAID…REFUNDED, **REFUND_FAILED**, EXPIRED) for a **QR Session**. **Effectively QR-only**: a **Wallet Session**'s money event is a `CHARGE_DEDUCT` row which carries *no* status enum (only TOP_UPs do), so wallet and **Internal-role** rows show blank (`—`) rather than a derived label — the wallet money outcome is already fully expressed by **Session Status** (COMPLETED = debited, BILLING_FAILED = billing failed) plus the amount. Shown verbatim; **never** projected into a synthesised cross-funding enum, and **never** derived for wallet just to fill the cell.
+
+**Funding Source** (here): a multi-select filter / column on the console — `QR` / `Wallet` / `Internal` — derived per session via the existing `_resolve_funding` helper. It disambiguates which native vocabulary a row's **Payment Status** belongs to.
+_Avoid_: a derived/canonical "PaymentStatus" projection spanning QR+Wallet — considered and **rejected** (lossy on exactly the mixed-state rows admins most need to triage; truthful native statuses + a funding-source filter is the convenience instead).
+
+### Admin logs console
+
+**Logs Console**:
+The admin page at `/admin/logs` listing **OCPP message log** rows across *all chargers* in one filterable, URL-shareable place. A convenience/triage view over the `log` table — the same doctrine as the **Transactions Console**, not a new ledger or abstraction. Backed by `GET /api/admin/logs`. **Charger** is one optional filter (single-select, searchable); **OCPP Action** is the primary filter (multi-select); **direction** (IN/OUT) and **status** (SUCCESS/error) refine the fetched window. The charger detail page deep-links here pre-filtered (`?charger=<id>`) rather than embedding its own log viewer — the old per-charger embedded viewer and its `/logs/charger/{id}` endpoint are retired.
+_Avoid_: "log viewer", "log page" — the canonical term is **Logs Console**, parallel to **Transactions Console**.
+
 ## Relationships
 
 - A **Charging Session** is funded by either a **Wallet** (debit at finalize) or a **QR Payment** (prepaid, refund-on-finalize).
 - **Funding source is determined at StartTransaction, not at initiation.** The `on_start_transaction` handler resolves the `User` by `rfid_card_id` (the idTag — the app's RemoteStart sends `user.rfid_card_id` as the idTag, so app-started and card-tapped sessions are indistinguishable at this layer), then: if a **QR Payment** links to the transaction it is a **QR Session**; otherwise, if the user has a **Wallet**, it is a **Wallet Session**. Consequence: nothing about *how* a session was triggered (app remote-start, deep-link API call, or local RFID tap) changes its funding — so any control that must prevent wallet-funded sessions has to act on this decision, not on the frontend.
 - A **QR Payment** carries both an **Actual platform fee** (truth from Razorpay) and a **Synthetic platform fee** (policy, fixed). They are not expected to be equal; variance is absorbed entirely by VoltLync. Post 2026-05-29, both the **GST Invoice** gateway-charges line AND the **`commission_ledger_entry.pg_fee_amount`** use the Synthetic figure; the franchisee is shielded from Razorpay's instantaneous fee schedule.
-- A non-zero-energy, non-internal **Charging Session** produces exactly one **GST Invoice**.
+- A **billable** (energy ≥ 0.5 kWh — the **Minimum billable energy**), non-internal **Charging Session** produces exactly one **GST Invoice** and exactly one **Settlement Entry**. A **Non-billable Session** (energy < 0.5 kWh) produces neither.
 - A **Tariff** stores both `tariff_per_kwh_all_in` (display) and `rate_per_kwh` (math); writes update both, reads pick the one that fits the surface.
 - The **Budget cap** is computed against the **Synthetic platform fee**, never the **Actual platform fee**, to give customers a predictable contract.
 

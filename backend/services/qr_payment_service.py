@@ -34,8 +34,8 @@ from services.razorpay_service import (
     extract_fee_from_payment,
 )
 from services.tariff_utils import synthetic_platform_fee, synthetic_fee_split
-from services.wallet_service import WalletService
-from services.monitoring_service import MetricsCollector, OCPPMetrics
+from services.wallet_service import WalletService, MIN_BILLABLE_ENERGY_KWH
+from services.monitoring_service import MetricsCollector
 from redis_manager import redis_manager
 from core.connection_manager import connection_manager
 from crud import log_audit_event
@@ -123,24 +123,6 @@ def build_refund_call_kwargs(qr_payment: QRPayment, refund_amount: Decimal) -> D
         "idempotency_key": f"refund_{qr_payment.razorpay_payment_id}",
         "speed": "optimum" if (instant_enabled and is_full_refund) else None,
     }
-
-
-async def _fetch_funding_pools() -> tuple:
-    """Best-effort snapshot of the Razorpay funding pools for refund diagnostics.
-
-    Returns ``(balance_before, refund_credits_before)`` in rupees, or
-    ``(None, None)`` when the balance read is unavailable. Never raises — a
-    failed read (or any error in the balance path) must not affect the refund.
-    See ADR 0002 (2026-06-18 amendment).
-    """
-    try:
-        funding = await razorpay_service.fetch_balance()
-    except Exception as e:  # diagnostic is strictly additive; never break refund
-        logger.warning("Funding-pool snapshot failed: %s", e)
-        return None, None
-    if not funding:
-        return None, None
-    return funding.get("balance"), funding.get("refund_credits")
 
 
 async def _ensure_actual_fee_captured(qr_payment: QRPayment) -> None:
@@ -830,15 +812,28 @@ class QRPaymentService:
 
         energy_kwh = transaction.energy_consumed_kwh or 0
 
-        # ADR 0002: zero-energy QR session must full-refund (amount_paid),
-        # not amount_paid - synthetic_platform_fee. The over-payment formula
-        # below is correct only when service was actually delivered. Route
-        # zero-energy cases to _full_refund so they hit the same path as the
-        # other "service not rendered" failures (RemoteStart fail, plug-in
-        # timeout, etc.) — `_full_refund` already handles the audit + the
-        # instant-refund speed=optimum amendment (ADR 0002, 2026-05-20).
-        if Decimal(str(energy_kwh)) <= 0:
-            await QRPaymentService._full_refund(qr_payment, "Zero energy delivered")
+        # ADR 0002 / ADR 0013: a Non-billable Session (energy below the
+        # Minimum billable energy cliff) full-refunds amount_paid and issues
+        # no GST invoice / settlement entry. The over-payment formula below is
+        # correct only when a billable service was delivered. Route these to
+        # _full_refund so they hit the same path as the other "service not
+        # rendered" outcomes — it already handles the audit + the instant
+        # speed=optimum amendment. The single `< MIN_BILLABLE_ENERGY_KWH`
+        # check subsumes the old `<= 0` (and negative meter-rollback) case.
+        #
+        # Two bands, two honest reasons (do NOT call de-minimis "zero energy"):
+        #   energy <= 0            -> no taxable supply occurred (ADR 0002)
+        #   0 < energy < 0.5 kWh   -> real tiny supply, waived as goodwill (ADR 0013)
+        energy_dec = Decimal(str(energy_kwh))
+        if energy_dec < MIN_BILLABLE_ENERGY_KWH:
+            if energy_dec <= 0:
+                reason = "Zero energy delivered"
+            else:
+                reason = (
+                    f"De-minimis energy {energy_dec:.3f} kWh "
+                    f"< {MIN_BILLABLE_ENERGY_KWH} kWh — waived"
+                )
+            await QRPaymentService._full_refund(qr_payment, reason)
             return
 
         tariff = await WalletService.get_applicable_tariff(qr_payment.charger_id)
@@ -1010,10 +1005,6 @@ class QRPaymentService:
                 "refund_reconciled=true qr_payment=%s existing_refund=%s reason=%s",
                 payment.id, existing["id"], reason,
             )
-            if refund_speed == "optimum" and existing_speed:
-                await OCPPMetrics.record_refund_speed(
-                    payment.charger_id, payment.id, existing_speed,
-                )
         else:
             payment.status = QRPaymentStatusEnum.REFUND_FAILED
             payment.failure_reason = no_refund_failure_reason
@@ -1066,13 +1057,6 @@ class QRPaymentService:
             refund_kwargs = build_refund_call_kwargs(locked, refund_amount)
             refund_speed = refund_kwargs["speed"]
 
-            # Snapshot the Razorpay funding pools BEFORE the refund POST so a
-            # downgrade (optimum -> normal) can be correlated with a thin
-            # settlement float. Optimum-only; best-effort. ADR 0002 (2026-06-18).
-            balance_before = refund_credits_before = None
-            if refund_speed == "optimum":
-                balance_before, refund_credits_before = await _fetch_funding_pools()
-
             try:
                 refund_result = await razorpay_service.refund_payment(
                     locked.razorpay_payment_id,
@@ -1085,17 +1069,9 @@ class QRPaymentService:
                     locked.status = QRPaymentStatusEnum.REFUNDED
                 await locked.save()
                 logger.info(
-                    "Full refund ₹%s issued for QR payment %s: %s "
-                    "(balance_before=%s refund_credits_before=%s)",
+                    "Full refund ₹%s issued for QR payment %s: %s",
                     refund_amount, locked.id, reason,
-                    balance_before, refund_credits_before,
                 )
-                if refund_speed == "optimum":
-                    await OCPPMetrics.record_refund_speed(
-                        locked.charger_id, locked.id, speed_processed,
-                        balance_before=balance_before,
-                        refund_credits_before=refund_credits_before,
-                    )
             except RazorpayAlreadyRefundedError as e:
                 await QRPaymentService._reconcile_conflict(
                     locked, refund_speed, reason,
