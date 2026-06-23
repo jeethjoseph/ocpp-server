@@ -8,6 +8,7 @@ import logging
 from models import Transaction, MeterValue, User, Charger, WalletTransaction, QRPayment, CommissionLedgerEntry
 from tortoise.exceptions import IntegrityError
 from tortoise.expressions import Q
+from tortoise.functions import Sum
 from auth_middleware import require_admin
 from core.roles import INTERNAL_ROLES
 from crud import log_audit_event
@@ -187,7 +188,7 @@ async def list_transactions(
     payment_status: Optional[str] = None,
     start_date: Optional[datetime] = None,
     end_date: Optional[datetime] = None,
-    sort: Optional[str] = Query("created_at", regex="^(created_at|updated_at|start_time|end_time)$")
+    sort: Optional[str] = Query("-created_at", regex="^-?(created_at|updated_at|start_time|end_time)$")
 ):
     """List all transactions with filtering options"""
 
@@ -209,6 +210,11 @@ async def list_transactions(
     # Get total count
     total = await query.count()
 
+    # Total energy over the FULL filtered set (not just the current page) — DB-side Sum.
+    # Page-scoped summing made this read 0.00 whenever page 1 held zero-energy rows.
+    energy_agg = await query.annotate(total_energy=Sum("energy_consumed_kwh")).values("total_energy")
+    total_energy_consumed = float(energy_agg[0]["total_energy"] or 0) if energy_agg else 0.0
+
     # Apply sorting
     if sort.startswith("-"):
         query = query.order_by(f"-{sort[1:]}")
@@ -221,7 +227,7 @@ async def list_transactions(
 
     # Build summary statistics
     summary = {
-        "total_energy_consumed": sum(t.energy_consumed_kwh or 0 for t in transactions),
+        "total_energy_consumed": total_energy_consumed,
         "active_sessions": await Transaction.filter(transaction_status__in=["STARTED", "RUNNING"]).count(),
         "suspended_sessions": await Transaction.filter(transaction_status="SUSPENDED").count(),
         "completed_sessions": await Transaction.filter(transaction_status="COMPLETED").count()

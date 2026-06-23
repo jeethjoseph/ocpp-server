@@ -35,7 +35,8 @@ skills-lock.json
 
 # Logs
 *.log
-logs/
+/logs/
+backend/logs/
 
 # Firmware files
 backend/firmware_files/*.bin

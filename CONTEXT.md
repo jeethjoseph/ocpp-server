@@ -50,11 +50,25 @@ _Avoid_: "energy consumed" without qualifier when context is ambiguous between l
 A single charging unit identified by its OCPP `charge_point_string_id`. State is tracked via `ChargerStatusEnum` (`AVAILABLE`, `CHARGING`, `FAULTED`, …) and the OCPP heartbeat. The unit of "availability" customers see and the unit our budget cap / RemoteStop dispatch operate on.
 
 **Connector**:
-A physical plug on a `Charger` (e.g. Type2, Socket, CCS), modelled as a `Connector` row with `connector_type` and `max_power_kw`. **Working invariant (2026-05-21):** every `Charger` in our fleet has exactly one `Connector`. The data model permits N:1 but no current deployment uses it, and no per-connector OCPP state is tracked.
+A physical plug on a `Charger`, modelled as a `Connector` row. **Working invariant (2026-05-21):** every `Charger` in our fleet has exactly one `Connector` (= one OCPI EVSE). The data model permits N:1 but no current deployment uses it, and no per-connector OCPP state is tracked. Carries `max_power_kw` plus the OCPI-native columns (`ocpi_standard`, `ocpi_format`, `ocpi_power_type`, `max_voltage`, `max_amperage`) that are the **source of truth for the [[ocpi-feed]]** (see [[adr-0016-connector-ocpi-normalization]]).
 
 **Plug type**:
-A `Connector.connector_type` value (Type2, Socket, CCS, …). Customer-facing groupings on the station map and modal are by **plug type**, but the underlying counts are charger-level — see [[ui-station-modal-chargers]] for the rendering rule.
-_Avoid_: "connector" as a customer-facing label when you mean "charger of plug type X". Renamed in the public station modal 2026-05-21 to avoid the conflation.
+The customer-facing label for a connector's physical type, rendered from the **display-only** `Connector.connector_type` free-text (Type2, Socket, CCS, …). Customer-facing groupings on the station map and modal are by **plug type**, but the underlying counts are charger-level — see [[ui-station-modal-chargers]] for the rendering rule.
+_Avoid_: treating `connector_type` as authoritative for anything machine-read — it is cosmetic; the OCPI `standard` (`ocpi_standard`) is the source of truth (see [[adr-0016-connector-ocpi-normalization]]). _Avoid_: "connector" as a customer-facing label when you mean "charger of plug type X". Renamed in the public station modal 2026-05-21 to avoid the conflation.
+
+### External interoperability (OCPI)
+
+**OCPI feed**:
+The standards-compliant **OCPI 2.2.1** (Open Charge Point Interface) CPO endpoint VoltLync exposes so external consumers — Google Maps (via `EVCS-global@google.com`), aggregators, and roaming hubs — can pull static **Location** data and real-time EVSE status. A **direct CPO feed** (no aggregator middleman), served from the same FastAPI app under `/ocpi/cpo/2.2/` (modules: Versions + Credentials + Locations; Tariffs deferred to phase 2), behind OCPI token auth (not Clerk), gated by `OCPI_ENABLED`. Google accepts **only** OCPI for EV charging data and requires Real-Time Availability (RTA). Both envs serve, kept distinct by an **env-specific `party_id`** (`VLT` prod / `VLS` staging); staging is a deliberate **pre-rollout canary** for chargers already live on Google. See [[adr-0015-ocpi-identity-scheme]].
+_Avoid_: "GELFS feed" (Google's legacy proprietary spec, superseded by OCPI for onboarding), "Google feed" (OCPI is the substrate; Google is one consumer).
+
+**Published charger**:
+A `Charger` with `publish_to_google = true` — the per-EVSE flag that gates [[ocpi-feed]] inclusion (a Location is published iff it has ≥1 published EVSE). The toggle to `true` is **completeness-gated** (requires `ocpi_evse_id` + station coords/city/address + connector `ocpi_standard`) and **audit-logged**, because publishing has irreversible-in-identity side effects: unpublishing removes the Google POI, but the `evse_id` is permanently spent and is never rebound to a different physical charger (see [[adr-0015-ocpi-identity-scheme]]).
+_Avoid_: conflating "published" (visible on Google) with the **OCPI EVSE status** `AVAILABLE` (live state) — a published charger can be `CHARGING`, `UNKNOWN`, etc.
+
+**OCPI EVSE status**:
+The single live status value OCPI exposes per EVSE (`AVAILABLE`, `CHARGING`, `BLOCKED`, `RESERVED`, `INOPERATIVE`, `OUTOFORDER`, `REMOVED`, `UNKNOWN`). It is a **fusion**, in strict priority order, of THREE inputs: admin `Charger.availability` (intent, per ADR 0008) → online/offline (Redis-connected + `last_heart_beat_time` ≤ 120s) → `Charger.latest_status` (OCPP-reported live state). Admin `Inoperative` wins over everything (→ `INOPERATIVE`); an **offline** charger is `UNKNOWN` (not `OUTOFORDER` — disconnection ≠ fault, given flaky Quectel modems); otherwise `latest_status` maps through (`FAULTED`→`OUTOFORDER`, `UNAVAILABLE`→`INOPERATIVE`, `RESERVED`→`RESERVED`, all occupied states `PREPARING/CHARGING/SUSPENDED_*/FINISHING`→`CHARGING`, `AVAILABLE`→`AVAILABLE`). A charger is **never dropped** from the feed by status — removal churns the Google POI (see [[adr-0015-ocpi-identity-scheme]]).
+_Avoid_: mapping OCPI status from our **`availability`** field alone (it's admin intent only) or from **`latest_status`** alone (it ignores admin override and offline state). Note the term collision: OCPI says "status" for the live state; our `ChargerAvailabilityEnum` is named "availability" but means admin intent — they are NOT the same axis.
 
 ### Firmware
 
