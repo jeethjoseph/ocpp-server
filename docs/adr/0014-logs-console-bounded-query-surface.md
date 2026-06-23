@@ -24,6 +24,7 @@ Constrain the query surface and index the two dimensions it filters on:
 - **The indexes cost write amplification and disk** on a high-write table. Accepted: two composite indexes on an append-mostly table is modest next to the read-safety they buy.
 - **The retention cleanup benefits too.** `DataRetentionService` deletes via `created_at__lt` in batches — itself an unindexed scan today. Aligning the time index with the column the deletes filter on (or accepting that `created_at` ≈ `timestamp`, both `auto_now_add`) lets the cleanup job use an index instead of a seq scan. The slice that adds the indexes should confirm the cleanup query and the Console query order on the *same* indexed column.
 - **Retention policy is unchanged.** This ADR governs *query safety*, not *growth*; the 90-day window is owned by `DataRetentionService` and `RETENTION_DAYS`.
+- **The `(message_type, timestamp)` index was dead until the column was populated (fixed 2026-06-24, forward-only).** This ADR assumed `message_type` held the **OCPP Action**, but ingestion hardcoded the literal `"OCPP"` for every frame, so the Action filter matched nothing. The ingestion adapter now derives the Action from the wire frame (CALL → action; CALLRESULT/CALLERROR → those labels; protocol-error → `OCPP`). **Forward-only**: historical rows keep `"OCPP"` and age out via the 90-day window — no backfill. See `.scratch/logs-console/issues/06-populate-message-type-with-ocpp-action.md` and the `CONTEXT.md` "OCPP Action" entry.
 
 ## Considered alternatives
 

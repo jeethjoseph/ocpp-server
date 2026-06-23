@@ -437,7 +437,7 @@ class TestChargerEndpoints:
             await OCPPLog.create(
                 charge_point_id=test_charger.charge_point_string_id,
                 direction="IN" if i % 2 == 0 else "OUT",
-                message_type="OCPP",
+                message_type="Heartbeat",
                 payload={"test": f"message{i}"},
                 status="received"
             )
