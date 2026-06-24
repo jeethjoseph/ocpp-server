@@ -209,15 +209,16 @@ class TestProcessTransactionBillingAtomicity:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("energy", [0.3, 0.499])
-    async def test_de_minimis_energy_skips_debit_no_breakdown(
+    async def test_failed_sub_half_kwh_skips_debit(
         self, client, test_charger, test_user, test_tariff, test_wallet, energy
     ):
-        """ADR 0013: a sub-0.5 kWh wallet session is waived — no debit, no
-        breakdown, symmetric with the QR full-refund waiver."""
+        """ADR 0013 (amended 2026-06-24): a FAILED sub-0.5 kWh wallet session
+        (faulted after a trivial delivery) is not debited — symmetric with the
+        QR full-refund fault path."""
         txn = await Transaction.create(
             charger=test_charger,
             user=test_user,
-            transaction_status=TransactionStatusEnum.STOPPED,
+            transaction_status=TransactionStatusEnum.FAILED,
             start_meter_kwh=10.0,
             end_meter_kwh=10.0 + energy,
             energy_consumed_kwh=energy,
@@ -236,6 +237,33 @@ class TestProcessTransactionBillingAtomicity:
             wallet_id=wallet.id, type=TransactionTypeEnum.CHARGE_DEDUCT
         ).count() == 0
         assert await WalletService.get_balance(wallet.id) == Decimal("500.00")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [TransactionStatusEnum.COMPLETED, TransactionStatusEnum.STOPPED])
+    async def test_completed_sub_half_kwh_now_debits(
+        self, client, test_charger, test_user, test_tariff, test_wallet, status
+    ):
+        """ADR 0013 amendment: a COMPLETED/STOPPED sub-0.5 kWh wallet session now
+        DEBITS from the first Wh (customer got the service) — the de-minimis
+        no-debit waiver was retired 2026-06-24. Only FAILED sub-0.5 skips."""
+        energy = 0.3
+        txn = await Transaction.create(
+            charger=test_charger,
+            user=test_user,
+            transaction_status=status,
+            start_meter_kwh=10.0,
+            end_meter_kwh=10.0 + energy,
+            energy_consumed_kwh=energy,
+        )
+
+        success, message, amount = await WalletService.process_transaction_billing(txn.id)
+
+        assert success is True
+        assert amount > Decimal("0.00")  # billed for the delivered energy
+        wallet = await Wallet.get(user_id=test_user.id)
+        assert await WalletTransaction.filter(
+            wallet_id=wallet.id, type=TransactionTypeEnum.CHARGE_DEDUCT
+        ).count() == 1
 
     @pytest.mark.asyncio
     async def test_billing_at_cliff_debits_total(

@@ -159,6 +159,62 @@ export default function AdminTransactionDetailPage() {
               </CardContent>
             </Card>
 
+            {/* Revenue Breakdown — read-only per-session money tally */}
+            {transactionData?.revenue && (
+              <Card>
+                <CardHeader>
+                  <CardTitle>Revenue Breakdown</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  {(() => {
+                    const r = transactionData.revenue;
+                    const money = (v?: number | null) =>
+                      v != null ? `₹${Number(v).toFixed(2)}` : "—";
+                    const rows: { label: string; value: string }[] = [
+                      { label: "Paid Amount", value: money(r.paid_amount) },
+                      {
+                        label: "Energy Consumed",
+                        value:
+                          r.energy_consumed_kwh != null
+                            ? `${Number(r.energy_consumed_kwh).toFixed(2)} kWh`
+                            : "—",
+                      },
+                      { label: "Energy Amount", value: money(r.energy_amount) },
+                      {
+                        label: `GST${
+                          r.gst_rate_percent != null
+                            ? ` (${Number(r.gst_rate_percent).toFixed(0)}%)`
+                            : ""
+                        }`,
+                        value: money(r.gst_amount),
+                      },
+                      { label: "Total Billed", value: money(r.total_billed) },
+                      { label: "Invoice Number", value: r.invoice_number ?? "—" },
+                      { label: "Razorpay Fee", value: money(r.razorpay_fee) },
+                      { label: "Refund", value: money(r.refund_amount) },
+                      {
+                        label: "Settlement Amount",
+                        value: money(r.settlement_amount),
+                      },
+                      { label: "TDS", value: money(r.tds_amount) },
+                    ];
+                    return (
+                      <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+                        {rows.map((row) => (
+                          <div key={row.label}>
+                            <p className="text-sm font-medium text-muted-foreground">
+                              {row.label}
+                            </p>
+                            <p className="text-sm">{row.value}</p>
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  })()}
+                </CardContent>
+              </Card>
+            )}
+
             {/* User & Charger */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               <Card>

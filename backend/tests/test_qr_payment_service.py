@@ -534,16 +534,17 @@ async def test_process_qr_session_billing_zero_energy_issues_full_refund(
 # ============================================================================
 
 @pytest.mark.asyncio
-async def test_process_qr_session_billing_de_minimis_issues_full_refund(
+async def test_failed_sub_half_kwh_issues_full_refund(
     client, qr_charger, qr_code, qr_tariff, monkeypatch
 ):
-    """ADR 0013: a sub-0.5 kWh QR session is waived as de-minimis goodwill —
-    full refund of amount_paid, instant speed, REFUNDED, no GST invoice. Same
-    mechanical outcome as zero-energy but a *real* tiny supply occurred."""
+    """ADR 0013 (amended 2026-06-24): a FAILED QR session that delivered
+    0 < energy < 0.5 kWh is fully refunded (faulted after a trivial delivery) —
+    full refund of amount_paid, instant speed, REFUNDED, no GST invoice."""
     monkeypatch.setenv("RAZORPAY_INSTANT_REFUND_ENABLED", "true")
 
     _, txn, qr_payment = await _make_qr_billing_fixture(
         qr_charger, qr_code, qr_tariff, energy_consumed_kwh=0.3,
+        status=TransactionStatusEnum.FAILED,
     )
 
     mock_razorpay = MagicMock()
@@ -575,19 +576,21 @@ async def test_process_qr_session_billing_de_minimis_issues_full_refund(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("energy,expected_substr", [
-    (0.0, "Zero energy delivered"),
-    (-0.1, "Zero energy delivered"),
-    (0.3, "De-minimis energy 0.300 kWh"),
-    (0.499, "De-minimis energy 0.499 kWh"),
+@pytest.mark.parametrize("energy,status,expected_substr", [
+    (0.0, TransactionStatusEnum.COMPLETED, "Zero energy delivered"),
+    (-0.1, TransactionStatusEnum.COMPLETED, "Zero energy delivered"),
+    (0.0, TransactionStatusEnum.FAILED, "Zero energy delivered"),
+    (0.3, TransactionStatusEnum.FAILED, "Faulted after 0.300 kWh"),
+    (0.499, TransactionStatusEnum.FAILED, "Faulted after 0.499 kWh"),
 ])
-async def test_qr_waiver_reason_is_band_accurate(
-    client, qr_charger, qr_code, qr_tariff, energy, expected_substr
+async def test_qr_refund_reason_is_band_accurate(
+    client, qr_charger, qr_code, qr_tariff, energy, status, expected_substr
 ):
-    """Audit honesty: de-minimis sessions must NOT be reported as 'Zero energy'.
+    """Audit honesty (ADR 0013 amendment): zero-energy refunds say 'Zero energy';
+    fault refunds (FAILED + sub-0.5) say 'Faulted after …' and never 'Zero energy'.
     The reason string passed to _full_refund names the band correctly."""
     _, txn, _ = await _make_qr_billing_fixture(
-        qr_charger, qr_code, qr_tariff, energy_consumed_kwh=energy,
+        qr_charger, qr_code, qr_tariff, energy_consumed_kwh=energy, status=status,
     )
 
     with patch.object(QRPaymentService, "_full_refund", new=AsyncMock()) as mock_refund:
@@ -598,6 +601,35 @@ async def test_qr_waiver_reason_is_band_accurate(
     assert expected_substr in reason
     if energy > 0:
         assert "Zero energy" not in reason
+
+
+@pytest.mark.asyncio
+async def test_completed_sub_half_kwh_now_bills_not_refunded(
+    client, qr_charger, qr_code, qr_tariff
+):
+    """ADR 0013 amendment: a COMPLETED QR session that delivered 0 < energy < 0.5
+    kWh is BILLED (customer got the service; franchisee earns it), NOT routed to
+    the full-refund waiver. The de-minimis waiver was retired 2026-06-24."""
+    _, txn, qr_payment = await _make_qr_billing_fixture(
+        qr_charger, qr_code, qr_tariff, energy_consumed_kwh=0.3,
+        status=TransactionStatusEnum.COMPLETED,
+    )
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment = AsyncMock(return_value={"id": "rfnd_CHANGE"})
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock()
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
+
+    with patch.object(QRPaymentService, "_full_refund", new=AsyncMock()) as mock_full_refund, \
+         patch("services.qr_payment_service.razorpay_service", mock_razorpay), \
+         patch("services.qr_payment_service.redis_manager") as mock_redis:
+        mock_redis.delete_qr_session = AsyncMock()
+        await QRPaymentService.process_qr_session_billing(txn.id)
+
+    # The full-refund (waiver/fault) branch must NOT fire for a completed session.
+    mock_full_refund.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1270,9 +1302,12 @@ def test_zero_decimal_serializes_as_string():
 # Budget cap on over-consumption in process_qr_session_billing
 # ============================================================================
 
-async def _make_qr_billing_fixture(qr_charger, qr_code, qr_tariff, energy_consumed_kwh: float):
+async def _make_qr_billing_fixture(qr_charger, qr_code, qr_tariff, energy_consumed_kwh: float,
+                                   status=TransactionStatusEnum.COMPLETED):
     """Set up a QR payment + transaction at the CHARGING state with the
-    given energy_consumed_kwh ready for process_qr_session_billing to run."""
+    given energy_consumed_kwh ready for process_qr_session_billing to run.
+    `status` controls the billing band (COMPLETED bills sub-0.5; FAILED refunds
+    sub-0.5) per the ADR 0013 amendment."""
     import uuid
     user = await User.create(
         email=f"u-{uuid.uuid4().hex[:8]}@v.test",
@@ -1283,7 +1318,7 @@ async def _make_qr_billing_fixture(qr_charger, qr_code, qr_tariff, energy_consum
         user=user,
         charger=qr_charger,
         energy_consumed_kwh=energy_consumed_kwh,
-        transaction_status=TransactionStatusEnum.COMPLETED,
+        transaction_status=status,
     )
     qr_payment = await QRPayment.create(
         razorpay_payment_id=f"pay_{uuid.uuid4().hex[:10]}",

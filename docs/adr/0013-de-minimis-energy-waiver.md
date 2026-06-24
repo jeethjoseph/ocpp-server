@@ -1,5 +1,38 @@
 # A sub-0.5 kWh session is fully refunded and not billed — as a goodwill waiver, not a non-supply
 
+> **Status: amended 2026-06-24 — the de-minimis *waiver* described below is REVERSED.** Completed sub-0.5 kWh sessions now bill; only a FAILED session that delivered a little is refunded. The original text is kept for history; read the Amendment first.
+
+## Amendment (2026-06-24): completed sub-0.5 kWh bills; only FAILED-after-trivial-delivery refunds
+
+The original decision — full-refund (QR) / no-debit (wallet) for **every** `0 < energy < 0.5 kWh` session, with no invoice or settlement — is **reversed**. New policy, keyed on `transaction_status` × energy:
+
+| status \ energy | `≤ 0` | `0 < e < 0.5` | `≥ 0.5` |
+|---|---|---|---|
+| **COMPLETED** (clean StopTransaction) | full refund *(ADR 0002)* | **bill** | bill |
+| **FAILED** (abnormal — `_fail_transaction_with_billing`) | full refund | **full refund** (fault) | bill |
+
+- A **COMPLETED** session that delivered any energy is **billed from the first Wh** (`energy × rate + GST`, GST invoice, settlement entry; refund only the unused prepaid change). **No minimum-charge floor.**
+- A **FAILED** session (charger stopped without a clean StopTransaction, or socket-grace timeout) that delivered `0 < energy < 0.5 kWh` is **fully refunded** (QR) / **not debited** (wallet) — the "intended a lot, faulted after delivering a little" case.
+- A **FAILED** session that delivered `≥ 0.5 kWh` is **billed** — the customer got a real charge despite the fault.
+- `energy ≤ 0` remains a full refund under **ADR 0002** (no taxable supply), regardless of status.
+
+### Why the reversal
+The waiver gave completed charges away for free and left the **franchisee unpaid for energy they actually delivered**. Two things outweigh the billing friction the original optimized for:
+1. **The customer received the service.** Someone who pays for ~0.2 kWh and completes the session happily should not be refunded — they got what they paid for.
+2. **The franchisee earns a legitimate settlement** for real energy delivered. The original "franchisee absorbs the de-minimis kWh" consequence is the specific grievance being corrected.
+
+The friction the original cited (a GST invoice + settlement entry + change-refund gateway fee on a ~₹5 session, some settlements landing below the Razorpay payout threshold and accumulating) is **accepted as the price of correctness**, not disputed.
+
+### `MIN_BILLABLE_ENERGY_KWH` is repurposed
+`MIN_BILLABLE_ENERGY_KWH = Decimal("0.5")` no longer means "minimum energy to bill" (completed sessions bill from the first Wh). It is now the **fault-refund ceiling**: the maximum energy a **FAILED** session can have delivered and still be fully refunded. Symmetric across QR (full refund) and wallet (no debit).
+
+### "De-minimis Session" retired
+The glossary term **De-minimis Session** (a *waived* completed sub-0.5 session) no longer exists — those sessions bill. The only non-billable bands are now **Zero-energy** (ADR 0002) and **Fault-refund** (FAILED + sub-0.5, this amendment).
+
+---
+
+_Original decision (now superseded by the amendment above):_
+
 A **Charging Session** that delivers `0 < energy_consumed_kwh < 0.5 kWh` (the **Minimum billable energy**, a half-unit) is treated as a **De-minimis Session**: the customer is refunded in full (QR) or not debited at all (wallet), **no GST invoice and no Settlement Entry are created**, and the franchisee silently absorbs the trivial delivered kWh. This widens the existing zero-energy full-refund path (ADR 0002) from `≤ 0` to `< 0.5`, but the justification is deliberately different and must not be conflated with ADR 0002's.
 
 ## Why this is *not* ADR 0002 reasoning

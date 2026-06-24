@@ -198,6 +198,22 @@ export interface TransactionDetail {
   refund_speed?: string | null;
   refund_amount?: number | null;
   qr_session?: QRSessionBudget | null;
+  revenue?: RevenueBreakdown | null;
+}
+
+export interface RevenueBreakdown {
+  paid_amount?: number | null;
+  energy_consumed_kwh?: number | null;
+  energy_amount?: number | null;
+  gst_amount?: number | null;
+  gst_rate_percent?: number | null;
+  total_billed?: number | null;
+  invoice_number?: string | null;
+  razorpay_fee?: number | null;
+  refund_amount?: number | null;
+  refund_speed?: string | null;
+  settlement_amount?: number | null;
+  tds_amount?: number | null;
 }
 
 export interface ApiResponse<T = any> {

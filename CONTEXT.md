@@ -19,16 +19,17 @@ A session funded by a one-time UPI payment scanned from the charger's QR sticker
 _Avoid_: guest session, anonymous session.
 
 **Non-billable Session**:
-A session that ended with `energy_consumed_kwh < 0.5 kWh` (the **Minimum billable energy**). For **QR Sessions** this triggers a full refund of `amount_paid`; for **Wallet Sessions** no debit occurs. Either way: **no GST invoice, no Settlement Entry**. The threshold is a *cliff*, not an allowance — a session at or above 0.5 kWh bills for its **total** energy from the first Wh; the half-unit is never carved off the top. Two sub-cases with the same mechanical outcome but distinct legal justification:
+A session that produces **no GST invoice and no Settlement Entry** — for **QR Sessions** a full refund of `amount_paid`, for **Wallet Sessions** no debit. Per [[adr-0013-de-minimis-energy-waiver]] (**amended 2026-06-24**) there are exactly TWO such bands, keyed on `transaction_status` × energy:
 
-- **Zero-energy Session** (`energy ≤ 0`): no taxable supply occurred — nothing was delivered. See [[adr-0002-zero-energy-full-refund]].
-- **De-minimis Session** (`0 < energy < 0.5 kWh`): a real (tiny) supply occurred and is **waived as goodwill** — collecting ≤ ~₹12 of revenue costs more in invoice/settlement/partial-refund friction than it's worth. The franchisee absorbs the trivial delivered kWh (no settlement). See [[adr-0013-de-minimis-energy-waiver]].
+- **Zero-energy Session** (`energy ≤ 0`, any status): no taxable supply occurred — nothing was delivered. See [[adr-0002-zero-energy-full-refund]].
+- **Fault-refund Session** (`transaction_status = FAILED` and `0 < energy < 0.5 kWh`): the session terminated abnormally (`_fail_transaction_with_billing` — charger stopped without a clean StopTransaction, or socket-grace timeout) after delivering a trivial amount — the "intended a lot, faulted early" case. Full refund / no debit; the franchisee absorbs the trivial kWh.
 
-_Avoid_: calling a **De-minimis Session** "zero-energy" — they have different legal bases (waived supply vs non-supply) even though the code routes both through one `< 0.5` check. _Avoid_: "failed session" (charger faults are a separate category).
+A **COMPLETED** session that delivered any energy is **billable**: it bills from the **first Wh** (no cliff, no minimum-charge floor) and issues a GST invoice + Settlement Entry — the customer received the service and the franchisee earns the settlement.
+_Avoid_: **De-minimis Session** — a **retired** term (2026-06-24). It used to mean a *waived* completed sub-0.5 session; those now **bill**. _Avoid_: conflating **Zero-energy** (non-supply, any status) with **Fault-refund** (FAILED + trivial delivery).
 
-**Minimum billable energy**:
-The 0.5 kWh (half-unit) cliff below which a **Charging Session** is **Non-billable**. A hardcoded `Decimal` policy constant (`MIN_BILLABLE_ENERGY_KWH`), not an env var — changing it goes through code review + ADR, not a deploy-config edit. Keyed on **energy** (`energy_consumed_kwh`), never power.
-_Avoid_: "minimum charge", "free allowance" (it is not an allowance — see the cliff note above).
+**Fault-refund ceiling** (`MIN_BILLABLE_ENERGY_KWH`):
+The 0.5 kWh threshold below which a **FAILED** session is fully refunded (the **Fault-refund Session** band). A hardcoded `Decimal` constant (`MIN_BILLABLE_ENERGY_KWH = Decimal("0.5")`), not an env var — changing it goes through code review + ADR. Keyed on **energy** (`energy_consumed_kwh`), never power. **Post-2026-06-24 it no longer gates billing** — COMPLETED sessions bill from the first Wh; the constant now only bounds the FAILED-session fault refund, so the variable name is a partial misnomer (kept to avoid churn).
+_Avoid_: "minimum billable energy" / "minimum charge" as if completed sessions below 0.5 kWh are free — they bill.
 
 **Internal-role Session**:
 A **Charging Session** initiated by an ADMIN or FRANCHISEE user, regardless of funding source. Purely operational — VoltLync staff testing a charger or a franchisee charging their own car at their own station. No **GST Invoice** is issued, no **Wallet** is debited, no **Budget cap** is enforced. The OCPP audit trail and meter values are still recorded so ops can see "this admin burned X kWh testing." If a FRANCHISEE wants to be billed for charging, they register a separate USER account.
@@ -185,7 +186,7 @@ _Avoid_: "log viewer", "log page" — the canonical term is **Logs Console**, pa
 - A **Charging Session** is funded by either a **Wallet** (debit at finalize) or a **QR Payment** (prepaid, refund-on-finalize).
 - **Funding source is determined at StartTransaction, not at initiation.** The `on_start_transaction` handler resolves the `User` by `rfid_card_id` (the idTag — the app's RemoteStart sends `user.rfid_card_id` as the idTag, so app-started and card-tapped sessions are indistinguishable at this layer), then: if a **QR Payment** links to the transaction it is a **QR Session**; otherwise, if the user has a **Wallet**, it is a **Wallet Session**. Consequence: nothing about *how* a session was triggered (app remote-start, deep-link API call, or local RFID tap) changes its funding — so any control that must prevent wallet-funded sessions has to act on this decision, not on the frontend.
 - A **QR Payment** carries both an **Actual platform fee** (truth from Razorpay) and a **Synthetic platform fee** (policy, fixed). They are not expected to be equal; variance is absorbed entirely by VoltLync. Post 2026-05-29, both the **GST Invoice** gateway-charges line AND the **`commission_ledger_entry.pg_fee_amount`** use the Synthetic figure; the franchisee is shielded from Razorpay's instantaneous fee schedule.
-- A **billable** (energy ≥ 0.5 kWh — the **Minimum billable energy**), non-internal **Charging Session** produces exactly one **GST Invoice** and exactly one **Settlement Entry**. A **Non-billable Session** (energy < 0.5 kWh) produces neither.
+- A **billable**, non-internal **Charging Session** produces exactly one **GST Invoice** and exactly one **Settlement Entry**. Billable = delivered `energy > 0` AND not a **Fault-refund Session** — i.e. any **COMPLETED** session with energy (from the first Wh), or a **FAILED** session with `energy ≥ 0.5 kWh`. A **Non-billable Session** (Zero-energy, or FAILED + sub-0.5) produces neither. See [[adr-0013-de-minimis-energy-waiver]] amendment.
 - A **Tariff** stores both `tariff_per_kwh_all_in` (display) and `rate_per_kwh` (math); writes update both, reads pick the one that fits the surface.
 - The **Budget cap** is computed against the **Synthetic platform fee**, never the **Actual platform fee**, to give customers a predictable contract.
 

@@ -812,28 +812,25 @@ class QRPaymentService:
 
         energy_kwh = transaction.energy_consumed_kwh or 0
 
-        # ADR 0002 / ADR 0013: a Non-billable Session (energy below the
-        # Minimum billable energy cliff) full-refunds amount_paid and issues
-        # no GST invoice / settlement entry. The over-payment formula below is
-        # correct only when a billable service was delivered. Route these to
-        # _full_refund so they hit the same path as the other "service not
-        # rendered" outcomes — it already handles the audit + the instant
-        # speed=optimum amendment. The single `< MIN_BILLABLE_ENERGY_KWH`
-        # check subsumes the old `<= 0` (and negative meter-rollback) case.
-        #
-        # Two bands, two honest reasons (do NOT call de-minimis "zero energy"):
-        #   energy <= 0            -> no taxable supply occurred (ADR 0002)
-        #   0 < energy < 0.5 kWh   -> real tiny supply, waived as goodwill (ADR 0013)
+        # Non-billable bands (full refund, no GST invoice / settlement). The
+        # over-payment formula below is correct only when a billable service was
+        # delivered, so route these to _full_refund (handles audit + instant
+        # speed=optimum). Per ADR 0013 (amended 2026-06-24), only TWO bands are
+        # non-billable — a COMPLETED session that delivered any energy now bills
+        # from the first Wh (customer got the service; franchisee earns it):
+        #   energy <= 0                         -> no taxable supply (ADR 0002)
+        #   FAILED and 0 < energy < 0.5 kWh     -> faulted after a trivial
+        #                                          delivery (ADR 0013 amendment)
         energy_dec = Decimal(str(energy_kwh))
-        if energy_dec < MIN_BILLABLE_ENERGY_KWH:
-            if energy_dec <= 0:
-                reason = "Zero energy delivered"
-            else:
-                reason = (
-                    f"De-minimis energy {energy_dec:.3f} kWh "
-                    f"< {MIN_BILLABLE_ENERGY_KWH} kWh — waived"
-                )
-            await QRPaymentService._full_refund(qr_payment, reason)
+        if energy_dec <= 0:
+            await QRPaymentService._full_refund(qr_payment, "Zero energy delivered")
+            return
+        if (transaction.transaction_status == TransactionStatusEnum.FAILED
+                and energy_dec < MIN_BILLABLE_ENERGY_KWH):
+            await QRPaymentService._full_refund(
+                qr_payment,
+                f"Faulted after {energy_dec:.3f} kWh (< {MIN_BILLABLE_ENERGY_KWH} kWh) — full refund",
+            )
             return
 
         tariff = await WalletService.get_applicable_tariff(qr_payment.charger_id)

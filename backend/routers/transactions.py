@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from datetime import datetime, timezone
 import logging
 
-from models import Transaction, MeterValue, User, Charger, WalletTransaction, QRPayment, CommissionLedgerEntry
+from models import Transaction, MeterValue, User, Charger, WalletTransaction, QRPayment, CommissionLedgerEntry, GSTInvoice
 from tortoise.exceptions import IntegrityError
 from tortoise.expressions import Q
 from tortoise.functions import Sum
@@ -125,6 +125,59 @@ class TransactionDetailResponse(BaseModel):
     # Refund drill-down (QR sessions only). See TransactionResponse.refund_speed.
     refund_speed: Optional[str] = None
     refund_amount: Optional[float] = None
+    # Per-session revenue tally (read-only). Present for all sessions; fields
+    # that don't apply to the funding source / band are null.
+    revenue: Optional["RevenueBreakdown"] = None
+
+
+class RevenueBreakdown(BaseModel):
+    """Read-only revenue tally for one session, sourced so the figures reconcile:
+    `paid = total_billed + refund`; `total_billed = energy_amount + gst`;
+    `settlement = gross − platform_commission − tds − pg_fee`. razorpay_fee is the
+    ACTUAL Razorpay deduction (commission + its GST), not the synthetic 2%."""
+    paid_amount: Optional[float] = None         # QRPayment.amount_paid (QR only)
+    energy_consumed_kwh: Optional[float] = None  # Transaction.energy_consumed_kwh
+    energy_amount: Optional[float] = None        # Transaction.energy_charge (pre-GST)
+    gst_amount: Optional[float] = None           # Transaction.gst_amount
+    gst_rate_percent: Optional[float] = None
+    total_billed: Optional[float] = None         # Transaction.total_billed
+    invoice_number: Optional[str] = None         # GSTInvoice.invoice_number
+    razorpay_fee: Optional[float] = None         # actual: razorpay_commission + razorpay_gst
+    refund_amount: Optional[float] = None         # QRPayment.refund_amount
+    refund_speed: Optional[str] = None
+    settlement_amount: Optional[float] = None     # CommissionLedgerEntry.franchisee_payout
+    tds_amount: Optional[float] = None           # CommissionLedgerEntry.tds_amount
+
+
+def _as_float(v) -> Optional[float]:
+    return float(v) if v is not None else None
+
+
+def _build_revenue(transaction, qrp, settlement, invoice) -> RevenueBreakdown:
+    """Assemble the per-session revenue tally from the transaction + its QR
+    payment, settlement entry, and GST invoice. Any of qrp/settlement/invoice
+    may be None (wallet/internal sessions, or non-billable bands)."""
+    razorpay_fee = None
+    if qrp and (qrp.razorpay_commission is not None or qrp.razorpay_gst is not None):
+        razorpay_fee = float((qrp.razorpay_commission or 0) + (qrp.razorpay_gst or 0))
+    return RevenueBreakdown(
+        paid_amount=_as_float(qrp.amount_paid) if qrp else None,
+        energy_consumed_kwh=_as_float(transaction.energy_consumed_kwh),
+        energy_amount=_as_float(transaction.energy_charge),
+        gst_amount=_as_float(transaction.gst_amount),
+        gst_rate_percent=_as_float(transaction.gst_rate_percent),
+        total_billed=_as_float(transaction.total_billed),
+        invoice_number=invoice.invoice_number if invoice else None,
+        razorpay_fee=razorpay_fee,
+        refund_amount=_as_float(qrp.refund_amount) if qrp else None,
+        refund_speed=qrp.razorpay_refund_speed_processed if qrp else None,
+        settlement_amount=_as_float(settlement.franchisee_payout) if settlement else None,
+        tds_amount=_as_float(settlement.tds_amount) if settlement else None,
+    )
+
+
+# Resolve the forward reference now that RevenueBreakdown is defined.
+TransactionDetailResponse.model_rebuild()
 
 class MeterValuesListResponse(BaseModel):
     meter_values: List[MeterValueResponse]
@@ -292,6 +345,7 @@ async def get_transaction_details(transaction_id: int):
     payment_status = None
     refund_speed = None
     refund_amount = None
+    qrp = None
     if funding_source == "QR":
         qrp = await QRPayment.filter(transaction_id=transaction_id).first()
         if qrp:
@@ -300,6 +354,8 @@ async def get_transaction_details(transaction_id: int):
             refund_amount = float(qrp.refund_amount) if qrp.refund_amount is not None else None
     settlement = await CommissionLedgerEntry.filter(transaction_id=transaction_id).first()
     settlement_status = settlement.settlement_status if settlement else None
+    invoice = await GSTInvoice.filter(transaction_id=transaction_id).first()
+    revenue = _build_revenue(transaction, qrp, settlement, invoice)
 
     return TransactionDetailResponse(
         transaction=TransactionResponse.model_validate(transaction, from_attributes=True),
@@ -314,6 +370,7 @@ async def get_transaction_details(transaction_id: int):
         settlement_status=settlement_status,
         refund_speed=refund_speed,
         refund_amount=refund_amount,
+        revenue=revenue,
     )
 
 
