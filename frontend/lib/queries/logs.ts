@@ -7,6 +7,8 @@ export const useLogs = (params: {
   message_type?: string[];
   start_date?: string;
   end_date?: string;
+  direction?: string;
+  errors_only?: boolean;
   offset?: number;
   limit?: number;
 }) => {

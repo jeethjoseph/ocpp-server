@@ -8,7 +8,13 @@ from fastapi import status
 from models import OCPPLog
 
 
-async def _make_log(charge_point_id: str, message_type: str, direction: str = "IN", age_hours: float = 0.0):
+async def _make_log(
+    charge_point_id: str,
+    message_type: str,
+    direction: str = "IN",
+    age_hours: float = 0.0,
+    status: str = "SUCCESS",
+):
     """Create an OCPPLog row, back-dating its timestamp via update() since
     `timestamp` is auto_now_add and cannot be set at create time."""
     log = await OCPPLog.create(
@@ -16,7 +22,7 @@ async def _make_log(charge_point_id: str, message_type: str, direction: str = "I
         message_type=message_type,
         direction=direction,
         payload={"status": "ok"},
-        status="SUCCESS",
+        status=status,
     )
     if age_hours:
         ts = datetime.now(tz=timezone.utc) - timedelta(hours=age_hours)
@@ -137,6 +143,68 @@ class TestLogsConsole:
         # Stable, non-overlapping slices (deterministic ordering by -timestamp, -id).
         ids = [r["id"] for r in b1["data"] + b2["data"] + b3["data"]]
         assert len(ids) == len(set(ids)) == 5
+
+    @pytest.mark.asyncio
+    async def test_direction_filter(self, client_admin: AsyncClient, test_charger):
+        cp = test_charger.charge_point_string_id
+        await _make_log(cp, "BootNotification", direction="IN")
+        await _make_log(cp, "BootNotification", direction="OUT")
+        await _make_log(cp, "Heartbeat", direction="IN")
+
+        resp = await client_admin.get(
+            "/api/admin/logs", params={"charge_point_id": cp, "direction": "OUT"}
+        )
+        assert resp.status_code == status.HTTP_200_OK
+        data = resp.json()["data"]
+        assert len(data) == 1
+        assert all(r["direction"] == "OUT" for r in data)
+
+    @pytest.mark.asyncio
+    async def test_errors_only_filter(self, client_admin: AsyncClient, test_charger):
+        cp = test_charger.charge_point_string_id
+        await _make_log(cp, "BootNotification", status="SUCCESS")
+        await _make_log(cp, "RemoteStartTransaction", status="Rejected")
+        await _make_log(cp, "DataTransfer", status="error")
+
+        resp = await client_admin.get(
+            "/api/admin/logs", params={"charge_point_id": cp, "errors_only": "true"}
+        )
+        assert resp.status_code == status.HTTP_200_OK
+        data = resp.json()["data"]
+        statuses = {r["status"] for r in data}
+        assert statuses == {"Rejected", "error"}
+        assert "SUCCESS" not in statuses
+
+    @pytest.mark.asyncio
+    async def test_errors_only_excludes_null_status(self, client_admin: AsyncClient, test_charger):
+        cp = test_charger.charge_point_string_id
+        log = await _make_log(cp, "Heartbeat", status="SUCCESS")
+        await OCPPLog.filter(id=log.id).update(status=None)
+        await _make_log(cp, "DataTransfer", status="error")
+
+        resp = await client_admin.get(
+            "/api/admin/logs", params={"charge_point_id": cp, "errors_only": "true"}
+        )
+        assert resp.status_code == status.HTTP_200_OK
+        data = resp.json()["data"]
+        assert len(data) == 1
+        assert data[0]["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_export_respects_errors_only(self, client_admin: AsyncClient, test_charger):
+        cp = test_charger.charge_point_string_id
+        await _make_log(cp, "BootNotification", status="SUCCESS")
+        await _make_log(cp, "DataTransfer", status="error")
+
+        resp = await client_admin.get(
+            "/api/admin/logs/export",
+            params={"charge_point_id": cp, "errors_only": "true"},
+        )
+        assert resp.status_code == status.HTTP_200_OK
+        lines = [ln for ln in resp.text.splitlines() if ln.strip()]
+        assert len(lines) == 2  # header + 1 error row
+        assert "DataTransfer" in resp.text
+        assert "BootNotification" not in resp.text
 
     @pytest.mark.asyncio
     async def test_export_streams_csv(self, client_admin: AsyncClient, test_charger):

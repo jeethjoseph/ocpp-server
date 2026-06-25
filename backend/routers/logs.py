@@ -70,18 +70,26 @@ MAX_LIST_LIMIT = 5000
 EXPORT_CHUNK_SIZE = 1000
 MAX_EXPORT_ROWS = 100000
 
+# The OCPPLog.status value that marks a non-error frame. `errors_only` returns
+# rows whose status is present AND is not this value (mirrors the prior
+# client-side `(status ?? "SUCCESS") === "SUCCESS"` success test, server-side).
+SUCCESS_STATUS = "SUCCESS"
+
 
 def _build_logs_query(
     charge_point_id: Optional[str],
     message_type: Optional[List[str]],
     start_date: Optional[str],
     end_date: Optional[str],
+    direction: Optional[str] = None,
+    errors_only: bool = False,
 ):
     """Build the shared, bounded OCPPLog queryset for the list + export endpoints.
 
     Always applies a bounded time window (defaulting to the last 24h) plus the
-    optional charger / OCPP-action filters. See ADR 0014. Ordering is deterministic
-    (timestamp desc, id desc tiebreak) so OFFSET pagination is stable.
+    optional charger / OCPP-action / direction / errors-only filters. See ADR
+    0014. Ordering is deterministic (timestamp desc, id desc tiebreak) so OFFSET
+    pagination is stable.
     """
     now = datetime.now(tz=timezone.utc)
     start_dt = _parse_date(start_date, "start_date") if start_date else now - timedelta(hours=DEFAULT_WINDOW_HOURS)
@@ -92,6 +100,10 @@ def _build_logs_query(
         query = query.filter(charge_point_id=charge_point_id)
     if message_type:
         query = query.filter(message_type__in=message_type)
+    if direction:
+        query = query.filter(direction=direction)
+    if errors_only:
+        query = query.filter(status__not_isnull=True).filter(~Q(status=SUCCESS_STATUS))
     return query.order_by("-timestamp", "-id")
 
 
@@ -101,6 +113,8 @@ async def get_logs(
     message_type: Optional[List[str]] = Query(None, description="Filter by one or more OCPP actions (repeat the param)"),
     start_date: Optional[str] = Query(None, description="Start date ISO 8601 w/ tz. Defaults to 24h ago."),
     end_date: Optional[str] = Query(None, description="End date ISO 8601 w/ tz. Defaults to now."),
+    direction: Optional[str] = Query(None, description="Filter by direction: IN or OUT"),
+    errors_only: bool = Query(False, description="Return only non-success (error/failed) rows"),
     offset: int = Query(0, ge=0, description="Row offset for pagination"),
     limit: int = Query(100, ge=1, le=MAX_LIST_LIMIT, description="Number of logs to return (max 5,000)"),
     admin_user: User = Depends(require_admin()),
@@ -111,7 +125,7 @@ async def get_logs(
     sequential scan of the log table — see ADR 0014. Newest first, OFFSET-paged.
     """
     try:
-        query = _build_logs_query(charge_point_id, message_type, start_date, end_date)
+        query = _build_logs_query(charge_point_id, message_type, start_date, end_date, direction, errors_only)
         total = await query.count()
         logs = await query.offset(offset).limit(limit)
         has_more = offset + len(logs) < total
@@ -187,6 +201,8 @@ async def export_logs(
     message_type: Optional[List[str]] = Query(None, description="Filter by one or more OCPP actions (repeat the param)"),
     start_date: Optional[str] = Query(None, description="Start date ISO 8601 w/ tz. Defaults to 24h ago."),
     end_date: Optional[str] = Query(None, description="End date ISO 8601 w/ tz. Defaults to now."),
+    direction: Optional[str] = Query(None, description="Filter by direction: IN or OUT"),
+    errors_only: bool = Query(False, description="Return only non-success (error/failed) rows"),
     admin_user: User = Depends(require_admin()),
 ):
     """
@@ -194,7 +210,7 @@ async def export_logs(
     paged through in bounded chunks so memory stays flat regardless of result
     size, and capped at MAX_EXPORT_ROWS rows. See ADR 0014.
     """
-    query = _build_logs_query(charge_point_id, message_type, start_date, end_date)
+    query = _build_logs_query(charge_point_id, message_type, start_date, end_date, direction, errors_only)
     return StreamingResponse(
         _stream_logs_csv(query),
         media_type="text/csv",

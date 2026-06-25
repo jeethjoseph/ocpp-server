@@ -567,7 +567,7 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
     - `useLatestSignalQuality()` - Latest reading (5s stale, **5s auto-refresh**)
     - `useChargerErrors()` - Error history (30s stale, **30s auto-refresh**)
   - **`logs.ts`** - Logs Console and audit trail hooks
-    - `useLogs()` - Fleet-wide OCPP message logs for the Logs Console (`/admin/logs`); filters by charger + action server-side, default 24h window, OFFSET-paged (`offset`/`limit` in params and query key). Replaced the retired per-charger `useChargerLogs()`/`useChargerLogSummary()` hooks. CSV export via `logService.exportCsv(params, getToken)` → streamed `Blob`.
+    - `useLogs()` - Fleet-wide OCPP message logs for the Logs Console (`/admin/logs`); ALL filters server-side (charger + action + direction + errors_only), default 24h window, OFFSET-paged (`offset`/`limit` in params and query key). The page (`app/admin/logs/page.tsx`) caps page size at 5000 (default 200), virtualizes the row list with `@tanstack/react-virtual` (`useVirtualizer`), has Prev/Next offset pagination (Next disabled when `!has_more`, Prev when `offset===0`, resets offset to 0 on any filter change), and a "Download CSV" button that calls `logService.exportCsv(filters, getToken)` → Blob → object-URL download (sonner toast on error). No client-side window filtering. Replaced the retired per-charger `useChargerLogs()`/`useChargerLogSummary()` hooks.
     - `useChargerTimeline()` - Charger event timeline
     - `useEntityAuditLogs()` - Entity audit log history
   - **`dashboard.ts`** - Admin dashboard hooks
@@ -1021,8 +1021,8 @@ POST /webhooks/razorpay - Razorpay payment events (HMAC-SHA256 signature verifie
 ```
 GET /api/charge-points - Connected charger list
 POST /api/charge-points/{id}/request - Send OCPP command  
-GET /api/admin/logs - Fleet-wide OCPP message logs (ADR 0014); bounded 24h default window, charger + action filters, OFFSET pagination (offset/limit, limit le=5000), returns {data,total,offset,limit,has_more}
-GET /api/admin/logs/export - Streaming CSV (text/csv, StreamingResponse) of the same filtered logs; paged in 1000-row chunks, capped at 100,000 rows; Content-Disposition attachment filename=ocpp-logs.csv
+GET /api/admin/logs - Fleet-wide OCPP message logs (ADR 0014); bounded 24h default window, charger + action + direction (IN/OUT) + errors_only filters (all server-side), OFFSET pagination (offset/limit, limit le=5000), returns {data,total,offset,limit,has_more}. errors_only=true returns rows where status IS NOT NULL AND status != 'SUCCESS'. All filters live in the shared `_build_logs_query()` helper in routers/logs.py.
+GET /api/admin/logs/export - Streaming CSV (text/csv, StreamingResponse) of the same filtered logs (incl. direction + errors_only); paged in 1000-row chunks, capped at 100,000 rows; Content-Disposition attachment filename=ocpp-logs.csv
 ```
 
 ---

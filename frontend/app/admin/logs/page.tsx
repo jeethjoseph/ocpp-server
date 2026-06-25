@@ -1,8 +1,10 @@
 "use client";
 
-import React, { Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import React, { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams, usePathname } from "next/navigation";
 import Link from "next/link";
+import { toast } from "sonner";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { AdminOnly } from "@/components/RoleWrapper";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
@@ -10,12 +12,15 @@ import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { AlertTriangle, ArrowUpDown, Download } from "lucide-react";
 import { useLogs } from "@/lib/queries/logs";
-import { LogEntry } from "@/lib/api-services";
+import { LogEntry, logService } from "@/lib/api-services";
 import { OCPP_ACTIONS } from "@/lib/ocpp-actions";
-import { exportLogsToCSV } from "@/lib/csv-export";
+import { useAuth } from "@/contexts/AuthContext";
 import ChargerCombobox from "@/components/ChargerCombobox";
 
 type Direction = "ALL" | "IN" | "OUT";
+
+const DEFAULT_LIMIT = 200;
+const MAX_LIMIT = 5000;
 
 // datetime-local <-> Date helpers (inputs are in local tz; the API wants ISO+tz).
 function toDateTimeLocal(date: Date): string {
@@ -27,6 +32,7 @@ function LogsConsoleInner() {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
+  const { getToken } = useAuth();
 
   // --- initial state from the URL (read once) ---
   const [charger, setCharger] = useState<string | undefined>(
@@ -42,12 +48,14 @@ function LogsConsoleInner() {
     searchParams.get("end") || toDateTimeLocal(new Date())
   );
   const [limit, setLimit] = useState<number>(
-    Number(searchParams.get("limit")) || 100
+    Number(searchParams.get("limit")) || DEFAULT_LIMIT
   );
   const [direction, setDirection] = useState<Direction>(
     (searchParams.get("dir") as Direction) || "ALL"
   );
   const [errorsOnly, setErrorsOnly] = useState<boolean>(searchParams.get("errors") === "1");
+  const [offset, setOffset] = useState<number>(0);
+  const [downloading, setDownloading] = useState<boolean>(false);
 
   // --- write state back to the URL (shareable) ---
   useEffect(() => {
@@ -56,38 +64,44 @@ function LogsConsoleInner() {
     if (actions.length) sp.set("actions", actions.join(","));
     if (startLocal) sp.set("start", startLocal);
     if (endLocal) sp.set("end", endLocal);
-    if (limit !== 100) sp.set("limit", String(limit));
+    if (limit !== DEFAULT_LIMIT) sp.set("limit", String(limit));
     if (direction !== "ALL") sp.set("dir", direction);
     if (errorsOnly) sp.set("errors", "1");
     const qs = sp.toString();
     router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
   }, [charger, actions, startLocal, endLocal, limit, direction, errorsOnly, pathname, router]);
 
-  // --- server query (charger + action + date window, all server-side) ---
-  const { data: logsResponse, isLoading, error } = useLogs({
-    charge_point_id: charger,
-    message_type: actions.length ? actions : undefined,
-    start_date: startLocal ? new Date(startLocal).toISOString() : undefined,
-    end_date: endLocal ? new Date(endLocal).toISOString() : undefined,
-    limit,
-  });
+  // --- reset paging to the first page whenever a filter changes ---
+  useEffect(() => {
+    setOffset(0);
+  }, [charger, actions, startLocal, endLocal, limit, direction, errorsOnly]);
 
-  const fetched = useMemo(() => logsResponse?.data ?? [], [logsResponse]);
-
-  // --- in-memory refinement: direction + errors-only ---
-  const visible = useMemo(
-    () =>
-      fetched.filter((log) => {
-        if (direction !== "ALL" && log.direction !== direction) return false;
-        if (errorsOnly && (log.status ?? "SUCCESS") === "SUCCESS") return false;
-        return true;
-      }),
-    [fetched, direction, errorsOnly]
+  // --- shared filter params (server-side: charger, action, window, direction, errors) ---
+  const filters = useMemo(
+    () => ({
+      charge_point_id: charger,
+      message_type: actions.length ? actions : undefined,
+      start_date: startLocal ? new Date(startLocal).toISOString() : undefined,
+      end_date: endLocal ? new Date(endLocal).toISOString() : undefined,
+      direction: direction !== "ALL" ? direction : undefined,
+      errors_only: errorsOnly || undefined,
+      limit,
+    }),
+    [charger, actions, startLocal, endLocal, direction, errorsOnly, limit]
   );
 
-  const inboundFetched = useMemo(() => fetched.filter((l) => l.direction === "IN").length, [fetched]);
-  const outboundFetched = fetched.length - inboundFetched;
-  const refined = visible.length !== fetched.length;
+  // --- server query (everything is filtered + paged server-side now) ---
+  const { data: logsResponse, isLoading, error } = useLogs({ ...filters, offset });
+
+  const rows = useMemo(() => logsResponse?.data ?? [], [logsResponse]);
+  const total = logsResponse?.total ?? 0;
+  const hasMore = logsResponse?.has_more ?? false;
+
+  const inbound = useMemo(() => rows.filter((l) => l.direction === "IN").length, [rows]);
+  const outbound = rows.length - inbound;
+
+  const rangeStart = total === 0 ? 0 : offset + 1;
+  const rangeEnd = offset + rows.length;
 
   const toggleAction = useCallback((action: string) => {
     setActions((prev) =>
@@ -95,9 +109,34 @@ function LogsConsoleInner() {
     );
   }, []);
 
-  const handleExportCSV = () => {
-    if (visible.length > 0) exportLogsToCSV(visible, charger || "logs-console");
+  const handleDownloadCSV = async () => {
+    setDownloading(true);
+    try {
+      const blob = await logService.exportCsv(filters, getToken);
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `${charger || "logs-console"}.csv`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error("CSV export failed", err);
+      toast.error("Failed to download CSV. Please try again.");
+    } finally {
+      setDownloading(false);
+    }
   };
+
+  // --- virtualized row list ---
+  const parentRef = useRef<HTMLDivElement>(null);
+  const virtualizer = useVirtualizer({
+    count: rows.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 140,
+    overscan: 8,
+  });
 
   return (
     <div className="space-y-4">
@@ -129,14 +168,18 @@ function LogsConsoleInner() {
             />
           </div>
           <div className="space-y-1">
-            <Label htmlFor="limit" className="text-xs font-medium text-gray-600 dark:text-gray-300">Limit</Label>
+            <Label htmlFor="limit" className="text-xs font-medium text-gray-600 dark:text-gray-300">
+              Page size (max {MAX_LIMIT})
+            </Label>
             <Input
               id="limit"
               type="number"
               min={1}
-              max={100000}
+              max={MAX_LIMIT}
               value={limit}
-              onChange={(e) => setLimit(Math.min(100000, Math.max(1, parseInt(e.target.value) || 100)))}
+              onChange={(e) =>
+                setLimit(Math.min(MAX_LIMIT, Math.max(1, parseInt(e.target.value) || DEFAULT_LIMIT)))
+              }
               className="w-28 bg-white dark:bg-gray-900"
             />
           </div>
@@ -171,7 +214,7 @@ function LogsConsoleInner() {
           </div>
         </div>
 
-        {/* In-memory refinements */}
+        {/* Direction + errors-only (server-side filters) */}
         <div className="flex flex-wrap gap-6 items-center">
           <div className="flex items-center gap-2">
             <Label className="text-xs font-medium text-gray-600 dark:text-gray-300">Direction</Label>
@@ -208,27 +251,44 @@ function LogsConsoleInner() {
         </div>
       )}
 
-      {/* Results summary */}
+      {/* Results summary + pagination */}
       {logsResponse && (
-        <div className="flex items-center justify-between bg-gray-50 dark:bg-gray-800 p-3 rounded-lg border border-gray-200 dark:border-gray-700">
+        <div className="flex flex-wrap items-center justify-between gap-3 bg-gray-50 dark:bg-gray-800 p-3 rounded-lg border border-gray-200 dark:border-gray-700">
           <div className="text-sm text-gray-600 dark:text-gray-400">
             <strong className="text-gray-900 dark:text-gray-100">
-              Showing {visible.length}
-              {refined ? ` of ${fetched.length} fetched` : ""}
-            </strong>{" "}
-            <span>
-              ({logsResponse.total} match on server
-              {logsResponse.has_more ? ", more beyond the fetched window" : ""})
-            </span>
-            <span className="ml-3 text-blue-600 dark:text-blue-400">IN {inboundFetched}</span>
-            <span className="ml-2 text-green-600 dark:text-green-400">OUT {outboundFetched}</span>
+              Showing {rangeStart}&ndash;{rangeEnd} of {total}
+            </strong>
+            <span className="ml-3 text-blue-600 dark:text-blue-400">IN {inbound}</span>
+            <span className="ml-2 text-green-600 dark:text-green-400">OUT {outbound}</span>
           </div>
-          {visible.length > 0 && (
-            <Button onClick={handleExportCSV} variant="outline" size="sm" className="flex items-center gap-2">
-              <Download className="w-4 h-4" />
-              Export CSV
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={offset === 0}
+              onClick={() => setOffset((o) => Math.max(0, o - limit))}
+            >
+              Prev
             </Button>
-          )}
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!hasMore}
+              onClick={() => setOffset((o) => o + limit)}
+            >
+              Next
+            </Button>
+            <Button
+              onClick={handleDownloadCSV}
+              variant="outline"
+              size="sm"
+              disabled={downloading}
+              className="flex items-center gap-2"
+            >
+              <Download className="w-4 h-4" />
+              {downloading ? "Downloading…" : "Download CSV"}
+            </Button>
+          </div>
         </div>
       )}
 
@@ -243,16 +303,40 @@ function LogsConsoleInner() {
         </div>
       )}
 
-      {/* Logs list */}
-      {logsResponse && visible.length > 0 && (
-        <div className="space-y-3">
-          {visible.map((log) => (
-            <LogRow key={log.id} log={log} />
-          ))}
+      {/* Virtualized logs list */}
+      {logsResponse && rows.length > 0 && (
+        <div
+          ref={parentRef}
+          className="h-[70vh] overflow-y-auto rounded-lg"
+        >
+          <div
+            style={{ height: `${virtualizer.getTotalSize()}px`, position: "relative", width: "100%" }}
+          >
+            {virtualizer.getVirtualItems().map((virtualRow) => {
+              const log = rows[virtualRow.index];
+              return (
+                <div
+                  key={log.id}
+                  data-index={virtualRow.index}
+                  ref={virtualizer.measureElement}
+                  style={{
+                    position: "absolute",
+                    top: 0,
+                    left: 0,
+                    width: "100%",
+                    transform: `translateY(${virtualRow.start}px)`,
+                  }}
+                  className="pb-3"
+                >
+                  <LogRow log={log} />
+                </div>
+              );
+            })}
+          </div>
         </div>
       )}
 
-      {logsResponse && visible.length === 0 && !isLoading && (
+      {logsResponse && rows.length === 0 && !isLoading && (
         <div className="text-center py-8 text-gray-500 dark:text-gray-400 bg-gray-50 dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
           No logs match the current filters. Try widening the date range or clearing filters.
         </div>
@@ -281,6 +365,10 @@ function LogRow({ log }: { log: LogEntry }) {
   } else if (Array.isArray(payload) && payload.length >= 4) {
     const [msgType, msgId, action, actualPayload] = payload;
     const kind = msgType === 2 ? "Call" : msgType === 3 ? "CallResult" : msgType === 4 ? "CallError" : "Unknown";
+    // The 4th element is usually an object, but can be an array or primitive on
+    // malformed/non-standard frames — guard before treating it as a record.
+    const isRecord = typeof actualPayload === "object" && actualPayload !== null;
+    const hasContent = isRecord ? Object.keys(actualPayload).length > 0 : actualPayload != null;
     body = (
       <div className="space-y-2">
         <div className="flex items-center gap-2 text-xs">
@@ -288,7 +376,7 @@ function LogRow({ log }: { log: LogEntry }) {
           <span className="font-medium text-gray-900 dark:text-gray-100">{String(action)}</span>
           <span className="text-gray-600 dark:text-gray-300 font-mono text-xs">ID: {String(msgId)}</span>
         </div>
-        {actualPayload && Object.keys(actualPayload).length > 0 && (
+        {hasContent && (
           <pre className="text-xs bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-600 p-3 rounded overflow-x-auto max-w-2xl text-gray-900 dark:text-gray-100">
             {JSON.stringify(actualPayload, null, 2)}
           </pre>

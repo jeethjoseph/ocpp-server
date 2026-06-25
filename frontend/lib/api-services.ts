@@ -429,6 +429,8 @@ export interface LogQueryParams {
   message_type?: string[];
   start_date?: string;
   end_date?: string;
+  direction?: string;
+  errors_only?: boolean;
   offset?: number;
   limit?: number;
 }
@@ -439,6 +441,8 @@ function buildLogQuery(params?: LogQueryParams): string {
   (params?.message_type ?? []).forEach((m) => sp.append("message_type", m));
   if (params?.start_date) sp.set("start_date", params.start_date);
   if (params?.end_date) sp.set("end_date", params.end_date);
+  if (params?.direction) sp.set("direction", params.direction);
+  if (params?.errors_only) sp.set("errors_only", "true");
   if (params?.offset !== undefined) sp.set("offset", params.offset.toString());
   if (params?.limit) sp.set("limit", params.limit.toString());
   return sp.toString();
