@@ -11,6 +11,7 @@ import {
   ChargerDetail,
   MeterValue,
   TransactionDetail,
+  TransactionListResponse,
   ApiResponse,
   SignalQuality,
   SignalQualityListResponse,
@@ -167,38 +168,6 @@ export const chargerService = {
       `/api/admin/chargers/${chargerId}/reset?type=${type}`
     ),
 };
-
-export interface TransactionListItem {
-  id: number;
-  user_id: number;
-  charger_id: number;
-  energy_consumed_kwh?: number | null;
-  start_time: string;
-  end_time?: string | null;
-  transaction_status: string;
-  funding_source: string;
-  payment_status: string | null;
-  // Razorpay processed refund speed ("instant" | "normal" | null) + amount;
-  // QR sessions only, null when no refund.
-  refund_speed?: string | null;
-  refund_amount?: number | null;
-  created_at: string;
-}
-
-export interface TransactionListSummary {
-  total_energy_consumed: number;
-  active_sessions: number;
-  suspended_sessions: number;
-  completed_sessions: number;
-}
-
-export interface TransactionListResponse {
-  data: TransactionListItem[];
-  total: number;
-  page: number;
-  limit: number;
-  summary: TransactionListSummary;
-}
 
 export const transactionService = {
   getAll: (params?: {

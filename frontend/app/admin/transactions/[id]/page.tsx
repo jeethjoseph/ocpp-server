@@ -3,6 +3,7 @@
 import { useParams } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { CreditCard } from "lucide-react";
 import { AdminOnly } from "@/components/RoleWrapper";
 import Link from "next/link";
@@ -10,13 +11,18 @@ import { useAdminTransaction } from "@/lib/queries/transactions";
 
 export default function AdminTransactionDetailPage() {
   const params = useParams();
-  const transactionId = parseInt(params.id as string);
+  const rawId = params.id as string;
+  const transactionId = Number(rawId);
+  // Guard against non-numeric / negative / fractional route params so a bad URL
+  // shows a clear "invalid ID" state rather than a misleading load failure.
+  const isValidId = Number.isInteger(transactionId) && transactionId > 0;
 
   const {
     data: transactionData,
     isLoading,
     error,
-  } = useAdminTransaction(transactionId);
+    refetch,
+  } = useAdminTransaction(isValidId ? transactionId : 0);
 
   const transaction = transactionData?.transaction;
 
@@ -47,11 +53,18 @@ export default function AdminTransactionDetailPage() {
             ← Back to Transactions Console
           </Link>
           <h1 className="text-3xl font-bold">
-            Charging Session #{transactionId}
+            Charging Session {isValidId ? `#${transactionId}` : ""}
           </h1>
         </div>
 
-        {isLoading ? (
+        {!isValidId ? (
+          <div className="text-center py-8">
+            <p className="text-destructive font-medium">Invalid transaction ID</p>
+            <p className="text-muted-foreground text-sm mt-1">
+              &quot;{rawId}&quot; is not a valid transaction ID.
+            </p>
+          </div>
+        ) : isLoading ? (
           <div className="flex items-center justify-center py-8">
             <div className="text-center">
               <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary mx-auto"></div>
@@ -61,8 +74,11 @@ export default function AdminTransactionDetailPage() {
             </div>
           </div>
         ) : error || !transaction ? (
-          <div className="text-center py-8">
+          <div className="text-center py-8 space-y-3">
             <p className="text-destructive">Failed to load session details</p>
+            <Button variant="outline" onClick={() => refetch()}>
+              Try again
+            </Button>
           </div>
         ) : (
           <>

@@ -91,7 +91,7 @@ function LogsConsoleInner() {
   );
 
   // --- server query (everything is filtered + paged server-side now) ---
-  const { data: logsResponse, isLoading, error } = useLogs({ ...filters, offset });
+  const { data: logsResponse, isLoading, error, refetch } = useLogs({ ...filters, offset });
 
   const rows = useMemo(() => logsResponse?.data ?? [], [logsResponse]);
   const total = logsResponse?.total ?? 0;
@@ -298,8 +298,11 @@ function LogsConsoleInner() {
         </div>
       )}
       {error && (
-        <div className="text-center py-8 text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 rounded-lg border border-red-200 dark:border-red-800">
-          Error loading logs. Please try again.
+        <div className="text-center py-8 text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 rounded-lg border border-red-200 dark:border-red-800 space-y-3">
+          <p>Error loading logs. Please try again.</p>
+          <Button variant="outline" size="sm" onClick={() => refetch()}>
+            Try again
+          </Button>
         </div>
       )}
 

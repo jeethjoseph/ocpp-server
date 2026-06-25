@@ -33,6 +33,19 @@ export default function ChargerCombobox({ value, onChange }: ChargerComboboxProp
     [chargers, value]
   );
 
+  // The selected charger may scroll out of the current search-result window
+  // (the server only returns rows matching the active query). Cache its
+  // human label so the button keeps showing the name, not a bare id, after a
+  // reload or an unrelated search.
+  const [cachedLabel, setCachedLabel] = useState<string | undefined>(undefined);
+  useEffect(() => {
+    if (!value) {
+      setCachedLabel(undefined);
+    } else if (selected) {
+      setCachedLabel(selected.name || selected.charge_point_string_id);
+    }
+  }, [value, selected]);
+
   // Close the dropdown when clicking outside.
   useEffect(() => {
     const onMouseDown = (e: MouseEvent) => {
@@ -44,21 +57,13 @@ export default function ChargerCombobox({ value, onChange }: ChargerComboboxProp
     return () => document.removeEventListener("mousedown", onMouseDown);
   }, []);
 
-  const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    if (!q) return chargers.slice(0, 50);
-    return chargers
-      .filter(
-        (c) =>
-          c.charge_point_string_id.toLowerCase().includes(q) ||
-          (c.name ?? "").toLowerCase().includes(q)
-      )
-      .slice(0, 50);
-  }, [chargers, search]);
+  // Filtering is server-side via debouncedSearch; render the result directly
+  // (capped) rather than re-filtering on the client.
+  const filtered = useMemo(() => chargers.slice(0, 50), [chargers]);
 
   const label = selected
-    ? `${selected.name || selected.charge_point_string_id}`
-    : value || "All chargers";
+    ? selected.name || selected.charge_point_string_id
+    : cachedLabel ?? value ?? "All chargers";
 
   const select = (chargePointId: string | undefined) => {
     onChange(chargePointId);

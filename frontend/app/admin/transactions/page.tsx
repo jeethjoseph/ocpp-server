@@ -157,7 +157,7 @@ function TransactionsConsole() {
 
   const limit = 20;
 
-  const { data, isLoading, error } = useAdminTransactions({
+  const { data, isLoading, error, refetch } = useAdminTransactions({
     page: currentPage,
     limit,
     status: statusFilter,
@@ -298,8 +298,11 @@ function TransactionsConsole() {
           </div>
         </div>
       ) : error ? (
-        <div className="text-center py-8">
+        <div className="text-center py-8 space-y-3">
           <p className="text-red-600">Failed to load charging sessions</p>
+          <Button variant="outline" onClick={() => refetch()}>
+            Try again
+          </Button>
         </div>
       ) : rows.length === 0 ? (
         <Card className="p-6 text-center">

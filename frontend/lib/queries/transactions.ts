@@ -1,6 +1,32 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, type Query } from "@tanstack/react-query";
 import { transactionService } from "@/lib/api-services";
+import { isTerminalTransactionStatus } from "@/types/api";
+import type { TransactionDetail, TransactionListResponse } from "@/types/api";
 import { useAuth } from "@/contexts/AuthContext";
+
+const DETAIL_POLL_MS = 1000 * 5;
+const LIST_POLL_MS = 1000 * 10;
+
+// Stop polling a settled session — its server-side state won't change again.
+function detailRefetchInterval(
+  query: Query<TransactionDetail, Error>
+): number | false {
+  const status = query.state.data?.transaction?.transaction_status;
+  return isTerminalTransactionStatus(status) ? false : DETAIL_POLL_MS;
+}
+
+// Gate the list poll: once every loaded row is settled there are no live
+// sessions to track, so stop refetching until a filter change re-runs the query.
+function listRefetchInterval(
+  query: Query<TransactionListResponse, Error>
+): number | false {
+  const rows = query.state.data?.data;
+  if (!rows || rows.length === 0) return LIST_POLL_MS;
+  const allTerminal = rows.every((r) =>
+    isTerminalTransactionStatus(r.transaction_status)
+  );
+  return allTerminal ? false : LIST_POLL_MS;
+}
 
 // Query Keys
 export const transactionKeys = {
@@ -34,7 +60,8 @@ export function useAdminTransactions(params: AdminTransactionsParams) {
     queryFn: () => transactionService.getAll(params),
     enabled: isAuthReady,
     staleTime: 1000 * 5, // 5 seconds
-    refetchInterval: 1000 * 10, // Auto-refresh every 10 seconds — sessions are live
+    // Poll while any loaded session is live; stop once all rows are terminal.
+    refetchInterval: listRefetchInterval,
   });
 }
 
@@ -47,7 +74,8 @@ export function useTransaction(transactionId: number) {
     queryFn: () => transactionService.getUserTransaction(transactionId),
     enabled: isAuthReady && !!transactionId,
     staleTime: 1000 * 5, // 5 seconds
-    refetchInterval: 1000 * 5, // Auto-refresh every 5 seconds for billing updates
+    // Stop polling once the session is settled (terminal status).
+    refetchInterval: detailRefetchInterval,
   });
 }
 
@@ -60,7 +88,8 @@ export function useAdminTransaction(transactionId: number) {
     queryFn: () => transactionService.getById(transactionId),
     enabled: isAuthReady && !!transactionId,
     staleTime: 1000 * 5, // 5 seconds
-    refetchInterval: 1000 * 5, // Auto-refresh every 5 seconds for billing updates
+    // Stop polling once the session is settled (terminal status).
+    refetchInterval: detailRefetchInterval,
   });
 }
 
