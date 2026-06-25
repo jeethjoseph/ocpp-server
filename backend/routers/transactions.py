@@ -125,6 +125,8 @@ class TransactionDetailResponse(BaseModel):
     # Refund drill-down (QR sessions only). See TransactionResponse.refund_speed.
     refund_speed: Optional[str] = None
     refund_amount: Optional[float] = None
+    # Payer UPI ID for QR sessions (QRPayment.customer_vpa); None otherwise.
+    customer_vpa: Optional[str] = None
     # Per-session revenue tally (read-only). Present for all sessions; fields
     # that don't apply to the funding source / band are null.
     revenue: Optional["RevenueBreakdown"] = None
@@ -345,6 +347,7 @@ async def get_transaction_details(transaction_id: int):
     payment_status = None
     refund_speed = None
     refund_amount = None
+    customer_vpa = None
     qrp = None
     if funding_source == "QR":
         qrp = await QRPayment.filter(transaction_id=transaction_id).first()
@@ -352,6 +355,7 @@ async def get_transaction_details(transaction_id: int):
             payment_status = qrp.status
             refund_speed = qrp.razorpay_refund_speed_processed
             refund_amount = float(qrp.refund_amount) if qrp.refund_amount is not None else None
+            customer_vpa = qrp.customer_vpa
     settlement = await CommissionLedgerEntry.filter(transaction_id=transaction_id).first()
     settlement_status = settlement.settlement_status if settlement else None
     invoice = await GSTInvoice.filter(transaction_id=transaction_id).first()
@@ -370,6 +374,7 @@ async def get_transaction_details(transaction_id: int):
         settlement_status=settlement_status,
         refund_speed=refund_speed,
         refund_amount=refund_amount,
+        customer_vpa=customer_vpa,
         revenue=revenue,
     )
 

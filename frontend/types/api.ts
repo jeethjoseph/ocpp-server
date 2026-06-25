@@ -197,6 +197,7 @@ export interface TransactionDetail {
   settlement_status?: string | null;
   refund_speed?: string | null;
   refund_amount?: number | null;
+  customer_vpa?: string | null;
   qr_session?: QRSessionBudget | null;
   revenue?: RevenueBreakdown | null;
 }

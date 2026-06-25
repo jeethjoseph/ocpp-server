@@ -247,6 +247,14 @@ export default function AdminTransactionDetailPage() {
                       </span>
                     </div>
                   )}
+                  {transactionData?.customer_vpa && (
+                    <div className="flex justify-between">
+                      <span className="text-sm font-medium">UPI ID</span>
+                      <span className="text-sm">
+                        {transactionData.customer_vpa}
+                      </span>
+                    </div>
+                  )}
                   {transactionData?.user.phone_number && (
                     <div className="flex justify-between">
                       <span className="text-sm font-medium">Phone</span>
