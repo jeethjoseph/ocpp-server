@@ -5,14 +5,12 @@ from pydantic import BaseModel
 from datetime import datetime, timezone
 import logging
 
-from models import Transaction, MeterValue, User, Charger, WalletTransaction, QRPayment, CommissionLedgerEntry, GSTInvoice
-from tortoise.exceptions import IntegrityError
-from tortoise.expressions import Q
+from models import Transaction, MeterValue, User, Charger, WalletTransaction
 from tortoise.functions import Sum
 from auth_middleware import require_admin
-from core.roles import INTERNAL_ROLES
 from crud import log_audit_event
 from services.qr_payment_service import QRPaymentService
+from services.transactions_console_service import TransactionsConsoleService
 
 logger = logging.getLogger(__name__)
 
@@ -86,12 +84,22 @@ class WalletTransactionResponse(BaseModel):
     class Config:
         from_attributes = True
 
+class TransactionListSummary(BaseModel):
+    """Aggregate tallies for the current filtered set (NOT the page). Keys are
+    consumed verbatim by the frontend (frontend/lib/api-services.ts
+    TransactionListSummary) — do not rename without a coordinated FE change."""
+    total_energy_consumed: float
+    active_sessions: int
+    suspended_sessions: int
+    completed_sessions: int
+
+
 class TransactionListResponse(BaseModel):
     data: List[TransactionResponse]
     total: int
     page: int
     limit: int
-    summary: Dict
+    summary: TransactionListSummary
 
 class QRSessionBudget(BaseModel):
     # ₹ figures as Decimal-encoded strings to preserve precision over the wire.
@@ -151,33 +159,6 @@ class RevenueBreakdown(BaseModel):
     tds_amount: Optional[float] = None           # CommissionLedgerEntry.tds_amount
 
 
-def _as_float(v) -> Optional[float]:
-    return float(v) if v is not None else None
-
-
-def _build_revenue(transaction, qrp, settlement, invoice) -> RevenueBreakdown:
-    """Assemble the per-session revenue tally from the transaction + its QR
-    payment, settlement entry, and GST invoice. Any of qrp/settlement/invoice
-    may be None (wallet/internal sessions, or non-billable bands)."""
-    razorpay_fee = None
-    if qrp and (qrp.razorpay_commission is not None or qrp.razorpay_gst is not None):
-        razorpay_fee = float((qrp.razorpay_commission or 0) + (qrp.razorpay_gst or 0))
-    return RevenueBreakdown(
-        paid_amount=_as_float(qrp.amount_paid) if qrp else None,
-        energy_consumed_kwh=_as_float(transaction.energy_consumed_kwh),
-        energy_amount=_as_float(transaction.energy_charge),
-        gst_amount=_as_float(transaction.gst_amount),
-        gst_rate_percent=_as_float(transaction.gst_rate_percent),
-        total_billed=_as_float(transaction.total_billed),
-        invoice_number=invoice.invoice_number if invoice else None,
-        razorpay_fee=razorpay_fee,
-        refund_amount=_as_float(qrp.refund_amount) if qrp else None,
-        refund_speed=qrp.razorpay_refund_speed_processed if qrp else None,
-        settlement_amount=_as_float(settlement.franchisee_payout) if settlement else None,
-        tds_amount=_as_float(settlement.tds_amount) if settlement else None,
-    )
-
-
 # Resolve the forward reference now that RevenueBreakdown is defined.
 TransactionDetailResponse.model_rebuild()
 
@@ -193,57 +174,6 @@ router = APIRouter(
     prefix="/api/admin/transactions",
     tags=["Transaction Management"]
 )
-
-async def _apply_funding_filters(query, funding_source: Optional[List[str]], payment_status: Optional[str]):
-    """Constrain a Transaction query by the derived Funding Source / Payment
-    Status axes (Transactions Console). Both are computed, not columns, so we
-    translate them to id/user-id constraints. payment_status is QR-only —
-    filtering by it implies QR funding."""
-    if payment_status:
-        qr_ids = await QRPayment.filter(status=payment_status).values_list("transaction_id", flat=True)
-        query = query.filter(id__in=[i for i in qr_ids if i is not None])
-
-    if funding_source:
-        wanted = {s.upper() for s in funding_source}
-        qr_ids = set(i for i in await QRPayment.all().values_list("transaction_id", flat=True) if i is not None)
-        internal_ids = set(await User.filter(role__in=INTERNAL_ROLES).values_list("id", flat=True))
-        clause = Q()
-        if "QR" in wanted:
-            clause |= Q(id__in=qr_ids)
-        if "WALLET" in wanted:
-            clause |= (~Q(id__in=qr_ids) & ~Q(user_id__in=internal_ids))
-        if "NONE" in wanted:
-            clause |= (~Q(id__in=qr_ids) & Q(user_id__in=internal_ids))
-        query = query.filter(clause)
-    return query
-
-
-async def _enrich_funding_payment(transactions) -> Dict[int, tuple]:
-    """Batch-resolve (funding_source, payment_status) for a page of sessions —
-    one QRPayment query + one User query, stitched in memory (no N+1).
-    Native QR status shown verbatim; wallet/internal carry no payment status."""
-    if not transactions:
-        return {}
-    txn_ids = [t.id for t in transactions]
-    user_ids = {t.user_id for t in transactions}
-    qr_rows = await QRPayment.filter(transaction_id__in=txn_ids).values(
-        "transaction_id", "status", "razorpay_refund_speed_processed", "refund_amount"
-    )
-    qr_by_txn = {r["transaction_id"]: r for r in qr_rows}
-    internal_ids = set(await User.filter(id__in=user_ids, role__in=INTERNAL_ROLES).values_list("id", flat=True))
-    out = {}
-    for t in transactions:
-        if t.id in qr_by_txn:
-            r = qr_by_txn[t.id]
-            amt = r["refund_amount"]
-            out[t.id] = ("QR", r["status"], r["razorpay_refund_speed_processed"],
-                         float(amt) if amt is not None else None)
-        elif t.user_id in internal_ids:
-            out[t.id] = ("NONE", None, None, None)
-        else:
-            out[t.id] = ("WALLET", None, None, None)
-    return out
-
 
 @router.get("", response_model=TransactionListResponse)
 async def list_transactions(
@@ -273,7 +203,7 @@ async def list_transactions(
         query = query.filter(start_time__gte=start_date)
     if end_date:
         query = query.filter(start_time__lte=end_date)
-    query = await _apply_funding_filters(query, funding_source, payment_status)
+    query = TransactionsConsoleService.apply_funding_filters(query, funding_source, payment_status)
 
     # Get total count
     total = await query.count()
@@ -294,14 +224,14 @@ async def list_transactions(
     transactions = await query.offset(offset).limit(limit)
 
     # Build summary statistics
-    summary = {
-        "total_energy_consumed": total_energy_consumed,
-        "active_sessions": await Transaction.filter(transaction_status__in=["STARTED", "RUNNING"]).count(),
-        "suspended_sessions": await Transaction.filter(transaction_status="SUSPENDED").count(),
-        "completed_sessions": await Transaction.filter(transaction_status="COMPLETED").count()
-    }
+    summary = TransactionListSummary(
+        total_energy_consumed=total_energy_consumed,
+        active_sessions=await Transaction.filter(transaction_status__in=["STARTED", "RUNNING"]).count(),
+        suspended_sessions=await Transaction.filter(transaction_status="SUSPENDED").count(),
+        completed_sessions=await Transaction.filter(transaction_status="COMPLETED").count(),
+    )
 
-    enrichment = await _enrich_funding_payment(transactions)
+    enrichment = await TransactionsConsoleService.enrich_funding_payment(transactions)
     transaction_responses = []
     for t in transactions:
         resp = TransactionResponse.model_validate(t, from_attributes=True)
@@ -334,32 +264,12 @@ async def get_transaction_details(transaction_id: int):
     if not user or not charger:
         raise HTTPException(status_code=500, detail="Related data not found")
 
-    live_energy_kwh: Optional[float] = None
-    if transaction.start_meter_kwh is not None and meter_values:
-        latest_reading = meter_values[-1].reading_kwh
-        live_energy_kwh = float(latest_reading - transaction.start_meter_kwh)
-
+    live_energy_kwh = _derive_live_energy(transaction, meter_values)
     funding_source, qr_session = await _resolve_funding(transaction_id, user)
-
-    # Read-only money/payout drill-down (Transactions Console). Payment status
-    # is the verbatim QR native value (None for wallet/internal). Settlement
-    # status is the franchisee-payout state, shown here only — never a filter.
-    payment_status = None
-    refund_speed = None
-    refund_amount = None
-    customer_vpa = None
-    qrp = None
-    if funding_source == "QR":
-        qrp = await QRPayment.filter(transaction_id=transaction_id).first()
-        if qrp:
-            payment_status = qrp.status
-            refund_speed = qrp.razorpay_refund_speed_processed
-            refund_amount = float(qrp.refund_amount) if qrp.refund_amount is not None else None
-            customer_vpa = qrp.customer_vpa
-    settlement = await CommissionLedgerEntry.filter(transaction_id=transaction_id).first()
-    settlement_status = settlement.settlement_status if settlement else None
-    invoice = await GSTInvoice.filter(transaction_id=transaction_id).first()
-    revenue = _build_revenue(transaction, qrp, settlement, invoice)
+    # Read-only money/payout drill-down (Transactions Console). Computation lives
+    # in the service; the router only serializes. customer_vpa, refund_*, revenue,
+    # settlement_status are surfaced here verbatim.
+    money = await TransactionsConsoleService.gather_detail_money(transaction_id, funding_source)
 
     return TransactionDetailResponse(
         transaction=TransactionResponse.model_validate(transaction, from_attributes=True),
@@ -370,84 +280,101 @@ async def get_transaction_details(transaction_id: int):
         live_energy_kwh=live_energy_kwh,
         funding_source=funding_source,
         qr_session=qr_session,
-        payment_status=payment_status,
-        settlement_status=settlement_status,
-        refund_speed=refund_speed,
-        refund_amount=refund_amount,
-        customer_vpa=customer_vpa,
-        revenue=revenue,
+        revenue=RevenueBreakdown(**money.pop("revenue")),
+        **money,
     )
+
+
+def _derive_live_energy(transaction, meter_values) -> Optional[float]:
+    """Live energy delta from the latest MeterValue. Read-only and decoupled
+    from Transaction.energy_consumed_kwh (only populated at StopTransaction)."""
+    if transaction.start_meter_kwh is None or not meter_values:
+        return None
+    return float(meter_values[-1].reading_kwh - transaction.start_meter_kwh)
 
 
 async def _resolve_funding(transaction_id: int, user: User) -> tuple[str, Optional[QRSessionBudget]]:
     """Classify the funding source for a Transaction and, for QR sessions,
     fetch the live budget snapshot.
 
-    Decision order: a present QRPayment row wins (matches CONTEXT.md
-    [[qr-session]]); otherwise an internal-role user is "NONE" per ADR 0004;
-    otherwise "WALLET". The QR snapshot is None when the session has no
-    cached/derivable budget row (e.g. the QR session was already finalised).
+    Classification is delegated to the canonical service helper. The QR snapshot
+    is None when the session has no cached/derivable budget row (e.g. the QR
+    session was already finalised).
     """
-    qr_payment_exists = await QRPayment.filter(transaction_id=transaction_id).exists()
-    if qr_payment_exists:
-        snapshot = await QRPaymentService.compute_budget_snapshot(transaction_id)
-        qr_session = None
-        if snapshot is not None:
-            qr_session = QRSessionBudget(
-                budget_limit=f"{snapshot.budget_limit:.2f}",
-                cost_so_far=f"{snapshot.cost_so_far:.2f}",
-                remaining=f"{snapshot.remaining:.2f}",
-            )
-        return "QR", qr_session
+    funding_source = await TransactionsConsoleService.classify_funding_source(transaction_id, user)
+    if funding_source != "QR":
+        return funding_source, None
 
-    if user.role in INTERNAL_ROLES:
-        return "NONE", None
-    return "WALLET", None
+    snapshot = await QRPaymentService.compute_budget_snapshot(transaction_id)
+    qr_session = None
+    if snapshot is not None:
+        qr_session = QRSessionBudget(
+            budget_limit=f"{snapshot.budget_limit:.2f}",
+            cost_so_far=f"{snapshot.cost_so_far:.2f}",
+            remaining=f"{snapshot.remaining:.2f}",
+        )
+    return "QR", qr_session
 
 @router.post("/{transaction_id}/stop", response_model=dict)
 async def force_stop_transaction(transaction_id: int, request: StopTransactionRequest, admin_user: User = Depends(require_admin())):
-    """Force stop a transaction (admin override)"""
+    """Force stop a transaction (admin override).
 
+    Billing semantics intentionally NOT delegated to transaction_finalizer:
+    the energy-recalc + WalletService.process_transaction_billing path here is
+    the established force-stop behavior. Logic is split into local helpers only
+    (review item M1), no behavioral change.
+    """
     transaction = await Transaction.filter(id=transaction_id).first()
     if not transaction:
         raise HTTPException(status_code=404, detail="Transaction not found")
-    
     if transaction.transaction_status in ["STOPPED", "COMPLETED", "CANCELLED"]:
         raise HTTPException(status_code=409, detail="Transaction is already stopped")
-    
-    # Get charger for OCPP command
+
     charger = await Charger.filter(id=transaction.charger_id).first()
     if not charger:
         raise HTTPException(status_code=500, detail="Charger not found")
-    
-    # Check if charger is connected (via Redis - works across all workers)
-    from redis_manager import redis_manager
-    charger_connected = await redis_manager.is_charger_connected(charger.charge_point_string_id)
 
-    # Try to send OCPP stop command if charger is connected
-    if charger_connected:
-        from main import send_ocpp_request
-        
-        success, response = await send_ocpp_request(
-            charger.charge_point_string_id,
-            "RemoteStopTransaction",
-            {"transactionId": transaction_id}
-        )
-        
-        if not success:
-            logger.warning(f"Failed to send OCPP stop command for transaction {transaction_id}: {response}")
-    
-    # Force stop the transaction in database
+    await _dispatch_remote_stop(charger, transaction_id)
+    await _mark_force_stopped(transaction, request.reason, admin_user)
+    await _recalc_energy_if_missing(transaction)
+    final_amount, billing_message = await _run_force_stop_billing(transaction)
+
+    return {
+        "success": True,
+        "message": "Transaction force stopped successfully",
+        "final_amount": final_amount,
+        "billing_message": billing_message,
+    }
+
+
+async def _dispatch_remote_stop(charger, transaction_id: int) -> None:
+    """Best-effort OCPP RemoteStopTransaction when the charger is connected.
+    Connection state is read via Redis so it works across all workers."""
+    from redis_manager import redis_manager
+    if not await redis_manager.is_charger_connected(charger.charge_point_string_id):
+        return
+    from main import send_ocpp_request
+    success, response = await send_ocpp_request(
+        charger.charge_point_string_id,
+        "RemoteStopTransaction",
+        {"transactionId": transaction_id},
+    )
+    if not success:
+        logger.warning(f"Failed to send OCPP stop command for transaction {transaction_id}: {response}")
+
+
+async def _mark_force_stopped(transaction, reason: str, admin_user: User) -> None:
+    """Persist STOPPED status + force-stop metadata and emit the two audit
+    events (status change + force stop)."""
     previous_status = transaction.transaction_status
     transaction.transaction_status = "STOPPED"
-    transaction.stop_reason = f"Force stopped by admin: {request.reason}"
+    transaction.stop_reason = f"Force stopped by admin: {reason}"
     transaction.end_time = datetime.now(timezone.utc)
     await transaction.save()
-
     await log_audit_event(
         action="transaction.status_changed",
         entity_type="transaction",
-        entity_id=transaction_id,
+        entity_id=transaction.id,
         actor_type="admin",
         actor=admin_user,
         changes={"previous_status": str(previous_status), "new_status": "STOPPED", "trigger": "AdminForceStop"},
@@ -455,56 +382,52 @@ async def force_stop_transaction(transaction_id: int, request: StopTransactionRe
     await log_audit_event(
         action="transaction.force_stopped",
         entity_type="transaction",
-        entity_id=transaction_id,
+        entity_id=transaction.id,
         actor_type="admin",
         actor=admin_user,
-        changes={"reason": request.reason},
+        changes={"reason": reason},
     )
 
-    # For SUSPENDED transactions, energy_consumed_kwh may be None — calculate from last meter value
-    if not transaction.energy_consumed_kwh or transaction.energy_consumed_kwh <= 0:
-        latest_meter_value = await MeterValue.filter(
-            transaction_id=transaction_id
-        ).order_by("-created_at").first()
-        if latest_meter_value:
-            transaction.end_meter_kwh = latest_meter_value.reading_kwh
-            transaction.energy_consumed_kwh = transaction.end_meter_kwh - (transaction.start_meter_kwh or 0)
-            await transaction.save()
-            logger.info(f"Calculated energy for force-stopped transaction {transaction_id}: {transaction.energy_consumed_kwh} kWh")
 
-    # Process wallet billing
-    final_amount = None
-    billing_message = "No billing processed"
-
+async def _recalc_energy_if_missing(transaction) -> None:
+    """For SUSPENDED transactions energy_consumed_kwh may be None/0 — backfill
+    it from the last MeterValue before billing."""
     if transaction.energy_consumed_kwh and transaction.energy_consumed_kwh > 0:
-        from services.wallet_service import WalletService
+        return
+    latest_meter_value = await MeterValue.filter(
+        transaction_id=transaction.id
+    ).order_by("-created_at").first()
+    if latest_meter_value:
+        transaction.end_meter_kwh = latest_meter_value.reading_kwh
+        transaction.energy_consumed_kwh = transaction.end_meter_kwh - (transaction.start_meter_kwh or 0)
+        await transaction.save()
+        logger.info(f"Calculated energy for force-stopped transaction {transaction.id}: {transaction.energy_consumed_kwh} kWh")
+
+
+async def _run_force_stop_billing(transaction) -> tuple[Optional[float], str]:
+    """Run wallet billing for the force-stopped session. Returns
+    (final_amount, billing_message). On error, flips the row to BILLING_FAILED."""
+    if not (transaction.energy_consumed_kwh and transaction.energy_consumed_kwh > 0):
+        return None, "No energy consumed - no billing required"
+
+    transaction_id = transaction.id
+    from services.wallet_service import WalletService
+    try:
+        success, message, billing_amount = await WalletService.process_transaction_billing(transaction_id)
+        if success:
+            final_amount = float(billing_amount) if billing_amount else 0.0
+            billing_message = f"Billing successful: ₹{billing_amount}" if billing_amount else message
+            logger.info(f"💰 Force stop billing successful for transaction {transaction_id}: ₹{billing_amount}")
+            return final_amount, billing_message
+        logger.warning(f"💰 Force stop billing failed for transaction {transaction_id}: {message}")
+        return None, f"Billing failed: {message}"
+    except Exception as billing_error:
+        logger.error(f"💰 Force stop billing error for transaction {transaction_id}: {billing_error}")
         try:
-            success, message, billing_amount = await WalletService.process_transaction_billing(transaction_id)
-            if success:
-                final_amount = float(billing_amount) if billing_amount else 0.0
-                billing_message = f"Billing successful: ₹{billing_amount}" if billing_amount else message
-                logger.info(f"💰 Force stop billing successful for transaction {transaction_id}: ₹{billing_amount}")
-            else:
-                billing_message = f"Billing failed: {message}"
-                logger.warning(f"💰 Force stop billing failed for transaction {transaction_id}: {message}")
-        except Exception as billing_error:
-            billing_message = f"Billing error: {str(billing_error)}"
-            logger.error(f"💰 Force stop billing error for transaction {transaction_id}: {billing_error}")
-            try:
-                await Transaction.filter(id=transaction_id).update(
-                    transaction_status="BILLING_FAILED"
-                )
-            except Exception as update_error:
-                logger.error(f"Failed to update transaction status to BILLING_FAILED: {update_error}")
-    else:
-        billing_message = "No energy consumed - no billing required"
-    
-    return {
-        "success": True,
-        "message": "Transaction force stopped successfully",
-        "final_amount": final_amount,
-        "billing_message": billing_message
-    }
+            await Transaction.filter(id=transaction_id).update(transaction_status="BILLING_FAILED")
+        except Exception as update_error:
+            logger.error(f"Failed to update transaction status to BILLING_FAILED: {update_error}")
+        return None, f"Billing error: {str(billing_error)}"
 
 @router.get("/{transaction_id}/meter-values", response_model=MeterValuesListResponse)
 async def get_transaction_meter_values(transaction_id: int):
