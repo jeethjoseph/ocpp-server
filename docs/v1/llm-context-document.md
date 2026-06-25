@@ -97,7 +97,9 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
 - **`logs.py`** - Admin OCPP log viewing
 
 ### Business Services (`/backend/services/`)
-- **`qr_payment_service.py`** - **NEW**: Complete QR-based appless charging lifecycle (~600 lines)
+- **`billing_rules.py`** - Pure leaf module (refactor 2026-06-25): `MIN_BILLABLE_ENERGY_KWH = Decimal("0.5")` + the non-billable predicate (`is_zero_energy`, `is_fault_refund`, `is_non_billable`) shared by `wallet_service` and `qr_payment_service`. Code is the source of truth: only `FAILED` sub-0.5 kWh refunds; `COMPLETED`/`STOPPED` bill (ADR 0013 amendment).
+- **`transactions_console_service.py`** - `TransactionsConsoleService` (refactor 2026-06-25): canonical funding-source classification, per-session revenue assembly, batch enrichment, and `Subquery`-based funding filters for the admin transactions console (logic moved out of `routers/transactions.py`).
+- **`qr_payment_service.py`** - **NEW**: Complete QR-based appless charging lifecycle (~600 lines). Refund exceptions on both the full and partial paths now go through one shared `_classify_refund_exception`; oversized functions split into helpers under the 40-line rule (2026-06-25).
   - `handle_qr_payment()` - Main webhook entry: idempotency → staleness → user resolution → charging trigger
   - `find_or_create_user_from_payment()` - Priority: phone → VPA → UPI_GUEST → system guest
   - `link_transaction_to_qr_payment()` - Called from StartTransaction, caches budget in Redis
