@@ -51,18 +51,15 @@ _BALANCE_SQL = """
     WHERE wallet_id = $1
 """
 
-# Minimum billable energy: the half-unit (0.5 kWh) cliff below which a
-# Charging Session is Non-billable (ADR 0013, CONTEXT.md "Non-billable
-# Session"). A session delivering `0 < energy < MIN_BILLABLE_ENERGY_KWH` is
-# waived as de-minimis goodwill — QR sessions full-refund, wallet sessions
-# skip the debit, and neither issues a GST Invoice or Settlement Entry.
-# This is a *cliff*, not an allowance: a session at or above the threshold
-# bills for its TOTAL energy from the first Wh (strict `<`).
-#
-# A hardcoded policy constant on purpose — NOT an env var. Changing it goes
-# through code review + an ADR amendment, not a per-environment deploy edit.
-# Single source of truth; imported by qr_payment_service for the QR path.
-MIN_BILLABLE_ENERGY_KWH = Decimal("0.5")
+# MIN_BILLABLE_ENERGY_KWH and the non-billable-band predicates now live in
+# services.billing_rules (single source of truth, imported by BOTH the wallet
+# and QR billing paths). Re-exported here so existing importers that do
+# `from services.wallet_service import MIN_BILLABLE_ENERGY_KWH` keep working.
+from services.billing_rules import (  # noqa: E402
+    MIN_BILLABLE_ENERGY_KWH,
+    is_zero_energy,
+    is_fault_refund,
+)
 
 
 class WalletService:
@@ -263,14 +260,12 @@ class WalletService:
             #   FAILED and 0 < energy < 0.5 kWh  -> faulted after a trivial
             #                                       delivery (ADR 0013 amendment)
             energy = transaction.energy_consumed_kwh
-            energy_dec = Decimal(str(energy)) if energy else Decimal('0')
-            if energy_dec <= 0:
+            if is_zero_energy(transaction):
                 logger.info(f"Transaction {transaction_id} zero energy ({energy or 0} kWh), no debit")
                 return True, "Zero energy delivered - no billing required", Decimal('0.00'), None
-            if (transaction.transaction_status == TransactionStatusEnum.FAILED
-                    and energy_dec < MIN_BILLABLE_ENERGY_KWH):
+            if is_fault_refund(transaction):
                 logger.info(
-                    f"Transaction {transaction_id} faulted after {energy_dec} kWh "
+                    f"Transaction {transaction_id} faulted after {Decimal(str(energy))} kWh "
                     f"(< {MIN_BILLABLE_ENERGY_KWH}), no debit"
                 )
                 return True, "Faulted below minimum billable energy - no billing required", Decimal('0.00'), None

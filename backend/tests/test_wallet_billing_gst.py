@@ -290,6 +290,36 @@ class TestProcessTransactionBillingAtomicity:
         wallet = await Wallet.get(user_id=test_user.id)
         assert await WalletService.get_balance(wallet.id) == Decimal("500.00") - Decimal("8.85")
 
+    @pytest.mark.asyncio
+    async def test_stopped_sub_half_kwh_bills_not_fault_refunded(
+        self, client, test_charger, test_user, test_tariff, test_wallet
+    ):
+        """ADR 0013 amendment (STOPPED row): a STOPPED sub-0.5 kWh wallet session
+        — from a timeout / disconnect / sweep / force-stop, which
+        finalize_stopped_transaction always marks STOPPED, never FAILED — DEBITS
+        for the delivered energy. It must NOT take the FAILED-only fault-refund
+        no-debit branch. Locks the STOPPED-bills behavior against regression."""
+        energy = 0.3
+        txn = await Transaction.create(
+            charger=test_charger,
+            user=test_user,
+            transaction_status=TransactionStatusEnum.STOPPED,
+            start_meter_kwh=10.0,
+            end_meter_kwh=10.0 + energy,
+            energy_consumed_kwh=energy,
+        )
+
+        success, message, amount = await WalletService.process_transaction_billing(txn.id)
+
+        assert success is True
+        # 0.3 kWh × ₹15 = ₹4.50 + 18% GST ₹0.81 = ₹5.31 — billed, not waived.
+        assert amount == Decimal("5.31")
+        wallet = await Wallet.get(user_id=test_user.id)
+        assert await WalletTransaction.filter(
+            wallet_id=wallet.id, type=TransactionTypeEnum.CHARGE_DEDUCT
+        ).count() == 1
+        assert await WalletService.get_balance(wallet.id) == Decimal("500.00") - Decimal("5.31")
+
 
 # ============================================================================
 # Internal-role skip (ADR 0004) — admin/franchisee sessions skip billing

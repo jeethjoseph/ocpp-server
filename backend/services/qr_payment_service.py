@@ -34,7 +34,12 @@ from services.razorpay_service import (
     extract_fee_from_payment,
 )
 from services.tariff_utils import synthetic_platform_fee, synthetic_fee_split
-from services.wallet_service import WalletService, MIN_BILLABLE_ENERGY_KWH
+from services.wallet_service import WalletService
+from services.billing_rules import (
+    MIN_BILLABLE_ENERGY_KWH,
+    is_zero_energy,
+    is_fault_refund,
+)
 from services.monitoring_service import MetricsCollector
 from redis_manager import redis_manager
 from core.connection_manager import connection_manager
@@ -822,11 +827,10 @@ class QRPaymentService:
         #   FAILED and 0 < energy < 0.5 kWh     -> faulted after a trivial
         #                                          delivery (ADR 0013 amendment)
         energy_dec = Decimal(str(energy_kwh))
-        if energy_dec <= 0:
+        if is_zero_energy(transaction):
             await QRPaymentService._full_refund(qr_payment, "Zero energy delivered")
             return
-        if (transaction.transaction_status == TransactionStatusEnum.FAILED
-                and energy_dec < MIN_BILLABLE_ENERGY_KWH):
+        if is_fault_refund(transaction):
             await QRPaymentService._full_refund(
                 qr_payment,
                 f"Faulted after {energy_dec:.3f} kWh (< {MIN_BILLABLE_ENERGY_KWH} kWh) — full refund",

@@ -633,6 +633,40 @@ async def test_completed_sub_half_kwh_now_bills_not_refunded(
 
 
 @pytest.mark.asyncio
+async def test_stopped_sub_half_kwh_now_bills_not_refunded(
+    client, qr_charger, qr_code, qr_tariff
+):
+    """ADR 0013 amendment (STOPPED row): a STOPPED QR session that delivered
+    0 < energy < 0.5 kWh is BILLED, NOT routed to the full-refund waiver.
+    finalize_stopped_transaction (timeout / disconnect / sweep / force-stop)
+    always marks STOPPED, never FAILED — so a trivial STOPPED delivery bills
+    exactly like COMPLETED. Locks the STOPPED-bills behavior against regression."""
+    _, txn, qr_payment = await _make_qr_billing_fixture(
+        qr_charger, qr_code, qr_tariff, energy_consumed_kwh=0.3,
+        status=TransactionStatusEnum.STOPPED,
+    )
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment = AsyncMock(return_value={"id": "rfnd_CHANGE"})
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock()
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
+
+    with patch.object(QRPaymentService, "_full_refund", new=AsyncMock()) as mock_full_refund, \
+         patch("services.qr_payment_service.razorpay_service", mock_razorpay), \
+         patch("services.qr_payment_service.redis_manager") as mock_redis:
+        mock_redis.delete_qr_session = AsyncMock()
+        await QRPaymentService.process_qr_session_billing(txn.id)
+
+    # The full-refund (waiver/fault) branch must NOT fire for a STOPPED session.
+    mock_full_refund.assert_not_called()
+    await qr_payment.refresh_from_db()
+    # Billed the delivered 0.3 kWh × ₹15/kWh = ₹4.50 via the normal path.
+    assert qr_payment.energy_cost == Decimal("4.50")
+
+
+@pytest.mark.asyncio
 async def test_qr_billing_at_cliff_bills_total_not_waived(
     client, qr_charger, qr_code, qr_tariff
 ):
