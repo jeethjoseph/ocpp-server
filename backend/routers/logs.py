@@ -1,6 +1,10 @@
 # routers/logs.py
-from typing import List, Optional
+import csv
+import io
+import json
+from typing import AsyncIterator, List, Optional
 from fastapi import APIRouter, HTTPException, Query, Depends
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from datetime import datetime, timezone, timedelta
 import logging
@@ -49,6 +53,7 @@ class LogResponse(BaseModel):
 class LogsResponse(BaseModel):
     data: List[LogResponse]
     total: int
+    offset: int
     limit: int
     has_more: bool
     message: Optional[str] = None
@@ -59,6 +64,35 @@ router = APIRouter(prefix="/api/admin/logs", tags=["admin-logs"])
 # Default bounded window for the Logs Console — see ADR 0014. The date range is
 # never unbounded; absent an explicit range we look back this many hours.
 DEFAULT_WINDOW_HOURS = 24
+# Hard caps on the query surface (ADR 0014). The list endpoint pages with
+# OFFSET; the CSV export streams in chunks but still stops at a sane ceiling.
+MAX_LIST_LIMIT = 5000
+EXPORT_CHUNK_SIZE = 1000
+MAX_EXPORT_ROWS = 100000
+
+
+def _build_logs_query(
+    charge_point_id: Optional[str],
+    message_type: Optional[List[str]],
+    start_date: Optional[str],
+    end_date: Optional[str],
+):
+    """Build the shared, bounded OCPPLog queryset for the list + export endpoints.
+
+    Always applies a bounded time window (defaulting to the last 24h) plus the
+    optional charger / OCPP-action filters. See ADR 0014. Ordering is deterministic
+    (timestamp desc, id desc tiebreak) so OFFSET pagination is stable.
+    """
+    now = datetime.now(tz=timezone.utc)
+    start_dt = _parse_date(start_date, "start_date") if start_date else now - timedelta(hours=DEFAULT_WINDOW_HOURS)
+    end_dt = _parse_date(end_date, "end_date") if end_date else now
+
+    query = OCPPLog.filter(timestamp__gte=start_dt, timestamp__lte=end_dt)
+    if charge_point_id:
+        query = query.filter(charge_point_id=charge_point_id)
+    if message_type:
+        query = query.filter(message_type__in=message_type)
+    return query.order_by("-timestamp", "-id")
 
 
 @router.get("", response_model=LogsResponse)
@@ -67,40 +101,26 @@ async def get_logs(
     message_type: Optional[List[str]] = Query(None, description="Filter by one or more OCPP actions (repeat the param)"),
     start_date: Optional[str] = Query(None, description="Start date ISO 8601 w/ tz. Defaults to 24h ago."),
     end_date: Optional[str] = Query(None, description="End date ISO 8601 w/ tz. Defaults to now."),
-    limit: int = Query(100, ge=1, le=100000, description="Number of logs to return (max 100,000)"),
+    offset: int = Query(0, ge=0, description="Row offset for pagination"),
+    limit: int = Query(100, ge=1, le=MAX_LIST_LIMIT, description="Number of logs to return (max 5,000)"),
     admin_user: User = Depends(require_admin()),
 ):
     """
     Fleet-wide OCPP message log query for the Logs Console. The date window is
     always bounded (defaults to the last 24h) to keep the query off a full
-    sequential scan of the log table — see ADR 0014. Newest first.
+    sequential scan of the log table — see ADR 0014. Newest first, OFFSET-paged.
     """
     try:
-        # Always-bounded window: default to the last 24h when unspecified.
-        now = datetime.now(tz=timezone.utc)
-        start_dt = _parse_date(start_date, "start_date") if start_date else now - timedelta(hours=DEFAULT_WINDOW_HOURS)
-        end_dt = _parse_date(end_date, "end_date") if end_date else now
-
-        query = OCPPLog.filter(timestamp__gte=start_dt, timestamp__lte=end_dt)
-        if charge_point_id:
-            query = query.filter(charge_point_id=charge_point_id)
-        if message_type:
-            query = query.filter(message_type__in=message_type)
-
+        query = _build_logs_query(charge_point_id, message_type, start_date, end_date)
         total = await query.count()
-        has_more = total > limit
-        message = None
-        if total > 100000:
-            message = "This query returns more than 100,000 logs. Narrow the date range or filters."
-            limit = min(limit, 100000)
-
-        logs = await query.order_by('-timestamp').limit(limit)
+        logs = await query.offset(offset).limit(limit)
+        has_more = offset + len(logs) < total
         return LogsResponse(
             data=[LogResponse.model_validate(log) for log in logs],
             total=total,
+            offset=offset,
             limit=limit,
             has_more=has_more,
-            message=message,
         )
 
     except HTTPException:
@@ -108,6 +128,78 @@ async def get_logs(
     except Exception as e:
         logger.error(f"Error fetching logs: {str(e)}")
         raise HTTPException(status_code=500, detail="Error fetching logs")
+
+
+_EXPORT_COLUMNS = [
+    "timestamp", "charge_point_id", "direction",
+    "message_type", "status", "message_id", "payload",
+]
+
+
+def _log_to_row(log: OCPPLog) -> List[str]:
+    """Map one OCPPLog to a CSV row matching _EXPORT_COLUMNS."""
+    return [
+        log.timestamp.isoformat() if log.timestamp else "",
+        log.charge_point_id or "",
+        str(log.direction.value if hasattr(log.direction, "value") else log.direction),
+        log.message_type or "",
+        log.status or "",
+        log.correlation_id or "",
+        json.dumps(log.payload) if log.payload is not None else "",
+    ]
+
+
+async def _stream_logs_csv(query) -> AsyncIterator[str]:
+    """Page through the queryset in bounded chunks, yielding CSV text.
+
+    Never materializes the whole result set — memory stays bounded to one chunk.
+    Stops at MAX_EXPORT_ROWS so a runaway export can't stream forever.
+    """
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(_EXPORT_COLUMNS)
+    yield _drain(buffer)
+
+    fetched = 0
+    while fetched < MAX_EXPORT_ROWS:
+        chunk = await query.offset(fetched).limit(EXPORT_CHUNK_SIZE)
+        if not chunk:
+            break
+        for log in chunk:
+            writer.writerow(_log_to_row(log))
+        yield _drain(buffer)
+        fetched += len(chunk)
+        if len(chunk) < EXPORT_CHUNK_SIZE:
+            break
+
+
+def _drain(buffer: io.StringIO) -> str:
+    """Return the buffer's contents and reset it for the next chunk."""
+    text = buffer.getvalue()
+    buffer.seek(0)
+    buffer.truncate(0)
+    return text
+
+
+@router.get("/export")
+async def export_logs(
+    charge_point_id: Optional[str] = Query(None, description="Filter to a single charger (charge_point_string_id)"),
+    message_type: Optional[List[str]] = Query(None, description="Filter by one or more OCPP actions (repeat the param)"),
+    start_date: Optional[str] = Query(None, description="Start date ISO 8601 w/ tz. Defaults to 24h ago."),
+    end_date: Optional[str] = Query(None, description="End date ISO 8601 w/ tz. Defaults to now."),
+    admin_user: User = Depends(require_admin()),
+):
+    """
+    Stream the filtered OCPP logs as CSV. Same filters as the list endpoint;
+    paged through in bounded chunks so memory stays flat regardless of result
+    size, and capped at MAX_EXPORT_ROWS rows. See ADR 0014.
+    """
+    query = _build_logs_query(charge_point_id, message_type, start_date, end_date)
+    return StreamingResponse(
+        _stream_logs_csv(query),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=ocpp-logs.csv"},
+    )
 
 
 # ============ Audit Log Endpoints ============

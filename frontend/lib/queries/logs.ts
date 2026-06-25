@@ -7,6 +7,7 @@ export const useLogs = (params: {
   message_type?: string[];
   start_date?: string;
   end_date?: string;
+  offset?: number;
   limit?: number;
 }) => {
   const { isAuthReady } = useAuth();

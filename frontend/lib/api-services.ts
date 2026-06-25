@@ -418,30 +418,63 @@ export interface LogEntry {
 export interface LogsResponse {
   data: LogEntry[];
   total: number;
+  offset: number;
   limit: number;
   has_more: boolean;
   message?: string;
 }
 
+export interface LogQueryParams {
+  charge_point_id?: string;
+  message_type?: string[];
+  start_date?: string;
+  end_date?: string;
+  offset?: number;
+  limit?: number;
+}
+
+function buildLogQuery(params?: LogQueryParams): string {
+  const sp = new URLSearchParams();
+  if (params?.charge_point_id) sp.set("charge_point_id", params.charge_point_id);
+  (params?.message_type ?? []).forEach((m) => sp.append("message_type", m));
+  if (params?.start_date) sp.set("start_date", params.start_date);
+  if (params?.end_date) sp.set("end_date", params.end_date);
+  if (params?.offset !== undefined) sp.set("offset", params.offset.toString());
+  if (params?.limit) sp.set("limit", params.limit.toString());
+  return sp.toString();
+}
+
 export const logService = {
   // Fleet-wide Logs Console query. Charger + action are filtered server-side;
   // the date window is always bounded (defaults to last 24h on the backend).
-  getLogs: (params?: {
-    charge_point_id?: string;
-    message_type?: string[];
-    start_date?: string;
-    end_date?: string;
-    limit?: number;
-  }) => {
-    const sp = new URLSearchParams();
-    if (params?.charge_point_id) sp.set("charge_point_id", params.charge_point_id);
-    (params?.message_type ?? []).forEach((m) => sp.append("message_type", m));
-    if (params?.start_date) sp.set("start_date", params.start_date);
-    if (params?.end_date) sp.set("end_date", params.end_date);
-    if (params?.limit) sp.set("limit", params.limit.toString());
-
-    const query = sp.toString();
+  getLogs: (params?: LogQueryParams) => {
+    const query = buildLogQuery(params);
     return api.get<LogsResponse>(`/api/admin/logs${query ? `?${query}` : ""}`);
+  },
+
+  // Stream the filtered logs as a CSV download. Uses a raw fetch (not api.get)
+  // because the backend returns a streamed text/csv body, not JSON.
+  exportCsv: async (
+    params: LogQueryParams | undefined,
+    getToken: () => Promise<string | null>
+  ): Promise<Blob> => {
+    const token = await getToken();
+    if (!token) throw new Error("Authentication token not available");
+
+    const query = buildLogQuery(params);
+    const base = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+    const response = await fetch(
+      `${base}/api/admin/logs/export${query ? `?${query}` : ""}`,
+      {
+        headers: { Authorization: `Bearer ${token}` },
+        credentials: "include",
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error("Failed to export logs");
+    }
+    return response.blob();
   },
 };
 

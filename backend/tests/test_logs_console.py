@@ -99,3 +99,60 @@ class TestLogsConsole:
         assert resp.status_code == status.HTTP_200_OK
         actions = {r["message_type"] for r in resp.json()["data"]}
         assert "BootNotification" in actions
+
+    @pytest.mark.asyncio
+    async def test_limit_over_ceiling_rejected(self, client_admin: AsyncClient):
+        resp = await client_admin.get("/api/admin/logs", params={"limit": 5001})
+        assert resp.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+    @pytest.mark.asyncio
+    async def test_limit_at_ceiling_accepted(self, client_admin: AsyncClient):
+        resp = await client_admin.get("/api/admin/logs", params={"limit": 5000})
+        assert resp.status_code == status.HTTP_200_OK
+
+    @pytest.mark.asyncio
+    async def test_offset_pagination_slices(self, client_admin: AsyncClient, test_charger):
+        cp = test_charger.charge_point_string_id
+        for _ in range(5):
+            await _make_log(cp, "Heartbeat")
+
+        page1 = await client_admin.get(
+            "/api/admin/logs", params={"charge_point_id": cp, "limit": 2, "offset": 0}
+        )
+        page2 = await client_admin.get(
+            "/api/admin/logs", params={"charge_point_id": cp, "limit": 2, "offset": 2}
+        )
+        page3 = await client_admin.get(
+            "/api/admin/logs", params={"charge_point_id": cp, "limit": 2, "offset": 4}
+        )
+        for r in (page1, page2, page3):
+            assert r.status_code == status.HTTP_200_OK
+
+        b1, b2, b3 = page1.json(), page2.json(), page3.json()
+        assert b1["total"] == 5 and b1["offset"] == 0 and b1["limit"] == 2
+        assert len(b1["data"]) == 2 and b1["has_more"] is True
+        assert len(b2["data"]) == 2 and b2["has_more"] is True
+        assert len(b3["data"]) == 1 and b3["has_more"] is False
+
+        # Stable, non-overlapping slices (deterministic ordering by -timestamp, -id).
+        ids = [r["id"] for r in b1["data"] + b2["data"] + b3["data"]]
+        assert len(ids) == len(set(ids)) == 5
+
+    @pytest.mark.asyncio
+    async def test_export_streams_csv(self, client_admin: AsyncClient, test_charger):
+        cp = test_charger.charge_point_string_id
+        await _make_log(cp, "BootNotification")
+        await _make_log(cp, "Heartbeat")
+
+        resp = await client_admin.get(
+            "/api/admin/logs/export", params={"charge_point_id": cp}
+        )
+        assert resp.status_code == status.HTTP_200_OK
+        assert resp.headers["content-type"].startswith("text/csv")
+        assert resp.headers["content-disposition"] == "attachment; filename=ocpp-logs.csv"
+
+        lines = [ln for ln in resp.text.splitlines() if ln.strip()]
+        header = lines[0]
+        assert header == "timestamp,charge_point_id,direction,message_type,status,message_id,payload"
+        assert len(lines) == 3  # header + 2 rows
+        assert "BootNotification" in resp.text and "Heartbeat" in resp.text

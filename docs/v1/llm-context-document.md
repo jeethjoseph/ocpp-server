@@ -567,7 +567,7 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
     - `useLatestSignalQuality()` - Latest reading (5s stale, **5s auto-refresh**)
     - `useChargerErrors()` - Error history (30s stale, **30s auto-refresh**)
   - **`logs.ts`** - Logs Console and audit trail hooks
-    - `useLogs()` - Fleet-wide OCPP message logs for the Logs Console (`/admin/logs`); filters by charger + action server-side, default 24h window. Replaced the retired per-charger `useChargerLogs()`/`useChargerLogSummary()` hooks.
+    - `useLogs()` - Fleet-wide OCPP message logs for the Logs Console (`/admin/logs`); filters by charger + action server-side, default 24h window, OFFSET-paged (`offset`/`limit` in params and query key). Replaced the retired per-charger `useChargerLogs()`/`useChargerLogSummary()` hooks. CSV export via `logService.exportCsv(params, getToken)` → streamed `Blob`.
     - `useChargerTimeline()` - Charger event timeline
     - `useEntityAuditLogs()` - Entity audit log history
   - **`dashboard.ts`** - Admin dashboard hooks
@@ -1021,8 +1021,8 @@ POST /webhooks/razorpay - Razorpay payment events (HMAC-SHA256 signature verifie
 ```
 GET /api/charge-points - Connected charger list
 POST /api/charge-points/{id}/request - Send OCPP command  
-GET /api/logs - OCPP message logs
-GET /api/logs/{charge_point_id} - Logs for specific charger
+GET /api/admin/logs - Fleet-wide OCPP message logs (ADR 0014); bounded 24h default window, charger + action filters, OFFSET pagination (offset/limit, limit le=5000), returns {data,total,offset,limit,has_more}
+GET /api/admin/logs/export - Streaming CSV (text/csv, StreamingResponse) of the same filtered logs; paged in 1000-row chunks, capped at 100,000 rows; Content-Disposition attachment filename=ocpp-logs.csv
 ```
 
 ---
