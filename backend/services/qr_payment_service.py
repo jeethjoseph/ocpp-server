@@ -26,6 +26,19 @@ class BudgetSnapshot(NamedTuple):
     budget_limit: Decimal
     cost_so_far: Decimal
     remaining: Decimal
+
+
+class ParsedQRWebhook(NamedTuple):
+    """Fields lifted out of a ``qr_code.credited`` webhook payload, used to
+    build the QRPayment row regardless of which branch (stale / rejected /
+    accepted) handles it."""
+    payment_id: Optional[str]
+    amount_paid: Decimal
+    vpa: Optional[str]
+    contact: Optional[str]
+    customer_name: Optional[str]
+    qr_code_id: str
+    fee_fields: Dict
 from services.razorpay_service import (
     razorpay_service,
     RazorpayAlreadyRefundedError,
@@ -252,28 +265,24 @@ class QRPaymentService:
     """Service for handling QR-based appless charging payments"""
 
     @staticmethod
-    async def handle_qr_payment(webhook_data: Dict) -> Dict:
-        """
-        Handle qr_code.credited webhook: validate, find user, start charging.
-        Returns a status dict for logging.
-        """
+    def _parse_qr_webhook(webhook_data: Dict) -> ParsedQRWebhook:
+        """Lift the QR-payment fields out of the raw ``qr_code.credited``
+        webhook payload (payment id, amount, customer identity, qr code id and
+        the actual-fee fields). Pure parsing — no DB or network."""
         payment_entity = webhook_data.get("payment", {}).get("entity", {})
         qr_code_entity = webhook_data.get("qr_code", {}).get("entity", {})
 
-        payment_id = payment_entity.get("id")
-        amount_paise = payment_entity.get("amount", 0)
-        amount_paid = Decimal(str(amount_paise)) / 100
-        vpa = payment_entity.get("vpa")
-        contact = payment_entity.get("contact")
+        amount_paid = Decimal(str(payment_entity.get("amount", 0))) / 100
         notes = payment_entity.get("notes", {})
         if not isinstance(notes, dict):
             notes = {}
         customer_name = notes.get("customer_name") or payment_entity.get("email")
-        qr_code_id = qr_code_entity.get("id") or payment_entity.get("description", "").split("|")[-1].strip()
+        qr_code_id = qr_code_entity.get("id") or payment_entity.get(
+            "description", ""
+        ).split("|")[-1].strip()
 
-        # Extract actual Razorpay fee from webhook payload
-        fee_data = extract_fee_from_payment(payment_entity)
         fee_fields = {}
+        fee_data = extract_fee_from_payment(payment_entity)
         if fee_data:
             total_fee, tax = fee_data
             fee_fields = {
@@ -283,85 +292,114 @@ class QRPaymentService:
                 "fee_source": "webhook",
             }
 
-        logger.info(
-            "QR payment received: payment_id=%s amount=₹%s qr_code=%s vpa=%s",
-            mask_payment_id(payment_id), amount_paid, qr_code_id, mask_vpa(vpa),
+        return ParsedQRWebhook(
+            payment_id=payment_entity.get("id"),
+            amount_paid=amount_paid,
+            vpa=payment_entity.get("vpa"),
+            contact=payment_entity.get("contact"),
+            customer_name=customer_name,
+            qr_code_id=qr_code_id,
+            fee_fields=fee_fields,
         )
 
-        # Idempotency check
-        existing = await QRPayment.filter(razorpay_payment_id=payment_id).first()
-        if existing:
-            logger.info(f"Duplicate webhook for payment {mask_payment_id(payment_id)}, skipping")
-            return {"status": "duplicate", "qr_payment_id": existing.id}
+    @staticmethod
+    def _qr_payment_create_kwargs(
+        parsed: ParsedQRWebhook, charger_qr: ChargerQRCode, user: User,
+        charger: Charger, webhook_data: Dict, **overrides,
+    ) -> Dict:
+        """Shared kwargs for ``QRPayment.create`` across the stale, rejected and
+        accepted branches. ``overrides`` supplies the branch-specific status /
+        failure_reason."""
+        return {
+            "charger": charger,
+            "charger_qr_code": charger_qr,
+            "user": user,
+            "razorpay_payment_id": parsed.payment_id,
+            "razorpay_qr_code_id": parsed.qr_code_id,
+            "amount_paid": parsed.amount_paid,
+            "customer_vpa": parsed.vpa,
+            "customer_name": parsed.customer_name,
+            "customer_contact": parsed.contact,
+            "metadata": webhook_data,
+            **parsed.fee_fields,
+            **overrides,
+        }
 
-        # Staleness check — if payment is older than the pending timeout,
-        # the user has long gone. Create record and refund immediately.
-        payment_created_at = payment_entity.get("created_at")
-        if payment_created_at:
-            payment_time = datetime.fromtimestamp(payment_created_at, tz=timezone.utc)
-            age_seconds = (datetime.now(timezone.utc) - payment_time).total_seconds()
-            if age_seconds > QR_PAYMENT_PENDING_TIMEOUT:
-                logger.warning(
-                    "Stale QR payment %s: %.0fs old (threshold %ss), refunding",
-                    mask_payment_id(payment_id), age_seconds, QR_PAYMENT_PENDING_TIMEOUT,
-                )
-                # Still need to look up charger for the record
-                charger_qr = await ChargerQRCode.filter(
-                    razorpay_qr_code_id=qr_code_id
-                ).prefetch_related("charger").first()
-                if not charger_qr:
-                    logger.error(f"No ChargerQRCode for stale payment {mask_payment_id(payment_id)}")
-                    return {"status": "error", "reason": "QR code not found"}
+    @staticmethod
+    async def _handle_stale_payment(
+        parsed: ParsedQRWebhook, webhook_data: Dict, payment_created_at,
+    ) -> Optional[Dict]:
+        """If the payment is older than the pending timeout the customer has
+        long gone — record + immediately refund. Returns a status dict when the
+        stale path handled it, or None to fall through to normal processing."""
+        if not payment_created_at:
+            return None
+        payment_time = datetime.fromtimestamp(payment_created_at, tz=timezone.utc)
+        age_seconds = (datetime.now(timezone.utc) - payment_time).total_seconds()
+        if age_seconds <= QR_PAYMENT_PENDING_TIMEOUT:
+            return None
 
-                user = await find_or_create_user_from_payment(contact, vpa, customer_name)
-                qr_payment = await QRPayment.create(
-                    charger=charger_qr.charger,
-                    charger_qr_code=charger_qr,
-                    user=user,
-                    razorpay_payment_id=payment_id,
-                    razorpay_qr_code_id=qr_code_id,
-                    amount_paid=amount_paid,
-                    customer_vpa=vpa,
-                    customer_name=customer_name,
-                    customer_contact=contact,
-                    status=QRPaymentStatusEnum.EXPIRED,
-                    failure_reason=f"Stale webhook: payment was {age_seconds:.0f}s old",
-                    metadata=webhook_data,
-                    **fee_fields,
-                )
-                await QRPaymentService._full_refund(qr_payment, "Stale payment - webhook delayed")
-                return {"status": "refunded_stale", "qr_payment_id": qr_payment.id}
+        logger.warning(
+            "Stale QR payment %s: %.0fs old (threshold %ss), refunding",
+            mask_payment_id(parsed.payment_id), age_seconds, QR_PAYMENT_PENDING_TIMEOUT,
+        )
+        # Still need to look up charger for the record
+        charger_qr = await ChargerQRCode.filter(
+            razorpay_qr_code_id=parsed.qr_code_id
+        ).prefetch_related("charger").first()
+        if not charger_qr:
+            logger.error(f"No ChargerQRCode for stale payment {mask_payment_id(parsed.payment_id)}")
+            return {"status": "error", "reason": "QR code not found"}
 
-        # Look up ChargerQRCode
+        user = await find_or_create_user_from_payment(
+            parsed.contact, parsed.vpa, parsed.customer_name
+        )
+        qr_payment = await QRPayment.create(
+            **QRPaymentService._qr_payment_create_kwargs(
+                parsed, charger_qr, user, charger_qr.charger, webhook_data,
+                status=QRPaymentStatusEnum.EXPIRED,
+                failure_reason=f"Stale webhook: payment was {age_seconds:.0f}s old",
+            )
+        )
+        await QRPaymentService._full_refund(qr_payment, "Stale payment - webhook delayed")
+        return {"status": "refunded_stale", "qr_payment_id": qr_payment.id}
+
+    @staticmethod
+    async def _resolve_active_charger_qr(qr_code_id: str) -> Optional[ChargerQRCode]:
+        """Look up the active ChargerQRCode for a qr_code_id, logging the two
+        distinct miss causes (cross-env noise vs a customer paying on an
+        inactive/closed QR). Returns None on any miss."""
         charger_qr = await ChargerQRCode.filter(
             razorpay_qr_code_id=qr_code_id, is_active=True
         ).prefetch_related("charger").first()
-        if not charger_qr:
-            # Two very different causes. If NO row exists for this qr_code_id,
-            # it's the other environment's QR (staging and prod share one
-            # Razorpay live account) — expected noise, log at info. But if a
-            # row DOES exist and is merely inactive, the QR is OURS (closed or
-            # regenerated) and a customer just paid on a dead QR → they get no
-            # session. That is real and customer-impacting: keep it at error.
-            exists_inactive = await ChargerQRCode.filter(
-                razorpay_qr_code_id=qr_code_id
-            ).exists()
-            if exists_inactive:
-                logger.error(f"Payment on INACTIVE ChargerQRCode qr_code_id={qr_code_id} — customer paid on a closed/regenerated QR, no session created")
-            else:
-                logger.info(f"No ChargerQRCode for qr_code_id={qr_code_id} (likely cross-environment webhook)")
-            return {"status": "error", "reason": "QR code not found or inactive"}
+        if charger_qr:
+            return charger_qr
 
-        charger = charger_qr.charger
+        # Two very different causes. If NO row exists for this qr_code_id,
+        # it's the other environment's QR (staging and prod share one
+        # Razorpay live account) — expected noise, log at info. But if a
+        # row DOES exist and is merely inactive, the QR is OURS (closed or
+        # regenerated) and a customer just paid on a dead QR → they get no
+        # session. That is real and customer-impacting: keep it at error.
+        exists_inactive = await ChargerQRCode.filter(
+            razorpay_qr_code_id=qr_code_id
+        ).exists()
+        if exists_inactive:
+            logger.error(f"Payment on INACTIVE ChargerQRCode qr_code_id={qr_code_id} — customer paid on a closed/regenerated QR, no session created")
+        else:
+            logger.info(f"No ChargerQRCode for qr_code_id={qr_code_id} (likely cross-environment webhook)")
+        return None
 
-        # Find or create user
-        user = await find_or_create_user_from_payment(contact, vpa, customer_name)
-
-        # Atomic double-payment guard: serialize concurrent QR webhooks for the
-        # same charger by locking the Charger row. Only one payment can win the
-        # "first slot"; any concurrent payment sees the active txn / pending QR
-        # and is rejected + refunded.
-        rejection_qr_payment_id = None
+    @staticmethod
+    async def _create_qr_payment_locked(
+        parsed: ParsedQRWebhook, charger_qr: ChargerQRCode, charger: Charger,
+        user: User, webhook_data: Dict,
+    ) -> Tuple[Optional[QRPayment], Optional[int]]:
+        """Atomic double-payment guard: lock the Charger row and either create
+        an accepted PAID QRPayment or, if the charger is busy, a rejected FAILED
+        one. Returns ``(qr_payment, None)`` on accept or ``(None, rejected_id)``
+        on rejection. The rejected payment is refunded by the caller outside the
+        lock (the Razorpay call is slow)."""
         async with in_transaction():
             locked_charger = await Charger.select_for_update().get(id=charger.id)
 
@@ -387,47 +425,31 @@ class QRPaymentService:
                 )
                 logger.warning(
                     "qr_payment_rejected reason=charger_busy charger_id=%s payment_id=%s detail=%s",
-                    locked_charger.id, mask_payment_id(payment_id), reason,
+                    locked_charger.id, mask_payment_id(parsed.payment_id), reason,
                 )
                 rejected = await QRPayment.create(
-                    charger=locked_charger,
-                    charger_qr_code=charger_qr,
-                    user=user,
-                    razorpay_payment_id=payment_id,
-                    razorpay_qr_code_id=qr_code_id,
-                    amount_paid=amount_paid,
-                    customer_vpa=vpa,
-                    customer_name=customer_name,
-                    customer_contact=contact,
-                    status=QRPaymentStatusEnum.FAILED,
-                    failure_reason="Concurrent payment rejected — charger busy",
-                    metadata=webhook_data,
-                    **fee_fields,
+                    **QRPaymentService._qr_payment_create_kwargs(
+                        parsed, charger_qr, user, locked_charger, webhook_data,
+                        status=QRPaymentStatusEnum.FAILED,
+                        failure_reason="Concurrent payment rejected — charger busy",
+                    )
                 )
-                rejection_qr_payment_id = rejected.id
-            else:
-                qr_payment = await QRPayment.create(
-                    charger=locked_charger,
-                    charger_qr_code=charger_qr,
-                    user=user,
-                    razorpay_payment_id=payment_id,
-                    razorpay_qr_code_id=qr_code_id,
-                    amount_paid=amount_paid,
-                    customer_vpa=vpa,
-                    customer_name=customer_name,
-                    customer_contact=contact,
+                return None, rejected.id
+
+            qr_payment = await QRPayment.create(
+                **QRPaymentService._qr_payment_create_kwargs(
+                    parsed, charger_qr, user, locked_charger, webhook_data,
                     status=QRPaymentStatusEnum.PAID,
-                    metadata=webhook_data,
-                    **fee_fields,
                 )
+            )
+            return qr_payment, None
 
-        # Refund rejected payment outside the lock (Razorpay call is slow)
-        if rejection_qr_payment_id is not None:
-            rejected = await QRPayment.get(id=rejection_qr_payment_id)
-            await QRPaymentService._full_refund(rejected, "Concurrent payment rejected — charger busy")
-            return {"status": "failed", "reason": "active_transaction", "qr_payment_id": rejection_qr_payment_id}
-
-        # Check if charger is in a suitable state and connected
+    @staticmethod
+    async def _dispatch_charging(
+        charger: Charger, user: User, qr_payment: QRPayment,
+    ) -> None:
+        """Decide what to do with an accepted PAID payment: start now, wait for
+        plug-in, or refund if the charger is offline."""
         # Socket chargers may remain Available (no CP signal for Preparing)
         from services.charger_type_service import is_socket_charger as _is_socket
         is_connected = await redis_manager.is_charger_connected(charger.charge_point_string_id)
@@ -450,6 +472,58 @@ class QRPaymentService:
             await qr_payment.save()
             await QRPaymentService._full_refund(qr_payment, "Charger not connected")
 
+    @staticmethod
+    async def handle_qr_payment(webhook_data: Dict) -> Dict:
+        """
+        Handle qr_code.credited webhook: validate, find user, start charging.
+        Returns a status dict for logging.
+        """
+        parsed = QRPaymentService._parse_qr_webhook(webhook_data)
+
+        logger.info(
+            "QR payment received: payment_id=%s amount=₹%s qr_code=%s vpa=%s",
+            mask_payment_id(parsed.payment_id), parsed.amount_paid,
+            parsed.qr_code_id, mask_vpa(parsed.vpa),
+        )
+
+        # Idempotency check
+        existing = await QRPayment.filter(razorpay_payment_id=parsed.payment_id).first()
+        if existing:
+            logger.info(f"Duplicate webhook for payment {mask_payment_id(parsed.payment_id)}, skipping")
+            return {"status": "duplicate", "qr_payment_id": existing.id}
+
+        # Staleness check — if payment is older than the pending timeout,
+        # the user has long gone. Create record and refund immediately.
+        stale_result = await QRPaymentService._handle_stale_payment(
+            parsed, webhook_data,
+            webhook_data.get("payment", {}).get("entity", {}).get("created_at"),
+        )
+        if stale_result is not None:
+            return stale_result
+
+        # Look up ChargerQRCode
+        charger_qr = await QRPaymentService._resolve_active_charger_qr(parsed.qr_code_id)
+        if not charger_qr:
+            return {"status": "error", "reason": "QR code not found or inactive"}
+
+        charger = charger_qr.charger
+
+        # Find or create user
+        user = await find_or_create_user_from_payment(
+            parsed.contact, parsed.vpa, parsed.customer_name
+        )
+
+        qr_payment, rejection_qr_payment_id = await QRPaymentService._create_qr_payment_locked(
+            parsed, charger_qr, charger, user, webhook_data,
+        )
+
+        # Refund rejected payment outside the lock (Razorpay call is slow)
+        if rejection_qr_payment_id is not None:
+            rejected = await QRPayment.get(id=rejection_qr_payment_id)
+            await QRPaymentService._full_refund(rejected, "Concurrent payment rejected — charger busy")
+            return {"status": "failed", "reason": "active_transaction", "qr_payment_id": rejection_qr_payment_id}
+
+        await QRPaymentService._dispatch_charging(charger, user, qr_payment)
         return {"status": "processed", "qr_payment_id": qr_payment.id}
 
     MAX_START_RETRIES = 2
@@ -799,6 +873,87 @@ class QRPaymentService:
             logger.error(f"Error sending auto-stop for QR session txn {transaction_id}: {e}")
 
     @staticmethod
+    async def _refund_if_non_billable(
+        qr_payment: QRPayment, transaction: Transaction, energy_kwh,
+    ) -> bool:
+        """Route the two non-billable bands to a full refund. Returns True when
+        a full refund was issued (caller must stop), False to keep billing.
+
+        Non-billable bands (full refund, no GST invoice / settlement). The
+        over-payment formula in the billing path is correct only when a billable
+        service was delivered, so route these to _full_refund (handles audit +
+        instant speed=optimum). Per ADR 0013 (amended 2026-06-24), only TWO
+        bands are non-billable — a COMPLETED session that delivered any energy
+        now bills from the first Wh (customer got the service; franchisee earns
+        it):
+          energy <= 0                         -> no taxable supply (ADR 0002)
+          FAILED and 0 < energy < 0.5 kWh     -> faulted after a trivial
+                                                 delivery (ADR 0013 amendment)
+        """
+        if is_zero_energy(transaction):
+            await QRPaymentService._full_refund(qr_payment, "Zero energy delivered")
+            return True
+        if is_fault_refund(transaction):
+            energy_dec = Decimal(str(energy_kwh))
+            await QRPaymentService._full_refund(
+                qr_payment,
+                f"Faulted after {energy_dec:.3f} kWh (< {MIN_BILLABLE_ENERGY_KWH} kWh) — full refund",
+            )
+            return True
+        return False
+
+    @staticmethod
+    def _compute_qr_energy_cost(
+        transaction_id: int, amount_paid: Decimal, energy_kwh,
+        tariff_rate: Decimal, gst_percent: Decimal,
+    ) -> Tuple[Decimal, Decimal]:
+        """Compute ``(energy_cost, gst_amount)`` for a billable QR session,
+        capping billable energy at the budgeted pre-tax ceiling. Returns
+        ``(0, 0)`` when there is no tariff rate. Pure (apart from over-cap
+        metric/log emission)."""
+        if not tariff_rate:
+            return Decimal('0.00'), Decimal('0.00')
+
+        uncapped_energy_cost = (Decimal(str(energy_kwh)) * tariff_rate).quantize(
+            Decimal('0.01'), rounding=ROUND_HALF_UP
+        )
+        # Cap billable energy at the budgeted pre-tax ceiling. The budget
+        # enforced in Redis is `amount_paid - platform_fee` (tax-inclusive).
+        # The charger keeps delivering for a few seconds after we send
+        # RemoteStopTransaction, so the metered kWh can overshoot the
+        # budget. Without this cap, the customer would be billed for
+        # energy they never paid for and the refund would clamp to zero,
+        # silently shifting the GST liability onto VoltLync.
+        platform_fee = synthetic_platform_fee(amount_paid)
+        budget_incl_tax = amount_paid - platform_fee
+        gst_multiplier = Decimal('1') + (gst_percent / Decimal('100'))
+        budget_excl_tax = (budget_incl_tax / gst_multiplier).quantize(
+            Decimal('0.01'), rounding=ROUND_HALF_UP
+        )
+        energy_cost = min(uncapped_energy_cost, budget_excl_tax)
+        if uncapped_energy_cost > budget_excl_tax:
+            over_kwh = float(
+                Decimal(str(energy_kwh)) - (budget_excl_tax / tariff_rate)
+            )
+            logger.warning(
+                "QR over-consumption capped for txn %s: "
+                "delivered=%.3fkWh, billable=%.3fkWh, over_delivery=%.3fkWh, "
+                "uncapped_cost=₹%s, capped_cost=₹%s",
+                transaction_id, energy_kwh,
+                float(budget_excl_tax / tariff_rate), over_kwh,
+                uncapped_energy_cost, energy_cost,
+            )
+            # Emit metrics so ops can quantify how much electricity is
+            # being absorbed past the budget. A non-zero rate here is a
+            # signal to tighten the auto-stop reaction time.
+            MetricsCollector.increment_counter("Custom/QR/OverConsumptionCapped")
+            MetricsCollector.record_metric("Custom/QR/OverDeliveryKwh", over_kwh)
+        gst_amount = (energy_cost * gst_percent / Decimal('100')).quantize(
+            Decimal('0.01'), rounding=ROUND_HALF_UP
+        )
+        return energy_cost, gst_amount
+
+    @staticmethod
     async def process_qr_session_billing(transaction_id: int):
         """
         Called after StopTransaction. Calculate energy cost, platform fee, and issue refund.
@@ -817,24 +972,7 @@ class QRPaymentService:
 
         energy_kwh = transaction.energy_consumed_kwh or 0
 
-        # Non-billable bands (full refund, no GST invoice / settlement). The
-        # over-payment formula below is correct only when a billable service was
-        # delivered, so route these to _full_refund (handles audit + instant
-        # speed=optimum). Per ADR 0013 (amended 2026-06-24), only TWO bands are
-        # non-billable — a COMPLETED session that delivered any energy now bills
-        # from the first Wh (customer got the service; franchisee earns it):
-        #   energy <= 0                         -> no taxable supply (ADR 0002)
-        #   FAILED and 0 < energy < 0.5 kWh     -> faulted after a trivial
-        #                                          delivery (ADR 0013 amendment)
-        energy_dec = Decimal(str(energy_kwh))
-        if is_zero_energy(transaction):
-            await QRPaymentService._full_refund(qr_payment, "Zero energy delivered")
-            return
-        if is_fault_refund(transaction):
-            await QRPaymentService._full_refund(
-                qr_payment,
-                f"Faulted after {energy_dec:.3f} kWh (< {MIN_BILLABLE_ENERGY_KWH} kWh) — full refund",
-            )
+        if await QRPaymentService._refund_if_non_billable(qr_payment, transaction, energy_kwh):
             return
 
         tariff = await WalletService.get_applicable_tariff(qr_payment.charger_id)
@@ -846,55 +984,31 @@ class QRPaymentService:
         platform_fee = synthetic_platform_fee(qr_payment.amount_paid)
         await _ensure_actual_fee_captured(qr_payment)
 
-        if tariff_rate:
-            uncapped_energy_cost = (Decimal(str(energy_kwh)) * tariff_rate).quantize(
-                Decimal('0.01'), rounding=ROUND_HALF_UP
-            )
-            # Cap billable energy at the budgeted pre-tax ceiling. The budget
-            # enforced in Redis is `amount_paid - platform_fee` (tax-inclusive).
-            # The charger keeps delivering for a few seconds after we send
-            # RemoteStopTransaction, so the metered kWh can overshoot the
-            # budget. Without this cap, the customer would be billed for
-            # energy they never paid for and the refund would clamp to zero,
-            # silently shifting the GST liability onto VoltLync.
-            budget_incl_tax = qr_payment.amount_paid - platform_fee
-            gst_multiplier = Decimal('1') + (gst_percent / Decimal('100'))
-            budget_excl_tax = (budget_incl_tax / gst_multiplier).quantize(
-                Decimal('0.01'), rounding=ROUND_HALF_UP
-            )
-            energy_cost = min(uncapped_energy_cost, budget_excl_tax)
-            if uncapped_energy_cost > budget_excl_tax:
-                over_kwh = float(
-                    Decimal(str(energy_kwh)) - (budget_excl_tax / tariff_rate)
-                )
-                logger.warning(
-                    "QR over-consumption capped for txn %s: "
-                    "delivered=%.3fkWh, billable=%.3fkWh, over_delivery=%.3fkWh, "
-                    "uncapped_cost=₹%s, capped_cost=₹%s",
-                    transaction_id, energy_kwh,
-                    float(budget_excl_tax / tariff_rate), over_kwh,
-                    uncapped_energy_cost, energy_cost,
-                )
-                # Emit metrics so ops can quantify how much electricity is
-                # being absorbed past the budget. A non-zero rate here is a
-                # signal to tighten the auto-stop reaction time.
-                MetricsCollector.increment_counter("Custom/QR/OverConsumptionCapped")
-                MetricsCollector.record_metric(
-                    "Custom/QR/OverDeliveryKwh", over_kwh
-                )
-            gst_amount = (energy_cost * gst_percent / Decimal('100')).quantize(
-                Decimal('0.01'), rounding=ROUND_HALF_UP
-            )
-        else:
-            energy_cost = Decimal('0.00')
-            gst_amount = Decimal('0.00')
+        energy_cost, gst_amount = QRPaymentService._compute_qr_energy_cost(
+            transaction_id, qr_payment.amount_paid, energy_kwh, tariff_rate, gst_percent,
+        )
 
         refund = max(Decimal('0'), qr_payment.amount_paid - energy_cost - gst_amount - platform_fee)
+        await QRPaymentService._finalize_qr_billing(
+            transaction_id, qr_payment, energy_cost, gst_amount, gst_percent,
+            platform_fee, refund,
+        )
 
+    @staticmethod
+    async def _finalize_qr_billing(
+        transaction_id: int, qr_payment: QRPayment, energy_cost: Decimal,
+        gst_amount: Decimal, gst_percent: Decimal, platform_fee: Decimal,
+        refund: Decimal,
+    ) -> None:
+        """Persist the billing breakdown, issue any positive unused-credit
+        refund, clear the Redis session, and emit the billing-completed audit
+        event. ``platform_fee`` here is the *synthetic* fee used for the refund
+        math + log/audit — it is NOT written to ``qr_payment.platform_fee``
+        (that holds the actual Razorpay fee, ADR 0001)."""
         qr_payment.energy_cost = energy_cost
         qr_payment.gst_amount = gst_amount
         # NB: qr_payment.platform_fee already holds the actual Razorpay fee
-        # (populated above by _ensure_actual_fee_captured) — do not overwrite
+        # (populated by _ensure_actual_fee_captured) — do not overwrite
         # with the synthetic value. ADR 0001.
         qr_payment.status = QRPaymentStatusEnum.COMPLETED
 
@@ -917,39 +1031,7 @@ class QRPaymentService:
         # Negative balance (over-consumption past budget) is absorbed as
         # operator loss — handled separately in the cap logic above.
         if refund > 0:
-            qr_payment.refund_amount = refund
-            try:
-                refund_result = await razorpay_service.refund_payment(
-                    qr_payment.razorpay_payment_id,
-                    **build_refund_call_kwargs(qr_payment, refund),
-                )
-                qr_payment.razorpay_refund_id = refund_result.get("id")
-                qr_payment.status = QRPaymentStatusEnum.REFUNDED
-                logger.info(f"Refund of ₹{refund} issued for QR payment {qr_payment.id}")
-            except RazorpayRefundBelowMinimumError:
-                # Razorpay rejects refunds < ₹1.00. Customer effectively
-                # forfeits the sub-rupee remainder; not a real failure.
-                # Tag with a specific reason so admin/billing-retry can
-                # disambiguate from genuine refund errors.
-                qr_payment.status = QRPaymentStatusEnum.REFUND_FAILED
-                qr_payment.failure_reason = BELOW_MINIMUM_REASON
-                logger.info(
-                    "QR payment %s refund ₹%s below Razorpay minimum; not refunded",
-                    qr_payment.id, refund,
-                )
-            except RazorpayIdempotencyConflictError:
-                # HTTP 409 on the unused-credit refund (cross-env key collision
-                # or lost-response retry). Reconcile to any existing refund; if
-                # none, mark non-retryable. Partial refunds never request
-                # instant speed, so pass refund_speed=None.
-                await QRPaymentService._reconcile_conflict(
-                    qr_payment, None, "Unused charging credit refund",
-                    IDEMPOTENCY_CONFLICT_NO_REFUND,
-                )
-            except Exception as e:
-                qr_payment.status = QRPaymentStatusEnum.REFUND_FAILED
-                qr_payment.failure_reason = str(e)
-                logger.error(f"Refund failed for QR payment {qr_payment.id}: {e}", exc_info=True)
+            await QRPaymentService._issue_unused_credit_refund(qr_payment, refund)
 
         await qr_payment.save()
 
@@ -984,6 +1066,80 @@ class QRPaymentService:
         await qr_payment.save()
         await QRPaymentService._full_refund(qr_payment, "Charging failure")
         await redis_manager.delete_qr_session(transaction_id)
+
+    @staticmethod
+    async def _issue_unused_credit_refund(qr_payment: QRPayment, refund: Decimal) -> None:
+        """Refund the unused prepaid balance after a billable QR session.
+
+        Partial refund — never requests instant speed (refund_speed=None). On
+        success sets the refund id + REFUNDED. On any Razorpay refund exception
+        defers to the shared classifier (which now also reconciles an
+        AlreadyRefunded reply, matching the full-refund path). Does NOT save —
+        the caller persists alongside the rest of the billing breakdown.
+        """
+        qr_payment.refund_amount = refund
+        try:
+            refund_result = await razorpay_service.refund_payment(
+                qr_payment.razorpay_payment_id,
+                **build_refund_call_kwargs(qr_payment, refund),
+            )
+            qr_payment.razorpay_refund_id = refund_result.get("id")
+            qr_payment.status = QRPaymentStatusEnum.REFUNDED
+            logger.info(f"Refund of ₹{refund} issued for QR payment {qr_payment.id}")
+        except Exception as exc:
+            await QRPaymentService._classify_refund_exception(
+                qr_payment, exc,
+                refund_speed=None,
+                reason="Unused charging credit refund",
+                below_minimum_log=(
+                    "QR payment %s refund ₹%s below Razorpay minimum; not refunded"
+                    % (qr_payment.id, refund)
+                ),
+                generic_error_log="Refund failed for QR payment %s: %s",
+            )
+
+    @staticmethod
+    async def _classify_refund_exception(
+        payment: QRPayment,
+        exc: Exception,
+        *,
+        refund_speed,
+        reason: str,
+        below_minimum_log: str,
+        generic_error_log: str,
+    ) -> None:
+        """Single source of truth for mapping a Razorpay refund exception onto
+        the QRPayment row. Used by BOTH the full-refund and partial (unused
+        credit) refund paths so their failure handling can never drift.
+
+        Branches (union of both historical paths):
+          - RazorpayAlreadyRefundedError -> reconcile via find_refund_for_payment;
+            REFUND_FAILED with an explanatory reason if no refund exists.
+          - RazorpayIdempotencyConflictError -> reconcile; REFUND_FAILED with the
+            non-retryable IDEMPOTENCY_CONFLICT_NO_REFUND marker if none exists.
+          - RazorpayRefundBelowMinimumError -> REFUND_FAILED, BELOW_MINIMUM_REASON
+            (benign sub-₹1 remainder); logs ``below_minimum_log`` at info.
+          - anything else -> REFUND_FAILED with str(exc), logged at error.
+
+        Does NOT save the row — the caller persists.
+        """
+        if isinstance(exc, RazorpayAlreadyRefundedError):
+            await QRPaymentService._reconcile_conflict(
+                payment, refund_speed, reason,
+                f"Razorpay reports already refunded but no refund record found: {exc}",
+            )
+        elif isinstance(exc, RazorpayIdempotencyConflictError):
+            await QRPaymentService._reconcile_conflict(
+                payment, refund_speed, reason, IDEMPOTENCY_CONFLICT_NO_REFUND,
+            )
+        elif isinstance(exc, RazorpayRefundBelowMinimumError):
+            payment.status = QRPaymentStatusEnum.REFUND_FAILED
+            payment.failure_reason = BELOW_MINIMUM_REASON
+            logger.info(below_minimum_log)
+        else:
+            logger.error(generic_error_log, payment.id, exc, exc_info=True)
+            payment.status = QRPaymentStatusEnum.REFUND_FAILED
+            payment.failure_reason = str(exc)
 
     @staticmethod
     async def _reconcile_conflict(
@@ -1056,52 +1212,43 @@ class QRPaymentService:
             # (RAZORPAY_INSTANT_REFUND_ENABLED, default true) live in
             # build_refund_call_kwargs so the retry path reproduces it exactly.
             refund_kwargs = build_refund_call_kwargs(locked, refund_amount)
-            refund_speed = refund_kwargs["speed"]
+            await QRPaymentService._perform_full_refund(
+                locked, refund_amount, reason, refund_kwargs,
+            )
+            await locked.save()
 
-            try:
-                refund_result = await razorpay_service.refund_payment(
-                    locked.razorpay_payment_id,
-                    **refund_kwargs,
-                )
-                locked.razorpay_refund_id = refund_result.get("id")
-                speed_processed = refund_result.get("speed_processed")
-                locked.razorpay_refund_speed_processed = speed_processed
-                if locked.status != QRPaymentStatusEnum.EXPIRED:
-                    locked.status = QRPaymentStatusEnum.REFUNDED
-                await locked.save()
-                logger.info(
-                    "Full refund ₹%s issued for QR payment %s: %s",
-                    refund_amount, locked.id, reason,
-                )
-            except RazorpayAlreadyRefundedError as e:
-                await QRPaymentService._reconcile_conflict(
-                    locked, refund_speed, reason,
-                    f"Razorpay reports already refunded but no refund record found: {e}",
-                )
-                await locked.save()
-            except RazorpayIdempotencyConflictError:
-                # HTTP 409: the key was already used (cross-env collision or a
-                # lost-response retry). Reconcile to any existing refund; if
-                # none, mark non-retryable so the sweep stops hammering it.
-                await QRPaymentService._reconcile_conflict(
-                    locked, refund_speed, reason, IDEMPOTENCY_CONFLICT_NO_REFUND,
-                )
-                await locked.save()
-            except RazorpayRefundBelowMinimumError:
-                # Sub-₹1 full refund (rare — amount_paid is normally ≥₹1).
-                # Tag with the canonical marker so the sweep excludes it,
-                # matching the partial-refund path.
-                locked.status = QRPaymentStatusEnum.REFUND_FAILED
-                locked.failure_reason = BELOW_MINIMUM_REASON
-                await locked.save()
-                logger.info(
-                    "QR payment %s full refund below Razorpay minimum; not refunded",
-                    locked.id,
-                )
-            except Exception as e:
-                logger.error(
-                    "Full refund error for QR payment %s: %s", locked.id, e, exc_info=True,
-                )
-                locked.status = QRPaymentStatusEnum.REFUND_FAILED
-                locked.failure_reason = str(e)
-                await locked.save()
+    @staticmethod
+    async def _perform_full_refund(
+        locked: QRPayment, refund_amount: Decimal, reason: str, refund_kwargs: Dict,
+    ) -> None:
+        """Issue the full-refund Razorpay call and apply the outcome to the row.
+
+        On success captures the refund id + processed speed and marks REFUNDED
+        (unless EXPIRED). On any refund exception defers to the shared classifier
+        so the failure handling stays identical to the partial-refund path. Does
+        NOT save — the caller persists once afterwards.
+        """
+        refund_speed = refund_kwargs["speed"]
+        try:
+            refund_result = await razorpay_service.refund_payment(
+                locked.razorpay_payment_id, **refund_kwargs,
+            )
+            locked.razorpay_refund_id = refund_result.get("id")
+            locked.razorpay_refund_speed_processed = refund_result.get("speed_processed")
+            if locked.status != QRPaymentStatusEnum.EXPIRED:
+                locked.status = QRPaymentStatusEnum.REFUNDED
+            logger.info(
+                "Full refund ₹%s issued for QR payment %s: %s",
+                refund_amount, locked.id, reason,
+            )
+        except Exception as exc:
+            await QRPaymentService._classify_refund_exception(
+                locked, exc,
+                refund_speed=refund_speed,
+                reason=reason,
+                below_minimum_log=(
+                    "QR payment %s full refund below Razorpay minimum; not refunded"
+                    % locked.id
+                ),
+                generic_error_log="Full refund error for QR payment %s: %s",
+            )
