@@ -26,6 +26,11 @@ export const OCPP_ACTIONS = [
   "UpdateFirmware",
   "GetDiagnostics",
   "TriggerMessage",
+  // Frame-type pseudo-actions: the message_type column stores these for OCPP
+  // type-3 (CallResult) and type-4 (CallError) reply frames, which carry no
+  // action name of their own. Listed here so replies/errors are filterable.
+  "CallResult",
+  "CallError",
 ] as const;
 
 export type OcppAction = (typeof OCPP_ACTIONS)[number];

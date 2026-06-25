@@ -9,8 +9,11 @@ The original decision — full-refund (QR) / no-debit (wallet) for **every** `0 
 | status \ energy | `≤ 0` | `0 < e < 0.5` | `≥ 0.5` |
 |---|---|---|---|
 | **COMPLETED** (clean StopTransaction) | full refund *(ADR 0002)* | **bill** | bill |
+| **STOPPED** (timeout / disconnect / sweep / force-stop) | full refund *(ADR 0002)* | **bill** | bill |
 | **FAILED** (abnormal — `_fail_transaction_with_billing`) | full refund | **full refund** (fault) | bill |
 
+- The fault-refund is **keyed strictly on `transaction_status == FAILED`** (`wallet_service.py`, `qr_payment_service.py`). It is the *only* status that triggers the sub-0.5 kWh refund. **Code is the source of truth for this** — if the predicate and this table ever diverge, the code wins and this table must be corrected to match.
+- A **STOPPED** session bills exactly like COMPLETED. `finalize_stopped_transaction` (the canonical path for `SUSPENDED_TIMEOUT`, `DISCONNECT_TIMEOUT`, `STALE_SUSPEND_SWEEP`, `STALE_RECONNECT`, and admin force-stop) always sets status **STOPPED**, never FAILED — so a session that delivered `0 < e < 0.5 kWh` and was cleaned up by a timeout/sweep/force-stop **bills for that energy**. Only the StatusNotification-driven `_fail_transaction_with_billing` path produces FAILED and thus the fault-refund. This is deliberate: a clean-but-trivial delivery is a real supply regardless of *how* the session ended; only an abnormal fault waives it.
 - A **COMPLETED** session that delivered any energy is **billed from the first Wh** (`energy × rate + GST`, GST invoice, settlement entry; refund only the unused prepaid change). **No minimum-charge floor.**
 - A **FAILED** session (charger stopped without a clean StopTransaction, or socket-grace timeout) that delivered `0 < energy < 0.5 kWh` is **fully refunded** (QR) / **not debited** (wallet) — the "intended a lot, faulted after delivering a little" case.
 - A **FAILED** session that delivered `≥ 0.5 kWh` is **billed** — the customer got a real charge despite the fault.
