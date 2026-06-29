@@ -29,6 +29,7 @@ function getStatusBadge(status: QRPaymentStatus, belowMinimum?: boolean) {
     CHARGING: "default",
     COMPLETED: "secondary",
     REFUNDED: "secondary",
+    REFUND_IN_PROGRESS: "secondary",
     REFUND_FAILED: "destructive",
     EXPIRED: "outline",
     FAILED: "destructive",

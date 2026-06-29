@@ -42,6 +42,7 @@ const PAYMENT_STATUSES = [
   "CHARGING",
   "COMPLETED",
   "REFUNDED",
+  "REFUND_IN_PROGRESS",
   "REFUND_FAILED",
   "EXPIRED",
   "FAILED",
@@ -82,6 +83,7 @@ function paymentStatusVariant(
       return "default";
     case "CHARGING":
     case "REFUNDED":
+    case "REFUND_IN_PROGRESS":
       return "secondary";
     case "FAILED":
     case "REFUND_FAILED":

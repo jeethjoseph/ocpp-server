@@ -604,6 +604,7 @@ export type QRPaymentStatus =
   | "CHARGING"
   | "COMPLETED"
   | "REFUNDED"
+  | "REFUND_IN_PROGRESS"
   | "REFUND_FAILED"
   | "EXPIRED"
   | "FAILED";

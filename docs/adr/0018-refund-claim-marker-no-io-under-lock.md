@@ -1,6 +1,7 @@
 # Refund execution uses a claim-marker — no remote I/O held under the row lock
 
-Status: proposed
+Status: accepted (implemented 2026-06-29 — migration 46, both refund paths,
+sweep recovery, REFUND_IN_PROGRESS UI)
 
 QR refund execution must not hold a database row lock (and its pooled
 connection) across the Razorpay HTTP call. Both refund paths acquire
