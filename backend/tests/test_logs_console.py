@@ -242,3 +242,29 @@ class TestLogsConsole:
         # The cell is neutralized (quote-prefixed), never written as a live formula.
         assert "'=cmd" in resp.text
         assert ",=cmd" not in resp.text
+
+    @pytest.mark.asyncio
+    async def test_export_keyset_pagination_spans_chunks(
+        self, client_admin: AsyncClient, test_charger, monkeypatch
+    ):
+        """Keyset pagination walks the (timestamp, id) cursor across chunks with
+        no skipped or duplicated rows. Forces a chunk size of 1 so the seek path
+        runs for every row. Regression guard for the OFFSET→keyset change."""
+        monkeypatch.setattr("routers.logs.EXPORT_CHUNK_SIZE", 1)
+        cp = test_charger.charge_point_string_id
+        await _make_log(cp, "BootNotification", age_hours=3)  # oldest
+        await _make_log(cp, "Heartbeat", age_hours=2)
+        await _make_log(cp, "MeterValues", age_hours=1)       # newest
+
+        resp = await client_admin.get(
+            "/api/admin/logs/export", params={"charge_point_id": cp}
+        )
+        assert resp.status_code == status.HTTP_200_OK
+        lines = [ln for ln in resp.text.splitlines() if ln.strip()]
+        # header + exactly 3 distinct rows — no dupes, none skipped.
+        assert len(lines) == 4
+        body = lines[1:]
+        # Newest-first (-timestamp): MeterValues, Heartbeat, BootNotification.
+        assert "MeterValues" in body[0]
+        assert "Heartbeat" in body[1]
+        assert "BootNotification" in body[2]

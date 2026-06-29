@@ -173,10 +173,15 @@ def _log_to_row(log: OCPPLog) -> List[str]:
 
 
 async def _stream_logs_csv(query) -> AsyncIterator[str]:
-    """Page through the queryset in bounded chunks, yielding CSV text.
+    """Page through the queryset in bounded chunks via KEYSET pagination,
+    yielding CSV text.
 
-    Never materializes the whole result set — memory stays bounded to one chunk.
-    Stops at MAX_EXPORT_ROWS so a runaway export can't stream forever.
+    Keyset (seek) on the ``(timestamp, id)`` sort key instead of OFFSET: deep
+    OFFSET re-scans every skipped row on each chunk (O(n²) over a large export)
+    and isn't snapshot-consistent — rows inserted mid-export shift the window and
+    cause skipped/duplicated rows. Seeking on the last ``(timestamp, id)`` is
+    O(log n) per chunk (rides the index) and stable against concurrent inserts.
+    Memory stays bounded to one chunk; capped at MAX_EXPORT_ROWS.
     """
     buffer = io.StringIO()
     writer = csv.writer(buffer)
@@ -184,14 +189,26 @@ async def _stream_logs_csv(query) -> AsyncIterator[str]:
     yield _drain(buffer)
 
     fetched = 0
+    cursor = None  # (timestamp, id) of the last emitted row
     while fetched < MAX_EXPORT_ROWS:
-        chunk = await query.offset(fetched).limit(EXPORT_CHUNK_SIZE)
+        page = query
+        if cursor is not None:
+            last_ts, last_id = cursor
+            # Next row after the cursor under the -timestamp, -id ordering.
+            page = page.filter(
+                Q(timestamp__lt=last_ts)
+                | (Q(timestamp=last_ts) & Q(id__lt=last_id))
+            )
+        limit = min(EXPORT_CHUNK_SIZE, MAX_EXPORT_ROWS - fetched)
+        chunk = await page.limit(limit)
         if not chunk:
             break
         for log in chunk:
             writer.writerow(_log_to_row(log))
         yield _drain(buffer)
         fetched += len(chunk)
+        last = chunk[-1]
+        cursor = (last.timestamp, last.id)
         if len(chunk) < EXPORT_CHUNK_SIZE:
             break
 

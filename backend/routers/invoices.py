@@ -149,52 +149,45 @@ async def admin_invoices_summary(
         place_of_supply_state_code, is_inter_state, q,
     )
 
-    # Pull only the columns we need to aggregate — keeps memory flat even
-    # without DB-side SUM(). Tortoise's annotate aggregates don't compose
-    # cleanly with our chained .filter() above, so iterate the values dicts.
-    rows = await query.values(
-        "series",
-        "total_taxable_value",
-        "cgst_amount",
-        "sgst_amount",
-        "igst_amount",
-        "total_tax",
-        "round_off",
-        "total_amount",
+    # DB-side aggregation — one SUM/COUNT round-trip instead of materializing
+    # every matching invoice into Python. GSTInvoice grows unbounded and the
+    # default summary view has no date filter, so the old per-row loop scanned
+    # the whole table per request. (Same single-row annotate-values pattern as
+    # transactions.py.) See the production-readiness review (Phase 4).
+    agg = await query.annotate(
+        cnt=Count("id"),
+        s_taxable=Sum("total_taxable_value"),
+        s_cgst=Sum("cgst_amount"),
+        s_sgst=Sum("sgst_amount"),
+        s_igst=Sum("igst_amount"),
+        s_tax=Sum("total_tax"),
+        s_round=Sum("round_off"),
+        s_amount=Sum("total_amount"),
+    ).values(
+        "cnt", "s_taxable", "s_cgst", "s_sgst",
+        "s_igst", "s_tax", "s_round", "s_amount",
     )
+    row = agg[0] if agg else {}
 
-    totals = {
-        "count": len(rows),
-        "total_taxable_value": Decimal("0"),
-        "total_cgst": Decimal("0"),
-        "total_sgst": Decimal("0"),
-        "total_igst": Decimal("0"),
-        "total_tax": Decimal("0"),
-        "total_round_off": Decimal("0"),
-        "total_amount": Decimal("0"),
-    }
-    by_series: dict[str, int] = {}
-    for r in rows:
-        totals["total_taxable_value"] += r["total_taxable_value"] or Decimal("0")
-        totals["total_cgst"] += r["cgst_amount"] or Decimal("0")
-        totals["total_sgst"] += r["sgst_amount"] or Decimal("0")
-        totals["total_igst"] += r["igst_amount"] or Decimal("0")
-        totals["total_tax"] += r["total_tax"] or Decimal("0")
-        totals["total_round_off"] += r["round_off"] or Decimal("0")
-        totals["total_amount"] += r["total_amount"] or Decimal("0")
-        by_series[r["series"]] = by_series.get(r["series"], 0) + 1
+    def _sum(key) -> Decimal:
+        return row.get(key) or Decimal("0")  # SUM over an empty set is NULL
+
+    series_rows = (
+        await query.annotate(c=Count("id")).group_by("series").values("series", "c")
+    )
+    by_series = {r["series"]: r["c"] for r in series_rows}
 
     return {
-        "count": totals["count"],
-        "total_taxable_value": str(totals["total_taxable_value"]),
-        "total_cgst": str(totals["total_cgst"]),
-        "total_sgst": str(totals["total_sgst"]),
-        "total_igst": str(totals["total_igst"]),
-        "total_tax": str(totals["total_tax"]),
+        "count": row.get("cnt", 0) or 0,
+        "total_taxable_value": str(_sum("s_taxable")),
+        "total_cgst": str(_sum("s_cgst")),
+        "total_sgst": str(_sum("s_sgst")),
+        "total_igst": str(_sum("s_igst")),
+        "total_tax": str(_sum("s_tax")),
         # Round Off keeps taxable + tax + round_off == total_amount in the
         # filing summary (ADR 0017); non-zero only for intra-state invoices.
-        "total_round_off": str(totals["total_round_off"]),
-        "total_amount": str(totals["total_amount"]),
+        "total_round_off": str(_sum("s_round")),
+        "total_amount": str(_sum("s_amount")),
         "by_series": by_series,
     }
 
