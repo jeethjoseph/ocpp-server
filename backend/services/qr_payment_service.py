@@ -143,6 +143,24 @@ def build_refund_call_kwargs(qr_payment: QRPayment, refund_amount: Decimal) -> D
     }
 
 
+_REFUND_MAX_CONCURRENCY = int(os.getenv("REFUND_MAX_CONCURRENCY", "3"))
+_refund_sem = None
+_refund_sem_loop = None
+
+
+def _refund_semaphore() -> asyncio.Semaphore:
+    """Bound the number of in-flight Razorpay refund calls (defense-in-depth: a
+    provider latency spike can't pile up unbounded outbound requests). Created
+    lazily per running event loop so the test suite's per-test loops don't trip
+    'bound to a different event loop'. See ADR 0018."""
+    global _refund_sem, _refund_sem_loop
+    loop = asyncio.get_running_loop()
+    if _refund_sem is None or _refund_sem_loop is not loop:
+        _refund_sem = asyncio.Semaphore(_REFUND_MAX_CONCURRENCY)
+        _refund_sem_loop = loop
+    return _refund_sem
+
+
 async def _ensure_actual_fee_captured(qr_payment: QRPayment) -> None:
     """Side-effect writer: ensure the actual Razorpay fee lives on the row.
 
@@ -1006,12 +1024,13 @@ class QRPaymentService:
         math + log/audit — it is NOT written to ``qr_payment.platform_fee``
         (that holds the actual Razorpay fee, ADR 0001).
 
-        Serialized by SELECT FOR UPDATE on the QRPayment row + a status re-check.
-        StopTransaction, the transaction finalizer, and the orphan-cleanup sweep
-        can all reach ``process_qr_session_billing`` concurrently; the Razorpay
-        idempotency key already prevents a double payout, but the lock prevents
-        the duplicate state writes / audit event / Redis delete the unlocked path
-        allowed. Mirrors ``_full_refund``."""
+        Claim-marker (ADR 0018): T1 persists the billing breakdown and, when a
+        refund is due, CLAIMS it (status -> REFUND_IN_PROGRESS) atomically under
+        the row lock. The Razorpay call then runs in _execute_claimed_refund with
+        NO lock held. StopTransaction, the finalizer, and the orphan sweep can
+        all reach this concurrently; the T1 lock + status re-check makes the
+        finalize at-most-once, and the idempotency key makes the payout single."""
+        # T1 — billing + claim, atomic, lock held only for this fast write.
         async with in_transaction():
             locked = await QRPayment.select_for_update().get(id=qr_payment.id)
             if locked.status not in (
@@ -1034,7 +1053,16 @@ class QRPaymentService:
 
             locked.energy_cost = energy_cost
             locked.gst_amount = gst_amount
-            locked.status = QRPaymentStatusEnum.COMPLETED
+
+            claimed = refund > 0
+            if claimed:
+                # Claim the unused-credit refund; the Razorpay call happens after
+                # this commits (no lock). Prepaid policy: every unused paisa back.
+                locked.refund_amount = refund
+                locked.refund_terminal_status = QRPaymentStatusEnum.REFUNDED.value
+                locked.status = QRPaymentStatusEnum.REFUND_IN_PROGRESS
+            else:
+                locked.status = QRPaymentStatusEnum.COMPLETED
 
             # Store billing breakdown on transaction
             await Transaction.filter(id=transaction_id).update(
@@ -1050,29 +1078,29 @@ class QRPaymentService:
                 f"GST({gst_percent}%)=₹{gst_amount}, platform_fee=₹{platform_fee}, refund=₹{refund}"
             )
 
-            # Always refund any positive balance (no minimum-refund threshold).
-            # Prepaid policy: customer gets every paisa back if they didn't use it.
-            # Negative balance (over-consumption past budget) is absorbed as
-            # operator loss — handled separately in the cap logic above.
-            if refund > 0:
-                await QRPaymentService._issue_unused_credit_refund(locked, refund)
-
             await locked.save()
 
-        # Post-commit (outside the lock): cache invalidation + audit.
+        # call → persist (T2) for the claimed refund — NO lock across the network.
+        if claimed:
+            await QRPaymentService._execute_claimed_refund(
+                qr_payment.id, "Unused charging credit refund",
+            )
+
+        # Post-commit (outside any lock): cache invalidation + audit.
         await redis_manager.delete_qr_session(transaction_id)
 
+        final = await QRPayment.get(id=qr_payment.id)
         safe_create_task(log_audit_event(
             action="qr_payment.billing_completed",
             entity_type="qr_payment",
-            entity_id=locked.id,
+            entity_id=final.id,
             actor_type="system",
             changes={
                 "energy_cost": float(energy_cost),
                 "gst_amount": float(gst_amount),
                 "platform_fee": float(platform_fee),
-                "refund_amount": float(locked.refund_amount or 0),
-                "status": locked.status.value,
+                "refund_amount": float(final.refund_amount or 0),
+                "status": final.status.value,
             },
         ))
 
@@ -1092,35 +1120,97 @@ class QRPaymentService:
         await redis_manager.delete_qr_session(transaction_id)
 
     @staticmethod
-    async def _issue_unused_credit_refund(qr_payment: QRPayment, refund: Decimal) -> None:
-        """Refund the unused prepaid balance after a billable QR session.
+    async def _claim_refund(
+        payment_id: int,
+        refund_amount: Decimal,
+        terminal_status: QRPaymentStatusEnum,
+        fee_source: Optional[QRPayment] = None,
+    ) -> bool:
+        """T1 — atomically CLAIM a refund under the row lock: persist
+        ``refund_amount`` + the post-refund terminal intent and flip status to
+        REFUND_IN_PROGRESS. Returns True iff THIS caller won the claim (must
+        proceed to execute), False if the row was already claimed/refunded (back
+        off). The lock is held only for this fast write — never across the
+        Razorpay call. ``fee_source`` carries the in-place actual-fee capture
+        (``_ensure_actual_fee_captured`` mutates without saving). See ADR 0018."""
+        async with in_transaction():
+            locked = await QRPayment.select_for_update().get(id=payment_id)
+            if locked.razorpay_refund_id or locked.status in (
+                QRPaymentStatusEnum.REFUNDED, QRPaymentStatusEnum.REFUND_IN_PROGRESS,
+            ):
+                return False
+            if fee_source is not None:
+                locked.platform_fee = fee_source.platform_fee
+                locked.razorpay_commission = fee_source.razorpay_commission
+                locked.razorpay_gst = fee_source.razorpay_gst
+                locked.fee_source = fee_source.fee_source
+            locked.refund_amount = refund_amount
+            locked.refund_terminal_status = terminal_status.value
+            locked.status = QRPaymentStatusEnum.REFUND_IN_PROGRESS
+            await locked.save()
+            return True
 
-        Partial refund — never requests instant speed (refund_speed=None). On
-        success sets the refund id + REFUNDED. On any Razorpay refund exception
-        defers to the shared classifier (which now also reconciles an
-        AlreadyRefunded reply, matching the full-refund path). Does NOT save —
-        the caller persists alongside the rest of the billing breakdown.
-        """
-        qr_payment.refund_amount = refund
+    @staticmethod
+    async def _execute_claimed_refund(payment_id: int, reason: str) -> None:
+        """call → persist (T2) for a row already CLAIMED (REFUND_IN_PROGRESS).
+
+        Holds NO row lock during the Razorpay call (bounded by the refund
+        semaphore); re-locks only to persist the outcome. Idempotency-safe and
+        resumable: running it twice for the same row issues at most one payout
+        (the idempotency key) and the status / refund_id re-checks make the
+        second run a no-op — this is exactly what the sweep relies on to recover
+        a claim stranded by a crash between T1 and T2. See ADR 0018. The one
+        bounded lookup still under the T2 lock is the rare AlreadyRefunded /
+        idempotency-conflict reconcile (via the shared classifier)."""
+        row = await QRPayment.get(id=payment_id)
+        if row.status != QRPaymentStatusEnum.REFUND_IN_PROGRESS:
+            return  # already persisted by a concurrent run, or never claimed
+        refund_amount = row.refund_amount
+        terminal = QRPaymentStatusEnum(
+            row.refund_terminal_status or QRPaymentStatusEnum.REFUNDED.value
+        )
+        refund_kwargs = build_refund_call_kwargs(row, refund_amount)
+
+        # NETWORK — no lock, no open transaction, bounded outbound concurrency.
+        result, call_exc = None, None
         try:
-            refund_result = await razorpay_service.refund_payment(
-                qr_payment.razorpay_payment_id,
-                **build_refund_call_kwargs(qr_payment, refund),
-            )
-            qr_payment.razorpay_refund_id = refund_result.get("id")
-            qr_payment.status = QRPaymentStatusEnum.REFUNDED
-            logger.info(f"Refund of ₹{refund} issued for QR payment {qr_payment.id}")
+            async with _refund_semaphore():
+                result = await razorpay_service.refund_payment(
+                    row.razorpay_payment_id, **refund_kwargs,
+                )
         except Exception as exc:
-            await QRPaymentService._classify_refund_exception(
-                qr_payment, exc,
-                refund_speed=None,
-                reason="Unused charging credit refund",
-                below_minimum_log=(
-                    "QR payment %s refund ₹%s below Razorpay minimum; not refunded"
-                    % (qr_payment.id, refund)
-                ),
-                generic_error_log="Refund failed for QR payment %s: %s",
-            )
+            call_exc = exc
+
+        # T2 — re-lock and persist the outcome (fast, no refund call).
+        async with in_transaction():
+            locked = await QRPayment.select_for_update().get(id=payment_id)
+            if locked.razorpay_refund_id:
+                return  # webhook/sweep already finalized this refund
+            if call_exc is None:
+                locked.razorpay_refund_id = result.get("id")
+                locked.razorpay_refund_speed_processed = result.get("speed_processed")
+                locked.status = terminal
+                locked.failure_reason = None
+                logger.info(
+                    "Refund ₹%s issued for QR payment %s: %s",
+                    refund_amount, locked.id, reason,
+                )
+            else:
+                # Restore the intended terminal status so _reconcile_conflict's
+                # EXPIRED-preservation works, then classify the failure.
+                locked.status = terminal
+                await QRPaymentService._classify_refund_exception(
+                    locked, call_exc,
+                    refund_speed=refund_kwargs["speed"],
+                    reason=reason,
+                    below_minimum_log=(
+                        "QR payment %s refund below Razorpay minimum; not refunded"
+                        % locked.id
+                    ),
+                    generic_error_log="Refund error for QR payment %s: %s",
+                )
+            locked.refund_terminal_status = None
+            await locked.save()
 
     @staticmethod
     async def _classify_refund_exception(
@@ -1200,91 +1290,55 @@ class QRPaymentService:
 
     @staticmethod
     async def _full_refund(qr_payment: QRPayment, reason: str):
-        """Issue a full refund for a QR payment, guarded by a row lock.
+        """Issue a full refund via the claim-marker pattern (ADR 0018): a short
+        locked CLAIM (T1), the Razorpay call with NO lock held, then a short
+        locked PERSIST (T2). Serialized (single claim), idempotent (single payout
+        via the key), and crash-resumable (a stranded REFUND_IN_PROGRESS is
+        recovered by the sweep).
 
-        The entire check-decide-write flow runs inside a single DB transaction
-        with SELECT FOR UPDATE on the QRPayment row. This serializes concurrent
-        callers (webhook retries, watchdogs, billing) so only one refund is ever
-        issued. Razorpay "already refunded" responses are reconciled by
-        fetching the existing refund and persisting its ID.
-
-        CONTRACT: this re-fetches the row under the lock and operates on that
-        copy — any in-memory mutation on the passed ``qr_payment`` is discarded.
-        A caller that needs a terminal status preserved (e.g. EXPIRED for an
-        orphaned / stale payment, which ``_perform_full_refund`` keeps instead of
-        flipping to REFUNDED) MUST ``save()`` that status BEFORE calling, so the
-        re-read sees it. Do NOT set status on the passed object and rely on it
-        surviving — it will not.
-        """
-        async with in_transaction():
-            locked = await QRPayment.select_for_update().get(id=qr_payment.id)
-
-            if locked.razorpay_refund_id:
-                logger.info(
-                    "QR payment %s already refunded (%s), skipping",
-                    locked.id, locked.razorpay_refund_id,
-                )
-                return
-
-            # Capture the actual Razorpay fee onto the row for ops/reconciliation,
-            # but don't subtract it from the refund — zero-energy = no service
-            # rendered, customer is made whole, VoltLync absorbs the fee as P&L.
-            # See ADR 0002.
-            await _ensure_actual_fee_captured(locked)
-            refund_amount = locked.amount_paid
-
-            if refund_amount <= 0:
-                await locked.save()  # Persist fee data even if refund is skipped
-                logger.info(f"Refund amount ₹{refund_amount} is zero/negative, skipping")
-                return
-
-            locked.refund_amount = refund_amount
-
-            # ADR 0002: request instant refund (speed=optimum) on full-refund
-            # flows so customers see the money back in minutes, not days.
-            # Razorpay falls back to normal speed server-side when rails or
-            # payment method don't support instant. VoltLync absorbs the
-            # per-refund instant fee. The speed decision + kill-switch
-            # (RAZORPAY_INSTANT_REFUND_ENABLED, default true) live in
-            # build_refund_call_kwargs so the retry path reproduces it exactly.
-            refund_kwargs = build_refund_call_kwargs(locked, refund_amount)
-            await QRPaymentService._perform_full_refund(
-                locked, refund_amount, reason, refund_kwargs,
-            )
-            await locked.save()
-
-    @staticmethod
-    async def _perform_full_refund(
-        locked: QRPayment, refund_amount: Decimal, reason: str, refund_kwargs: Dict,
-    ) -> None:
-        """Issue the full-refund Razorpay call and apply the outcome to the row.
-
-        On success captures the refund id + processed speed and marks REFUNDED
-        (unless EXPIRED). On any refund exception defers to the shared classifier
-        so the failure handling stays identical to the partial-refund path. Does
-        NOT save — the caller persists once afterwards.
-        """
-        refund_speed = refund_kwargs["speed"]
-        try:
-            refund_result = await razorpay_service.refund_payment(
-                locked.razorpay_payment_id, **refund_kwargs,
-            )
-            locked.razorpay_refund_id = refund_result.get("id")
-            locked.razorpay_refund_speed_processed = refund_result.get("speed_processed")
-            if locked.status != QRPaymentStatusEnum.EXPIRED:
-                locked.status = QRPaymentStatusEnum.REFUNDED
+        CONTRACT (unchanged): a caller needing a terminal status preserved (e.g.
+        EXPIRED for an orphaned / stale payment) MUST ``save()`` that status
+        BEFORE calling — it is read here to record the post-refund terminal
+        intent, which T2 restores."""
+        # Fast path: already refunded → nothing to do, and skip the fee fetch.
+        # (Authoritative re-check happens under the lock in _claim_refund; a stale
+        # object that misses here just wastes a fee fetch, never double-refunds.)
+        if qr_payment.razorpay_refund_id:
             logger.info(
-                "Full refund ₹%s issued for QR payment %s: %s",
-                refund_amount, locked.id, reason,
+                "QR payment %s already refunded (%s), skipping",
+                qr_payment.id, qr_payment.razorpay_refund_id,
             )
-        except Exception as exc:
-            await QRPaymentService._classify_refund_exception(
-                locked, exc,
-                refund_speed=refund_speed,
-                reason=reason,
-                below_minimum_log=(
-                    "QR payment %s full refund below Razorpay minimum; not refunded"
-                    % locked.id
-                ),
-                generic_error_log="Full refund error for QR payment %s: %s",
-            )
+            return
+        # Pre-claim, NO lock: capture the actual Razorpay fee (may hit Razorpay's
+        # fetch-fees API). Ops/reconciliation only; never subtracted from the
+        # refund — zero-energy = no service rendered, customer made whole, fee
+        # absorbed as P&L (ADR 0002).
+        await _ensure_actual_fee_captured(qr_payment)
+        refund_amount = qr_payment.amount_paid
+        terminal = (
+            QRPaymentStatusEnum.EXPIRED
+            if qr_payment.status == QRPaymentStatusEnum.EXPIRED
+            else QRPaymentStatusEnum.REFUNDED
+        )
+
+        if refund_amount <= 0:
+            # Nothing to refund — persist the captured fee under a short lock.
+            async with in_transaction():
+                locked = await QRPayment.select_for_update().get(id=qr_payment.id)
+                if locked.razorpay_refund_id:
+                    return
+                locked.platform_fee = qr_payment.platform_fee
+                locked.razorpay_commission = qr_payment.razorpay_commission
+                locked.razorpay_gst = qr_payment.razorpay_gst
+                locked.fee_source = qr_payment.fee_source
+                await locked.save()
+            logger.info("Refund amount ₹%s is zero/negative, skipping", refund_amount)
+            return
+
+        # T1 claim (carries the captured fee), then call + persist with no lock
+        # across the network. build_refund_call_kwargs derives speed=optimum for
+        # full refunds (ADR 0002) deterministically from the amount.
+        if await QRPaymentService._claim_refund(
+            qr_payment.id, refund_amount, terminal, fee_source=qr_payment,
+        ):
+            await QRPaymentService._execute_claimed_refund(qr_payment.id, reason)
