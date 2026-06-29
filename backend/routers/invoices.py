@@ -159,6 +159,7 @@ async def admin_invoices_summary(
         "sgst_amount",
         "igst_amount",
         "total_tax",
+        "round_off",
         "total_amount",
     )
 
@@ -169,6 +170,7 @@ async def admin_invoices_summary(
         "total_sgst": Decimal("0"),
         "total_igst": Decimal("0"),
         "total_tax": Decimal("0"),
+        "total_round_off": Decimal("0"),
         "total_amount": Decimal("0"),
     }
     by_series: dict[str, int] = {}
@@ -178,6 +180,7 @@ async def admin_invoices_summary(
         totals["total_sgst"] += r["sgst_amount"] or Decimal("0")
         totals["total_igst"] += r["igst_amount"] or Decimal("0")
         totals["total_tax"] += r["total_tax"] or Decimal("0")
+        totals["total_round_off"] += r["round_off"] or Decimal("0")
         totals["total_amount"] += r["total_amount"] or Decimal("0")
         by_series[r["series"]] = by_series.get(r["series"], 0) + 1
 
@@ -188,6 +191,9 @@ async def admin_invoices_summary(
         "total_sgst": str(totals["total_sgst"]),
         "total_igst": str(totals["total_igst"]),
         "total_tax": str(totals["total_tax"]),
+        # Round Off keeps taxable + tax + round_off == total_amount in the
+        # filing summary (ADR 0017); non-zero only for intra-state invoices.
+        "total_round_off": str(totals["total_round_off"]),
         "total_amount": str(totals["total_amount"]),
         "by_series": by_series,
     }
@@ -209,7 +215,7 @@ CSV_COLUMNS = [
     "total_taxable_value",
     "cgst_rate", "cgst_amount", "sgst_rate", "sgst_amount",
     "igst_rate", "igst_amount",
-    "total_tax", "total_amount", "amount_in_words",
+    "total_tax", "round_off", "total_amount", "amount_in_words",
     "payment_method", "transaction_amount", "refund_amount",
     "transaction_id",
 ]
@@ -399,6 +405,7 @@ def _invoice_to_dict(inv: GSTInvoice) -> dict:
         "igst_rate": _d(inv.igst_rate),
         "igst_amount": _d(inv.igst_amount),
         "total_tax": _d(inv.total_tax),
+        "round_off": _d(inv.round_off),
         "total_amount": _d(inv.total_amount),
         "amount_in_words": inv.amount_in_words,
         "payment_method": inv.payment_method,

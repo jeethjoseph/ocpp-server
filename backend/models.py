@@ -975,6 +975,13 @@ class GSTInvoice(Model):
 
     # Totals
     total_tax = fields.DecimalField(max_digits=10, decimal_places=2)
+    # Sub-rupee reconciling residual. CGST/SGST are each computed independently
+    # from the taxable value (so they're equal and pass GSTR-1 portal
+    # recomputation), which can differ by a paisa from the billing tax that
+    # total_amount must reconcile to (= amount_paid − refund for QR). That
+    # residual is carried here as an explicit Round Off line rather than as an
+    # asymmetric SGST. 0 for inter-state (single IGST component). See ADR 0017.
+    round_off = fields.DecimalField(max_digits=10, decimal_places=2, default=0)
     total_amount = fields.DecimalField(max_digits=10, decimal_places=2)
     amount_in_words = fields.CharField(max_length=500, null=True)
 

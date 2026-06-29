@@ -1589,8 +1589,12 @@ async def test_synthetic_drives_billing_and_invoice_while_actual_lands_on_row(
     assert invoice.gateway_gst == Decimal("1.53")
     # Total taxable = energy(₹200) + gateway_commission(₹8.47) = ₹208.47
     assert invoice.total_taxable_value == Decimal("208.47")
-    # Total tax = energy_gst(₹36) + gateway_gst(₹1.53) = ₹37.53
-    assert invoice.total_tax == Decimal("37.53")
+    # CGST/SGST computed independently from ₹208.47 at 9% → ₹18.76 each = ₹37.52
+    # (equal halves), with a ₹0.01 Round Off vs the billing tax ₹37.53. ADR 0017.
+    assert invoice.cgst_amount == invoice.sgst_amount == Decimal("18.76")
+    assert invoice.total_tax == Decimal("37.52")
+    assert invoice.round_off == Decimal("0.01")
+    assert invoice.total_tax + invoice.round_off == Decimal("37.53")
     # The QRPayment row's actual razorpay_commission/_gst stay distinct from
     # the invoice's snapshotted synthetic values.
     assert qr_payment.razorpay_commission != invoice.gateway_charges
