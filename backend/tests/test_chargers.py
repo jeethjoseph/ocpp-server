@@ -108,7 +108,15 @@ class TestChargerEndpoints:
         assert len(data["connectors"]) == 1
         assert data["connectors"][0]["connector_type"] == "Type2"
         assert data["current_transaction"] is None
-    
+
+    @pytest.mark.asyncio
+    async def test_charger_logs_requires_admin(self, client: AsyncClient, test_charger):
+        """GET /api/admin/chargers/{id}/logs must be admin-gated — it exposes raw
+        OCPP frames (payloads, idTags, command params) for any charger by id.
+        Regression guard for the anonymous-IDOR gap found in the readiness re-review."""
+        resp = await client.get(f"/api/admin/chargers/{test_charger.id}/logs")
+        assert resp.status_code in (401, 403), resp.text
+
     @pytest.mark.asyncio
     async def test_get_charger_with_active_transaction(self, client_admin: AsyncClient, test_charger, test_user, test_vehicle):
         """Test getting charger with active transaction"""
