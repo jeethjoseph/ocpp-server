@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, keepPreviousData } from "@tanstack/react-query";
 import { logService, auditLogService } from "../api-services";
 import { useAuth } from "@/contexts/AuthContext";
 
@@ -21,6 +21,9 @@ export const useLogs = (params: {
     staleTime: 30 * 1000,
     gcTime: 5 * 60 * 1000,
     refetchOnWindowFocus: false,
+    // Keep the previous page visible while the next loads (offset pagination)
+    // so stepping Prev/Next doesn't unmount the list and flash the loading state.
+    placeholderData: keepPreviousData,
   });
 };
 

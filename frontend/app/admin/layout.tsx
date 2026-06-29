@@ -14,7 +14,7 @@ import {
   UserCog,
 } from "lucide-react";
 import SidebarShell, { type NavItem } from "@/components/SidebarShell";
-import ErrorBoundary from "@/components/ErrorBoundary";
+import RouteErrorBoundary from "@/components/RouteErrorBoundary";
 
 const adminItems: NavItem[] = [
   { name: "Dashboard", href: "/admin", icon: LayoutDashboard },
@@ -32,7 +32,7 @@ const adminItems: NavItem[] = [
 export default function AdminLayout({ children }: { children: React.ReactNode }) {
   return (
     <SidebarShell items={adminItems}>
-      <ErrorBoundary>{children}</ErrorBoundary>
+      <RouteErrorBoundary>{children}</RouteErrorBoundary>
     </SidebarShell>
   );
 }

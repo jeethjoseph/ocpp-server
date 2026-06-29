@@ -416,35 +416,38 @@ function TransactionsConsole() {
         </Card>
       )}
 
-      {/* Pagination */}
-      {totalPages > 1 && (
+      {/* Pagination — row count always shown when there are rows; nav controls
+          only when there's more than one page. */}
+      {rows.length > 0 && (
         <div className="flex items-center justify-between">
           <div className="text-sm text-gray-600">
             Showing {rows.length} of {total} sessions
           </div>
-          <div className="flex items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setCurrentPage((prev) => Math.max(prev - 1, 1))}
-              disabled={currentPage === 1}
-            >
-              Previous
-            </Button>
-            <span className="text-sm px-3 py-1 bg-gray-100 rounded">
-              {currentPage} of {totalPages}
-            </span>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() =>
-                setCurrentPage((prev) => Math.min(prev + 1, totalPages))
-              }
-              disabled={currentPage === totalPages}
-            >
-              Next
-            </Button>
-          </div>
+          {totalPages > 1 && (
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setCurrentPage((prev) => Math.max(prev - 1, 1))}
+                disabled={currentPage === 1}
+              >
+                Previous
+              </Button>
+              <span className="text-sm px-3 py-1 bg-gray-100 rounded">
+                {currentPage} of {totalPages}
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() =>
+                  setCurrentPage((prev) => Math.min(prev + 1, totalPages))
+                }
+                disabled={currentPage === totalPages}
+              >
+                Next
+              </Button>
+            </div>
+          )}
         </div>
       )}
     </div>

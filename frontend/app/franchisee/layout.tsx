@@ -10,6 +10,7 @@ import {
   User,
 } from "lucide-react";
 import SidebarShell, { type NavItem } from "@/components/SidebarShell";
+import RouteErrorBoundary from "@/components/RouteErrorBoundary";
 
 const franchiseeItems: NavItem[] = [
   { name: "Dashboard", href: "/franchisee", icon: LayoutDashboard },
@@ -21,5 +22,9 @@ const franchiseeItems: NavItem[] = [
 ];
 
 export default function FranchiseeLayout({ children }: { children: React.ReactNode }) {
-  return <SidebarShell items={franchiseeItems}>{children}</SidebarShell>;
+  return (
+    <SidebarShell items={franchiseeItems}>
+      <RouteErrorBoundary>{children}</RouteErrorBoundary>
+    </SidebarShell>
+  );
 }

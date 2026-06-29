@@ -5,6 +5,9 @@ import { Button } from "@/components/ui/button";
 
 interface ErrorBoundaryProps {
   children: React.ReactNode;
+  // When this changes (e.g. the route pathname), a tripped boundary auto-resets
+  // so navigating away from a broken view recovers without a hard reload.
+  resetKey?: string | number;
 }
 
 interface ErrorBoundaryState {
@@ -32,8 +35,20 @@ export default class ErrorBoundary extends React.Component<
     console.error("Render error caught by ErrorBoundary", error, info);
   }
 
+  componentDidUpdate(prevProps: ErrorBoundaryProps) {
+    // Auto-clear the error when the reset key changes (navigation) — otherwise a
+    // deterministic error would re-throw immediately and "Try again" would loop.
+    if (this.state.hasError && prevProps.resetKey !== this.props.resetKey) {
+      this.setState({ hasError: false });
+    }
+  }
+
   handleReset = () => {
     this.setState({ hasError: false });
+  };
+
+  handleReload = () => {
+    if (typeof window !== "undefined") window.location.reload();
   };
 
   render() {
@@ -48,9 +63,12 @@ export default class ErrorBoundary extends React.Component<
               This view hit an unexpected error. You can try again, or reload the
               page if the problem persists.
             </p>
-            <Button variant="outline" onClick={this.handleReset}>
-              Try again
-            </Button>
+            <div className="flex items-center justify-center gap-3">
+              <Button variant="outline" onClick={this.handleReset}>
+                Try again
+              </Button>
+              <Button onClick={this.handleReload}>Reload page</Button>
+            </div>
           </div>
         </div>
       );
