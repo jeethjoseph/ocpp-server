@@ -410,7 +410,8 @@ function LogRow({ log }: { log: LogEntry }) {
           )}
         </div>
         <span className="text-xs text-gray-500 dark:text-gray-400 whitespace-nowrap ml-2">
-          {new Date(log.timestamp).toLocaleString()}
+          {/* Force IST regardless of the admin's browser timezone (server is UTC). See CLAUDE.md "Timestamps". */}
+          {new Date(log.timestamp).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}
         </span>
       </div>
       {log.correlation_id && (

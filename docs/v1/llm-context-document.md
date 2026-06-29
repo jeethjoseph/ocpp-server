@@ -1024,7 +1024,7 @@ POST /webhooks/razorpay - Razorpay payment events (HMAC-SHA256 signature verifie
 GET /api/charge-points - Connected charger list
 POST /api/charge-points/{id}/request - Send OCPP command  
 GET /api/admin/logs - Fleet-wide OCPP message logs (ADR 0014); bounded 24h default window, charger + action + direction (IN/OUT) + errors_only filters (all server-side), OFFSET pagination (offset/limit, limit le=5000), returns {data,total,offset,limit,has_more}. errors_only=true returns rows where status IS NOT NULL AND status != 'SUCCESS'. All filters live in the shared `_build_logs_query()` helper in routers/logs.py.
-GET /api/admin/logs/export - Streaming CSV (text/csv, StreamingResponse) of the same filtered logs (incl. direction + errors_only); paged in 1000-row chunks, capped at 100,000 rows; Content-Disposition attachment filename=ocpp-logs.csv
+GET /api/admin/logs/export - Streaming CSV (text/csv, StreamingResponse) of the same filtered logs (incl. direction + errors_only); paged in 1000-row chunks, capped at 100,000 rows; Content-Disposition attachment filename=ocpp-logs.csv. Timestamps are emitted in **IST** via `to_ist(...).isoformat()` (column `timestamp_ist`, ends `+05:30`), NOT UTC — the admin-facing convention (see CLAUDE.md "Timestamps"; fixed 2026-06-29). The on-screen table likewise forces `timeZone:"Asia/Kolkata"`.
 ```
 
 ---

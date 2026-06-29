@@ -12,6 +12,7 @@ import logging
 from models import OCPPLog, User, AuditLog, Charger, Transaction
 from auth_middleware import require_admin
 from tortoise.queryset import Q
+from utils import to_ist
 
 logger = logging.getLogger(__name__)
 
@@ -145,15 +146,21 @@ async def get_logs(
 
 
 _EXPORT_COLUMNS = [
-    "timestamp", "charge_point_id", "direction",
+    "timestamp_ist", "charge_point_id", "direction",
     "message_type", "status", "message_id", "payload",
 ]
 
 
 def _log_to_row(log: OCPPLog) -> List[str]:
-    """Map one OCPPLog to a CSV row matching _EXPORT_COLUMNS."""
+    """Map one OCPPLog to a CSV row matching _EXPORT_COLUMNS.
+
+    Timestamps are emitted in IST (UTC+5:30) — the admin-facing convention.
+    Stored values are UTC; ``to_ist`` converts, and the ``+05:30`` offset in the
+    ISO string keeps the column unambiguous and machine-parseable. See the
+    "Timestamps" section in CLAUDE.md.
+    """
     return [
-        log.timestamp.isoformat() if log.timestamp else "",
+        to_ist(log.timestamp).isoformat() if log.timestamp else "",
         log.charge_point_id or "",
         str(log.direction.value if hasattr(log.direction, "value") else log.direction),
         log.message_type or "",

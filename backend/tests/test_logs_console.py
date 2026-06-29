@@ -221,6 +221,8 @@ class TestLogsConsole:
 
         lines = [ln for ln in resp.text.splitlines() if ln.strip()]
         header = lines[0]
-        assert header == "timestamp,charge_point_id,direction,message_type,status,message_id,payload"
+        assert header == "timestamp_ist,charge_point_id,direction,message_type,status,message_id,payload"
         assert len(lines) == 3  # header + 2 rows
         assert "BootNotification" in resp.text and "Heartbeat" in resp.text
+        # Timestamps are exported in IST (UTC+5:30), not UTC — see CLAUDE.md "Timestamps".
+        assert lines[1].split(",")[0].endswith("+05:30")
