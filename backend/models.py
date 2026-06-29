@@ -92,6 +92,11 @@ class QRPaymentStatusEnum(str, enum.Enum):
     REFUND_FAILED = "REFUND_FAILED"
     EXPIRED = "EXPIRED"
     FAILED = "FAILED"
+    # Refund decided + amount committed, but the Razorpay outcome is not yet
+    # confirmed — the window between the claim (T1) and the persist (T2) where
+    # the network call runs WITHOUT a row lock. A crash here strands the row in
+    # this state; BillingRetryService resumes it idempotently. See ADR 0018.
+    REFUND_IN_PROGRESS = "REFUND_IN_PROGRESS"
 
 class WebhookSourceEnum(str, enum.Enum):
     CLERK = "CLERK"
@@ -619,6 +624,11 @@ class QRPayment(Model):
     razorpay_refund_speed_processed = fields.CharField(max_length=20, null=True)
     refund_processed_at = fields.DatetimeField(null=True)
     refund_failure_reason = fields.TextField(null=True)
+    # Post-refund terminal status to restore at T2 (REFUNDED, or EXPIRED for
+    # orphan/stale payments) — carried across the claim→call→persist gap because
+    # T1 overwrites `status` with REFUND_IN_PROGRESS. NULL when no claim is open.
+    # See ADR 0018.
+    refund_terminal_status = fields.CharField(max_length=20, null=True)
     status = fields.CharEnumField(QRPaymentStatusEnum)
     failure_reason = fields.TextField(null=True)
     metadata = fields.JSONField(null=True)
