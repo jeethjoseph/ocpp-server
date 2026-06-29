@@ -14,9 +14,15 @@ logger = logging.getLogger(__name__)
 class BillingRetryService:
     """Background service to periodically retry failed billing transactions"""
     
-    def __init__(self, retry_interval_minutes: int = 30, max_retry_age_hours: int = 24):
+    def __init__(self, retry_interval_minutes: int = 30, max_retry_age_hours: int = 24,
+                 stranded_claim_minutes: int = 5):
         self.retry_interval_minutes = retry_interval_minutes
         self.max_retry_age_hours = max_retry_age_hours
+        # A refund claim (REFUND_IN_PROGRESS) older than this with no terminal
+        # outcome was stranded by a crash between T1 and T2 (ADR 0018). Kept well
+        # above the few-second normal claim→persist latency so we never race an
+        # in-flight executor.
+        self.stranded_claim_minutes = stranded_claim_minutes
         self.is_running = False
         self._task = None
     
@@ -51,6 +57,7 @@ class BillingRetryService:
             try:
                 await self._process_failed_billing_transactions()
                 await self._process_failed_qr_refunds()
+                await self._recover_stranded_refund_claims()
                 await self._cleanup_orphaned_qr_payments()
                 await self._cleanup_stale_suspended_transactions()
                 await asyncio.sleep(self.retry_interval_minutes * 60)
@@ -181,6 +188,35 @@ class BillingRetryService:
 
         if success_count > 0 or failure_count > 0:
             logger.info(f"🔄 QR refund retry completed: {success_count} successful, {failure_count} failed")
+
+    async def _recover_stranded_refund_claims(self):
+        """Resume refunds stranded in REFUND_IN_PROGRESS by a crash between the
+        claim (T1) and the persist (T2) — see ADR 0018. ``_execute_claimed_refund``
+        is idempotent and resumable: the idempotency key yields a single payout
+        and its status / refund_id re-checks no-op a row another worker already
+        finalized, so re-running a claim is always safe. Bounded to claims older
+        than ``stranded_claim_minutes`` so an in-flight executor is never raced."""
+        from services.qr_payment_service import QRPaymentService
+
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=self.stranded_claim_minutes)
+        stranded = await QRPayment.filter(
+            status=QRPaymentStatusEnum.REFUND_IN_PROGRESS,
+            updated_at__lt=cutoff,
+        ).all()
+        if not stranded:
+            return
+
+        logger.info(f"🔁 Recovering {len(stranded)} stranded refund claim(s)")
+        for qr_payment in stranded:
+            try:
+                await QRPaymentService._execute_claimed_refund(
+                    qr_payment.id, "Stranded refund claim recovery",
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to recover stranded refund claim %s: %s",
+                    qr_payment.id, e, exc_info=True,
+                )
 
     async def _cleanup_orphaned_qr_payments(self):
         """Refund QR payments stuck in PAID or CHARGING with no active transaction.

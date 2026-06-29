@@ -2348,3 +2348,65 @@ async def test_concurrent_qr_billing_finalizes_exactly_once(
     assert qr_payment.status == QRPaymentStatusEnum.REFUNDED
     assert qr_payment.razorpay_refund_id == "rfnd_ONCE"
     assert qr_payment.refund_amount is not None and qr_payment.refund_amount > 0
+
+
+async def _make_stranded_claim(qr_charger, qr_code, *, terminal=None):
+    """A QRPayment stranded in REFUND_IN_PROGRESS — the state a crash between the
+    claim (T1) and the persist (T2) leaves behind (ADR 0018)."""
+    import uuid
+    user = await User.create(
+        email=f"strand_{uuid.uuid4().hex[:6]}@v.test",
+        phone_number=f"9{uuid.uuid4().int % 1000000000:09d}",
+    )
+    return await QRPayment.create(
+        charger=qr_charger, charger_qr_code=qr_code, user=user,
+        razorpay_payment_id=f"pay_{uuid.uuid4().hex[:12]}",
+        razorpay_qr_code_id="qr_TEST123",
+        amount_paid=Decimal("100.00"), refund_amount=Decimal("40.00"),
+        refund_terminal_status=(terminal or QRPaymentStatusEnum.REFUNDED).value,
+        status=QRPaymentStatusEnum.REFUND_IN_PROGRESS,
+    )
+
+
+@pytest.mark.asyncio
+async def test_sweep_recovers_stranded_refund_claim(client, qr_charger, qr_code):
+    """ADR 0018 crash recovery: a refund stranded in REFUND_IN_PROGRESS (claimed,
+    process died before T2) is resumed by the sweep — exactly one payout, the row
+    lands REFUNDED with the refund id and the claim marker cleared."""
+    from datetime import timedelta
+    qr_payment = await _make_stranded_claim(qr_charger, qr_code)
+    # Backdate the claim past the recovery threshold (no in-flight executor).
+    await QRPayment.filter(id=qr_payment.id).update(
+        updated_at=datetime.now(timezone.utc) - timedelta(minutes=30)
+    )
+
+    sweep_rzp = MagicMock()
+    sweep_rzp.refund_payment = AsyncMock(
+        return_value={"id": "rfnd_RECOVERED", "speed_processed": "normal"}
+    )
+    sweep_rzp.find_refund_for_payment = AsyncMock(return_value=None)
+
+    with patch("services.qr_payment_service.razorpay_service", sweep_rzp):
+        await BillingRetryService()._recover_stranded_refund_claims()
+
+    sweep_rzp.refund_payment.assert_called_once()
+    await qr_payment.refresh_from_db()
+    assert qr_payment.status == QRPaymentStatusEnum.REFUNDED
+    assert qr_payment.razorpay_refund_id == "rfnd_RECOVERED"
+    assert qr_payment.refund_terminal_status is None
+
+
+@pytest.mark.asyncio
+async def test_sweep_does_not_race_fresh_refund_claim(client, qr_charger, qr_code):
+    """A just-claimed REFUND_IN_PROGRESS row (executor may still be in flight) is
+    NOT touched by the sweep — only claims older than stranded_claim_minutes."""
+    qr_payment = await _make_stranded_claim(qr_charger, qr_code)  # updated_at = now
+
+    sweep_rzp = MagicMock()
+    sweep_rzp.refund_payment = AsyncMock()
+    with patch("services.qr_payment_service.razorpay_service", sweep_rzp):
+        await BillingRetryService()._recover_stranded_refund_claims()
+
+    sweep_rzp.refund_payment.assert_not_called()
+    await qr_payment.refresh_from_db()
+    assert qr_payment.status == QRPaymentStatusEnum.REFUND_IN_PROGRESS
