@@ -1004,51 +1004,75 @@ class QRPaymentService:
         refund, clear the Redis session, and emit the billing-completed audit
         event. ``platform_fee`` here is the *synthetic* fee used for the refund
         math + log/audit — it is NOT written to ``qr_payment.platform_fee``
-        (that holds the actual Razorpay fee, ADR 0001)."""
-        qr_payment.energy_cost = energy_cost
-        qr_payment.gst_amount = gst_amount
-        # NB: qr_payment.platform_fee already holds the actual Razorpay fee
-        # (populated by _ensure_actual_fee_captured) — do not overwrite
-        # with the synthetic value. ADR 0001.
-        qr_payment.status = QRPaymentStatusEnum.COMPLETED
+        (that holds the actual Razorpay fee, ADR 0001).
 
-        # Store billing breakdown on transaction
-        await Transaction.filter(id=transaction_id).update(
-            energy_charge=energy_cost,
-            gst_amount=gst_amount,
-            gst_rate_percent=gst_percent,
-            total_billed=energy_cost + gst_amount,
-        )
+        Serialized by SELECT FOR UPDATE on the QRPayment row + a status re-check.
+        StopTransaction, the transaction finalizer, and the orphan-cleanup sweep
+        can all reach ``process_qr_session_billing`` concurrently; the Razorpay
+        idempotency key already prevents a double payout, but the lock prevents
+        the duplicate state writes / audit event / Redis delete the unlocked path
+        allowed. Mirrors ``_full_refund``."""
+        async with in_transaction():
+            locked = await QRPayment.select_for_update().get(id=qr_payment.id)
+            if locked.status not in (
+                QRPaymentStatusEnum.CHARGING, QRPaymentStatusEnum.PAID,
+            ):
+                logger.info(
+                    "QR billing for txn %s already finalized (status=%s) — "
+                    "skipping duplicate finalize", transaction_id, locked.status,
+                )
+                return
 
-        logger.info(
-            f"QR billing for txn {transaction_id}: "
-            f"paid=₹{qr_payment.amount_paid}, energy_cost=₹{energy_cost}, "
-            f"GST({gst_percent}%)=₹{gst_amount}, platform_fee=₹{platform_fee}, refund=₹{refund}"
-        )
+            # Carry the actual-fee capture made on the pre-lock object
+            # (_ensure_actual_fee_captured mutates in place and does NOT save,
+            # so the freshly-locked row doesn't have it yet). ADR 0001 — actual
+            # fee, never the synthetic platform_fee.
+            locked.platform_fee = qr_payment.platform_fee
+            locked.razorpay_commission = qr_payment.razorpay_commission
+            locked.razorpay_gst = qr_payment.razorpay_gst
+            locked.fee_source = qr_payment.fee_source
 
-        # Always refund any positive balance (no minimum-refund threshold).
-        # Prepaid policy: customer gets every paisa back if they didn't use it.
-        # Negative balance (over-consumption past budget) is absorbed as
-        # operator loss — handled separately in the cap logic above.
-        if refund > 0:
-            await QRPaymentService._issue_unused_credit_refund(qr_payment, refund)
+            locked.energy_cost = energy_cost
+            locked.gst_amount = gst_amount
+            locked.status = QRPaymentStatusEnum.COMPLETED
 
-        await qr_payment.save()
+            # Store billing breakdown on transaction
+            await Transaction.filter(id=transaction_id).update(
+                energy_charge=energy_cost,
+                gst_amount=gst_amount,
+                gst_rate_percent=gst_percent,
+                total_billed=energy_cost + gst_amount,
+            )
 
-        # Clean up Redis cache
+            logger.info(
+                f"QR billing for txn {transaction_id}: "
+                f"paid=₹{locked.amount_paid}, energy_cost=₹{energy_cost}, "
+                f"GST({gst_percent}%)=₹{gst_amount}, platform_fee=₹{platform_fee}, refund=₹{refund}"
+            )
+
+            # Always refund any positive balance (no minimum-refund threshold).
+            # Prepaid policy: customer gets every paisa back if they didn't use it.
+            # Negative balance (over-consumption past budget) is absorbed as
+            # operator loss — handled separately in the cap logic above.
+            if refund > 0:
+                await QRPaymentService._issue_unused_credit_refund(locked, refund)
+
+            await locked.save()
+
+        # Post-commit (outside the lock): cache invalidation + audit.
         await redis_manager.delete_qr_session(transaction_id)
 
         safe_create_task(log_audit_event(
             action="qr_payment.billing_completed",
             entity_type="qr_payment",
-            entity_id=qr_payment.id,
+            entity_id=locked.id,
             actor_type="system",
             changes={
                 "energy_cost": float(energy_cost),
                 "gst_amount": float(gst_amount),
                 "platform_fee": float(platform_fee),
-                "refund_amount": float(qr_payment.refund_amount or 0),
-                "status": qr_payment.status.value,
+                "refund_amount": float(locked.refund_amount or 0),
+                "status": locked.status.value,
             },
         ))
 
@@ -1158,6 +1182,10 @@ class QRPaymentService:
             payment.razorpay_refund_speed_processed = existing_speed
             if payment.status != QRPaymentStatusEnum.EXPIRED:
                 payment.status = QRPaymentStatusEnum.REFUNDED
+            # Clear any prior failure_reason — the row is REFUNDED now, so a
+            # lingering reason would falsely read as a failed row in ops/sweep
+            # predicates that key on failure_reason presence.
+            payment.failure_reason = None
             logger.warning(
                 "refund_reconciled=true qr_payment=%s existing_refund=%s reason=%s",
                 payment.id, existing["id"], reason,
@@ -1179,6 +1207,14 @@ class QRPaymentService:
         callers (webhook retries, watchdogs, billing) so only one refund is ever
         issued. Razorpay "already refunded" responses are reconciled by
         fetching the existing refund and persisting its ID.
+
+        CONTRACT: this re-fetches the row under the lock and operates on that
+        copy — any in-memory mutation on the passed ``qr_payment`` is discarded.
+        A caller that needs a terminal status preserved (e.g. EXPIRED for an
+        orphaned / stale payment, which ``_perform_full_refund`` keeps instead of
+        flipping to REFUNDED) MUST ``save()`` that status BEFORE calling, so the
+        re-read sees it. Do NOT set status on the passed object and rely on it
+        surviving — it will not.
         """
         async with in_transaction():
             locked = await QRPayment.select_for_update().get(id=qr_payment.id)

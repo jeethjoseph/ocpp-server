@@ -247,7 +247,9 @@ class BillingRetryService:
                     else:
                         await QRPaymentService.handle_charging_failure(qr_payment.transaction_id)
                 else:
-                    # No transaction — full refund
+                    # No transaction — full refund. MUST persist EXPIRED before
+                    # _full_refund: it re-locks a fresh copy and preserves only a
+                    # persisted terminal status (see _full_refund CONTRACT).
                     qr_payment.status = QRPaymentStatusEnum.EXPIRED
                     qr_payment.failure_reason = "Orphaned payment - no transaction linked"
                     await qr_payment.save()

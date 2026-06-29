@@ -2301,3 +2301,50 @@ async def test_initial_network_failure_marks_retryable_then_sweep_refunds(
     assert qr_payment.status == QRPaymentStatusEnum.REFUNDED
     assert qr_payment.razorpay_refund_id == "rfnd_SWEPT"
     assert qr_payment.failure_reason is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_qr_billing_finalizes_exactly_once(
+    client, qr_charger, qr_code, qr_tariff
+):
+    """True concurrency on the BILLABLE finalize path: StopTransaction, the
+    transaction finalizer, and the orphan sweep can all call
+    process_qr_session_billing for the same CHARGING session. The SELECT FOR
+    UPDATE + status re-check in _finalize_qr_billing must collapse two racers to
+    EXACTLY ONE unused-credit refund + one finalize — no duplicate state writes.
+    Regression guard for the partial-refund lock added in the readiness review."""
+    import asyncio
+    _, txn, qr_payment = await _make_qr_billing_fixture(
+        qr_charger, qr_code, qr_tariff, energy_consumed_kwh=0.5,
+    )
+
+    call_count = {"n": 0}
+
+    async def _slow_refund(*args, **kwargs):
+        call_count["n"] += 1
+        await asyncio.sleep(0.05)  # widen the window so the two finalizes overlap
+        return {"id": "rfnd_ONCE", "speed_processed": "normal"}
+
+    mock_rzp = MagicMock()
+    mock_rzp.refund_payment = AsyncMock(side_effect=_slow_refund)
+    mock_rzp.find_refund_for_payment = AsyncMock(return_value=None)
+    mock_rzp.fetch_payment = AsyncMock()
+    mock_rzp.fetch_payment_fees = AsyncMock(return_value=None)
+    mock_rzp.fetch_order = AsyncMock()
+    mock_rzp.create_transfer = AsyncMock()
+
+    with patch("services.qr_payment_service.razorpay_service", mock_rzp), \
+         patch("services.qr_payment_service.redis_manager") as mock_redis:
+        mock_redis.delete_qr_session = AsyncMock()
+        await asyncio.gather(
+            QRPaymentService.process_qr_session_billing(txn.id),
+            QRPaymentService.process_qr_session_billing(txn.id),
+        )
+
+    # Exactly one Razorpay refund despite two concurrent finalizes — the loser
+    # short-circuits on the status re-check under the lock.
+    assert call_count["n"] == 1, f"expected exactly one refund, got {call_count['n']}"
+    await qr_payment.refresh_from_db()
+    assert qr_payment.status == QRPaymentStatusEnum.REFUNDED
+    assert qr_payment.razorpay_refund_id == "rfnd_ONCE"
+    assert qr_payment.refund_amount is not None and qr_payment.refund_amount > 0
