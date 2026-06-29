@@ -28,7 +28,7 @@ from auth_middleware import (
 from services.invoice_service import InvoiceService
 from services import s3_service
 from services.monitoring_service import MetricsCollector
-from utils import to_ist
+from utils import to_ist, csv_safe_cell
 
 logger = logging.getLogger("ocpp-server")
 
@@ -230,7 +230,10 @@ def _csv_value(v):
         return v.isoformat()
     if isinstance(v, Decimal):
         return f"{v:f}"  # avoid scientific notation
-    return str(v)
+    # String cells (customer / franchisee / station names, invoice number) are
+    # user-influenced and the GSTR-1 CSV is opened by external CAs — neutralize
+    # formula injection. Numeric/date cells above are safe and left intact.
+    return csv_safe_cell(str(v))
 
 
 @router.get("/api/admin/invoices/export.csv")

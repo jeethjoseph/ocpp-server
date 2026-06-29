@@ -172,7 +172,11 @@ class StopTransactionRequest(BaseModel):
 # Create router
 router = APIRouter(
     prefix="/api/admin/transactions",
-    tags=["Transaction Management"]
+    tags=["Transaction Management"],
+    # Admin-only by prefix and intent. Router-level guard so EVERY route
+    # (list / detail / meter-values / stop) is gated — these expose customer
+    # VPAs, refund, and settlement economics and must never be anonymous.
+    dependencies=[Depends(require_admin())],
 )
 
 @router.get("", response_model=TransactionListResponse)

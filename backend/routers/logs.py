@@ -12,7 +12,7 @@ import logging
 from models import OCPPLog, User, AuditLog, Charger, Transaction
 from auth_middleware import require_admin
 from tortoise.queryset import Q
-from utils import to_ist
+from utils import to_ist, csv_safe_cell
 
 logger = logging.getLogger(__name__)
 
@@ -161,12 +161,14 @@ def _log_to_row(log: OCPPLog) -> List[str]:
     """
     return [
         to_ist(log.timestamp).isoformat() if log.timestamp else "",
-        log.charge_point_id or "",
+        # charge_point_id and message_type (OCPP Action) are charger-self-reported;
+        # payload/status/correlation_id are likewise data — neutralize formula cells.
+        csv_safe_cell(log.charge_point_id or ""),
         str(log.direction.value if hasattr(log.direction, "value") else log.direction),
-        log.message_type or "",
-        log.status or "",
-        log.correlation_id or "",
-        json.dumps(log.payload) if log.payload is not None else "",
+        csv_safe_cell(log.message_type or ""),
+        csv_safe_cell(log.status or ""),
+        csv_safe_cell(log.correlation_id or ""),
+        csv_safe_cell(json.dumps(log.payload) if log.payload is not None else ""),
     ]
 
 

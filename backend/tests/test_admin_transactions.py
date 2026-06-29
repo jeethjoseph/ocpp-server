@@ -356,3 +356,18 @@ async def test_detail_exposes_payment_and_settlement_status(
     body = resp.json()
     assert body["payment_status"] == "REFUNDED"
     assert body["settlement_status"] is None
+
+
+async def test_transactions_endpoints_require_admin(client, test_charger, test_user):
+    """Every /api/admin/transactions route is admin-gated at the router level.
+    Unauthenticated access must be rejected — these expose customer VPAs,
+    refund amounts, and franchisee settlement economics. Regression guard for
+    the auth gap found in the production-readiness review."""
+    txn = await _make_transaction(test_charger, test_user, start_meter_kwh=Decimal("0"))
+    for path in (
+        "/api/admin/transactions",
+        f"/api/admin/transactions/{txn.id}",
+        f"/api/admin/transactions/{txn.id}/meter-values",
+    ):
+        resp = await client.get(path)  # `client` = no admin override
+        assert resp.status_code in (401, 403), f"{path} not gated: {resp.status_code}"

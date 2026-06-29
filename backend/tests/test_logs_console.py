@@ -226,3 +226,19 @@ class TestLogsConsole:
         assert "BootNotification" in resp.text and "Heartbeat" in resp.text
         # Timestamps are exported in IST (UTC+5:30), not UTC — see CLAUDE.md "Timestamps".
         assert lines[1].split(",")[0].endswith("+05:30")
+
+    @pytest.mark.asyncio
+    async def test_export_neutralizes_csv_formula_injection(self, client_admin: AsyncClient):
+        """Charger-self-reported fields beginning with = + - @ are prefixed with
+        a single quote in the CSV so spreadsheets don't execute them as formulas
+        (OWASP CSV injection). Regression guard from the production-readiness review."""
+        malicious = "=cmd|'/c calc'!A1"
+        await _make_log(malicious, "BootNotification")
+
+        resp = await client_admin.get(
+            "/api/admin/logs/export", params={"charge_point_id": malicious}
+        )
+        assert resp.status_code == status.HTTP_200_OK
+        # The cell is neutralized (quote-prefixed), never written as a live formula.
+        assert "'=cmd" in resp.text
+        assert ",=cmd" not in resp.text
