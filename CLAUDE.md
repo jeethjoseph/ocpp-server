@@ -138,6 +138,25 @@ The `charger` table carries TWO orthogonal state-shaped fields. They are NOT red
 
 If you ever consider unifying these or deriving one from the other, re-read ADR 0008 first.
 
+## Timestamps (CRITICAL — store UTC, present IST)
+
+**The rule, no exceptions:** the database and the API store and return timestamps in **UTC**. Every surface a *human* reads — admin/franchisee UI, CSV/Excel exports, PDF invoices, anything emailed or downloaded — must convert to **IST (Asia/Kolkata, UTC+5:30)** at the moment of rendering. India is the only operating jurisdiction; a UTC timestamp shown to a human is a **bug**, even when it "looks fine" on an IST-set browser (it breaks for anyone whose browser/OS is on another zone, and for any server-rendered surface). This bit us on the Logs Console — both the table and the CSV shipped UTC (fixed 2026-06-29).
+
+**Never** rely on the ambient/browser timezone to do the conversion for you. `new Date(x).toLocaleString()` *without* an explicit `timeZone` renders in the browser's zone — that is NOT "IST", it's "whatever the admin's laptop is set to". Always pass the zone explicitly.
+
+Canonical converters — use these, don't hand-roll offsets (`+5:30` math silently breaks at no DST but is still the wrong habit):
+
+- **Backend (Python)**: `from utils import to_ist` → `to_ist(dt)` returns a tz-aware IST datetime (naive inputs are assumed UTC, matching Tortoise). For exports keep ISO so it stays machine-parseable: `to_ist(dt).isoformat()` (yields the unambiguous `…+05:30`). Precedents: `routers/invoices.py`, `routers/logs.py` CSV export.
+- **Frontend (TS/React)**: `new Date(iso).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })`, or the `formatDateTime` pattern in `app/admin/gst-filings/page.tsx` (per ADR 0012). For IST *calendar* math (date-range presets) use `lib/date-presets.ts` (`istToday()`), never `new Date()` day arithmetic.
+
+**Label the zone** so it's never ambiguous: CSV/export columns are named `*_ist` (e.g. `timestamp_ist`); UI columns showing a bare time should say IST where there's any doubt. When debugging against logs/Sentry/`pg_stat`, remember UI-shared timestamps are IST — subtract 5:30 to match server UTC.
+
+**Checklist when you add or touch a timestamp on any human-facing surface:**
+1. Source value is UTC (DB/API) — confirm, don't assume the field is already local.
+2. Convert with the canonical helper (`to_ist` / `toLocaleString(..., {timeZone:"Asia/Kolkata"})`) at render/export time — never store IST back.
+3. Name/label the output so the zone is explicit (`*_ist`, or an "IST" hint in the header).
+4. Add/adjust a test asserting the IST offset or value (e.g. CSV cell ends with `+05:30`) — a bare UTC test passes silently and hides the regression.
+
 ## Agent skills
 
 ### Issue tracker

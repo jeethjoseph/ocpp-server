@@ -912,7 +912,8 @@ async def get_charger_logs(
     limit: int = Query(20, ge=1, le=100),
     direction: Optional[str] = Query(None, regex="^(IN|OUT)$"),
     start_date: Optional[datetime] = None,
-    end_date: Optional[datetime] = None
+    end_date: Optional[datetime] = None,
+    admin_user: User = Depends(require_admin()),
 ):
     """Get OCPP communication logs for a specific charger"""
     

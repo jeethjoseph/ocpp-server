@@ -47,6 +47,7 @@ const STATUS_OPTIONS = [
   { value: "ALL", label: "All Statuses" },
   { value: "COMPLETED", label: "Completed" },
   { value: "REFUNDED", label: "Refunded" },
+  { value: "REFUND_IN_PROGRESS", label: "Refund processing" },
   { value: "CHARGING", label: "Charging" },
   { value: "PAID", label: "Paid" },
   { value: "FAILED", label: "Failed" },

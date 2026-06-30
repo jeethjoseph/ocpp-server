@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
-import Navbar from "@/components/Navbar";
+import AppFrame from "@/components/AppFrame";
 import { ThemeProvider } from "@/contexts/ThemeContext";
 import { QueryProvider } from "@/contexts/QueryClientProvider";
 import { AuthProvider } from "@/contexts/AuthContext";
@@ -70,10 +70,7 @@ export default function RootLayout({
           <AuthProvider>
             <QueryProvider>
               <ThemeProvider>
-                <Navbar />
-                <main className="max-w-7xl mx-auto py-6 px-4 sm:px-6 lg:px-8">
-                  {children}
-                </main>
+                <AppFrame>{children}</AppFrame>
                 <Toaster />
               </ThemeProvider>
             </QueryProvider>

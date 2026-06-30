@@ -24,6 +24,8 @@ function getStatusBadgeClass(status: string) {
       return "bg-amber-100 text-amber-800 dark:bg-amber-900/20 dark:text-amber-400";
     case "REFUNDED":
       return "bg-purple-100 text-purple-800 dark:bg-purple-900/20 dark:text-purple-400";
+    case "REFUND_IN_PROGRESS":
+      return "bg-blue-100 text-blue-800 dark:bg-blue-900/20 dark:text-blue-400";
     case "FAILED":
     case "REFUND_FAILED":
       return "bg-red-100 text-red-800 dark:bg-red-900/20 dark:text-red-400";
@@ -66,7 +68,11 @@ export function TransactionCard({ txn, vpa }: { txn: QRTransactionItem; vpa: str
   // A REFUND_FAILED row whose only "failure" is the sub-₹1 Razorpay floor is a
   // benign completed charge — show it as Completed, not a red error.
   const belowMin = txn.refund_below_minimum;
-  const displayStatus = belowMin ? "Completed" : txn.status.replace("_", " ");
+  const displayStatus = belowMin
+    ? "Completed"
+    : txn.status === "REFUND_IN_PROGRESS"
+      ? "Refund processing"
+      : txn.status.replace(/_/g, " ");
   const badgeClass = belowMin
     ? getStatusBadgeClass("COMPLETED")
     : getStatusBadgeClass(txn.status);
@@ -103,7 +109,7 @@ export function TransactionCard({ txn, vpa }: { txn: QRTransactionItem; vpa: str
               <p className="text-xs text-muted-foreground">Energy</p>
               <p className="font-semibold text-card-foreground">
                 {txn.energy_consumed_kwh != null
-                  ? `${txn.energy_consumed_kwh.toFixed(2)} kWh`
+                  ? `${Number(txn.energy_consumed_kwh).toFixed(2)} kWh`
                   : "N/A"}
               </p>
             </div>

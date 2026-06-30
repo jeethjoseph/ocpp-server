@@ -266,7 +266,7 @@ function UsersTable() {
                 </TableCell>
                 <TableCell>
                   <div className="text-sm">
-                    <div className="font-medium">₹{user.wallet_balance?.toFixed(2) || '0.00'}</div>
+                    <div className="font-medium">₹{Number(user.wallet_balance ?? 0).toFixed(2)}</div>
                     <div className="text-gray-600">{user.total_wallet_transactions} transactions</div>
                   </div>
                 </TableCell>

@@ -86,7 +86,7 @@ class OCPPRunner:
         self.msg_counter += 1
         return f"sim_{self.msg_counter:04d}"
 
-    async def run(self, amount_rupees: float):
+    async def run(self, amount_rupees: float, max_wh: Optional[int] = None, step_wh: int = 1000):
         uri = f"{self.ws_url}/ocpp/{self.charger_id}"
         async with websockets.connect(uri, subprotocols=["ocpp1.6"]) as ws:
             print(f"[SIM] Connected to {uri}")
@@ -118,13 +118,21 @@ class OCPPRunner:
             self.transaction_id = start_resp.get("transactionId") or 1
             print(f"[SIM] StartTransaction accepted: txn={self.transaction_id}")
 
-            # Emit MeterValues in ~1 kWh steps until RemoteStopTransaction arrives
+            # Emit MeterValues in step_wh increments until RemoteStopTransaction
+            # arrives — or, when --max-wh is set, self-stop once that total is
+            # delivered. Use --max-wh 300 to demo a Non-billable Session
+            # (sub-0.5 kWh de-minimis waiver → full refund, no bill; ADR 0013).
             stop_task = asyncio.create_task(self._await_server_request(ws, "RemoteStopTransaction"))
             try:
                 for step in range(1, 20):
                     if stop_task.done():
                         break
-                    self.meter_wh += 1000
+                    if max_wh is not None and self.meter_wh >= max_wh:
+                        print(f"[SIM] Reached --max-wh {max_wh}; self-stopping")
+                        break
+                    self.meter_wh += step_wh
+                    if max_wh is not None:
+                        self.meter_wh = min(self.meter_wh, max_wh)
                     await self._send(ws, "MeterValues", {
                         "connectorId": 1,
                         "transactionId": self.transaction_id,
@@ -187,6 +195,9 @@ async def main():
     parser.add_argument("--server-ws", default="ws://localhost:8000", help="Backend WebSocket base URL")
     parser.add_argument("--webhook-secret", default=None, help="Razorpay webhook secret (if signing)")
     parser.add_argument("--skip-signature", action="store_true", help="Don't sign the webhook (dev server only)")
+    parser.add_argument("--max-wh", type=int, default=None,
+                        help="Self-stop after delivering this many Wh (e.g. 300 to demo a sub-0.5 kWh de-minimis full refund). Default: deliver until RemoteStop.")
+    parser.add_argument("--step-wh", type=int, default=1000, help="Wh delivered per MeterValues frame (default 1000)")
     args = parser.parse_args()
 
     payment_id = f"pay_SIM_{uuid.uuid4().hex[:16]}"
@@ -196,7 +207,7 @@ async def main():
     print(f"[SIM] Webhook response: {result}")
 
     runner = OCPPRunner(args.charger_id, args.server_ws)
-    await runner.run(args.amount)
+    await runner.run(args.amount, max_wh=args.max_wh, step_wh=args.step_wh)
     print("[SIM] Simulation completed — verify server logs for billing/refund outcome")
 
 

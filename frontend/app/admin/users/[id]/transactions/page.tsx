@@ -96,7 +96,7 @@ function TransactionsTable({ userId }: { userId: number }) {
                   </TableCell>
                   <TableCell>
                     {transaction.energy_consumed_kwh ? (
-                      <span>{transaction.energy_consumed_kwh.toFixed(2)} kWh</span>
+                      <span>{Number(transaction.energy_consumed_kwh).toFixed(2)} kWh</span>
                     ) : (
                       <span className="text-gray-400">-</span>
                     )}

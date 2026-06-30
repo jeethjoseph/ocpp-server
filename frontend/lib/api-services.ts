@@ -11,6 +11,7 @@ import {
   ChargerDetail,
   MeterValue,
   TransactionDetail,
+  TransactionListResponse,
   ApiResponse,
   SignalQuality,
   SignalQualityListResponse,
@@ -178,6 +179,8 @@ export const transactionService = {
     start_date?: string;
     end_date?: string;
     sort?: string;
+    funding_source?: string[];
+    payment_status?: string;
   }) => {
     const searchParams = new URLSearchParams();
     if (params?.page) searchParams.set("page", params.page.toString());
@@ -189,15 +192,18 @@ export const transactionService = {
     if (params?.start_date) searchParams.set("start_date", params.start_date);
     if (params?.end_date) searchParams.set("end_date", params.end_date);
     if (params?.sort) searchParams.set("sort", params.sort);
+    if (params?.funding_source) {
+      params.funding_source.forEach((fs) =>
+        searchParams.append("funding_source", fs)
+      );
+    }
+    if (params?.payment_status)
+      searchParams.set("payment_status", params.payment_status);
 
     const query = searchParams.toString();
-    return api.get<{
-      data: unknown[];
-      total: number;
-      page: number;
-      limit: number;
-      summary: Record<string, unknown>;
-    }>(`/api/admin/transactions${query ? `?${query}` : ""}`);
+    return api.get<TransactionListResponse>(
+      `/api/admin/transactions${query ? `?${query}` : ""}`
+    );
   },
 
   getById: (id: number) =>
@@ -381,42 +387,68 @@ export interface LogEntry {
 export interface LogsResponse {
   data: LogEntry[];
   total: number;
+  offset: number;
   limit: number;
   has_more: boolean;
   message?: string;
 }
 
-export interface LogSummary {
-  charge_point_id: string;
-  total_logs: number;
-  inbound_logs: number;
-  outbound_logs: number;
-  oldest_log_date: string | null;
-  newest_log_date: string | null;
+export interface LogQueryParams {
+  charge_point_id?: string;
+  message_type?: string[];
+  start_date?: string;
+  end_date?: string;
+  direction?: string;
+  errors_only?: boolean;
+  offset?: number;
+  limit?: number;
+}
+
+function buildLogQuery(params?: LogQueryParams): string {
+  const sp = new URLSearchParams();
+  if (params?.charge_point_id) sp.set("charge_point_id", params.charge_point_id);
+  (params?.message_type ?? []).forEach((m) => sp.append("message_type", m));
+  if (params?.start_date) sp.set("start_date", params.start_date);
+  if (params?.end_date) sp.set("end_date", params.end_date);
+  if (params?.direction) sp.set("direction", params.direction);
+  if (params?.errors_only) sp.set("errors_only", "true");
+  if (params?.offset !== undefined) sp.set("offset", params.offset.toString());
+  if (params?.limit) sp.set("limit", params.limit.toString());
+  return sp.toString();
 }
 
 export const logService = {
-  getChargerLogs: (
-    chargePointId: string,
-    params?: {
-      start_date?: string;
-      end_date?: string;
-      limit?: number;
-    }
-  ) => {
-    const searchParams = new URLSearchParams();
-    if (params?.start_date) searchParams.set("start_date", params.start_date);
-    if (params?.end_date) searchParams.set("end_date", params.end_date);
-    if (params?.limit) searchParams.set("limit", params.limit.toString());
-
-    const query = searchParams.toString();
-    return api.get<LogsResponse>(
-      `/api/admin/logs/charger/${chargePointId}${query ? `?${query}` : ""}`
-    );
+  // Fleet-wide Logs Console query. Charger + action are filtered server-side;
+  // the date window is always bounded (defaults to last 24h on the backend).
+  getLogs: (params?: LogQueryParams) => {
+    const query = buildLogQuery(params);
+    return api.get<LogsResponse>(`/api/admin/logs${query ? `?${query}` : ""}`);
   },
 
-  getChargerLogSummary: (chargePointId: string) =>
-    api.get<LogSummary>(`/api/admin/logs/charger/${chargePointId}/summary`),
+  // Stream the filtered logs as a CSV download. Uses a raw fetch (not api.get)
+  // because the backend returns a streamed text/csv body, not JSON.
+  exportCsv: async (
+    params: LogQueryParams | undefined,
+    getToken: () => Promise<string | null>
+  ): Promise<Blob> => {
+    const token = await getToken();
+    if (!token) throw new Error("Authentication token not available");
+
+    const query = buildLogQuery(params);
+    const base = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+    const response = await fetch(
+      `${base}/api/admin/logs/export${query ? `?${query}` : ""}`,
+      {
+        headers: { Authorization: `Bearer ${token}` },
+        credentials: "include",
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error("Failed to export logs");
+    }
+    return response.blob();
+  },
 };
 
 // Audit Log Service

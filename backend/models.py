@@ -92,6 +92,11 @@ class QRPaymentStatusEnum(str, enum.Enum):
     REFUND_FAILED = "REFUND_FAILED"
     EXPIRED = "EXPIRED"
     FAILED = "FAILED"
+    # Refund decided + amount committed, but the Razorpay outcome is not yet
+    # confirmed — the window between the claim (T1) and the persist (T2) where
+    # the network call runs WITHOUT a row lock. A crash here strands the row in
+    # this state; BillingRetryService resumes it idempotently. See ADR 0018.
+    REFUND_IN_PROGRESS = "REFUND_IN_PROGRESS"
 
 class WebhookSourceEnum(str, enum.Enum):
     CLERK = "CLERK"
@@ -414,10 +419,18 @@ class OCPPLog(Model):
     payload = fields.JSONField(null=True)
     status = fields.CharField(max_length=50, null=True)
     correlation_id = fields.CharField(max_length=100, null=True)
-    timestamp = fields.DatetimeField(auto_now_add=True)
-    
+    timestamp = fields.DatetimeField(auto_now_add=True, index=True)
+
     class Meta:
         table = "log"
+        # Logs Console query surface — see ADR 0014. The standalone `timestamp`
+        # index (above) backs the default all-chargers/all-actions date window
+        # and the retention cleanup's `timestamp`-keyed deletes; the composites
+        # back charger- and action-filtered queries.
+        indexes = [
+            ("charge_point_id", "timestamp"),
+            ("message_type", "timestamp"),
+        ]
 
 class FirmwareFile(Model):
     id = fields.IntField(pk=True)
@@ -611,6 +624,11 @@ class QRPayment(Model):
     razorpay_refund_speed_processed = fields.CharField(max_length=20, null=True)
     refund_processed_at = fields.DatetimeField(null=True)
     refund_failure_reason = fields.TextField(null=True)
+    # Post-refund terminal status to restore at T2 (REFUNDED, or EXPIRED for
+    # orphan/stale payments) — carried across the claim→call→persist gap because
+    # T1 overwrites `status` with REFUND_IN_PROGRESS. NULL when no claim is open.
+    # See ADR 0018.
+    refund_terminal_status = fields.CharField(max_length=20, null=True)
     status = fields.CharEnumField(QRPaymentStatusEnum)
     failure_reason = fields.TextField(null=True)
     metadata = fields.JSONField(null=True)
@@ -967,6 +985,13 @@ class GSTInvoice(Model):
 
     # Totals
     total_tax = fields.DecimalField(max_digits=10, decimal_places=2)
+    # Sub-rupee reconciling residual. CGST/SGST are each computed independently
+    # from the taxable value (so they're equal and pass GSTR-1 portal
+    # recomputation), which can differ by a paisa from the billing tax that
+    # total_amount must reconcile to (= amount_paid − refund for QR). That
+    # residual is carried here as an explicit Round Off line rather than as an
+    # asymmetric SGST. 0 for inter-state (single IGST component). See ADR 0017.
+    round_off = fields.DecimalField(max_digits=10, decimal_places=2, default=0)
     total_amount = fields.DecimalField(max_digits=10, decimal_places=2)
     amount_in_words = fields.CharField(max_length=500, null=True)
 

@@ -7,16 +7,22 @@ from datetime import datetime, timedelta, timezone
 from utils import safe_create_task
 from services.wallet_service import WalletService
 from services.razorpay_service import razorpay_service
-from models import Transaction, TransactionStatusEnum, MeterValue, QRPayment, QRPaymentStatusEnum
+from models import Transaction, TransactionStatusEnum, QRPayment, QRPaymentStatusEnum
 
 logger = logging.getLogger(__name__)
 
 class BillingRetryService:
     """Background service to periodically retry failed billing transactions"""
     
-    def __init__(self, retry_interval_minutes: int = 30, max_retry_age_hours: int = 24):
+    def __init__(self, retry_interval_minutes: int = 30, max_retry_age_hours: int = 24,
+                 stranded_claim_minutes: int = 5):
         self.retry_interval_minutes = retry_interval_minutes
         self.max_retry_age_hours = max_retry_age_hours
+        # A refund claim (REFUND_IN_PROGRESS) older than this with no terminal
+        # outcome was stranded by a crash between T1 and T2 (ADR 0018). Kept well
+        # above the few-second normal claim→persist latency so we never race an
+        # in-flight executor.
+        self.stranded_claim_minutes = stranded_claim_minutes
         self.is_running = False
         self._task = None
     
@@ -51,6 +57,7 @@ class BillingRetryService:
             try:
                 await self._process_failed_billing_transactions()
                 await self._process_failed_qr_refunds()
+                await self._recover_stranded_refund_claims()
                 await self._cleanup_orphaned_qr_payments()
                 await self._cleanup_stale_suspended_transactions()
                 await asyncio.sleep(self.retry_interval_minutes * 60)
@@ -182,6 +189,35 @@ class BillingRetryService:
         if success_count > 0 or failure_count > 0:
             logger.info(f"🔄 QR refund retry completed: {success_count} successful, {failure_count} failed")
 
+    async def _recover_stranded_refund_claims(self):
+        """Resume refunds stranded in REFUND_IN_PROGRESS by a crash between the
+        claim (T1) and the persist (T2) — see ADR 0018. ``_execute_claimed_refund``
+        is idempotent and resumable: the idempotency key yields a single payout
+        and its status / refund_id re-checks no-op a row another worker already
+        finalized, so re-running a claim is always safe. Bounded to claims older
+        than ``stranded_claim_minutes`` so an in-flight executor is never raced."""
+        from services.qr_payment_service import QRPaymentService
+
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=self.stranded_claim_minutes)
+        stranded = await QRPayment.filter(
+            status=QRPaymentStatusEnum.REFUND_IN_PROGRESS,
+            updated_at__lt=cutoff,
+        ).all()
+        if not stranded:
+            return
+
+        logger.info(f"🔁 Recovering {len(stranded)} stranded refund claim(s)")
+        for qr_payment in stranded:
+            try:
+                await QRPaymentService._execute_claimed_refund(
+                    qr_payment.id, "Stranded refund claim recovery",
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to recover stranded refund claim %s: %s",
+                    qr_payment.id, e, exc_info=True,
+                )
+
     async def _cleanup_orphaned_qr_payments(self):
         """Refund QR payments stuck in PAID or CHARGING with no active transaction.
 
@@ -247,7 +283,9 @@ class BillingRetryService:
                     else:
                         await QRPaymentService.handle_charging_failure(qr_payment.transaction_id)
                 else:
-                    # No transaction — full refund
+                    # No transaction — full refund. MUST persist EXPIRED before
+                    # _full_refund: it re-locks a fresh copy and preserves only a
+                    # persisted terminal status (see _full_refund CONTRACT).
                     qr_payment.status = QRPaymentStatusEnum.EXPIRED
                     qr_payment.failure_reason = "Orphaned payment - no transaction linked"
                     await qr_payment.save()
@@ -258,85 +296,17 @@ class BillingRetryService:
             await asyncio.sleep(0.1)
 
     async def _cleanup_stale_suspended_transactions(self):
-        """Auto-stop SUSPENDED transactions orphaned by server restarts.
+        """Backstop for SUSPENDED transactions orphaned by server restarts.
 
-        The in-memory asyncio timeout task is lost on restart, so this catches
-        any SUSPENDED transaction whose suspend window has expired.
-
-        Uses an atomic compare-and-swap update to avoid racing with
-        _suspend_timeout or other code paths that also transition SUSPENDED
-        transactions.
+        Delegates to the shared sweep in disconnect_handler so the cutoff and
+        finalize path can never drift from the startup sweep — the drift that
+        previously let this loop kill live sessions inside their reconnect grace
+        window. Runs every cycle (the startup sweep runs only once), so it also
+        catches transactions whose in-memory timer task died without a full
+        process restart.
         """
-        from main import SUSPEND_TIMEOUT_SECONDS
-
-        cutoff_time = datetime.now(timezone.utc) - timedelta(seconds=SUSPEND_TIMEOUT_SECONDS)
-
-        stale_transactions = await Transaction.filter(
-            transaction_status=TransactionStatusEnum.SUSPENDED,
-            suspended_at__lt=cutoff_time
-        ).all()
-
-        if not stale_transactions:
-            return
-
-        logger.info(f"🧹 Found {len(stale_transactions)} stale SUSPENDED transactions to clean up")
-
-        for transaction in stale_transactions:
-            try:
-                # Atomic compare-and-swap: only update if still SUSPENDED
-                rows_affected = await Transaction.filter(
-                    id=transaction.id,
-                    transaction_status=TransactionStatusEnum.SUSPENDED
-                ).update(
-                    transaction_status=TransactionStatusEnum.STOPPED,
-                    stop_reason="SUSPENDED_TIMEOUT",
-                    end_time=datetime.now(timezone.utc),
-                )
-
-                if rows_affected == 0:
-                    # Another code path already transitioned this transaction
-                    logger.debug(f"Transaction {transaction.id} already handled by another path, skipping")
-                    continue
-
-                # Refresh from DB after the atomic update
-                txn_id = transaction.id
-                transaction = await Transaction.filter(id=txn_id).first()
-                if not transaction:
-                    logger.warning(f"Transaction {txn_id} disappeared after CAS update, skipping")
-                    continue
-
-                # Calculate energy from last meter value
-                latest_meter_value = await MeterValue.filter(
-                    transaction_id=transaction.id
-                ).order_by("-created_at").first()
-
-                if latest_meter_value:
-                    transaction.end_meter_kwh = latest_meter_value.reading_kwh
-                    transaction.energy_consumed_kwh = transaction.end_meter_kwh - (transaction.start_meter_kwh or 0)
-                    await transaction.save()
-
-                logger.info(f"🛑 Auto-stopped stale SUSPENDED transaction {transaction.id}")
-
-                # Process billing
-                if transaction.energy_consumed_kwh is not None and transaction.energy_consumed_kwh > 0:
-                    success, message, billing_amount = await WalletService.process_transaction_billing(transaction.id)
-                    if success:
-                        logger.info(f"💰 Billed stale transaction {transaction.id}: ₹{billing_amount}")
-                    else:
-                        logger.warning(f"💰 Billing failed for stale transaction {transaction.id}: {message}")
-
-                # Process QR payment billing (refund unused amount or full refund)
-                try:
-                    from services.qr_payment_service import QRPaymentService
-                    if transaction.energy_consumed_kwh is not None and transaction.energy_consumed_kwh > 0:
-                        await QRPaymentService.process_qr_session_billing(transaction.id)
-                    else:
-                        await QRPaymentService.handle_charging_failure(transaction.id)
-                except Exception as qr_err:
-                    logger.error(f"QR billing error for stale suspended transaction {transaction.id}: {qr_err}", exc_info=True)
-
-            except Exception as e:
-                logger.error(f"Error cleaning up stale SUSPENDED transaction {transaction.id}: {e}", exc_info=True)
+        from services.disconnect_handler import finalize_stale_suspended_transactions
+        await finalize_stale_suspended_transactions("SUSPENDED_TIMEOUT")
 
     async def cleanup_old_failed_transactions(self, max_age_days: int = 7):
         """

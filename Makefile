@@ -23,8 +23,8 @@ SCRIPTS_DIR=$(BACKEND_DIR)/scripts
 
 .PHONY: help db-reset db-reset-cloud db-first-time db-drop-user db-create-user db-drop db-create migrate seed setup-dev truncate-tables
 .PHONY: docker-dev docker-dev-detach docker-staging docker-staging-detach docker-prod docker-prod-detach docker-down docker-down-staging docker-down-prod docker-logs docker-logs-backend docker-logs-frontend docker-build docker-build-staging docker-build-prod docker-clean docker-migrate docker-staging-cert docker-prod-cert docker-cert-renew
-.PHONY: prod-push prod-pull prod-up prod-down prod-deploy prod-rebuild prod-rebuild-service prod-rebuild-clean prod-nuke prod-restart prod-prune prod-prune-if-needed prod-logs prod-logs-backend prod-logs-frontend prod-logs-nginx prod-ps prod-cert prod-migrate prod-backup-db prod-restore-db prod-cache-clear prod-health prod-stats prod-shell prod-bash prod-ssm prod-db-reset prod-seed
-.PHONY: staging-push staging-pull staging-up staging-down staging-deploy staging-rebuild staging-rebuild-service staging-rebuild-clean staging-nuke staging-restart staging-logs staging-logs-backend staging-logs-frontend staging-logs-nginx staging-ps staging-cert staging-migrate staging-backup-db staging-restore-db staging-cache-clear staging-health staging-stats staging-shell staging-bash staging-ssm staging-db-reset staging-seed staging-rds-shell
+.PHONY: prod-push prod-pull prod-up prod-down prod-deploy prod-rebuild prod-rebuild-service prod-rebuild-clean prod-nuke prod-restart prod-prune prod-prune-if-needed prod-logs prod-logs-backend prod-logs-frontend prod-logs-nginx prod-ps prod-cert prod-migrate prod-backup-db prod-restore-db prod-cache-clear prod-health prod-stats prod-shell prod-bash prod-ssm prod-db-reset prod-seed prod-create-log-indexes
+.PHONY: staging-push staging-pull staging-up staging-down staging-deploy staging-rebuild staging-rebuild-service staging-rebuild-clean staging-nuke staging-restart staging-logs staging-logs-backend staging-logs-frontend staging-logs-nginx staging-ps staging-cert staging-migrate staging-backup-db staging-restore-db staging-cache-clear staging-health staging-stats staging-shell staging-bash staging-ssm staging-db-reset staging-seed staging-rds-shell staging-create-log-indexes
 
 help:
 	@echo "OCPP Server - Available Commands"
@@ -644,6 +644,29 @@ staging-rds-shell:
 	fi
 	$(STAGING_COMPOSE) exec backend sh -c \
 		'PGPASSWORD=$$DB_PASSWORD psql -h $$DB_HOST -p $$DB_PORT -U $$DB_USER -d $$DB_NAME'
+
+# Build the Logs-Console indexes on the hot `log` table CONCURRENTLY (non-blocking).
+# MUST run BEFORE `make {env}-migrate` when deploying the logs-console branch:
+# migration 44 does plain `CREATE INDEX` (blocks OCPP ingestion for the build on a
+# large table). Building CONCURRENTLY here first means the migration's
+# `CREATE INDEX IF NOT EXISTS` no-ops. Index names MUST match migration 44 exactly.
+# Each CONCURRENTLY runs in its own psql -c (autocommit) — never combine with `;`.
+# See migrations/models/44_*_logs_console_indexes.py and ADR 0014.
+define _create_log_indexes
+	$(1) exec backend sh -c 'PGPASSWORD=$$DB_PASSWORD psql -h $$DB_HOST -p $$DB_PORT -U $$DB_USER -d $$DB_NAME -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_log_message_e28b80 ON \"log\" (message_type, timestamp)"'
+	$(1) exec backend sh -c 'PGPASSWORD=$$DB_PASSWORD psql -h $$DB_HOST -p $$DB_PORT -U $$DB_USER -d $$DB_NAME -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_log_charge__e6d1d2 ON \"log\" (charge_point_id, timestamp)"'
+	$(1) exec backend sh -c 'PGPASSWORD=$$DB_PASSWORD psql -h $$DB_HOST -p $$DB_PORT -U $$DB_USER -d $$DB_NAME -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_log_timesta_7cff2c ON \"log\" (timestamp)"'
+endef
+
+staging-create-log-indexes:
+	@echo "Building log indexes CONCURRENTLY on staging (non-blocking)... run BEFORE staging-migrate"
+	$(call _create_log_indexes,$(STAGING_COMPOSE))
+	@echo "Done. Now run: make staging-migrate (migration 44 will no-op the index build)."
+
+prod-create-log-indexes:
+	@echo "Building log indexes CONCURRENTLY on prod (non-blocking)... run BEFORE prod-migrate"
+	$(call _create_log_indexes,$(PROD_COMPOSE))
+	@echo "Done. Now run: make prod-migrate (migration 44 will no-op the index build)."
 
 # Backups: post-RDS-migration this is handled by RDS automated snapshots + PITR.
 # Pre-migration this still wrote a pg_dump from Docker postgres to backups/.

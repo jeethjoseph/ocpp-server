@@ -48,6 +48,28 @@ def _disconnect_category_for(reason: str) -> str:
     return "ops_initiated"
 
 
+def _ocpp_message_type(parsed) -> str:
+    """Derive ``OCPPLog.message_type`` (the OCPP Action) from a parsed wire frame.
+
+    CALL ``[2, id, action, payload]`` -> the action; CALLRESULT ``[3, id, {...}]``
+    -> ``"CallResult"``; CALLERROR ``[4, ...]`` -> ``"CallError"``; anything else
+    (unparseable / pre-validation / protocol-error frames) -> the ``"OCPP"``
+    sentinel. Forward-only labeling so the Logs Console Action filter works — see
+    .scratch/logs-console/issues/06 and ADR 0014. Only Action strings emitted
+    here must match the frontend OCPP_ACTIONS list exactly (case-sensitive).
+    """
+    if not isinstance(parsed, list) or not parsed:
+        return "OCPP"
+    message_type_id = parsed[0]
+    if message_type_id == 2 and len(parsed) >= 3 and isinstance(parsed[2], str):
+        return parsed[2]
+    if message_type_id == 3:
+        return "CallResult"
+    if message_type_id == 4:
+        return "CallError"
+    return "OCPP"
+
+
 class ConnectionManager:
     """
     Singleton that owns all charge point connection state.
@@ -557,7 +579,7 @@ class LoggingWebSocketAdapter(FastAPIWebSocketAdapter):
             safe_create_task(log_message(
                 charger_id=self.charge_point_id,
                 direction="IN",
-                message_type="OCPP",
+                message_type=_ocpp_message_type(parsed),
                 payload=msg,
                 status="received",
                 correlation_id=correlation_id
@@ -588,7 +610,7 @@ class LoggingWebSocketAdapter(FastAPIWebSocketAdapter):
             await log_message(
                 charger_id=self.charge_point_id,
                 direction="OUT",
-                message_type="OCPP",
+                message_type="CallError",
                 payload=error_json,
                 status="sent",
                 correlation_id=message_id
@@ -601,6 +623,7 @@ class LoggingWebSocketAdapter(FastAPIWebSocketAdapter):
 
     async def send(self, data):
         correlation_id = None
+        parsed = None
         try:
             parsed = json.loads(data)
             if isinstance(parsed, list) and len(parsed) > 1:
@@ -611,7 +634,7 @@ class LoggingWebSocketAdapter(FastAPIWebSocketAdapter):
         await log_message(
             charger_id=self.charge_point_id,
             direction="OUT",
-            message_type="OCPP",
+            message_type=_ocpp_message_type(parsed),
             payload=data,
             status="sent",
             correlation_id=correlation_id

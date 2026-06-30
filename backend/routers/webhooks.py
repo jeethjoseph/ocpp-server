@@ -9,6 +9,7 @@ import json
 import os
 from clerk_backend_api import Clerk
 from services.razorpay_service import razorpay_service, extract_fee_from_payment
+from services.monitoring_service import OCPPMetrics
 from services.wallet_service import WalletService
 from crud import log_webhook_event
 from models import WebhookSourceEnum
@@ -825,6 +826,13 @@ async def handle_refund_event(event_type: str, event_data: dict):
             logger.info(
                 "Refund processed for QR payment %s (refund=%s, speed=%s)",
                 qr_payment.id, refund_id, speed or "unchanged",
+            )
+            # Terminal event — the authoritative point to track the instant
+            # fulfilment ratio (creation-time speed is optimistic; Razorpay
+            # downgrades optimum->normal asynchronously). ADR 0002 (2026-06-22).
+            OCPPMetrics.record_refund_final_speed(
+                qr_payment.charger_id, qr_payment.id,
+                refund.get("speed_requested"), speed,
             )
         elif event_type == "refund.failed":
             reason = (

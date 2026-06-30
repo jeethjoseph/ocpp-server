@@ -606,19 +606,8 @@ class RazorpayService:
             logger.error("Cannot create refund - Razorpay not configured")
             return None
 
+        body, headers = self._build_refund_request(amount, notes, speed, idempotency_key)
         url = f"https://api.razorpay.com/v1/payments/{payment_id}/refund"
-        body: Dict = {}
-        if amount is not None:
-            # Convert to paise
-            body["amount"] = int(amount * 100)
-        if notes:
-            body["notes"] = notes
-        if speed:
-            body["speed"] = speed
-
-        headers: Dict[str, str] = {}
-        if idempotency_key:
-            headers["X-Refund-Idempotency"] = idempotency_key
 
         try:
             async with httpx.AsyncClient(timeout=10) as client:
@@ -634,31 +623,7 @@ class RazorpayService:
                 parsed = {"raw": resp.text}
 
             if resp.is_error:
-                description = ""
-                if isinstance(parsed, dict):
-                    description = parsed.get("error", {}).get("description") or ""
-                description = description or f"HTTP {resp.status_code}"
-                http_error = Exception(description)
-                if _is_already_refunded_error(http_error):
-                    raise RazorpayAlreadyRefundedError(payment_id, http_error)
-                if _is_amount_below_minimum_error(http_error):
-                    logger.info(
-                        "Refund for %s skipped: amount below Razorpay ₹1.00 minimum",
-                        payment_id,
-                    )
-                    raise RazorpayRefundBelowMinimumError(payment_id, http_error)
-                if resp.status_code == 409 or _is_idempotency_conflict_error(http_error):
-                    logger.warning(
-                        "Refund for %s hit idempotency conflict (HTTP %s): %s",
-                        payment_id, resp.status_code, description,
-                    )
-                    raise RazorpayIdempotencyConflictError(payment_id, http_error)
-                logger.error(f"Failed to create refund for payment {payment_id}: {description}")
-                if resp.status_code == 400:
-                    raise razorpay.errors.BadRequestError(description)
-                if resp.status_code in (502, 503, 504):
-                    raise razorpay.errors.GatewayError(description)
-                raise Exception(f"HTTP {resp.status_code}: {description}")
+                self._raise_refund_error(payment_id, resp, parsed)
 
             logger.info(
                 "Refund created: %s for payment %s idempotency_key=%s "
@@ -677,6 +642,60 @@ class RazorpayService:
         except httpx.HTTPError as e:
             logger.error(f"Failed to create refund for payment {payment_id}: {e}")
             raise
+
+    @staticmethod
+    def _build_refund_request(
+        amount: Optional[Decimal],
+        notes: Optional[Dict],
+        speed: Optional[str],
+        idempotency_key: Optional[str],
+    ) -> Tuple[Dict, Dict]:
+        """Build the ``(body, headers)`` for a refund POST. Amount is converted
+        to paise; ``idempotency_key`` becomes the ``X-Refund-Idempotency``
+        header. Pure."""
+        body: Dict = {}
+        if amount is not None:
+            # Convert to paise
+            body["amount"] = int(amount * 100)
+        if notes:
+            body["notes"] = notes
+        if speed:
+            body["speed"] = speed
+
+        headers: Dict[str, str] = {}
+        if idempotency_key:
+            headers["X-Refund-Idempotency"] = idempotency_key
+        return body, headers
+
+    @staticmethod
+    def _raise_refund_error(payment_id: str, resp, parsed) -> None:
+        """Normalize a Razorpay refund error response into the right typed
+        exception. Always raises — never returns."""
+        description = ""
+        if isinstance(parsed, dict):
+            description = parsed.get("error", {}).get("description") or ""
+        description = description or f"HTTP {resp.status_code}"
+        http_error = Exception(description)
+        if _is_already_refunded_error(http_error):
+            raise RazorpayAlreadyRefundedError(payment_id, http_error)
+        if _is_amount_below_minimum_error(http_error):
+            logger.info(
+                "Refund for %s skipped: amount below Razorpay ₹1.00 minimum",
+                payment_id,
+            )
+            raise RazorpayRefundBelowMinimumError(payment_id, http_error)
+        if resp.status_code == 409 or _is_idempotency_conflict_error(http_error):
+            logger.warning(
+                "Refund for %s hit idempotency conflict (HTTP %s): %s",
+                payment_id, resp.status_code, description,
+            )
+            raise RazorpayIdempotencyConflictError(payment_id, http_error)
+        logger.error(f"Failed to create refund for payment {payment_id}: {description}")
+        if resp.status_code == 400:
+            raise razorpay.errors.BadRequestError(description)
+        if resp.status_code in (502, 503, 504):
+            raise razorpay.errors.GatewayError(description)
+        raise Exception(f"HTTP {resp.status_code}: {description}")
 
     async def find_refund_for_payment(self, payment_id: str) -> Optional[Dict]:
         """Fetch existing refund(s) for a payment. Returns the first refund dict or None.

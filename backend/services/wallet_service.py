@@ -51,6 +51,16 @@ _BALANCE_SQL = """
     WHERE wallet_id = $1
 """
 
+# MIN_BILLABLE_ENERGY_KWH and the non-billable-band predicates now live in
+# services.billing_rules (single source of truth, imported by BOTH the wallet
+# and QR billing paths). Re-exported here so existing importers that do
+# `from services.wallet_service import MIN_BILLABLE_ENERGY_KWH` keep working.
+from services.billing_rules import (  # noqa: E402
+    MIN_BILLABLE_ENERGY_KWH,
+    is_zero_energy,
+    is_fault_refund,
+)
+
 
 class WalletService:
     """Service for handling wallet operations with proper locking and transactions"""
@@ -242,10 +252,23 @@ class WalletService:
                 logger.info(f"Transaction {transaction_id} already billed (wallet_txn={existing_charge.id}), skipping")
                 return True, f"Already billed ₹{abs(existing_charge.amount)}", abs(existing_charge.amount), None
 
-            # Validate transaction state
-            if not transaction.energy_consumed_kwh or transaction.energy_consumed_kwh <= 0:
-                logger.info(f"Transaction {transaction_id} has no energy consumption, skipping billing")
-                return True, "No energy consumed - no billing required", Decimal('0.00'), None
+            # Non-billable bands (no debit, no GST invoice / settlement),
+            # symmetric with the QR full-refund path. Per ADR 0013 (amended
+            # 2026-06-24), a COMPLETED wallet session that delivered any energy
+            # now DEBITS from the first Wh — only two bands skip the debit:
+            #   energy <= 0                      -> no taxable supply (ADR 0002)
+            #   FAILED and 0 < energy < 0.5 kWh  -> faulted after a trivial
+            #                                       delivery (ADR 0013 amendment)
+            energy = transaction.energy_consumed_kwh
+            if is_zero_energy(transaction):
+                logger.info(f"Transaction {transaction_id} zero energy ({energy or 0} kWh), no debit")
+                return True, "Zero energy delivered - no billing required", Decimal('0.00'), None
+            if is_fault_refund(transaction):
+                logger.info(
+                    f"Transaction {transaction_id} faulted after {Decimal(str(energy))} kWh "
+                    f"(< {MIN_BILLABLE_ENERGY_KWH}), no debit"
+                )
+                return True, "Faulted below minimum billable energy - no billing required", Decimal('0.00'), None
             
             # Get applicable tariff
             tariff = await WalletService.get_applicable_tariff(transaction.charger_id)

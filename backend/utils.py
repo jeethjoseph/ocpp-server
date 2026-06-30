@@ -31,6 +31,20 @@ def to_ist(dt):
         dt = dt.replace(tzinfo=datetime.timezone.utc)
     return dt.astimezone(IST)
 
+def csv_safe_cell(value) -> str:
+    """Neutralize CSV formula injection (OWASP). A spreadsheet treats a cell
+    whose first character is ``= + - @`` (or a leading tab/CR) as a formula, so
+    a malicious value like ``=cmd|'/c calc'!A1`` executes when the export is
+    opened in Excel/Sheets. Prefix such cells with a single quote so they render
+    as inert text. Apply to every user/charger-influenced TEXT cell in any CSV
+    export (NOT numeric/date cells — a leading ``-`` on a number is not a
+    formula and must stay numeric). Always returns a string."""
+    s = "" if value is None else str(value)
+    if s and s[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + s
+    return s
+
+
 def generate_uuid():
     """Generate a new UUID4 as string."""
     return str(uuid.uuid4())

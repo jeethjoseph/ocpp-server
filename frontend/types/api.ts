@@ -141,6 +141,35 @@ export interface MeterValue {
   power_kw?: number;
 }
 
+// Charging-session lifecycle states, mirrors backend TransactionStatusEnum
+// (backend/models.py). Terminal states are settled — see TERMINAL_TRANSACTION_STATUSES.
+export type TransactionStatus =
+  | "STARTED"
+  | "PENDING_START"
+  | "RUNNING"
+  | "SUSPENDED"
+  | "PENDING_STOP"
+  | "STOPPED"
+  | "COMPLETED"
+  | "CANCELLED"
+  | "FAILED"
+  | "BILLING_FAILED";
+
+// Settled states — no further server-side mutation expected, so polling can stop.
+export const TERMINAL_TRANSACTION_STATUSES: readonly TransactionStatus[] = [
+  "STOPPED",
+  "COMPLETED",
+  "CANCELLED",
+  "FAILED",
+  "BILLING_FAILED",
+] as const;
+
+export function isTerminalTransactionStatus(
+  status?: string | null
+): boolean {
+  return !!status && (TERMINAL_TRANSACTION_STATUSES as readonly string[]).includes(status);
+}
+
 export interface Transaction {
   id: number;
   user_id: number;
@@ -152,11 +181,51 @@ export interface Transaction {
   end_time?: string;
   stop_reason?: string;
   transaction_status: string;
+  funding_source?: FundingSource;
+  payment_status?: string | null;
+  // Razorpay processed refund speed ("instant" | "normal" | null) and amount.
+  // QR sessions only; null when no refund or speed not yet confirmed.
+  refund_speed?: string | null;
+  refund_amount?: number | null;
   created_at: string;
   updated_at: string;
 }
 
 export type FundingSource = "WALLET" | "QR" | "NONE";
+
+// Admin transactions list (GET /api/admin/transactions). A flattened row shape
+// distinct from the full `Transaction`/`TransactionDetail` used on the detail page.
+export interface TransactionListItem {
+  id: number;
+  user_id: number;
+  charger_id: number;
+  energy_consumed_kwh?: number | null;
+  start_time: string;
+  end_time?: string | null;
+  transaction_status: string;
+  funding_source: FundingSource;
+  payment_status: string | null;
+  // Razorpay processed refund speed ("instant" | "normal" | null) + amount;
+  // QR sessions only, null when no refund.
+  refund_speed?: string | null;
+  refund_amount?: number | null;
+  created_at: string;
+}
+
+export interface TransactionListSummary {
+  total_energy_consumed: number;
+  active_sessions: number;
+  suspended_sessions: number;
+  completed_sessions: number;
+}
+
+export interface TransactionListResponse {
+  data: TransactionListItem[];
+  total: number;
+  page: number;
+  limit: number;
+  summary: TransactionListSummary;
+}
 
 export interface QRSessionBudget {
   budget_limit: string;
@@ -187,7 +256,28 @@ export interface TransactionDetail {
   }>;
   live_energy_kwh?: number | null;
   funding_source?: FundingSource;
+  payment_status?: string | null;
+  settlement_status?: string | null;
+  refund_speed?: string | null;
+  refund_amount?: number | null;
+  customer_vpa?: string | null;
   qr_session?: QRSessionBudget | null;
+  revenue?: RevenueBreakdown | null;
+}
+
+export interface RevenueBreakdown {
+  paid_amount?: number | null;
+  energy_consumed_kwh?: number | null;
+  energy_amount?: number | null;
+  gst_amount?: number | null;
+  gst_rate_percent?: number | null;
+  total_billed?: number | null;
+  invoice_number?: string | null;
+  razorpay_fee?: number | null;
+  refund_amount?: number | null;
+  refund_speed?: string | null;
+  settlement_amount?: number | null;
+  tds_amount?: number | null;
 }
 
 export interface ApiResponse<T = any> {
@@ -514,6 +604,7 @@ export type QRPaymentStatus =
   | "CHARGING"
   | "COMPLETED"
   | "REFUNDED"
+  | "REFUND_IN_PROGRESS"
   | "REFUND_FAILED"
   | "EXPIRED"
   | "FAILED";

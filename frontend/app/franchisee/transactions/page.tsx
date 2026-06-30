@@ -266,7 +266,7 @@ function TransactionsContent() {
                           <TableCell>{txn.charger_name || "--"}</TableCell>
                           <TableCell>
                             {txn.energy_consumed_kwh != null
-                              ? txn.energy_consumed_kwh.toFixed(3)
+                              ? Number(txn.energy_consumed_kwh).toFixed(3)
                               : "--"}
                           </TableCell>
                           <TableCell>

@@ -19,6 +19,7 @@
     "@radix-ui/react-slot": "^1.2.3",
     "@sentry/nextjs": "^10.53.1",
     "@tanstack/react-query": "^5.81.2",
+    "@tanstack/react-virtual": "^3.14.3",
     "@types/leaflet": "^1.9.20",
     "@zxing/library": "^0.21.3",
     "class-variance-authority": "^0.7.1",

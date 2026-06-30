@@ -244,6 +244,7 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 - Transaction history with filtering and pagination
 - Meter value aggregation for energy consumption charts
 - Admin override capabilities for transaction management
+- **Domain logic lives in `services/transactions_console_service.py` (refactor 2026-06-25), not the router.** `TransactionsConsoleService` owns the single canonical funding-source classification (`classify_funding_source` → `WALLET`/`QR`/`NONE`), per-session revenue assembly (`build_revenue`), page enrichment (`enrich_funding_payment`, batch — no N+1), and the funding filter. The funding filter is expressed via Tortoise `Subquery` (`WHERE id IN (SELECT transaction_id FROM qr_payment ...)`) — it no longer materializes full-table id lists into Python (avoids the unbounded `id__in=[...]` / Postgres-parameter-limit risk). The list `summary` is a typed `TransactionListSummary` Pydantic model (`total_energy_consumed`, `active_sessions`, `suspended_sessions`, `completed_sessions`), not a bare `Dict`.
 
 #### User Management (`backend/routers/users.py`)
 **Endpoints**: `/users/*`
@@ -388,6 +389,7 @@ Chargers using Quectel cellular modems (BG95/BG96, EC25, EG21/25 family) cannot 
 - Routes `qr_code.credited` events to `QRPaymentService.handle_qr_payment()` for appless charging
 - **Refund lifecycle (`handle_refund_event`)** handles three Razorpay events: `refund.processed` stamps `refund_processed_at` and captures `speed_processed` onto the row; `refund.failed` records the bank/error reason into `refund_failure_reason`; **`refund.speed_changed` (added 2026-05-21)** updates `razorpay_refund_speed_processed` when Razorpay silently downgrades instant→normal (or upgrades), so the customer-facing `/my-charges` ETA stays honest per ADR 0005. Razorpay does NOT emit any event confirming the refund has actually credited the customer's source bank account — `refund.processed` is the terminal Razorpay-side signal and for normal-speed refunds the 5–10 working-day issuing-bank settlement is outside Razorpay's visibility.
 - **Cross-environment handling**: All handlers gracefully skip "not found" transactions (return 200, log warning) since production and staging share the same Razorpay live keys and both receive all webhook events. Only real errors (DB, API) return 500 for Razorpay retry.
+- **Refund instant-fulfilment ratio metric (2026-06-22, ADR 0002 amendment)**: `optimum` (instant) refunds silently downgrade to `normal` per-transaction. The ratio is tracked from the authoritative terminal event — `handle_refund_event` on `refund.processed` calls `OCPPMetrics.record_refund_final_speed`, emitting the **`QRRefundFinalSpeed`** New Relic event with `charger_id`, `qr_payment_id`, `speed_requested`, and the final `speed_processed`. Chart with `SELECT percentage(count(*), WHERE speed_processed = 'instant') FROM QRRefundFinalSpeed WHERE speed_requested = 'optimum' FACET appName TIMESERIES 1 day`. This **replaced** the 2026-06-18 funding-pool diagnostics (the `QRRefundSpeed` event enriched with `balance_before`/`refund_credits_before` via `RazorpayService.fetch_balance` / `_fetch_funding_pools`), which were **removed** after the data disproved the thin-float hypothesis: downgrades occurred at the *highest* float (₹1034–₹1231) while instant *succeeded* at the lowest (₹416–₹447), with `refund_credits=0` throughout. The real cause is the customer's destination-bank IMPS instant-refund support, not the settlement float — confirmed via Razorpay's refund API (`speed_requested=optimum`/`speed_processed=normal`) and the synchronous-instant-then-async-downgrade pattern in the logs. A gateway switch would not help (same IMPS/UPI rails; ~30–50% instant success proves the feature works when the bank cooperates). The remaining levers are product, not code (customer-facing ETA copy; skip `optimum` on sub-threshold refunds). See `docs/adr/0002` and CONTEXT.md *Settlements and payouts*.
 
 ### Business Logic Services (`backend/services/`)
 
@@ -435,7 +437,7 @@ total_billed = energy_charge + gst_amount         # Wallet deducts total_billed
 - Automatic retry for BILLING_FAILED transactions
 - **QR Refund Retry**: Retries REFUND_FAILED QR payments via Razorpay
 - **Orphaned QR Cleanup**: Detects and refunds QR payments stuck in PAID status (no transaction linked)
-- **Stale Suspended Cleanup**: Auto-stops SUSPENDED transactions older than 5 hours with billing + QR refund
+- **Stale Suspended Cleanup**: Delegates to `disconnect_handler.finalize_stale_suspended_transactions("SUSPENDED_TIMEOUT")` (shared backstop; cutoff = `max(DISCONNECT_SUSPEND_TIMEOUT, SUSPEND_TIMEOUT) + 60`). Runs every cycle, so it also catches SUSPENDED txns whose in-memory timer died without a full restart. **Do not give this its own cutoff** — see the disconnect-handler section for the 2026-06-18 incident where a private 5-min cutoff here killed disconnect-suspended sessions inside their 30-min reconnect window.
 - Comprehensive error logging with per-item error handling (one failure doesn't block others)
 
 **Recent Enhancement**: Zero Charged Transaction Handling
@@ -539,6 +541,13 @@ That indicator is a deliberate future enhancement; not built yet.
 - Idempotency preserved: `razorpay_refund_id` guard prevents duplicate refunds on webhook retries.
 - See `docs/adr/0002-zero-energy-full-refund.md` for the policy rationale and rejected alternatives.
 
+**De-minimis energy waiver (effective 2026-06-20, ADR 0013)**:
+- The zero-energy full-refund path is widened from `≤ 0` to a **Minimum billable energy** cliff: a session delivering `0 < energy_consumed_kwh < 0.5 kWh` is **Non-billable**. The single constant `MIN_BILLABLE_ENERGY_KWH = Decimal("0.5")` and the predicate that uses it now live in the pure leaf module **`services/billing_rules.py`** (`is_zero_energy`, `is_fault_refund`, `is_non_billable`), imported by both `wallet_service.py` and `qr_payment_service.py` — one source of truth, no duplication (refactor 2026-06-25; `wallet_service` re-exports the constant for backwards-compatible importers).
+- **Amended 2026-06-24 (ADR 0013): the waiver is keyed strictly on `transaction_status == FAILED`.** Only an abnormal FAILED session that delivered `0 < energy < 0.5 kWh` is refunded (QR) / not debited (wallet). **COMPLETED and STOPPED sub-0.5 kWh sessions BILL** from the first Wh. Note `finalize_stopped_transaction` always sets **STOPPED** (timeout / disconnect / stale-suspend sweep / force-stop), never FAILED — so only the StatusNotification-driven `_fail_transaction_with_billing` path triggers the fault-refund. **Code is the source of truth**; `is_fault_refund` is the single predicate. `energy ≤ 0` remains a full refund under ADR 0002 for any status.
+- **Symmetric across funding**: QR sessions (`process_qr_session_billing`) route to `_full_refund` (full `amount_paid`, instant speed); wallet sessions (`process_transaction_billing`) skip the debit. Neither issues a `GSTInvoice` or a `CommissionLedgerEntry` (Settlement Entry). The single `< MIN_BILLABLE_ENERGY_KWH` check subsumes the old `≤ 0` (and negative meter-rollback) case.
+- **Cliff, not allowance**: a session at or above 0.5 kWh bills its TOTAL energy from the first Wh (strict `<`). The half-unit is never carved off the top — this avoids per-session revenue bleed and stop/restart gaming.
+- **Justification differs from zero-energy and must not be conflated**: zero-energy = *no taxable supply*; de-minimis = a *real tiny supply waived as goodwill* (collecting ≤ ~₹12 costs more in invoice/settlement/partial-refund friction than the revenue). The QR refund/audit reason string is band-accurate (`"Zero energy delivered"` only for `≤ 0`, else a de-minimis reason naming the kWh). The franchisee absorbs the trivial delivered kWh (no settlement). See `docs/adr/0013-de-minimis-energy-waiver.md` and CONTEXT.md "Non-billable Session".
+
 **Razorpay instant refunds for full-refund flows (effective 2026-05-20, ADR 0002 amendment)**:
 - All six `_full_refund` call sites — zero-energy at StopTransaction, stale payment, concurrent rejection on busy charger, charger not connected at start, RemoteStart failure, plug-in timeout — request Razorpay's `speed=optimum` mode. Customers see refunds in minutes instead of the default 5–7 working days.
 - VoltLync absorbs Razorpay's per-refund instant fee (~₹5–₹6 + 18% GST per UPI refund) **in addition to** the original gateway fee. Same philosophy as the gateway-fee absorption: the customer experiencing a failure should not feel the cost of the failure.
@@ -546,11 +555,7 @@ That indicator is a deliberate future enhancement; not built yet.
 - `speed=optimum` is best-effort. Razorpay falls back to `normal` server-side when rails or payment method don't support instant. The actual outcome is exposed in `speed_processed`, which `RazorpayService.refund_payment` logs on every refund.
 - **Kill-switch env var**: `RAZORPAY_INSTANT_REFUND_ENABLED` (default `true`). Wired into `docker-compose.yml`, `docker-compose.staging.yml`, `docker-compose.prod.yml`, and the three `.env.*.example` files. Logged at startup in `backend/main.py`. Set to `false` and redeploy to revert all full refunds to normal speed without a code change.
 - **Outcome persisted on the QRPayment row**: column `razorpay_refund_speed_processed` (VARCHAR(20), nullable; migration 40) holds Razorpay's reported `speed_processed` value (`"instant"` or `"normal"`) for every full-refund call — including the `RazorpayAlreadyRefundedError` reconciliation path when the existing-refund dict carries the field. NULL on partial refunds and on all pre-feature rows. The admin QR detail page (`/admin/qr-codes/[id]`) renders an `Instant` (green) or `Normal (5-7 days)` (gray) badge next to the refund amount when the column is non-null; customer-facing `/my-charges` is unchanged.
-- **Monitoring counters** (emitted from `OCPPMetrics.record_refund_speed`, gated on `speed=optimum` actually being requested):
-  - `Custom/QR/RefundInstantSucceeded` — `speed_processed == "instant"`.
-  - `Custom/QR/RefundInstantFallback` — `speed_processed` came back as anything other than `"instant"` (typically `"normal"`).
-  - Neither counter fires when `RAZORPAY_INSTANT_REFUND_ENABLED=false` (a normal-speed refund under the kill-switch is intentional, not a Razorpay-side fallback). A sudden spike in `RefundInstantFallback` is the operational alert for rail outages, account-level rate limits, or payment-method shifts.
-  - A `QRRefundSpeed` New Relic event is also emitted with `charger_id`, `qr_payment_id`, and `speed_processed` for ad-hoc querying.
+- **Monitoring (2026-06-22)**: the instant-fulfilment ratio is emitted from the **webhook**, not refund creation, because Razorpay returns `speed_processed=instant` optimistically at creation and downgrades to `normal` asynchronously. `handle_refund_event` on `refund.processed` calls `OCPPMetrics.record_refund_final_speed`, emitting the **`QRRefundFinalSpeed`** event with `charger_id`, `qr_payment_id`, `speed_requested`, and the final `speed_processed`. The instant ratio is `percentage(count(*), WHERE speed_processed = 'instant')` over `WHERE speed_requested = 'optimum'`, faceted by `appName`. The earlier creation-time `Custom/QR/RefundInstant{Succeeded,Fallback}` counters and `QRRefundSpeed` event were retired — they measured the optimistic synchronous value and under-counted downgrades.
 
 **Error Handling**:
 - **Idempotency**: Checks `razorpay_payment_id` uniqueness before processing
@@ -566,6 +571,7 @@ That indicator is a deliberate future enhancement; not built yet.
 - **Key = `f"refund_{razorpay_payment_id}"`**, derived from the globally-unique Razorpay payment id — replacing the old `f"qr_payment_{qr_payment.id}"` (the per-database PK). **Root cause it fixes**: staging and prod share one Razorpay **live** account (QR requires live mode). The PK is a separate sequence per DB, so staging payment #235 and prod payment #235 both emitted key `qr_payment_235` to the same account; whichever env refunded that id first registered the key, and the other env's later refund (different amount/notes) got **HTTP 409 "Different request with the same idempotency key has already been processed,"** permanently stranding the refund in `REFUND_FAILED`. (Razorpay idempotency keys expire ~24h, so the collision is transient — observed self-healing once the other env's key aged out.) See `[[project-refund-idempotency-cross-env-collision]]` and `.scratch/qr-refund-idempotency-fix/`.
 - **Body is deterministic and path-independent**: `notes={"qr_payment_id": str(id)}` (no variable transaction reason / "Retry:" prefix) and `speed` derived from amount (`refund_amount >= amount_paid` → `optimum` when the instant flag is on; partial → normal). This guarantees the initial attempt and every retry send a byte-identical request for the same payment, so a same-key retry **replays** the original refund (HTTP 200) instead of 409ing.
 - **409 handling**: `razorpay_service.refund_payment` maps a 409 to `RazorpayIdempotencyConflictError` (re-raised through the outer guard). Both refund call sites and the retry loop catch it and call `QRPaymentService._reconcile_conflict()`: if a refund already exists at Razorpay it persists the id and marks `REFUNDED`; otherwise it sets `failure_reason="idempotency_conflict_no_refund"`.
+- **Unified refund-exception classifier (refactor 2026-06-25)**: the full-refund path (`_perform_full_refund`) and the partial unused-credit path (`_issue_unused_credit_refund`) both route raised Razorpay exceptions through one shared `QRPaymentService._classify_refund_exception` (handles `RazorpayAlreadyRefundedError` → reconcile, `RazorpayIdempotencyConflictError` → reconcile/`idempotency_conflict_no_refund`, `RazorpayRefundBelowMinimumError` → below-minimum, generic → `REFUND_FAILED` with `str(exc)`). This closed a latent gap where the **partial path previously did not reconcile `AlreadyRefunded`** and would mark it `REFUND_FAILED`. The oversized refund functions (`handle_qr_payment`, `process_qr_session_billing`, `_full_refund`, `refund_payment`) were split into helpers under the 40-line rule; idempotency key, `SELECT FOR UPDATE` lock, and amount math are unchanged.
 - **Retry exclusion**: `BillingRetryService` filters candidates through `is_retryable_refund_failure(failure_reason)` (substring-robust), which excludes the `idempotency_conflict_no_refund` marker AND below-minimum reasons in both the canonical (`below_razorpay_minimum`) and legacy long-form (`"... below Razorpay minimum (₹1.00) ..."`) shapes — so permanently-stuck rows are never re-hammered.
 
 **Redis Session Cache**:
@@ -723,8 +729,8 @@ await start_data_retention_service(
 ```
 
 **Cleanup Targets**:
-1. **Signal Quality Data**: Deletes `signal_quality` records older than retention period
-2. **OCPP Logs**: Deletes `log` (OCPPLog) records older than retention period
+1. **Signal Quality Data**: Deletes `signal_quality` records older than retention period (keyed on `created_at`)
+2. **OCPP Logs**: Deletes `log` (OCPPLog) records older than retention period, keyed on the indexed `timestamp` column so the batched delete rides the same index the Logs Console uses (see ADR 0014)
 
 **Monitoring**:
 - Logs cleanup operations with record counts
@@ -741,11 +747,23 @@ async def suspend_transactions_on_disconnect(charge_point_id: str) -> None
     transactions (RUNNING, STARTED, PENDING_START, PENDING_STOP) and starts
     a configurable timeout for each."""
 
+def stale_suspended_cutoff_seconds() -> int
+    """Longest legitimate suspend window + buffer:
+    max(DISCONNECT_SUSPEND_TIMEOUT, SUSPEND_TIMEOUT) + 60. A backstop sweep must
+    wait this long because a SUSPENDED row doesn't record which window applies."""
+
+async def finalize_stale_suspended_transactions(stop_reason: str) -> int
+    """Shared stale-suspended backstop. Finds SUSPENDED txns older than the
+    cutoff and finalizes each via transaction_finalizer. Used by BOTH the startup
+    sweep and the recurring billing-retry sweep so their cutoff can't drift."""
+
 async def sweep_stale_suspended_transactions() -> None
-    """Safety net called once at server startup. Finds SUSPENDED transactions
-    older than the max timeout and auto-stops them (covers server restarts
-    where in-memory timeout tasks were lost)."""
+    """Safety net called once at server startup. Thin wrapper over
+    finalize_stale_suspended_transactions (stop_reason=STALE_SUSPEND_SWEEP);
+    covers server restarts where in-memory timeout tasks were lost."""
 ```
+
+> ⚠️ **Stale-suspended cutoff incident (2026-06-18)**: `billing_retry_service` once ran its own stale-suspended cleanup with a private cutoff of `SUSPEND_TIMEOUT_SECONDS` (5 min), ignoring the 30-min `DISCONNECT_SUSPEND_TIMEOUT`. On its 30-min cycle it force-stopped disconnect-suspended sessions ~5–9 min after a transient blip — inside the intended reconnect grace. Confirmed on prod txn 949: suspended 06:08:51Z, swept 06:17:36Z (8m45s), charger reconnected 06:27:27Z (18.5 min, inside the 30-min window) but already finalized+refunded. Fix: both sweeps now share `finalize_stale_suspended_transactions` with the `max(...)+60` cutoff. Regression test: `tests/test_billing_retry_stale_suspended.py`. Lesson: a backstop must always wait the LONGEST primary window, never a shorter one.
 
 **Disconnect Flow**:
 1. Heartbeat monitor detects charger silence (120s inactivity)
@@ -815,7 +833,7 @@ async def finalize_stopped_transaction(
 **Used by**:
 - `main.py:ChargePoint._suspend_timeout` (BootNotification suspend timeout, stop_reason=`SUSPENDED_TIMEOUT`)
 - `disconnect_handler._disconnect_suspend_timeout` (disconnect timeout, stop_reason=`DISCONNECT_TIMEOUT`)
-- `disconnect_handler.sweep_stale_suspended_transactions` (startup safety net, stop_reason=`STALE_SUSPEND_SWEEP`)
+- `disconnect_handler.finalize_stale_suspended_transactions` (shared backstop): startup sweep uses stop_reason=`STALE_SUSPEND_SWEEP`, recurring billing-retry sweep uses stop_reason=`SUSPENDED_TIMEOUT`
 - `main.py:ChargePoint._handle_ongoing_transaction_on_boot` (BootNotification staleness guard, stop_reason=`STALE_RECONNECT`)
 - `main.py:ChargePoint.on_meter_values` (MeterValues staleness guard, stop_reason=`STALE_RECONNECT`)
 - `main.py:ChargePoint._handle_get_last_meter_value` (GetLastMeterValue staleness guard, stop_reason=`STALE_RECONNECT`)
@@ -2875,7 +2893,7 @@ Per-session, customer-facing tax invoice generated for every completed charging 
 
 The counter row is incremented under `SELECT FOR UPDATE` and the full `generate_invoice` call holds a row lock on the underlying `transaction` to prevent gaps from concurrent callers. Migration 28 briefly consolidated counters across franchisees; migration 29 reverted to per-franchisee sequences (with snapshot fields added) to satisfy Razorpay disclosure.
 
-**Tax math.** `gst_rate_percent` is snapshotted onto the `transaction` row at billing time (from `tariff.gst_percent`). The invoice reads stored taxable values directly — `energy_taxable_value = transaction.energy_charge`, `gateway_charges = qr_payment.razorpay_commission`. No reverse-calc from a tax-inclusive total. CGST+SGST (intra-state) vs IGST (inter-state) is decided by comparing `supplier_state_code` to the station's `state_code`; the latter is frozen on the invoice as `place_of_supply_state_code`.
+**Tax math.** `gst_rate_percent` is snapshotted onto the `transaction` row at billing time (from `tariff.gst_percent`). The invoice reads stored taxable values directly — `energy_taxable_value = transaction.energy_charge`, `gateway_charges = qr_payment.razorpay_commission`. No reverse-calc from a tax-inclusive total. CGST+SGST (intra-state) vs IGST (inter-state) is decided by comparing `supplier_state_code` to the station's `state_code`; the latter is frozen on the invoice as `place_of_supply_state_code`. Intra-state **CGST and SGST are each computed independently from the taxable value at half-rate, so they're equal** (Section 170 — not the old halve-the-total which made them differ by a paisa); the sub-rupee residual vs the billing tax (`energy_tax + gateway_tax`) is carried in a new `round_off` column and rendered as a **Round Off** line, keeping `total_amount` (and the QR refund `amount_paid − refund`) reconciled to the paisa. Inter-state IGST is a single component, `round_off = 0`. See **ADR 0017**.
 
 **Compliance guards.**
 - A tax invoice without supplier GSTIN is not valid under CGST Rule 46. `generate_invoice` aborts and logs an error when the supplier (`Franchisee.gstin` or `VOLTLYNC_GSTIN`) is empty.
@@ -2966,6 +2984,31 @@ export const AuthenticatedOnly = ({ children }) => {
 **Error Format**: Standardized HTTP status codes with detailed JSON responses  
 
 ### Admin Management APIs
+
+#### Logs Console (`backend/routers/logs.py`)
+
+The **Logs Console** (`/admin/logs`) is the fleet-wide, filterable view over OCPP
+message logs — a triage view over the `log` table, parallel to the Transactions
+Console. It replaced the per-charger embedded log viewer; the charger detail page
+now deep-links here (`/admin/logs?charger=<id>`). The old `GET /api/admin/logs/charger/{id}`
+and `/summary` endpoints were retired.
+
+```http
+GET /api/admin/logs
+Authorization: Bearer {jwt_token}
+Query Parameters:
+  - charge_point_id: string (optional)        # single charger, server-side filter
+  - message_type: string (repeatable)         # OCPP action(s), server-side `IN (...)`
+  - start_date / end_date: ISO 8601 w/ tz     # always-bounded; defaults to last 24h
+  - limit: int = 100 (max 100,000)
+Response: { data: LogResponse[], total, limit, has_more, message? }   # newest first
+```
+
+**Query-safety guard (ADR 0014)**: the date window is never unbounded (defaults to
+the last 24h), and three indexes on `log` back the access paths — `(timestamp)` for
+the default/date-only window, `(charge_point_id, timestamp)` and `(message_type, timestamp)`
+for the filtered cases. Direction (IN/OUT) and status (errors-only) are refined client-side
+over the fetched window. Filter state is URL-shareable.
 
 #### Station Management (`backend/routers/stations.py`)
 
@@ -5322,7 +5365,7 @@ CORS_ORIGINS = [
   - `_process_failed_billing_transactions()` - Retries BILLING_FAILED transactions
   - `_process_failed_qr_refunds()` - Retries REFUND_FAILED QR payments via Razorpay, skipping permanently-stuck rows via `is_retryable_refund_failure()` (excludes `idempotency_conflict_no_refund` and below-minimum reasons); a retry that 409s is reconciled, not re-hammered. See the "Refund idempotency contract" subsection.
   - `_cleanup_orphaned_qr_payments()` - Detects and refunds QR payments stuck in PAID status with no linked transaction
-  - `_cleanup_stale_suspended_transactions()` - Auto-stops SUSPENDED transactions older than 5 hours
+  - `_cleanup_stale_suspended_transactions()` - Delegates to the shared `disconnect_handler.finalize_stale_suspended_transactions("SUSPENDED_TIMEOUT")`; cutoff = `max(DISCONNECT_SUSPEND_TIMEOUT, SUSPEND_TIMEOUT) + 60` (NOT a private 5-min cutoff — see the 2026-06-18 incident in the disconnect-handler section)
   - Per-item error handling (one failure doesn't block others)
 
 **7. Remote Start Double Prevention**

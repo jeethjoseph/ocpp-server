@@ -391,7 +391,7 @@ export default function AdminGSTFilingsPage() {
                               {inv.hsn_sac_code || "—"}
                             </TableCell>
                             <TableCell className="text-right text-sm tabular-nums">
-                              {inv.energy_consumed_kwh.toFixed(2)}
+                              {Number(inv.energy_consumed_kwh).toFixed(2)}
                             </TableCell>
                             <TableCell className="text-right text-sm tabular-nums">
                               {formatINR(inv.total_taxable_value ?? "0")}
@@ -553,7 +553,7 @@ function InvoiceDetail({ inv }: { inv: GSTInvoice }) {
           </thead>
           <tbody>
             <tr className="border-t">
-              <td className="p-2">Energy ({inv.energy_consumed_kwh.toFixed(2)} kWh)</td>
+              <td className="p-2">Energy ({Number(inv.energy_consumed_kwh).toFixed(2)} kWh)</td>
               <td className="p-2 font-mono text-xs">{inv.hsn_sac_code}</td>
               <td className="p-2 text-right tabular-nums">
                 {formatINR(inv.energy_taxable_value ?? "0")}

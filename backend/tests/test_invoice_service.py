@@ -1,7 +1,7 @@
 """Tests for the GST invoice generation flow after the schema cleanup."""
 
 import os
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 
 import pytest
 
@@ -134,7 +134,10 @@ async def test_wallet_invoice_uses_stored_taxable_values(client):
     assert invoice.energy_taxable_value == txn.energy_charge
     assert invoice.gateway_charges == Decimal("0")
     assert invoice.total_taxable_value == txn.energy_charge
-    assert invoice.total_tax == txn.gst_amount
+    # CGST and SGST are independent equal halves; their sum + round_off
+    # reconciles to the billing tax (ADR 0017).
+    assert invoice.cgst_amount == invoice.sgst_amount
+    assert invoice.total_tax + invoice.round_off == txn.gst_amount
     assert invoice.total_amount == txn.energy_charge + txn.gst_amount
     assert invoice.gst_rate_percent == Decimal("18.00")
     assert invoice.hsn_sac_code == "996749"
@@ -206,10 +209,39 @@ async def test_qr_invoice_gateway_line_uses_synthetic_2_percent(client):
         invoice.total_taxable_value
         == txn.energy_charge + Decimal("0.34")
     )
-    assert invoice.total_tax == txn.gst_amount + Decimal("0.06")
+    assert invoice.cgst_amount == invoice.sgst_amount  # equal halves (ADR 0017)
+    assert invoice.total_tax + invoice.round_off == txn.gst_amount + Decimal("0.06")
     # Actual Razorpay fee on the QRPayment row is untouched
     assert qr_payment.razorpay_commission == Decimal("0.20")
     assert qr_payment.razorpay_gst == Decimal("0.04")
+
+
+@pytest.mark.asyncio
+async def test_cgst_sgst_independent_equal_with_round_off(client):
+    """ADR 0017: intra-state CGST and SGST are each computed independently from
+    the taxable value (= round(total_taxable × 9%)), so they're EQUAL — never
+    the old asymmetric halve-the-total. The Round Off line absorbs the paisa
+    residual so the invoice still reconciles exactly:
+    total_taxable + total_tax + round_off == total_amount."""
+    _, _, txn, _, _ = await _make_session(with_qr=True)
+
+    invoice = await InvoiceService.generate_invoice(txn.id)
+
+    assert invoice.is_inter_state is False
+    # Two equal, independently-derived levies.
+    assert invoice.cgst_amount == invoice.sgst_amount
+    expected_half = (
+        invoice.total_taxable_value * Decimal("9") / Decimal("100")
+    ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    assert invoice.cgst_amount == expected_half
+    assert invoice.total_tax == invoice.cgst_amount + invoice.sgst_amount
+    # Reconciliation invariant — Round Off makes the totals add up exactly.
+    assert (
+        invoice.total_taxable_value + invoice.total_tax + invoice.round_off
+        == invoice.total_amount
+    )
+    # Residual is sub-rupee.
+    assert abs(invoice.round_off) <= Decimal("0.02")
 
 
 @pytest.mark.asyncio
@@ -264,6 +296,7 @@ async def test_place_of_supply_frozen_on_invoice(client):
     # supplier is VoltLync default state_code=32 → inter-state
     assert invoice.is_inter_state is True
     assert invoice.igst_amount == invoice.total_tax
+    assert invoice.round_off == Decimal("0")  # single IGST component, no residual (ADR 0017)
     assert invoice.cgst_amount is None
     assert invoice.sgst_amount is None
 

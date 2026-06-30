@@ -1,0 +1,270 @@
+# tests/test_logs_console.py
+import pytest
+from datetime import datetime, timezone, timedelta
+
+from httpx import AsyncClient
+from fastapi import status
+
+from models import OCPPLog
+
+
+async def _make_log(
+    charge_point_id: str,
+    message_type: str,
+    direction: str = "IN",
+    age_hours: float = 0.0,
+    status: str = "SUCCESS",
+):
+    """Create an OCPPLog row, back-dating its timestamp via update() since
+    `timestamp` is auto_now_add and cannot be set at create time."""
+    log = await OCPPLog.create(
+        charge_point_id=charge_point_id,
+        message_type=message_type,
+        direction=direction,
+        payload={"status": "ok"},
+        status=status,
+    )
+    if age_hours:
+        ts = datetime.now(tz=timezone.utc) - timedelta(hours=age_hours)
+        await OCPPLog.filter(id=log.id).update(timestamp=ts)
+    return log
+
+
+@pytest.mark.unit
+class TestLogsConsole:
+    @pytest.mark.asyncio
+    async def test_action_filter_single(self, client_admin: AsyncClient, test_charger):
+        cp = test_charger.charge_point_string_id
+        await _make_log(cp, "BootNotification")
+        await _make_log(cp, "Heartbeat")
+        await _make_log(cp, "MeterValues")
+
+        resp = await client_admin.get(f"/api/admin/logs?message_type=BootNotification")
+        assert resp.status_code == status.HTTP_200_OK
+        data = resp.json()["data"]
+        assert len(data) == 1
+        assert all(r["message_type"] == "BootNotification" for r in data)
+
+    @pytest.mark.asyncio
+    async def test_action_filter_multi(self, client_admin: AsyncClient, test_charger):
+        cp = test_charger.charge_point_string_id
+        await _make_log(cp, "BootNotification")
+        await _make_log(cp, "StatusNotification")
+        await _make_log(cp, "Heartbeat")
+
+        resp = await client_admin.get(
+            "/api/admin/logs?message_type=BootNotification&message_type=StatusNotification"
+        )
+        assert resp.status_code == status.HTTP_200_OK
+        actions = {r["message_type"] for r in resp.json()["data"]}
+        assert actions == {"BootNotification", "StatusNotification"}
+
+    @pytest.mark.asyncio
+    async def test_no_action_filter_returns_all(self, client_admin: AsyncClient, test_charger):
+        cp = test_charger.charge_point_string_id
+        await _make_log(cp, "BootNotification")
+        await _make_log(cp, "Heartbeat")
+
+        resp = await client_admin.get("/api/admin/logs")
+        assert resp.status_code == status.HTTP_200_OK
+        assert resp.json()["total"] >= 2
+
+    @pytest.mark.asyncio
+    async def test_charger_filter(self, client_admin: AsyncClient, test_charger):
+        cp = test_charger.charge_point_string_id
+        await _make_log(cp, "BootNotification")
+        await _make_log("some-other-charger", "BootNotification")
+
+        resp = await client_admin.get(f"/api/admin/logs?charge_point_id={cp}")
+        assert resp.status_code == status.HTTP_200_OK
+        data = resp.json()["data"]
+        assert len(data) == 1
+        assert all(r["charge_point_id"] == cp for r in data)
+
+    @pytest.mark.asyncio
+    async def test_default_window_excludes_old_rows(self, client_admin: AsyncClient, test_charger):
+        cp = test_charger.charge_point_string_id
+        await _make_log(cp, "Heartbeat", age_hours=0.0)        # within 24h
+        await _make_log(cp, "BootNotification", age_hours=48.0)  # older than the default window
+
+        resp = await client_admin.get(f"/api/admin/logs?charge_point_id={cp}")
+        assert resp.status_code == status.HTTP_200_OK
+        actions = {r["message_type"] for r in resp.json()["data"]}
+        assert "Heartbeat" in actions
+        assert "BootNotification" not in actions
+
+    @pytest.mark.asyncio
+    async def test_explicit_range_includes_old_rows(self, client_admin: AsyncClient, test_charger):
+        cp = test_charger.charge_point_string_id
+        await _make_log(cp, "BootNotification", age_hours=48.0)
+
+        start = (datetime.now(tz=timezone.utc) - timedelta(hours=72)).isoformat()
+        resp = await client_admin.get(
+            "/api/admin/logs", params={"charge_point_id": cp, "start_date": start}
+        )
+        assert resp.status_code == status.HTTP_200_OK
+        actions = {r["message_type"] for r in resp.json()["data"]}
+        assert "BootNotification" in actions
+
+    @pytest.mark.asyncio
+    async def test_limit_over_ceiling_rejected(self, client_admin: AsyncClient):
+        resp = await client_admin.get("/api/admin/logs", params={"limit": 5001})
+        assert resp.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+    @pytest.mark.asyncio
+    async def test_limit_at_ceiling_accepted(self, client_admin: AsyncClient):
+        resp = await client_admin.get("/api/admin/logs", params={"limit": 5000})
+        assert resp.status_code == status.HTTP_200_OK
+
+    @pytest.mark.asyncio
+    async def test_offset_pagination_slices(self, client_admin: AsyncClient, test_charger):
+        cp = test_charger.charge_point_string_id
+        for _ in range(5):
+            await _make_log(cp, "Heartbeat")
+
+        page1 = await client_admin.get(
+            "/api/admin/logs", params={"charge_point_id": cp, "limit": 2, "offset": 0}
+        )
+        page2 = await client_admin.get(
+            "/api/admin/logs", params={"charge_point_id": cp, "limit": 2, "offset": 2}
+        )
+        page3 = await client_admin.get(
+            "/api/admin/logs", params={"charge_point_id": cp, "limit": 2, "offset": 4}
+        )
+        for r in (page1, page2, page3):
+            assert r.status_code == status.HTTP_200_OK
+
+        b1, b2, b3 = page1.json(), page2.json(), page3.json()
+        assert b1["total"] == 5 and b1["offset"] == 0 and b1["limit"] == 2
+        assert len(b1["data"]) == 2 and b1["has_more"] is True
+        assert len(b2["data"]) == 2 and b2["has_more"] is True
+        assert len(b3["data"]) == 1 and b3["has_more"] is False
+
+        # Stable, non-overlapping slices (deterministic ordering by -timestamp, -id).
+        ids = [r["id"] for r in b1["data"] + b2["data"] + b3["data"]]
+        assert len(ids) == len(set(ids)) == 5
+
+    @pytest.mark.asyncio
+    async def test_direction_filter(self, client_admin: AsyncClient, test_charger):
+        cp = test_charger.charge_point_string_id
+        await _make_log(cp, "BootNotification", direction="IN")
+        await _make_log(cp, "BootNotification", direction="OUT")
+        await _make_log(cp, "Heartbeat", direction="IN")
+
+        resp = await client_admin.get(
+            "/api/admin/logs", params={"charge_point_id": cp, "direction": "OUT"}
+        )
+        assert resp.status_code == status.HTTP_200_OK
+        data = resp.json()["data"]
+        assert len(data) == 1
+        assert all(r["direction"] == "OUT" for r in data)
+
+    @pytest.mark.asyncio
+    async def test_errors_only_filter(self, client_admin: AsyncClient, test_charger):
+        cp = test_charger.charge_point_string_id
+        await _make_log(cp, "BootNotification", status="SUCCESS")
+        await _make_log(cp, "RemoteStartTransaction", status="Rejected")
+        await _make_log(cp, "DataTransfer", status="error")
+
+        resp = await client_admin.get(
+            "/api/admin/logs", params={"charge_point_id": cp, "errors_only": "true"}
+        )
+        assert resp.status_code == status.HTTP_200_OK
+        data = resp.json()["data"]
+        statuses = {r["status"] for r in data}
+        assert statuses == {"Rejected", "error"}
+        assert "SUCCESS" not in statuses
+
+    @pytest.mark.asyncio
+    async def test_errors_only_excludes_null_status(self, client_admin: AsyncClient, test_charger):
+        cp = test_charger.charge_point_string_id
+        log = await _make_log(cp, "Heartbeat", status="SUCCESS")
+        await OCPPLog.filter(id=log.id).update(status=None)
+        await _make_log(cp, "DataTransfer", status="error")
+
+        resp = await client_admin.get(
+            "/api/admin/logs", params={"charge_point_id": cp, "errors_only": "true"}
+        )
+        assert resp.status_code == status.HTTP_200_OK
+        data = resp.json()["data"]
+        assert len(data) == 1
+        assert data[0]["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_export_respects_errors_only(self, client_admin: AsyncClient, test_charger):
+        cp = test_charger.charge_point_string_id
+        await _make_log(cp, "BootNotification", status="SUCCESS")
+        await _make_log(cp, "DataTransfer", status="error")
+
+        resp = await client_admin.get(
+            "/api/admin/logs/export",
+            params={"charge_point_id": cp, "errors_only": "true"},
+        )
+        assert resp.status_code == status.HTTP_200_OK
+        lines = [ln for ln in resp.text.splitlines() if ln.strip()]
+        assert len(lines) == 2  # header + 1 error row
+        assert "DataTransfer" in resp.text
+        assert "BootNotification" not in resp.text
+
+    @pytest.mark.asyncio
+    async def test_export_streams_csv(self, client_admin: AsyncClient, test_charger):
+        cp = test_charger.charge_point_string_id
+        await _make_log(cp, "BootNotification")
+        await _make_log(cp, "Heartbeat")
+
+        resp = await client_admin.get(
+            "/api/admin/logs/export", params={"charge_point_id": cp}
+        )
+        assert resp.status_code == status.HTTP_200_OK
+        assert resp.headers["content-type"].startswith("text/csv")
+        assert resp.headers["content-disposition"] == "attachment; filename=ocpp-logs.csv"
+
+        lines = [ln for ln in resp.text.splitlines() if ln.strip()]
+        header = lines[0]
+        assert header == "timestamp_ist,charge_point_id,direction,message_type,status,message_id,payload"
+        assert len(lines) == 3  # header + 2 rows
+        assert "BootNotification" in resp.text and "Heartbeat" in resp.text
+        # Timestamps are exported in IST (UTC+5:30), not UTC — see CLAUDE.md "Timestamps".
+        assert lines[1].split(",")[0].endswith("+05:30")
+
+    @pytest.mark.asyncio
+    async def test_export_neutralizes_csv_formula_injection(self, client_admin: AsyncClient):
+        """Charger-self-reported fields beginning with = + - @ are prefixed with
+        a single quote in the CSV so spreadsheets don't execute them as formulas
+        (OWASP CSV injection). Regression guard from the production-readiness review."""
+        malicious = "=cmd|'/c calc'!A1"
+        await _make_log(malicious, "BootNotification")
+
+        resp = await client_admin.get(
+            "/api/admin/logs/export", params={"charge_point_id": malicious}
+        )
+        assert resp.status_code == status.HTTP_200_OK
+        # The cell is neutralized (quote-prefixed), never written as a live formula.
+        assert "'=cmd" in resp.text
+        assert ",=cmd" not in resp.text
+
+    @pytest.mark.asyncio
+    async def test_export_keyset_pagination_spans_chunks(
+        self, client_admin: AsyncClient, test_charger, monkeypatch
+    ):
+        """Keyset pagination walks the (timestamp, id) cursor across chunks with
+        no skipped or duplicated rows. Forces a chunk size of 1 so the seek path
+        runs for every row. Regression guard for the OFFSET→keyset change."""
+        monkeypatch.setattr("routers.logs.EXPORT_CHUNK_SIZE", 1)
+        cp = test_charger.charge_point_string_id
+        await _make_log(cp, "BootNotification", age_hours=3)  # oldest
+        await _make_log(cp, "Heartbeat", age_hours=2)
+        await _make_log(cp, "MeterValues", age_hours=1)       # newest
+
+        resp = await client_admin.get(
+            "/api/admin/logs/export", params={"charge_point_id": cp}
+        )
+        assert resp.status_code == status.HTTP_200_OK
+        lines = [ln for ln in resp.text.splitlines() if ln.strip()]
+        # header + exactly 3 distinct rows — no dupes, none skipped.
+        assert len(lines) == 4
+        body = lines[1:]
+        # Newest-first (-timestamp): MeterValues, Heartbeat, BootNotification.
+        assert "MeterValues" in body[0]
+        assert "Heartbeat" in body[1]
+        assert "BootNotification" in body[2]

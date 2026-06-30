@@ -136,10 +136,15 @@ class InvoiceService:
         gateway_tax: Decimal,
         gst_rate: Decimal,
     ) -> dict:
-        """Split pre-computed tax amounts across CGST+SGST (intra-state) or IGST (inter-state).
+        """Split tax across CGST+SGST (intra-state) or IGST (inter-state).
 
-        Inputs are the stored taxable values and tax amounts; we only decide
-        which buckets to put them in.
+        Intra-state: CGST and SGST are each computed INDEPENDENTLY from the
+        taxable value at half-rate, so they come out equal (Section 170 — round
+        each component, don't halve a pre-summed total). The paisa difference
+        between (CGST+SGST) and the billing tax that ``total_amount`` reconciles
+        to (``energy_tax + gateway_tax``) is returned as ``round_off``, carried
+        on the invoice as an explicit Round Off line. Inter-state: single IGST
+        component equals the billing tax, ``round_off`` is 0. See ADR 0017.
         """
         is_inter = (
             supplier_state_code
@@ -147,6 +152,7 @@ class InvoiceService:
             and supplier_state_code != station_state_code
         )
 
+        # Billing tax — the source of truth ``total_amount`` must reconcile to.
         total_tax = energy_tax + gateway_tax
 
         if is_inter:
@@ -156,18 +162,25 @@ class InvoiceService:
                 "sgst_rate": None, "sgst_amount": None,
                 "igst_rate": gst_rate, "igst_amount": total_tax,
                 "total_tax": total_tax,
+                "round_off": Decimal("0"),
             }
 
+        total_taxable = energy_taxable + gateway_taxable
         half_rate = (gst_rate / 2).quantize(TWO_DP, ROUND_HALF_UP)
-        half_tax = (total_tax / 2).quantize(TWO_DP, ROUND_HALF_UP)
-        # Keep paise balance: SGST absorbs any 1-paise residual from /2 rounding
-        sgst_amount = total_tax - half_tax
+        # Each levy from the taxable base at half-rate → CGST == SGST.
+        half_tax = (total_taxable * half_rate / Decimal("100")).quantize(
+            TWO_DP, ROUND_HALF_UP
+        )
+        component_tax = half_tax + half_tax
         return {
             "is_inter_state": False,
             "cgst_rate": half_rate, "cgst_amount": half_tax,
-            "sgst_rate": half_rate, "sgst_amount": sgst_amount,
+            "sgst_rate": half_rate, "sgst_amount": half_tax,
             "igst_rate": None, "igst_amount": None,
-            "total_tax": total_tax,
+            "total_tax": component_tax,
+            # Residual vs the billing tax → Round Off line (keeps total_amount,
+            # and therefore the QR refund, reconciling to the paisa).
+            "round_off": total_tax - component_tax,
         }
 
     @staticmethod
@@ -310,7 +323,10 @@ class InvoiceService:
             gst_rate=gst_rate,
         )
 
-        total_amount = total_taxable + gst_split["total_tax"]
+        # total_amount stays anchored to the billing tax (total_taxable +
+        # energy_tax + gateway_tax) so QR reconciliation (amount_paid − refund)
+        # is untouched; round_off carries the CGST/SGST component residual.
+        total_amount = total_taxable + gst_split["total_tax"] + gst_split["round_off"]
 
         # Tariff (needed both for HSN/SAC and for deriving billable_kwh on QR
         # invoices, where `txn.energy_charge` may be capped at the budget).
@@ -412,6 +428,7 @@ class InvoiceService:
             igst_rate=gst_split["igst_rate"],
             igst_amount=gst_split["igst_amount"],
             total_tax=gst_split["total_tax"],
+            round_off=gst_split["round_off"],
             total_amount=total_amount,
             amount_in_words=_amount_in_words(total_amount),
             payment_method=payment_method,
@@ -593,6 +610,11 @@ class InvoiceService:
             tax_rows.append([f"SGST {invoice.sgst_rate}%:", f"{invoice.sgst_amount:.2f}"])
         elif invoice.igst_rate:
             tax_rows.append([f"IGST {invoice.igst_rate}%:", f"{invoice.igst_amount:.2f}"])
+
+        # Round Off — sub-rupee residual between independent CGST/SGST and the
+        # billing tax (ADR 0017). Shown only when non-zero.
+        if invoice.round_off and invoice.round_off != 0:
+            tax_rows.append(["Round Off:", f"{invoice.round_off:.2f}"])
 
         tax_rows.append(["TOTAL", f"{invoice.total_amount:.2f}"])
 

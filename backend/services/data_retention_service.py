@@ -15,11 +15,17 @@ logger = logging.getLogger(__name__)
 DELETE_BATCH_SIZE = int(os.getenv("RETENTION_DELETE_BATCH_SIZE", "5000"))
 
 
-async def _delete_old_in_batches(model, cutoff_date: datetime) -> int:
-    """Delete rows of ``model`` older than ``cutoff_date`` in batches of ids."""
+async def _delete_old_in_batches(model, cutoff_date: datetime, date_field: str = "created_at") -> int:
+    """Delete rows of ``model`` older than ``cutoff_date`` in batches of ids.
+
+    ``date_field`` selects the column to compare against so the delete can ride
+    an existing index — OCPP logs use ``timestamp`` (indexed for the Logs
+    Console, see ADR 0014); ``created_at`` ≈ ``timestamp`` as both are
+    ``auto_now_add``, so the cutoff semantics are identical.
+    """
     total = 0
     while True:
-        ids = await model.filter(created_at__lt=cutoff_date).limit(
+        ids = await model.filter(**{f"{date_field}__lt": cutoff_date}).limit(
             DELETE_BATCH_SIZE
         ).values_list("id", flat=True)
         if not ids:
@@ -129,7 +135,7 @@ class DataRetentionService:
     async def _cleanup_ocpp_logs(self, cutoff_date: datetime) -> int:
         """Delete OCPP log records older than cutoff date (batched)"""
         try:
-            count = await _delete_old_in_batches(OCPPLog, cutoff_date)
+            count = await _delete_old_in_batches(OCPPLog, cutoff_date, date_field="timestamp")
             if count == 0:
                 logger.info("🗑️  No old OCPP logs to delete")
             else:
