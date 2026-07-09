@@ -802,7 +802,7 @@ If the counter reaches `MAX_RESETS_WITHOUT_PROGRESS` (default 3), BootNotificati
 | `SUSPEND_TIMEOUT_SECONDS` | 300 | Resume window after BootNotification resets the timeout |
 | `MAX_DISCONNECT_RESETS_WITHOUT_PROGRESS` | 3 | Max BootNotification resets allowed without energy progress |
 
-> ⚠️ **Timing invariant**: `MAX_RESUME_GAP_SECONDS` (resume staleness guard, below) MUST exceed `DISCONNECT_SUSPEND_TIMEOUT_SECONDS`, or chargers reconnecting between the gap and the disconnect timeout are force-finalized `STALE_RECONNECT` instead of resuming. Because staging/prod widened the disconnect timeout to **1800**, `MAX_RESUME_GAP_SECONDS` was raised to **2100** on both (2026-06-09). This ordering is documented but **not validated at startup** — a proposed `validate_timing_invariants()` would make it fail-loud.
+> ✅ **Timing invariant (now structural — ADR 0022, 2026-07-06)**: the resume staleness guard's threshold is **derived** from the disconnect window (`stale_suspended_cutoff_seconds()` = `max(DISCONNECT_SUSPEND_TIMEOUT, SUSPEND_TIMEOUT)+60`), so it can never be misordered below `DISCONNECT_SUSPEND_TIMEOUT_SECONDS`. The standalone `MAX_RESUME_GAP_SECONDS` env var was retired. This replaces the fragile 2026-06-09 hotfix (hand-raise 900→2100) — the misconfig that force-finalized chargers reconnecting in the 15–30 min window is now unrepresentable, and no startup `validate_timing_invariants()` is needed for it.
 
 **Integration Points**:
 - `ConnectionManager.register_on_disconnect()` -- wires up the callback
@@ -3002,8 +3002,11 @@ Query Parameters:
   - charge_point_id: string (optional)        # single charger, server-side filter
   - message_type: string (repeatable)         # OCPP action(s), server-side `IN (...)`
   - start_date / end_date: ISO 8601 w/ tz     # always-bounded; defaults to last 24h
-  - limit: int = 100 (max 100,000)
-Response: { data: LogResponse[], total, limit, has_more, message? }   # newest first
+  - direction: IN | OUT (optional)            # server-side filter
+  - errors_only: bool                         # status IS NOT NULL AND != 'SUCCESS'
+  - correlation_id: string (optional)         # OCPP messageId; powers expand-to-reply
+  - limit: int = 100 (max 5,000)
+Response: { data: LogResponse[], total, offset, limit, has_more, message? }   # newest first
 ```
 
 **Query-safety guard (ADR 0014)**: the date window is never unbounded (defaults to
@@ -3011,6 +3014,15 @@ the last 24h), and three indexes on `log` back the access paths — `(timestamp)
 the default/date-only window, `(charge_point_id, timestamp)` and `(message_type, timestamp)`
 for the filtered cases. Direction (IN/OUT) and status (errors-only) are refined client-side
 over the fetched window. Filter state is URL-shareable.
+
+**Expand-to-reply (ADR 0014 addendum, 2026-07-09)**: response frames are stored as bare
+`CallResult`/`CallError` (the wire type carries no action name), so the action filter can
+never return a request's reply, and `CallResult` is too voluminous (~62.5k/24h) to fish
+through. Instead, each request card (wire type `2`) has a **"Show response"** toggle that
+lazily fetches its correlated reply via the additive `correlation_id` filter, scoped by
+`correlation_id + charge_point_id + a ±window` around the request (the window beats the 24h
+default for historical rows and disambiguates charger-reused messageIds across reboots).
+Forward-only; `correlation_id` was already persisted, so no migration.
 
 #### Station Management (`backend/routers/stations.py`)
 

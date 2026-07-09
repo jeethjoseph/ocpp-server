@@ -33,3 +33,14 @@ Constrain the query surface and index the two dimensions it filters on:
 - **Archival / retention tiering (move old rows to cold storage).** Rejected as redundant: `DataRetentionService` already deletes beyond 90 days, so there is no long tail to tier. Revisit only if the retention window itself ever needs to grow dramatically.
 - **A dedicated analytics/observability store.** Rejected as disproportionate: the need is admin triage over recent protocol traffic, not analytics. The `log` table within its retention window is the source of truth; duplicating it earns nothing here.
 - **A hard gate requiring a charger or action before any query runs.** Rejected: clunky UX and asymmetric with the "All / All" default. The bounded window + limit + indexes make the unfiltered case safe without forcing a selection.
+
+## Addendum (2026-07-09): expand-to-reply — correlated response drill-down
+
+The action filter is an **OR over `message_type`** (`message_type__in`), and every response frame is stored as a bare `CallResult` / `CallError` — the wire type carries no action name. Two consequences bit users:
+
+1. Filtering by an action (e.g. `BootNotification`) with direction `OUT` returns nothing, because the outbound row's `message_type` is `CallResult`, not `BootNotification`.
+2. Adding `CallResult` to the filter to compensate floods the newest-first list — `CallResult` is the single highest-volume type (~62.5k rows/24h on staging vs ~52 BootNotifications, since every heartbeat/status/meter ack is one), so the request you want is buried pages deep.
+
+**Decision:** rather than denormalize the answered action onto response rows (rejected — needs an in-memory correlation map, a schema column, and a backfill, and muddies `message_type` semantics), add a narrow drill-down. The list endpoint gains an additive **`correlation_id`** filter (the OCPP messageId, already stored on every row and shared by a request and its reply). The Console renders a **"Show response"** toggle on request frames (wire type `2`) that lazily fetches the correlated `CallResult`/`CallError`.
+
+The reply lookup is scoped by **`correlation_id` + `charge_point_id` + a tight time window** (request time −5s … +120s), because (a) the default 24h window would otherwise hide a historical request's reply, and (b) charger-chosen messageIds (`boot_…`) are **reused across reboots**, so `correlation_id` alone is not globally unique. This stays within the bounded-surface principle above — the drill-down is itself a narrow, indexed, time-bounded query, not an unbounded scan. Forward-only, no migration: `correlation_id` was already persisted. See `.scratch/logs-console-correlated-reply/`.

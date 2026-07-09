@@ -15,8 +15,16 @@ A session funded from the user's `Wallet`; billed at StopTransaction by debiting
 _Avoid_: app session.
 
 **QR Session** / **Appless Session**:
-A session funded by a one-time UPI payment scanned from the charger's QR sticker; the user is a `UPI_GUEST` or a pre-existing user matched by phone/VPA.
-_Avoid_: guest session, anonymous session.
+A session funded by **one or more** UPI payments scanned from the charger's QR sticker; the user is a `UPI_GUEST` or a pre-existing user matched by phone/VPA. A single QR Session is still **one OCPP transaction** (one `Transaction` row, one `transaction_id`) — stacking multiple payments does not create multiple sessions (see [[stacked-qr-payment]] and [[adr-0021-stackable-qr-budget]]).
+_Avoid_: guest session, anonymous session; assuming one QR Session ⇒ exactly one `QRPayment` (it is now **1:N** — see [[stacked-qr-payment]]).
+
+**Stacked QR payment** / **QR budget top-up**:
+An additional `QRPayment` made by the **same payer** (matched on `customer_vpa`, falling back to `customer_contact`/phone) against a charger that is **already CHARGING**, which **extends the QR Session's budget instead of being rejected**. Replaces the prior "charger busy ⇒ reject + full-refund" behavior *for the same payer only* — a **different** payer scanning a busy charger still gets reject + full-refund. The session's spendable budget is the **sum** of every linked payment's net amount (`amount_paid − synthetic_platform_fee`, per [[adr-0001-synthetic-vs-actual-platform-fee]]); charging continues with **no StopTransaction** at the seam. Relationship `QRPayment → Transaction` is therefore **1:N** (one billable OCPP transaction funded by N payments), a deliberate relaxation of the old 1:1 (see [[adr-0021-stackable-qr-budget]]).
+_Avoid_: "continuation transaction" / "segment" — there is exactly one `Transaction`; stacking tops up its budget, it does not spawn new transactions. _Avoid_: calling a different-payer concurrent payment a stack — that is still a rejected **concurrent payment**.
+
+**LIFO refund allocation**:
+The rule for returning a QR Session's **unused budget** (`Σ prepaid − actual cost`) across its stacked payments at StopTransaction: refund the **most recent** payment first, walking backward. Earlier payments are treated as consumed first, so each ends up fully consumed (no refund), fully unused (full refund), or — for at most one boundary payment — partially refunded. Minimises Razorpay refund calls and reuses the per-payment refund path + `qr_payment_{PK}` idempotency key. See [[adr-0021-stackable-qr-budget]].
+_Avoid_: pro-rata splitting (partial refund on every payment — more calls/fees, no fairness gain since it is one payer).
 
 **Non-billable Session**:
 A session that produces **no GST invoice and no Settlement Entry** — for **QR Sessions** a full refund of `amount_paid`, for **Wallet Sessions** no debit. Per [[adr-0013-de-minimis-energy-waiver]] (**amended 2026-06-24**) there are exactly TWO such bands, keyed on `transaction_status` × energy:
@@ -56,6 +64,16 @@ A physical plug on a `Charger`, modelled as a `Connector` row. **Working invaria
 **Plug type**:
 The customer-facing label for a connector's physical type, rendered from the **display-only** `Connector.connector_type` free-text (Type2, Socket, CCS, …). Customer-facing groupings on the station map and modal are by **plug type**, but the underlying counts are charger-level — see [[ui-station-modal-chargers]] for the rendering rule.
 _Avoid_: treating `connector_type` as authoritative for anything machine-read — it is cosmetic; the OCPI `standard` (`ocpi_standard`) is the source of truth (see [[adr-0016-connector-ocpi-normalization]]). _Avoid_: "connector" as a customer-facing label when you mean "charger of plug type X". Renamed in the public station modal 2026-05-21 to avoid the conflation.
+
+### Charger connection security
+
+**Charger Auth Key**:
+The per-`Charger` secret that authenticates the OCPP WebSocket connection under **OCPP 1.6 Security Profile 2** (WSS transport + HTTP Basic Auth). A 20-byte random key; the charger presents it as the Basic Auth **password** with the `charge_point_string_id` as the **username** on the WSS upgrade. The server stores only a **SHA-256 hash** (`Charger.auth_key_hash`), never the plaintext — the plaintext is revealed exactly once at provisioning/rotation and loaded onto the unit by charger-side tooling (delivery is out of scope for the server). Lost key ⇒ rotate, never retrieve. SHA-256 (not bcrypt) is deliberate: the key is a high-entropy machine credential checked on every reconnect, so a fast hash is both sufficient and cheaper for flaky-modem reconnect churn. See [[adr-0020-charger-websocket-basic-auth]].
+_Avoid_: "charger password" (implies a low-entropy human secret and the wrong hashing choice); conflating it with **AuthorizationKey** (the OCPP config key the charger-side tool writes locally) — same value, different side.
+
+**Charger auth enforcement**:
+The rule deciding whether a connection is required to present a valid **Charger Auth Key**. **Per-charger**, keyed on `auth_key_hash` presence: null ⇒ *legacy mode* (connection allowed, logged as `charger.connection_insecure` — the migration burn-down signal); non-null ⇒ *enforced* (valid Basic Auth required, **username must equal the path `charge_point_id`**, else close `1008`). Auth is checked **before** the force-disconnect-stale-connection logic so an unauthenticated caller can never kick a live charger offline. Once the insecure count reaches zero fleet-wide, the global `REQUIRE_CHARGER_AUTH` flag closes the window by rejecting even null-hash chargers. See [[adr-0020-charger-websocket-basic-auth]].
+_Avoid_: "big-bang cutover" — enforcement is intentionally per-charger to avoid a flag-day outage across flaky-modem fleet.
 
 ### External interoperability (OCPI)
 
@@ -123,18 +141,20 @@ _Avoid_: calendar year, billing year.
 
 **Settlement Entry**:
 The per-**Charging Session** record of what a franchisee earned, one `CommissionLedgerEntry` row per billable session, created at session finalize. Carries `franchisee_payout` (the franchisee's take) net of `platform_commission` and `tds_amount`, alongside `gross_amount` and the session's `energy_consumed_kwh`. This is the unit the franchisee Settlements page lists and aggregates over.
-_Avoid_: "settlement" unqualified (overloaded with the money-movement below), "commission" as a noun for the whole row (it's one field).
+The row **stores** `gross_amount`, but the **franchisee portal deliberately does not surface it** (2026-07-01) — a franchisee sees **Payout**, **TDS**, **commission %**, and **Power Consumed (kWh)**, never platform Gross. Gross is a platform-level figure for admin/reconciliation only; the franchisee's economic story is payout-per-energy-delivered. The franchisee settlements endpoint therefore omits `gross_amount`/`total_gross` from its response.
+_Avoid_: "settlement" unqualified (overloaded with the money-movement below), "commission" as a noun for the whole row (it's one field). _Avoid_: surfacing **Gross** on any franchisee-facing surface (table, summary, graph, export).
 
 **Settlement Status**:
 The lifecycle of *paying out* a **Settlement Entry** to the franchisee via Razorpay Route, tracked on `CommissionLedgerEntry.settlement_status`: `PENDING → TRANSFER_INITIATED → TRANSFER_PROCESSED → SETTLED`, with `FAILED`, `REVERSED`, `ON_HOLD`, `BELOW_THRESHOLD` as off-happy-path states. A **Settlement Entry** exists and counts as earned the moment the session finalizes; its **Settlement Status** is whether the money has reached the franchisee yet.
 _Avoid_: conflating "earned" (the entry exists) with "settled" (the status reached its terminal state).
 
 **Account balance (Razorpay float)**:
-The money sitting in VoltLync's Razorpay account that has been captured but not yet swept to the bank — the spendable float Razorpay uses to fund **instant refunds** (`speed=optimum`) and Route payouts. Read live from `/v1/balance` (`balance`, in paise); the endpoint's `updated_at`/`last_fetched_at` fields are unmaintained junk but the value is real-time. **Drained by each settlement sweep**, so it trends toward zero between settlements regardless of transaction volume — a high-volume account that settles near-daily can still hold only a few hundred rupees. This is why large instant refunds intermittently downgrade to `normal`: the float is below the refund amount at that instant. Not the same as total unsettled or total transacted volume.
+The money sitting in VoltLync's Razorpay account that has been captured but not yet swept to the bank — the spendable float Razorpay uses to fund **instant refunds** (`speed=optimum`) and Route payouts. Read live from `/v1/balance` (`balance`, in paise); the endpoint's `updated_at`/`last_fetched_at` fields are unmaintained junk but the value is real-time. **Drained by each settlement sweep**, so it trends toward zero between settlements regardless of transaction volume — a high-volume account that settles near-daily can still hold only a few hundred rupees. Low float is **one** cause of an instant refund downgrading to `normal` (when the float is below the refund amount). Not the same as total unsettled or total transacted volume.
+**Correction (2026-07-01):** low float is NOT the only — nor the observed primary — cause of `speed=optimum` downgrades. Razorpay confirmed in writing (ticket #19564492) that the downgrades VoltLync actually hit were caused by their **opaque, non-configurable fraud shield rules** — specifically a **per-VPA instant-refund limit inside a 24-hour window** plus a **soft-failure-then-retry-pinned-to-normal** behavior — with no merchant visibility or control. Do NOT diagnose the next downgrade as a float problem by default; the risk-engine cause is provider-side and invisible from `/v1/balance`. This opacity is the driver for evaluating a Paytm migration.
 _Avoid_: "balance" unqualified (collides with **Wallet** balance), "unsettled amount" (related but not identical — fees, holds, and payouts also move it).
 
 **Refund Credits**:
-A prepaid Razorpay wallet, separate from the **Account balance (Razorpay float)**, that funds refunds independently of the settlement schedule — top it up in advance and instant refunds draw from it even when the float has been swept to bank. **Must be enabled by Razorpay before use; currently disabled** on the VoltLync account (`refund_credits=0`), so it provides no cushion today. The recommended fix for instant-refund downgrades.
+A prepaid Razorpay wallet, separate from the **Account balance (Razorpay float)**, that funds refunds independently of the settlement schedule — top it up in advance and instant refunds draw from it even when the float has been swept to bank. **Must be enabled by Razorpay before use; currently disabled** on the VoltLync account (`refund_credits=0`), so it provides no cushion today. Fixes only the **float** cause of instant-refund downgrades — it does **NOT** address the **fraud-shield / per-VPA 24h** downgrades Razorpay confirmed in ticket #19564492 (see the correction on **Account balance (Razorpay float)**). So it is a partial cushion, not a complete fix for the downgrades VoltLync has actually experienced.
 _Avoid_: "refund balance", "refund wallet" (the canonical Razorpay term is Refund Credits).
 
 ### Observability
