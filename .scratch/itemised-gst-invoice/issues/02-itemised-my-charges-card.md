@@ -1,6 +1,6 @@
 # 02 — Itemised /my-charges receipt card (line items + totals)
 
-Status: ready-for-agent
+Status: done (commit 92c010c)
 
 ## What to build
 
