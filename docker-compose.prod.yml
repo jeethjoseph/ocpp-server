@@ -79,6 +79,9 @@ services:
       # Server
       - HOST=0.0.0.0
       - PORT=8000
+      # Must stay 1: OCPP connection state is in-memory per process and not
+      # shared across workers. >1 worker splits a charger's WS session from its
+      # command-dispatch path.
       - WORKERS=${WORKERS:-1}
       - LOG_LEVEL=${LOG_LEVEL:-warning}
       # Clerk Authentication
@@ -131,7 +134,6 @@ services:
       - ZERO_ENERGY_GRACE_PERIOD_SECONDS=${ZERO_ENERGY_GRACE_PERIOD_SECONDS:-60}
       - OCPP_TIMEOUT=${OCPP_TIMEOUT:-120}
       - MAX_DISCONNECT_RESETS_WITHOUT_PROGRESS=${MAX_DISCONNECT_RESETS_WITHOUT_PROGRESS:-3}
-      - MAX_RESUME_GAP_SECONDS=${MAX_RESUME_GAP_SECONDS:-900}
       - RETENTION_DAYS=${RETENTION_DAYS:-90}
       - CLEANUP_INTERVAL_HOURS=${CLEANUP_INTERVAL_HOURS:-24}
       # New Relic
