@@ -1,8 +1,11 @@
 """Tests for the resume staleness guard.
 
 The guard is a defense-in-depth mechanism that refuses to resume a transaction
-whose last known activity is older than MAX_RESUME_GAP_SECONDS, even if the
-upstream disconnect handler failed to mark it SUSPENDED in time.
+whose last known activity is older than the derived stale-suspended cutoff
+(`stale_suspended_cutoff_seconds()`, ADR 0022), even if the upstream disconnect
+handler failed to mark it SUSPENDED in time. The threshold is derived from the
+disconnect window, not a separate env var, so it can never be misordered below
+the disconnect timer.
 
 Two layers tested:
 1. The pure helper `is_resume_too_stale` (unit tests)
@@ -20,12 +23,16 @@ from decimal import Decimal
 from unittest.mock import patch, AsyncMock, MagicMock
 
 from services import transaction_finalizer
-from services.transaction_finalizer import (
-    is_resume_too_stale,
-    MAX_RESUME_GAP_SECONDS,
+from services.transaction_finalizer import is_resume_too_stale
+from services.disconnect_handler import (
+    _disconnect_reset_count,
+    stale_suspended_cutoff_seconds,
+    DISCONNECT_SUSPEND_TIMEOUT,
 )
-from services.disconnect_handler import _disconnect_reset_count
 from models import Transaction, TransactionStatusEnum, MeterValue
+
+# The staleness threshold is now DERIVED from the disconnect window (ADR 0022).
+THRESHOLD = stale_suspended_cutoff_seconds()
 
 
 @pytest.fixture(autouse=True)
@@ -94,7 +101,7 @@ class TestIsResumeTooStale:
     async def test_returns_true_for_old_suspended_at(
         self, client, test_charger, test_user
     ):
-        old = datetime.now(timezone.utc) - timedelta(seconds=MAX_RESUME_GAP_SECONDS + 300)
+        old = datetime.now(timezone.utc) - timedelta(seconds=THRESHOLD + 300)
         txn = await Transaction.create(
             charger=test_charger,
             user=test_user,
@@ -104,7 +111,7 @@ class TestIsResumeTooStale:
         )
         is_stale, gap = await is_resume_too_stale(txn)
         assert is_stale is True
-        assert gap > MAX_RESUME_GAP_SECONDS
+        assert gap > THRESHOLD
 
     @pytest.mark.asyncio
     async def test_recent_meter_value_overrides_old_suspended_at(
@@ -172,13 +179,13 @@ class TestIsResumeTooStale:
             transaction_status=TransactionStatusEnum.RUNNING,
             start_meter_kwh=0.0,
         )
-        old = datetime.now(timezone.utc) - timedelta(seconds=MAX_RESUME_GAP_SECONDS + 100)
+        old = datetime.now(timezone.utc) - timedelta(seconds=THRESHOLD + 100)
         await _set_transaction_start_time(txn.id, old)
         refreshed = await Transaction.get(id=txn.id)
 
         is_stale, gap = await is_resume_too_stale(refreshed)
         assert is_stale is True
-        assert gap > MAX_RESUME_GAP_SECONDS
+        assert gap > THRESHOLD
 
     @pytest.mark.asyncio
     async def test_recent_start_time_is_not_stale(
@@ -196,10 +203,12 @@ class TestIsResumeTooStale:
         assert gap is not None and gap < 60
 
     @pytest.mark.asyncio
-    async def test_threshold_is_configurable(
+    async def test_threshold_tracks_derived_cutoff(
         self, client, test_charger, test_user, monkeypatch
     ):
-        """Boundary check: a 200s gap is fresh at 900s threshold but stale at 100s."""
+        """Boundary check: a 200s gap is fresh at the derived cutoff but stale
+        once the derived cutoff is lowered below it. The threshold follows
+        stale_suspended_cutoff_seconds(), not a standalone env var."""
         suspended_at = datetime.now(timezone.utc) - timedelta(seconds=200)
         txn = await Transaction.create(
             charger=test_charger,
@@ -209,15 +218,44 @@ class TestIsResumeTooStale:
             start_meter_kwh=0.0,
         )
 
-        # Default threshold (900s) — 200s is fresh
+        # Derived cutoff (>= 360s in test env) — 200s is fresh
+        assert THRESHOLD > 200
         is_stale, _ = await is_resume_too_stale(txn)
         assert is_stale is False
 
-        # Tighten threshold to 100s — 200s is now stale
-        monkeypatch.setattr(transaction_finalizer, "MAX_RESUME_GAP_SECONDS", 100)
+        # Lower the DERIVED cutoff below 200s — 200s is now stale. Patch the
+        # source of truth; is_resume_too_stale imports it fresh on each call.
+        monkeypatch.setattr(
+            "services.disconnect_handler.stale_suspended_cutoff_seconds",
+            lambda: 100,
+        )
         is_stale, gap = await is_resume_too_stale(txn)
         assert is_stale is True
         assert gap > 100
+
+    @pytest.mark.asyncio
+    async def test_derived_cutoff_exceeds_disconnect_timer(
+        self, client, test_charger, test_user
+    ):
+        """ADR 0022 invariant regression: the derived staleness cutoff is
+        guaranteed larger than the disconnect timer, so a charger reconnecting
+        just past the disconnect window (the txn 870 case) is NOT refused as
+        stale — it resumes. Under the old misconfigured MAX_RESUME_GAP_SECONDS
+        (900 < 1800) this would have been finalized STALE_RECONNECT."""
+        assert stale_suspended_cutoff_seconds() > DISCONNECT_SUSPEND_TIMEOUT
+        suspended_at = datetime.now(timezone.utc) - timedelta(
+            seconds=DISCONNECT_SUSPEND_TIMEOUT + 30
+        )
+        txn = await Transaction.create(
+            charger=test_charger,
+            user=test_user,
+            transaction_status=TransactionStatusEnum.SUSPENDED,
+            suspended_at=suspended_at,
+            start_meter_kwh=0.0,
+        )
+        is_stale, gap = await is_resume_too_stale(txn)
+        assert is_stale is False
+        assert gap > DISCONNECT_SUSPEND_TIMEOUT
 
 
 # ============================================================================

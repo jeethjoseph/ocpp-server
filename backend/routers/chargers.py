@@ -43,6 +43,14 @@ class ChargerCreate(BaseModel):
     )
 
 
+# Selectable connector types for the admin Edit Charger form. The socket subset
+# (see services.charger_type_service.SOCKET_CONNECTOR_TYPES) is untethered and
+# start-from-Available; the rest are tethered/DC. Kept as canonical display
+# strings; validation is case-insensitive.
+ALLOWED_CONNECTOR_TYPES = ["Type2", "Type1", "Socket", "CCS", "CHAdeMO", "GB/T", "domestic"]
+_ALLOWED_CONNECTOR_TYPES_LC = {t.lower() for t in ALLOWED_CONNECTOR_TYPES}
+
+
 class ChargerUpdate(BaseModel):
     """ADR 0003: see ChargerCreate."""
     model_config = {"extra": "forbid"}
@@ -52,6 +60,10 @@ class ChargerUpdate(BaseModel):
     vendor: Optional[str] = None
     latest_status: Optional[str] = None
     external_charger_id: Optional[str] = None
+    # Connector type drives socket-vs-tethered behaviour (start-from-Available).
+    # Editable so an admin can correct a mis-provisioned charger. Validated
+    # against ALLOWED_CONNECTOR_TYPES; applied to the charger's connector(s).
+    connector_type: Optional[str] = None
     tariff_per_kwh_all_in: Optional[float] = Field(
         None, ge=1.0, le=100.0,
         description="All-inclusive per-kWh tariff (incl. GST + 2% gateway fee). 1.0–100.0.",
@@ -86,6 +98,7 @@ class ChargerResponse(BaseModel):
     tariff_gst_percent: Optional[float] = None
     tariff_per_kwh_all_in: Optional[float] = None  # operator-set, customer-displayed
     latest_error: Optional[LatestErrorInfo] = None
+    connectors: List["ConnectorResponse"] = []
 
     class Config:
         from_attributes = True
@@ -101,9 +114,13 @@ class ConnectorResponse(BaseModel):
     connector_id: int
     connector_type: str
     max_power_kw: Optional[float]
-    
+
     class Config:
         from_attributes = True
+
+# ChargerResponse.connectors forward-references ConnectorResponse (defined above);
+# resolve the ref now that it exists.
+ChargerResponse.model_rebuild()
 
 class StationBasicInfo(BaseModel):
     id: int
@@ -185,6 +202,7 @@ def charger_to_response(
     connection_status: bool,
     latest_error: Optional[ChargerError] = None,
     tariff: Optional[Tariff] = None,
+    connectors: Optional[List["Connector"]] = None,
 ) -> ChargerResponse:
     """Convert a Charger model to ChargerResponse with connection status, latest error, and tariff"""
     error_info = None
@@ -224,6 +242,10 @@ def charger_to_response(
         tariff_per_kwh=tariff_rate,
         tariff_gst_percent=tariff_gst,
         tariff_per_kwh_all_in=tariff_all_in,
+        connectors=[
+            ConnectorResponse.model_validate(c, from_attributes=True)
+            for c in (connectors or [])
+        ],
     )
 
 
@@ -309,6 +331,13 @@ async def list_chargers(
     # Bulk-resolve applicable tariff per charger (charger-specific or global fallback)
     tariff_dict = await get_applicable_tariffs_for_chargers(charger_ids)
 
+    # Bulk-load connectors so the list carries connector_type (drives socket
+    # classification + the admin Edit form's connector dropdown). One query.
+    connectors_dict: Dict[int, List[Connector]] = {}
+    if charger_ids:
+        for conn in await Connector.filter(charger_id__in=charger_ids):
+            connectors_dict.setdefault(conn.charger_id, []).append(conn)
+
     # Build response with connection status, errors, and tariff
     charger_responses = []
     for charger in chargers:
@@ -316,7 +345,10 @@ async def list_chargers(
         latest_error = error_dict.get(charger.id)
         tariff = tariff_dict.get(charger.id)
         charger_responses.append(
-            charger_to_response(charger, connection_status, latest_error, tariff)
+            charger_to_response(
+                charger, connection_status, latest_error, tariff,
+                connectors=connectors_dict.get(charger.id, []),
+            )
         )
 
     return ChargerListResponse(
@@ -492,6 +524,28 @@ async def get_charger_details(charger_id: int, user: User = Depends(require_user
     
     return response
 
+async def _upsert_charger_tariff(charger_id: int, all_in_value) -> None:
+    """Create or update the single charger-specific tariff, race-safe.
+
+    Preserves the existing GST rate if a tariff already exists, else the model
+    default. A concurrent double-submit can have two requests both find no row
+    and both attempt an insert; the UNIQUE(charger_id) constraint (migration 47)
+    makes the loser raise IntegrityError, which we resolve as an update rather
+    than a 500. See upsert-race-hardening issue 01.
+    """
+    existing = await Tariff.filter(charger_id=charger_id).first()
+    if existing:
+        gst = existing.gst_percent
+    else:
+        gst = Decimal(str(Tariff._meta.fields_map["gst_percent"].default))
+    all_in = Decimal(str(all_in_value))
+    rate = back_derive_rate_per_kwh(all_in, gst, RAZORPAY_PLATFORM_FEE_PERCENT)
+    defaults = {"rate_per_kwh": rate, "tariff_per_kwh_all_in": all_in, "gst_percent": gst}
+    try:
+        await Tariff.update_or_create(defaults=defaults, charger_id=charger_id)
+    except IntegrityError:
+        await Tariff.filter(charger_id=charger_id).update(**defaults)
+
 @router.put("/{charger_id}", response_model=dict)
 async def update_charger(charger_id: int, update_data: ChargerUpdate, admin_user: User = Depends(require_admin())):
     """Update charger information"""
@@ -518,21 +572,17 @@ async def update_charger(charger_id: int, update_data: ChargerUpdate, admin_user
     # operator-typed all-in value and persist both columns. ADR 0003.
     tariff_per_kwh_all_in = update_dict.pop("tariff_per_kwh_all_in", None)
     if tariff_per_kwh_all_in is not None:
-        existing = await Tariff.filter(charger_id=charger_id).first()
-        if existing:
-            gst = existing.gst_percent
-        else:
-            gst_default = Tariff._meta.fields_map["gst_percent"].default
-            gst = Decimal(str(gst_default))
-        all_in = Decimal(str(tariff_per_kwh_all_in))
-        rate = back_derive_rate_per_kwh(all_in, gst, RAZORPAY_PLATFORM_FEE_PERCENT)
-        await Tariff.update_or_create(
-            defaults={
-                "rate_per_kwh": rate,
-                "tariff_per_kwh_all_in": all_in,
-                "gst_percent": gst,
-            },
-            charger_id=charger_id,
+        await _upsert_charger_tariff(charger_id, tariff_per_kwh_all_in)
+
+    # Connector type lives on the connector row(s), not the charger. Validate and
+    # apply to all of this charger's connectors so socket-vs-tethered gating is
+    # correct. See socket-charger-classification issue 01.
+    connector_type = update_dict.pop("connector_type", None)
+    if connector_type is not None:
+        if connector_type.strip().lower() not in _ALLOWED_CONNECTOR_TYPES_LC:
+            raise HTTPException(status_code=400, detail="Invalid connector type")
+        await Connector.filter(charger_id=charger_id).update(
+            connector_type=connector_type.strip()
         )
 
     for field, value in update_dict.items():

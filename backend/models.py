@@ -349,6 +349,11 @@ class Tariff(Model):
     id = fields.IntField(pk=True)
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)
+    # At most one charger-specific tariff per charger (the domain invariant —
+    # get_applicable_tariffs_for_chargers resolves a single charger tariff then
+    # falls back to global). Enforced via the unique_together in Meta below;
+    # Postgres treats NULLs as distinct, so global tariffs (charger_id IS NULL,
+    # is_global=True) may coexist. See upsert-race-hardening issue 01.
     charger = fields.ForeignKeyField("models.Charger", related_name="tariffs", null=True)
     # Internal back-derived rate, used by line-item billing math only.
     # Equals `tariff_per_kwh_all_in × (1 - fee_pct/100) / (1 + gst_pct/100)`.
@@ -364,6 +369,7 @@ class Tariff(Model):
 
     class Meta:
         table = "tariff"
+        unique_together = [("charger",)]
 
 class Transaction(Model):
     id = fields.IntField(pk=True)

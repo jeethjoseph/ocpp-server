@@ -21,7 +21,6 @@ Idempotent against already-stopped transactions.
 """
 import datetime
 import logging
-import os
 from typing import Optional, Tuple
 
 from models import Transaction, TransactionStatusEnum, MeterValue
@@ -35,10 +34,15 @@ logger = logging.getLogger("ocpp-server")
 # Defense-in-depth staleness threshold for transaction resume.
 # If the gap between a txn's last activity and a resume attempt exceeds this,
 # we finalize the txn (STALE_RECONNECT) instead of resuming. This only fires
-# when the primary disconnect/suspend timer chain has failed — it must be
-# larger than DISCONNECT_SUSPEND_TIMEOUT_SECONDS (180s) and SUSPEND_TIMEOUT_SECONDS
-# (300s) to avoid racing with the existing finalize chain.
-MAX_RESUME_GAP_SECONDS = int(os.environ.get("MAX_RESUME_GAP_SECONDS", "900"))
+# when the primary disconnect/suspend timer chain has failed.
+#
+# The threshold is DERIVED from the disconnect window via
+# disconnect_handler.stale_suspended_cutoff_seconds() (= max(DISCONNECT_SUSPEND_TIMEOUT,
+# SUSPEND_TIMEOUT) + buffer) — the same single source of truth the stale-suspended
+# sweeps use — NOT a separate env var. Deriving it guarantees by construction that
+# the guard fires strictly AFTER the primary disconnect timer, so it can never be
+# misconfigured to pre-empt a legitimate in-window reconnect (the txn 870 bug).
+# See ADR 0022.
 
 
 async def is_resume_too_stale(
@@ -51,7 +55,8 @@ async def is_resume_too_stale(
     activity signal we found, or None if we couldn't find any.
 
     Looks at the most recent of: suspended_at, latest MeterValue.created_at,
-    falling back to start_time. Threshold is MAX_RESUME_GAP_SECONDS.
+    falling back to start_time. Threshold is the derived stale-suspended cutoff
+    (see module comment) — guaranteed larger than the disconnect timer.
     """
     now = datetime.datetime.now(datetime.timezone.utc)
     candidates = []
@@ -68,7 +73,9 @@ async def is_resume_too_stale(
         return False, None
     most_recent = max(candidates)
     gap = (now - most_recent).total_seconds()
-    return gap > MAX_RESUME_GAP_SECONDS, gap
+    # Derived, not configured — see module comment / ADR 0022.
+    from services.disconnect_handler import stale_suspended_cutoff_seconds
+    return gap > stale_suspended_cutoff_seconds(), gap
 
 
 async def finalize_stopped_transaction(
@@ -112,19 +119,28 @@ async def finalize_stopped_transaction(
         f"(was {previous_status}, energy={transaction.energy_consumed_kwh} kWh)"
     )
 
-    # Step 3: audit log
-    safe_create_task(log_audit_event(
-        action="transaction.finalized",
-        entity_type="transaction",
-        entity_id=transaction.id,
-        actor_type="system",
-        changes={
-            "previous_status": str(previous_status),
-            "new_status": "STOPPED",
-            "trigger": stop_reason,
-            "energy_consumed_kwh": float(transaction.energy_consumed_kwh) if transaction.energy_consumed_kwh is not None else None,
-        },
-    ))
+    # Step 3: audit log. Awaited (NOT fire-and-forget) because this transition
+    # is the audit trail's source of record for a system-stopped txn — a dropped
+    # background task left txn 870 with no `transaction.finalized` row despite a
+    # correct STOPPED state (issue 03). try/except so an audit-write failure can
+    # never block the finalize itself.
+    try:
+        await log_audit_event(
+            action="transaction.finalized",
+            entity_type="transaction",
+            entity_id=transaction.id,
+            actor_type="system",
+            changes={
+                "previous_status": str(previous_status),
+                "new_status": "STOPPED",
+                "trigger": stop_reason,
+                "energy_consumed_kwh": float(transaction.energy_consumed_kwh) if transaction.energy_consumed_kwh is not None else None,
+            },
+        )
+    except Exception as audit_err:
+        logger.warning(
+            f"finalize audit write failed for txn {transaction.id} (non-fatal): {audit_err}"
+        )
 
     # Metric: record disconnect-driven stops separately for alerting
     if stop_reason == "DISCONNECT_TIMEOUT":

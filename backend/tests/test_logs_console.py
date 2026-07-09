@@ -160,6 +160,57 @@ class TestLogsConsole:
         assert all(r["direction"] == "OUT" for r in data)
 
     @pytest.mark.asyncio
+    async def test_correlation_id_filter_returns_only_the_pair(
+        self, client_admin: AsyncClient, test_charger
+    ):
+        """The expand-to-reply drill-down filters by the OCPP messageId, which the
+        request (IN Call) and its response (OUT CallResult) share. See ADR 0014."""
+        cp = test_charger.charge_point_string_id
+        cid = "boot_ABC123"
+        req = await OCPPLog.create(
+            charge_point_id=cp, message_type="BootNotification", direction="IN",
+            payload=[2, cid, "BootNotification", {}], status="received", correlation_id=cid,
+        )
+        rep = await OCPPLog.create(
+            charge_point_id=cp, message_type="CallResult", direction="OUT",
+            payload=[3, cid, {"interval": 30, "status": "Accepted"}], status="sent", correlation_id=cid,
+        )
+        # Noise that must NOT come back: a different messageId entirely.
+        await OCPPLog.create(
+            charge_point_id=cp, message_type="Heartbeat", direction="IN",
+            payload=[2, "hb_999", "Heartbeat", {}], status="received", correlation_id="hb_999",
+        )
+
+        resp = await client_admin.get(f"/api/admin/logs?correlation_id={cid}")
+        assert resp.status_code == status.HTTP_200_OK
+        ids = {r["id"] for r in resp.json()["data"]}
+        assert ids == {req.id, rep.id}
+
+    @pytest.mark.asyncio
+    async def test_correlation_id_composes_with_direction(
+        self, client_admin: AsyncClient, test_charger
+    ):
+        """correlation_id composes with the existing filters — direction=OUT plus
+        the messageId isolates just the reply frame."""
+        cp = test_charger.charge_point_string_id
+        cid = "boot_XYZ789"
+        await OCPPLog.create(
+            charge_point_id=cp, message_type="BootNotification", direction="IN",
+            payload=[2, cid, "BootNotification", {}], status="received", correlation_id=cid,
+        )
+        rep = await OCPPLog.create(
+            charge_point_id=cp, message_type="CallResult", direction="OUT",
+            payload=[3, cid, {"status": "Accepted"}], status="sent", correlation_id=cid,
+        )
+
+        resp = await client_admin.get(
+            "/api/admin/logs", params={"correlation_id": cid, "direction": "OUT"}
+        )
+        assert resp.status_code == status.HTTP_200_OK
+        data = resp.json()["data"]
+        assert [r["id"] for r in data] == [rep.id]
+
+    @pytest.mark.asyncio
     async def test_errors_only_filter(self, client_admin: AsyncClient, test_charger):
         cp = test_charger.charge_point_string_id
         await _make_log(cp, "BootNotification", status="SUCCESS")

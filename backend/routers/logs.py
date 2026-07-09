@@ -84,13 +84,14 @@ def _build_logs_query(
     end_date: Optional[str],
     direction: Optional[str] = None,
     errors_only: bool = False,
+    correlation_id: Optional[str] = None,
 ):
     """Build the shared, bounded OCPPLog queryset for the list + export endpoints.
 
     Always applies a bounded time window (defaulting to the last 24h) plus the
-    optional charger / OCPP-action / direction / errors-only filters. See ADR
-    0014. Ordering is deterministic (timestamp desc, id desc tiebreak) so OFFSET
-    pagination is stable.
+    optional charger / OCPP-action / direction / errors-only / correlation_id
+    filters. See ADR 0014. Ordering is deterministic (timestamp desc, id desc
+    tiebreak) so OFFSET pagination is stable.
     """
     now = datetime.now(tz=timezone.utc)
     start_dt = _parse_date(start_date, "start_date") if start_date else now - timedelta(hours=DEFAULT_WINDOW_HOURS)
@@ -103,6 +104,8 @@ def _build_logs_query(
         query = query.filter(message_type__in=message_type)
     if direction:
         query = query.filter(direction=direction)
+    if correlation_id:
+        query = query.filter(correlation_id=correlation_id)
     if errors_only:
         query = query.filter(status__not_isnull=True).filter(~Q(status=SUCCESS_STATUS))
     return query.order_by("-timestamp", "-id")
@@ -116,6 +119,7 @@ async def get_logs(
     end_date: Optional[str] = Query(None, description="End date ISO 8601 w/ tz. Defaults to now."),
     direction: Optional[str] = Query(None, description="Filter by direction: IN or OUT"),
     errors_only: bool = Query(False, description="Return only non-success (error/failed) rows"),
+    correlation_id: Optional[str] = Query(None, description="Filter to a single OCPP messageId — the request and its CallResult/CallError share it. Used by the expand-to-reply drill-down."),
     offset: int = Query(0, ge=0, description="Row offset for pagination"),
     limit: int = Query(100, ge=1, le=MAX_LIST_LIMIT, description="Number of logs to return (max 5,000)"),
     admin_user: User = Depends(require_admin()),
@@ -126,7 +130,9 @@ async def get_logs(
     sequential scan of the log table — see ADR 0014. Newest first, OFFSET-paged.
     """
     try:
-        query = _build_logs_query(charge_point_id, message_type, start_date, end_date, direction, errors_only)
+        query = _build_logs_query(
+            charge_point_id, message_type, start_date, end_date, direction, errors_only, correlation_id
+        )
         total = await query.count()
         logs = await query.offset(offset).limit(limit)
         has_more = offset + len(logs) < total

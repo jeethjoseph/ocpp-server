@@ -1,5 +1,6 @@
 """Public endpoint for QR payment users to look up transaction history by UPI ID"""
 import logging
+from decimal import Decimal
 from fastapi import APIRouter, HTTPException, Query, Request
 from typing import Optional
 
@@ -112,6 +113,13 @@ async def get_transactions_by_vpa(
     total = await query.count()
     payments = await query.order_by("-created_at").offset((page - 1) * limit).limit(limit)
 
+    # Bulk-load the reconciled invoices so the card mirrors the PDF exactly.
+    txn_ids = [p.transaction_id for p in payments if p.transaction_id]
+    invoices_by_txn = {}
+    if txn_ids:
+        for inv in await GSTInvoice.filter(transaction_id__in=txn_ids):
+            invoices_by_txn[inv.transaction_id] = inv
+
     results = []
     for p in payments:
         txn = p.transaction if p.transaction_id else None
@@ -129,13 +137,10 @@ async def get_transactions_by_vpa(
             "created_at": p.created_at.isoformat(),
             "amount_paid": str(p.amount_paid),
             "status": p.status.value,
-            "energy_consumed_kwh": txn.energy_consumed_kwh if txn else None,
-            "energy_cost": str(p.energy_cost) if p.energy_cost else None,
-            "gst_amount": str(p.gst_amount) if p.gst_amount else None,
-            "platform_fee": str(p.platform_fee) if p.platform_fee is not None else None,
-            "razorpay_commission": str(p.razorpay_commission) if p.razorpay_commission is not None else None,
-            "razorpay_gst": str(p.razorpay_gst) if p.razorpay_gst is not None else None,
-            "fee_source": p.fee_source,
+            # Reconciled breakdown identical to the GST invoice — energy_cost +
+            # gateway_fee + gst_amount == amount_paid − refund. Never exposes the
+            # actual Razorpay commission (ADR 0001).
+            **_customer_breakdown(p, txn, invoices_by_txn.get(p.transaction_id)),
             "refund_amount": str(p.refund_amount) if p.refund_amount else None,
             "razorpay_refund_id": p.razorpay_refund_id,
             "razorpay_refund_speed_processed": p.razorpay_refund_speed_processed,

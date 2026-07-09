@@ -150,3 +150,36 @@ class TestFinalizeStoppedTransaction:
         with patch("services.zero_energy_watchdog.clear_zero_energy_tracking", new=AsyncMock()) as mock_clear:
             await finalize_stopped_transaction(txn, "TEST")
             mock_clear.assert_called_once_with(txn.id)
+
+    @pytest.mark.asyncio
+    async def test_writes_finalized_audit_event(
+        self, client, test_charger, test_user, test_tariff, test_wallet
+    ):
+        """The finalize transition must leave exactly one transaction.finalized
+        audit row. Regression for issue 03: the audit was fire-and-forget and
+        could be silently dropped (txn 870 finalized with a correct STOPPED
+        state but no audit row). It is now awaited."""
+        from models import AuditLog
+        txn = await Transaction.create(
+            charger=test_charger,
+            user=test_user,
+            transaction_status=TransactionStatusEnum.SUSPENDED,
+            start_meter_kwh=0.0,
+        )
+        await MeterValue.create(
+            transaction=txn,
+            charger=test_charger,
+            reading_kwh=3.0,
+            measurand="Energy.Active.Import.Register",
+        )
+
+        await finalize_stopped_transaction(txn, "DISCONNECT_TIMEOUT")
+
+        rows = await AuditLog.filter(
+            entity_type="transaction",
+            entity_id=str(txn.id),
+            action="transaction.finalized",
+        )
+        assert len(rows) == 1, "finalize must write exactly one transaction.finalized audit row"
+        assert rows[0].changes["trigger"] == "DISCONNECT_TIMEOUT"
+        assert rows[0].changes["new_status"] == "STOPPED"

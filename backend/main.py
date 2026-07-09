@@ -34,6 +34,72 @@ import json
 # Transaction resume constants
 SUSPEND_TIMEOUT_SECONDS = int(os.environ.get("SUSPEND_TIMEOUT_SECONDS", "300"))
 
+# StartTransaction reconcile (ADR 0022 / RCA issue 04): when a new session starts
+# on a charger that still has an open transaction, classify the old one. Last
+# activity newer than this window ⇒ genuinely live (reject ConcurrentTx); older ⇒
+# a stale orphan the charger has moved on from (finalize + accept the new one).
+START_TXN_LIVE_WINDOW_SECONDS = 90
+# A live txn whose meter baseline matches an incoming StartTransaction within this
+# window is treated as a network RETRY of the same start — return its txn id.
+START_TXN_RETRY_WINDOW_SECONDS = 30
+
+
+async def _reconcile_existing_open_transaction(charge_point_id, charger, meter_start):
+    """Resolve any existing open transaction on this charger before starting a new
+    one (ADR 0022 / RCA issue 04). Returns a StartTransaction response to send
+    immediately (idempotent retry-Accept, or ConcurrentTx reject), or None to
+    proceed with a fresh transaction (having finalized a stale orphan).
+
+    Module-level (not a ChargePoint method) so tests that drive on_start_transaction
+    via a mocked self still exercise the real reconcile. Scoped per CHARGER:
+    Transaction carries no connector_id and the fleet is single-connector — revisit
+    if multi-connector chargers are introduced.
+    """
+    from models import Transaction, TransactionStatusEnum
+    from services.transaction_finalizer import is_resume_too_stale
+    open_states = [
+        TransactionStatusEnum.STARTED, TransactionStatusEnum.PENDING_START,
+        TransactionStatusEnum.RUNNING, TransactionStatusEnum.SUSPENDED,
+        TransactionStatusEnum.PENDING_STOP,
+    ]
+    existing = await Transaction.filter(
+        charger_id=charger.id, transaction_status__in=open_states,
+    ).order_by("-start_time").first()
+    if not existing:
+        return None
+
+    _, gap = await is_resume_too_stale(existing)
+    live = (
+        existing.transaction_status in (
+            TransactionStatusEnum.RUNNING, TransactionStatusEnum.STARTED)
+        and gap is not None and gap < START_TXN_LIVE_WINDOW_SECONDS
+    )
+    if live:
+        incoming_kwh = Decimal(str(meter_start)) / Decimal(1000)
+        if (existing.start_meter_kwh is not None
+                and abs(existing.start_meter_kwh - incoming_kwh) < Decimal("0.001")
+                and gap < START_TXN_RETRY_WINDOW_SECONDS):
+            logger.info(
+                f"🔁 StartTransaction from {charge_point_id}: retry of live txn "
+                f"{existing.id} — returning same transactionId"
+            )
+            return call_result.StartTransaction(
+                transaction_id=existing.id, id_tag_info={"status": "Accepted"})
+        logger.warning(
+            f"⛔ StartTransaction from {charge_point_id}: charger already has live "
+            f"transaction {existing.id} (gap={gap:.0f}s) — rejecting ConcurrentTx"
+        )
+        return call_result.StartTransaction(
+            transaction_id=0, id_tag_info={"status": "ConcurrentTx"})
+
+    logger.warning(
+        f"♻️ StartTransaction from {charge_point_id}: superseding stale open "
+        f"transaction {existing.id} (status={existing.transaction_status}, gap={gap}s)"
+    )
+    from services.transaction_finalizer import finalize_stopped_transaction
+    await finalize_stopped_transaction(existing, "SUPERSEDED_BY_NEW_START")
+    return None
+
 # Socket charger grace period (seconds) before failing txn on Available status
 SOCKET_GRACE_PERIOD_SECONDS = int(os.environ.get("SOCKET_GRACE_PERIOD_SECONDS", "300"))
 
@@ -759,7 +825,7 @@ class ChargePoint(OcppChargePoint):
 
         logger.info(f"StartTransaction from {self.id}: connector_id={connector_id}, id_tag={mask_id_tag(id_tag)}, meter_start={meter_start}")
         
-        from models import Transaction, User, VehicleProfile, Charger, TransactionStatusEnum
+        from models import Transaction, User, Charger, TransactionStatusEnum
         
         try:
             # Get charger from database
@@ -789,18 +855,27 @@ class ChargePoint(OcppChargePoint):
                     transaction_id=0,
                     id_tag_info={"status": "Blocked"}
                 )
-            
-            # Get or create a vehicle profile for the user
-            vehicle, _ = await VehicleProfile.get_or_create(
-                user=user,
-                defaults={"make": "Unknown", "model": "Unknown"}
+
+            # Reconcile any existing open transaction on this charger before
+            # starting a new one — finalize a stale orphan, or short-circuit on a
+            # retry / genuine concurrent (ADR 0022 / RCA issue 04).
+            reconcile_response = await _reconcile_existing_open_transaction(
+                self.id, charger, meter_start
             )
-            
+            if reconcile_response is not None:
+                return reconcile_response
+
+            # No vehicle is recorded. OCPP 1.6 StartTransaction carries no vehicle
+            # identity, so Transaction.vehicle is left null (the FK is nullable)
+            # rather than fabricating an "Unknown" placeholder profile — which also
+            # removed a non-atomic get_or_create race that could lock a user out of
+            # charging once they had >1 profile. Populate vehicle only when a real
+            # vehicle-identity mechanism exists. See upsert-race-hardening issue 02.
+
             # Create transaction record
             transaction = await Transaction.create(
                 user=user,
                 charger=charger,
-                vehicle=vehicle,
                 start_meter_kwh=Decimal(str(meter_start)) / Decimal(1000),  # Convert Wh to kWh
                 transaction_status=TransactionStatusEnum.RUNNING  # Changed from STARTED to RUNNING
             )
@@ -1035,7 +1110,7 @@ class ChargePoint(OcppChargePoint):
                 if is_stale:
                     logger.warning(
                         f"⏰ Refusing to resume stale transaction {transaction_id} "
-                        f"via MeterValues — gap={gap:.0f}s exceeds MAX_RESUME_GAP_SECONDS"
+                        f"via MeterValues — gap={gap:.0f}s exceeds derived staleness cutoff"
                     )
                     safe_create_task(log_audit_event(
                         action="transaction.resume_blocked",
