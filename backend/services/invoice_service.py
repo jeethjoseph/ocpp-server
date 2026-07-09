@@ -96,6 +96,68 @@ def _format_energy_billed_kwh(energy_kwh) -> str:
     return f"{energy_kwh:.3f}"
 
 
+def build_invoice_line_items(invoice) -> list:
+    """Numeric per-line breakdown for the itemised invoice/receipt (ADR 0024).
+
+    Returns up to two items — Energy and (unless wallet) Gateway charges — each a
+    dict: {label, hsn, rate, qty, taxable, taxes, line_total}. `taxes` is a list
+    of (head_name, rate_pct, amount): [SGST, CGST] intra-state, [IGST] inter-state.
+
+    Per-line tax is a DISPLAY ALLOCATION of the stored total-level tax (ADR 0017
+    is untouched): the Energy line takes `round(energy_taxable × rate%)` for each
+    head and the Gateway line takes `stored_total − energy_share`, so every head
+    sums exactly back to the stored amount (the residual lands on the gateway
+    line). Energy `rate` is derived as `taxable ÷ qty` (== rate_per_kwh) so it
+    works for legacy invoices that never stored it. Shared by generate_pdf and the
+    /my-charges receipt endpoint.
+    """
+    if invoice.is_inter_state:
+        heads = [("IGST", invoice.igst_rate or Decimal("0"),
+                  invoice.igst_amount or Decimal("0"))]
+    else:
+        heads = [
+            ("SGST", invoice.sgst_rate or Decimal("0"), invoice.sgst_amount or Decimal("0")),
+            ("CGST", invoice.cgst_rate or Decimal("0"), invoice.cgst_amount or Decimal("0")),
+        ]
+
+    energy_taxable = invoice.energy_taxable_value or Decimal("0")
+    gateway_taxable = invoice.gateway_charges or Decimal("0")
+    has_gateway = gateway_taxable > 0
+
+    energy_taxes, gateway_taxes = [], []
+    for name, rate, total in heads:
+        e_share = (energy_taxable * rate / Decimal("100")).quantize(TWO_DP, ROUND_HALF_UP)
+        energy_taxes.append((name, rate, e_share))
+        if has_gateway:
+            gateway_taxes.append((name, rate, total - e_share))
+
+    qty = invoice.energy_consumed_kwh or Decimal("0")
+    energy_rate = (
+        (energy_taxable / qty).quantize(TWO_DP, ROUND_HALF_UP)
+        if qty > 0 else Decimal("0")
+    )
+    items = [{
+        "label": "Energy",
+        "hsn": str(invoice.hsn_sac_code),
+        "rate": energy_rate,
+        "qty": qty,
+        "taxable": energy_taxable,
+        "taxes": energy_taxes,
+        "line_total": energy_taxable + sum((t[2] for t in energy_taxes), Decimal("0")),
+    }]
+    if has_gateway:
+        items.append({
+            "label": "Gateway charges",
+            "hsn": str(invoice.gateway_hsn_code),
+            "rate": gateway_taxable,
+            "qty": Decimal("1"),
+            "taxable": gateway_taxable,
+            "taxes": gateway_taxes,
+            "line_total": gateway_taxable + sum((t[2] for t in gateway_taxes), Decimal("0")),
+        })
+    return items
+
+
 class InvoiceService:
 
     @staticmethod
@@ -442,11 +504,13 @@ class InvoiceService:
             connector_type=connector_type,
             energy_consumed_kwh=billable_kwh,
             tariff_rate_incl_tax=tariff_rate_incl,
-            # Snapshot the operator-set all-in rate at issuance time so the
-            # PDF can show the same number the customer saw on the QR /
-            # stations screen when they paid. NULL for legacy invoices and
-            # for wallet/admin sessions where no Tariff row resolves; the
-            # PDF falls back to `tariff_rate_incl_tax` in that case.
+            # Snapshot the operator-set all-in rate at issuance time so the PDF
+            # can show, as a "Tariff quoted (all-inclusive)" note, the same number
+            # the customer saw on the QR / stations screen when they paid (ADR
+            # 0024). NULL for legacy invoices and for wallet/admin sessions where
+            # no Tariff row resolves; the note is then omitted. The itemised
+            # table's Rate column is derived (energy_taxable ÷ kWh), independent
+            # of this snapshot, so legacy invoices still render a correct Rate.
             tariff_per_kwh_all_in=(
                 tariff.tariff_per_kwh_all_in if tariff else None
             ),
@@ -595,69 +659,94 @@ class InvoiceService:
         elements.append(t)
         elements.append(Spacer(1, 4*mm))
 
-        # Line items table
+        # Charging-session metadata — moved out of the line-item table (ADR 0024):
+        # charged-on / duration are session attributes, not line attributes.
         charged_on_str = to_ist(invoice.charged_on).strftime("%d/%m/%Y, %I:%M %p") if invoice.charged_on else ""
         duration_str = _format_duration(invoice.duration_seconds)
-
-        # Tariff column shows the operator-set, customer-displayed all-in
-        # rate when we snapshotted it at issuance (post-2026-05-19 invoices);
-        # legacy invoices fall back to the GST-only-effective rate captured
-        # in `tariff_rate_incl_tax`. The column header reflects which one
-        # we're displaying so the customer / auditor isn't misled.
+        charging_meta = f"<b>Charging date/time:</b> {charged_on_str or 'NA'}"
+        if duration_str:
+            charging_meta += f"&nbsp;&nbsp;·&nbsp;&nbsp;<b>Duration:</b> {duration_str}"
+        elements.append(Paragraph(charging_meta, normal_style))
+        # All-in tariff the customer was quoted at pay time (ADR 0003), shown so
+        # the GST-exclusive per-kWh Rate in the table below isn't mistaken for a
+        # price change (ADR 0024 consequence).
         if invoice.tariff_per_kwh_all_in is not None:
-            tariff_header = "TARIFF / kWh\n(Including Taxes and\nGateway Charges)"
-            tariff_cell = f"{invoice.tariff_per_kwh_all_in:.2f}"
-        else:
-            tariff_header = "TARIFF / kWh\n(Including Taxes)"
-            tariff_cell = str(invoice.tariff_rate_incl_tax)
+            elements.append(Paragraph(
+                f"Tariff quoted (all-inclusive): {invoice.tariff_per_kwh_all_in:.2f} / kWh",
+                small_style,
+            ))
+        elements.append(Spacer(1, 3*mm))
 
-        header = ["HSN CODE", "ENERGY BILLED\n(kWh)", tariff_header, "CHARGED ON", "DURATION", "AMOUNT (INR)"]
+        # Itemised line-item table (ADR 0024): HSN · Item · Rate · Qty · tax
+        # heads · Line total. Per-line tax is a display allocation of the stored
+        # total-level tax; inter-state collapses SGST+CGST into one IGST column.
+        line_items = build_invoice_line_items(invoice)
+        tax_heads = ["IGST"] if invoice.is_inter_state else ["SGST", "CGST"]
+        header = ["HSN", "ITEM", "RATE", "QTY", "TAXABLE\nVALUE"] + tax_heads + ["LINE TOTAL"]
         rows = [header]
-        rows.append([
-            str(invoice.hsn_sac_code),
-            _format_energy_billed_kwh(invoice.energy_consumed_kwh),
-            tariff_cell,
-            charged_on_str,
-            duration_str,
-            f"{invoice.energy_taxable_value:.2f}",
-        ])
-        if invoice.gateway_charges and invoice.gateway_charges > 0:
-            rows.append([
-                str(invoice.gateway_hsn_code), "", "", "", "Gateway Charges",
-                f"{invoice.gateway_charges:.2f}",
-            ])
+        for it in line_items:
+            if it["label"] == "Energy":
+                # GST-exclusive per-kWh rate against kWh delivered.
+                rate_str = f"{it['rate']:.2f}/kWh"
+                qty_str = _format_energy_billed_kwh(it["qty"])
+            else:
+                # Gateway is a flat % of the amount paid — show the nominal rate
+                # (derived from the invoice's own synthetic split so legacy
+                # invoices keep their historical %) against the paid amount as qty.
+                paid = invoice.transaction_amount or Decimal("0")
+                gw_all_in = (invoice.gateway_charges or Decimal("0")) + (invoice.gateway_gst or Decimal("0"))
+                pct = (
+                    (gw_all_in / paid * Decimal("100")).quantize(TWO_DP, ROUND_HALF_UP)
+                    if paid > 0 else Decimal("0")
+                )
+                rate_str = f"{pct.normalize():f}%"
+                qty_str = f"{paid:.2f}"
+            rows.append(
+                [it["hsn"], it["label"], rate_str, qty_str, f"{it['taxable']:.2f}"]
+                + [f"{amt:.2f}" for (_, _, amt) in it["taxes"]]
+                + [f"{it['line_total']:.2f}"]
+            )
 
-        t = Table(rows, colWidths=[60, 70, 80, 90, 70, 80])
+        # Fill the full body width (page minus the 15mm L/R margins). Weights
+        # are relative; scaled to the available frame so the table spans edge to
+        # edge rather than floating at its intrinsic width.
+        avail = A4[0] - 30 * mm
+        weights = (
+            [0.9, 2.3, 1.5, 1.3, 1.4, 1.3, 1.5] if invoice.is_inter_state
+            else [0.9, 2.2, 1.4, 1.2, 1.3, 1.0, 1.0, 1.3]
+        )
+        wsum = sum(weights)
+        col_widths = [w / wsum * avail for w in weights]
+        t = Table(rows, colWidths=col_widths)
         t.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E8F5E9")),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
             ("FONTSIZE", (0, 0), (-1, -1), 8),
-            ("ALIGN", (-1, 0), (-1, -1), "RIGHT"),
+            ("ALIGN", (2, 0), (-1, -1), "RIGHT"),
             ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ("TOPPADDING", (0, 0), (-1, -1), 4),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
         ]))
+        t.hAlign = "LEFT"  # align the table with the rest of the document body
         elements.append(t)
         elements.append(Spacer(1, 3*mm))
 
-        # Tax breakdown
-        tax_rows = []
-        if not invoice.is_inter_state and invoice.cgst_rate:
-            tax_rows.append([f"CGST {invoice.cgst_rate}%:", f"{invoice.cgst_amount:.2f}"])
-            tax_rows.append([f"SGST {invoice.sgst_rate}%:", f"{invoice.sgst_amount:.2f}"])
-        elif invoice.igst_rate:
-            tax_rows.append([f"IGST {invoice.igst_rate}%:", f"{invoice.igst_amount:.2f}"])
-
-        # Round Off — sub-rupee residual between independent CGST/SGST and the
-        # billing tax (ADR 0017). Shown only when non-zero.
+        # Totals footer (ADR 0024): the Line total column sums to Sub Total; the
+        # ADR 0017 paisa residual is the Round Off; TOTAL reconciles to
+        # amount_paid − refund for QR. Sub Total is shown only when there is a
+        # Round Off to explain — otherwise it just duplicates TOTAL.
+        footer_rows = []
         if invoice.round_off and invoice.round_off != 0:
-            tax_rows.append(["Round Off:", f"{invoice.round_off:.2f}"])
+            sub_total = sum((it["line_total"] for it in line_items), Decimal("0"))
+            footer_rows.append(["Sub Total:", f"{sub_total:.2f}"])
+            footer_rows.append(["Round Off:", f"{invoice.round_off:.2f}"])
+        footer_rows.append(["TOTAL", f"{invoice.total_amount:.2f}"])
 
-        tax_rows.append(["TOTAL", f"{invoice.total_amount:.2f}"])
-
-        t = Table(tax_rows, colWidths=[370, 80])
-        style_cmds = [
+        # Full-width footer so the rule above TOTAL spans the same width as the
+        # line-item table rather than floating at an intrinsic width.
+        t = Table(footer_rows, colWidths=[avail - 90, 90])
+        t.setStyle(TableStyle([
             ("ALIGN", (0, 0), (0, -1), "RIGHT"),
             ("ALIGN", (1, 0), (1, -1), "RIGHT"),
             ("FONTSIZE", (0, 0), (-1, -1), 9),
@@ -665,8 +754,8 @@ class InvoiceService:
             ("LINEABOVE", (0, -1), (-1, -1), 1, colors.black),
             ("TOPPADDING", (0, 0), (-1, -1), 2),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-        ]
-        t.setStyle(TableStyle(style_cmds))
+        ]))
+        t.hAlign = "LEFT"
         elements.append(t)
         elements.append(Spacer(1, 3*mm))
 

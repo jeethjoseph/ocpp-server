@@ -88,7 +88,7 @@ Per-kWh price the operator types and the customer sees. Includes BOTH GST and th
 _Avoid_: incl-tax tariff, gross tariff, retail tariff.
 
 **`rate_per_kwh`**:
-Internal back-derived figure used by line-item billing math. Equals `all_in × (1 - fee_pct/100) / (1 + gst_pct/100)`. Never shown to customers.
+Back-derived GST- and gateway-exclusive per-kWh figure used by line-item billing math. Equals `all_in × (1 - fee_pct/100) / (1 + gst_pct/100)`. **Shown to customers as the "Rate" of the Energy line on the itemised GST Invoice (2026-07-09)** — it is the only per-kWh value that reconciles against additive per-line SGST/CGST columns and a separate gateway line. Not shown on non-invoice customer surfaces (QR/stations screens show the **All-in tariff**). Previously "never shown to customers"; the itemised-invoice redesign reverses that. See [[adr-0024-itemised-gst-invoice-layout]].
 _Avoid_: base rate, excl-tax tariff (both ambiguous post-2026-05-18).
 
 ### Fees and budget

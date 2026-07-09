@@ -573,6 +573,107 @@ async def test_invoice_gateway_gst_uses_synthetic_split(client):
 # IST invoice date / financial year (ADR 0012)
 # ============================================================================
 
+@pytest.mark.asyncio
+async def test_line_items_intra_state_allocation_sums_to_stored(client):
+    """ADR 0024: per-line SGST/CGST are a display allocation of the stored
+    total-level tax. Each head must sum back to the stored amount (gateway line
+    absorbs the residual), and the line totals reconcile to the grand total."""
+    from services.invoice_service import build_invoice_line_items
+
+    _, _, txn, _, _ = await _make_session(with_qr=True, energy_kwh=1.0)
+    invoice = await InvoiceService.generate_invoice(txn.id)
+    items = build_invoice_line_items(invoice)
+
+    assert [i["label"] for i in items] == ["Energy", "Gateway charges"]
+    # Tax heads intra-state are SGST + CGST on every line.
+    assert [name for name, _, _ in items[0]["taxes"]] == ["SGST", "CGST"]
+
+    def head_sum(head):
+        return sum(amt for i in items for name, _, amt in i["taxes"] if name == head)
+
+    assert head_sum("SGST") == invoice.sgst_amount
+    assert head_sum("CGST") == invoice.cgst_amount
+    # Energy rate is derived taxable ÷ qty (== rate_per_kwh), 2 dp.
+    assert items[0]["rate"] == (
+        invoice.energy_taxable_value / invoice.energy_consumed_kwh
+    ).quantize(Decimal("0.01"), ROUND_HALF_UP)
+    # Line total = taxable + its allocated tax; sum reconciles to grand total.
+    for i in items:
+        assert i["line_total"] == i["taxable"] + sum(a for _, _, a in i["taxes"])
+    sub_total = sum(i["line_total"] for i in items)
+    assert sub_total + (invoice.round_off or Decimal("0")) == invoice.total_amount
+
+
+def test_line_items_gateway_absorbs_rounding_residual():
+    """The residual-absorption is load-bearing, not incidental: pick taxable
+    values where naive per-line rounding would NOT sum to the stored total, and
+    assert the gateway line absorbs the difference so the head still sums exactly.
+
+    energy=0.05, gateway=0.05 @ 9%: naive round(0.05×9%)=0.00 on BOTH lines → 0.00,
+    but the stored total is round(0.10×9%)=0.01. Gateway must carry the 0.01."""
+    from types import SimpleNamespace
+    from services.invoice_service import build_invoice_line_items
+
+    inv = SimpleNamespace(
+        is_inter_state=False,
+        sgst_rate=Decimal("9.00"), sgst_amount=Decimal("0.01"),
+        cgst_rate=Decimal("9.00"), cgst_amount=Decimal("0.01"),
+        igst_rate=None, igst_amount=None,
+        energy_taxable_value=Decimal("0.05"), gateway_charges=Decimal("0.05"),
+        energy_consumed_kwh=Decimal("0.010"),
+        hsn_sac_code="996749", gateway_hsn_code="997158",
+    )
+    energy, gateway = build_invoice_line_items(inv)
+    # Energy rounds to 0.00; gateway absorbs the full 0.01 residual.
+    assert dict((n, a) for n, _, a in energy["taxes"]) == {"SGST": Decimal("0.00"), "CGST": Decimal("0.00")}
+    assert dict((n, a) for n, _, a in gateway["taxes"]) == {"SGST": Decimal("0.01"), "CGST": Decimal("0.01")}
+    # Heads still sum exactly to the stored totals.
+    assert energy["taxes"][0][2] + gateway["taxes"][0][2] == inv.sgst_amount
+    assert energy["taxes"][1][2] + gateway["taxes"][1][2] == inv.cgst_amount
+
+
+@pytest.mark.asyncio
+async def test_line_items_inter_state_uses_single_igst_head(client):
+    """Inter-state invoices allocate a single IGST head per line, summing to the
+    stored igst_amount."""
+    from services.invoice_service import build_invoice_line_items
+
+    _, _, txn, _, _ = await _make_session(with_qr=True, station_state_code="29")
+    invoice = await InvoiceService.generate_invoice(txn.id)
+    assert invoice.is_inter_state is True
+    items = build_invoice_line_items(invoice)
+
+    assert all([name for name, _, _ in i["taxes"]] == ["IGST"] for i in items)
+    igst_sum = sum(amt for i in items for _, _, amt in i["taxes"])
+    assert igst_sum == invoice.igst_amount
+
+
+@pytest.mark.asyncio
+async def test_line_items_wallet_has_single_energy_line(client):
+    """Wallet sessions have no gateway line — a single Energy item."""
+    from services.invoice_service import build_invoice_line_items
+
+    _, _, txn, _, _ = await _make_session(energy_kwh=2.0)  # no QR → wallet
+    invoice = await InvoiceService.generate_invoice(txn.id)
+    items = build_invoice_line_items(invoice)
+
+    assert len(items) == 1
+    assert items[0]["label"] == "Energy"
+
+
+@pytest.mark.asyncio
+async def test_itemised_pdf_renders_for_all_variants(client):
+    """generate_pdf produces a valid PDF for intra-state QR, inter-state QR, and
+    wallet invoices with the new itemised table."""
+    intra_txn = (await _make_session(with_qr=True))[2]
+    inter_txn = (await _make_session(with_qr=True, station_state_code="29"))[2]
+    wallet_txn = (await _make_session())[2]
+    for txn in (intra_txn, inter_txn, wallet_txn):
+        invoice = await InvoiceService.generate_invoice(txn.id)
+        pdf = InvoiceService.generate_pdf(invoice)
+        assert pdf[:4] == b"%PDF"
+
+
 def test_energy_billed_kwh_renders_at_milli_precision():
     """Regression (invoice 60): the "ENERGY BILLED (kWh)" cell must render at 3
     decimals. A sub-0.1 kWh session previously rendered "0.0" (1 dp) next to a
