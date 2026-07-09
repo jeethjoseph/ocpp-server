@@ -84,6 +84,18 @@ def _format_duration(seconds: Optional[int]) -> str:
     return f"{m:02d}m:{s:02d}"
 
 
+def _format_energy_billed_kwh(energy_kwh) -> str:
+    """Render the invoice's "ENERGY BILLED (kWh)" cell at milli-precision (3 dp).
+
+    Milli-precision, NOT 1 dp: a sub-0.1 kWh session (de-minimis or budget-capped)
+    must not round to "0.0" beside a non-zero amount — that shipped once as a bug
+    (a 0.02 kWh session rendered "0.0"). 3 dp also matches the precision that
+    `billable_kwh` is quantized to in `generate_invoice`, so the line-item
+    `tariff × kWh = amount` reconciles on the page.
+    """
+    return f"{energy_kwh:.3f}"
+
+
 class InvoiceService:
 
     @staticmethod
@@ -213,6 +225,35 @@ class InvoiceService:
         if energy <= 0:
             return None
 
+        # Suppress issuance for a fully-refunded / non-billed session. Metered
+        # energy can be > 0 (so the guard above passes) while the customer was
+        # made whole — e.g. the ADR 0013 fault-refund band (FAILED with
+        # 0 < energy < MIN_BILLABLE_ENERGY_KWH), or a goodwill full refund of an
+        # otherwise-billed session. Issuing a tax invoice then asserts a taxable
+        # supply (the synthetic gateway line + GST, ADR 0001) that was actually
+        # returned to the customer, and breaks the prepaid invariant
+        # total_amount + refund_amount == amount_paid. Gate on the NET amount
+        # retained, not the metered kWh (which is > 0 here). QRPayment is fetched
+        # here (rather than further down) so the guard runs before any lookups
+        # that could consume work or an invoice number.
+        qr_payment = await QRPayment.filter(
+            transaction_id=transaction_id
+        ).first()
+        if qr_payment is not None:
+            net_retained = (qr_payment.amount_paid or Decimal("0")) - (
+                qr_payment.refund_amount or Decimal("0")
+            )
+        else:
+            net_retained = txn.total_billed or Decimal("0")
+        if net_retained <= 0:
+            logger.info(
+                "GST invoice skipped for txn %s: net amount retained <= 0 "
+                "(fully-refunded / non-billed session)",
+                transaction_id,
+            )
+            MetricsCollector.increment_counter("Custom/Invoice/NonBillableSkipped")
+            return None
+
         # Skip invoicing for internal-role sessions (admin test-charges or
         # franchisee remote-starts on their own stations). These are purely
         # operational — no wallet deduction (skipped in WalletService per
@@ -272,11 +313,8 @@ class InvoiceService:
             MetricsCollector.increment_counter("Custom/Invoice/GstinMissing")
             return None
 
-        # Customer details (user already fetched above for the role-skip guard)
-        qr_payment = await QRPayment.filter(
-            transaction_id=transaction_id
-        ).first()
-
+        # Customer details. `user` was fetched above for the role-skip guard;
+        # `qr_payment` was fetched above for the net-retained guard.
         if qr_payment:
             payment_method = "UPI"
             # QR customers identify by VPA — use it as the name fallback
@@ -577,7 +615,7 @@ class InvoiceService:
         rows = [header]
         rows.append([
             str(invoice.hsn_sac_code),
-            f"{invoice.energy_consumed_kwh:.1f}",
+            _format_energy_billed_kwh(invoice.energy_consumed_kwh),
             tariff_cell,
             charged_on_str,
             duration_str,

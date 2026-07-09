@@ -449,6 +449,106 @@ async def test_invoice_total_plus_refund_equals_amount_paid(client):
 
 
 @pytest.mark.asyncio
+async def test_fault_refund_session_issues_no_invoice(client):
+    """Regression (invoice 61 / VL/F3/QR/202627/00061): a QR session that
+    ended FAILED after delivering 0 < energy < 0.5 kWh is fully refunded and
+    its billing breakdown is never written (energy_charge stays 0, per the
+    ADR 0013 fault-refund band in QRPaymentService._refund_if_non_billable).
+
+    No GST invoice should be issued for a fully-refunded, non-billed session —
+    issuing one asserts a taxable supply (the synthetic gateway fee + GST) that
+    was in fact returned to the customer. The pre-existing `energy <= 0` guard
+    in generate_invoice protects the zero-energy full-refund band but NOT this
+    fault-refund band, because it checks *metered* kWh (0.19 > 0) rather than
+    the *billed* amount (energy_charge == 0)."""
+    rate = Decimal("25.00")
+    _, _, txn, _, qr_payment = await _make_session(
+        rate=rate, energy_kwh=0.19, with_qr=True
+    )
+    # Simulate the fault-refund outcome: FAILED, billing skipped (energy_charge
+    # / gst zeroed), and the full ₹50 payment refunded to the customer.
+    await Transaction.filter(id=txn.id).update(
+        transaction_status=TransactionStatusEnum.FAILED,
+        energy_charge=Decimal("0"),
+        gst_amount=Decimal("0"),
+        total_billed=Decimal("0"),
+    )
+    await QRPayment.filter(id=qr_payment.id).update(
+        amount_paid=Decimal("50.00"),
+        refund_amount=Decimal("50.00"),
+        energy_cost=Decimal("0"),
+        gst_amount=Decimal("0"),
+        status=QRPaymentStatusEnum.REFUNDED,
+    )
+
+    invoice = await InvoiceService.generate_invoice(txn.id)
+
+    assert invoice is None, (
+        "A fully-refunded fault session must not produce a GST invoice — "
+        "it asserts a taxable gateway supply that was refunded."
+    )
+    assert await GSTInvoice.filter(transaction_id=txn.id).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_goodwill_full_refund_of_billed_session_issues_no_invoice(client):
+    """Net-retained guard (stricter than energy_charge alone): a QR session that
+    DID bill energy but was later fully refunded (e.g. a goodwill/admin refund)
+    has net retained = amount_paid - refund_amount = 0, so no invoice is issued.
+    This is the case the net-retained form catches that a bare `energy_charge > 0`
+    guard would not."""
+    _, _, txn, _, qr_payment = await _make_session(with_qr=True, energy_kwh=0.5)
+    # energy_charge stays > 0 (real billing happened), but the whole payment is
+    # returned — net retained collapses to zero.
+    await QRPayment.filter(id=qr_payment.id).update(
+        refund_amount=qr_payment.amount_paid,
+        status=QRPaymentStatusEnum.REFUNDED,
+    )
+
+    invoice = await InvoiceService.generate_invoice(txn.id)
+
+    assert invoice is None, (
+        "A fully-refunded billed session (net retained == 0) must not produce "
+        "a GST invoice, even though energy_charge > 0."
+    )
+    assert await GSTInvoice.filter(transaction_id=txn.id).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_wallet_zero_billed_session_issues_no_invoice(client):
+    """Wallet sessions (no QRPayment) gate on total_billed: a metered session
+    that somehow billed nothing (total_billed == 0) issues no invoice."""
+    _, _, txn, _, _ = await _make_session(energy_kwh=1.0)
+    await Transaction.filter(id=txn.id).update(
+        energy_charge=Decimal("0"),
+        gst_amount=Decimal("0"),
+        total_billed=Decimal("0"),
+    )
+
+    invoice = await InvoiceService.generate_invoice(txn.id)
+
+    assert invoice is None
+    assert await GSTInvoice.filter(transaction_id=txn.id).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_partial_refund_session_still_issues_invoice(client):
+    """Guardrail: a normal partially-refunded QR session (net retained > 0) still
+    issues an invoice, and the prepaid invariant holds. Ensures the net-retained
+    guard doesn't over-suppress."""
+    _, _, txn, _, qr_payment = await _make_session(with_qr=True, energy_kwh=0.5)
+
+    invoice = await InvoiceService.generate_invoice(txn.id)
+
+    assert invoice is not None
+    assert qr_payment.refund_amount < qr_payment.amount_paid  # partial refund
+    reconciled = (invoice.total_amount or Decimal("0")) + (
+        invoice.refund_amount or Decimal("0")
+    )
+    assert abs(reconciled - invoice.transaction_amount) <= Decimal("0.02")
+
+
+@pytest.mark.asyncio
 async def test_invoice_gateway_gst_uses_synthetic_split(client):
     """generate_invoice writes gateway_gst from the synthetic 2% split,
     NOT from qr_payment.razorpay_gst. Wallet sessions (no qr_payment) leave
@@ -472,6 +572,21 @@ async def test_invoice_gateway_gst_uses_synthetic_split(client):
 # ============================================================================
 # IST invoice date / financial year (ADR 0012)
 # ============================================================================
+
+def test_energy_billed_kwh_renders_at_milli_precision():
+    """Regression (invoice 60): the "ENERGY BILLED (kWh)" cell must render at 3
+    decimals. A sub-0.1 kWh session previously rendered "0.0" (1 dp) next to a
+    non-zero amount, which reads as "billed for zero energy". Milli-precision
+    also keeps `tariff × kWh = amount` reconciling on the page."""
+    from services.invoice_service import _format_energy_billed_kwh
+
+    # The exact invoice-60 case: 0.02 kWh must not collapse to "0.0".
+    assert _format_energy_billed_kwh(Decimal("0.02")) == "0.020"
+    assert _format_energy_billed_kwh(Decimal("0.188")) == "0.188"
+    # Always 3 decimal places, even for whole/large values.
+    assert _format_energy_billed_kwh(Decimal("2")) == "2.000"
+    assert _format_energy_billed_kwh(Decimal("15.5")) == "15.500"
+
 
 def test_to_ist_treats_naive_as_utc_and_crosses_day():
     from datetime import datetime, timezone
