@@ -296,12 +296,17 @@ export interface QRTransactionItem {
   amount_paid: string;
   status: string;
   energy_consumed_kwh: number | null;
+  // Reconciled to match the GST invoice exactly: energy_cost + gateway_fee +
+  // gst_amount == amount_paid − refund. gateway_fee is the synthetic gateway
+  // charge shown on the bill, NOT the actual Razorpay commission (ADR 0001).
   energy_cost: string | null;
   gst_amount: string | null;
-  platform_fee: string | null;
-  razorpay_commission: string | null;
-  razorpay_gst: string | null;
-  fee_source: string | null;
+  gateway_fee: string | null;
+  // Itemised, tax-inclusive line totals mirroring the GST invoice's Line total
+  // column (ADR 0024): Energy + Gateway charges. `bill_total` is the amount the
+  // customer netted (amount_paid − refund). Line amounts sum to bill_total.
+  line_items: { label: string; amount: string }[];
+  bill_total: string | null;
   refund_amount: string | null;
   razorpay_refund_id: string | null;
   razorpay_refund_speed_processed: string | null;

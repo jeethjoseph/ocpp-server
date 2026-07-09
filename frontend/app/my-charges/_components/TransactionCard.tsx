@@ -139,22 +139,21 @@ export function TransactionCard({ txn, vpa }: { txn: QRTransactionItem; vpa: str
           )}
         </div>
 
-        {txn.energy_cost && (
+        {txn.line_items?.length > 0 && (
           <div className="border-t border-border pt-2 space-y-1 text-sm">
-            <div className="flex justify-between text-muted-foreground">
-              <span>Energy cost</span>
-              <span>{formatINRBare(txn.energy_cost)}</span>
-            </div>
-            {txn.gst_amount && (
-              <div className="flex justify-between text-muted-foreground">
-                <span>GST</span>
-                <span>{formatINRBare(txn.gst_amount)}</span>
+            {txn.line_items.map((item) => (
+              <div
+                key={item.label}
+                className="flex justify-between text-muted-foreground"
+              >
+                <span>{item.label}</span>
+                <span>{formatINRBare(item.amount)}</span>
               </div>
-            )}
-            {txn.platform_fee && (
-              <div className="flex justify-between text-muted-foreground">
-                <span>Platform fee{txn.fee_source === 'estimated' ? ' (est.)' : ''}</span>
-                <span>{formatINRBare(txn.platform_fee)}</span>
+            ))}
+            {txn.bill_total && (
+              <div className="flex justify-between font-semibold text-card-foreground border-t border-border pt-1 mt-1">
+                <span>Total</span>
+                <span>{formatINRBare(txn.bill_total)}</span>
               </div>
             )}
           </div>

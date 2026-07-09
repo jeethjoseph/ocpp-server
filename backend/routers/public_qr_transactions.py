@@ -7,7 +7,9 @@ from core.validators import VPA_PATTERN
 from models import GSTInvoice, QRPayment, QRPaymentStatusEnum
 from redis_manager import redis_manager
 from routers.invoices import serve_invoice_pdf
+from services.invoice_service import build_invoice_line_items
 from services.qr_payment_service import is_below_minimum_reason
+from services.tariff_utils import synthetic_fee_split
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/public/qr-transactions", tags=["Public QR Transactions"])
@@ -30,6 +32,56 @@ def _validate_vpa_format(vpa: str) -> str:
     if not VPA_PATTERN.match(vpa):
         raise HTTPException(status_code=400, detail="Invalid UPI ID format")
     return vpa
+
+
+def _customer_breakdown(payment, txn, invoice):
+    """Reconciled customer-facing billing breakdown, identical to the GST invoice.
+
+    Returns tax-inclusive per-line `line_items` (Energy, Gateway charges) plus a
+    `bill_total` — the same line totals the itemised PDF shows (ADR 0024), summing
+    to `amount_paid − refund`. Sources from the invoice (the reconciled source of
+    truth) when present, else falls back to the synthetic gateway split so we
+    never expose the actual Razorpay commission (`qr_payment.platform_fee`, ADR
+    0001). The flat `energy_cost` / `gst_amount` / `gateway_fee` fields are kept
+    for backward compatibility. Energy is shown at full stored precision.
+    """
+    if invoice is not None:
+        items = [
+            {"label": it["label"], "amount": str(it["line_total"])}
+            for it in build_invoice_line_items(invoice)
+        ]
+        return {
+            "energy_consumed_kwh": invoice.energy_consumed_kwh,
+            "energy_cost": str(invoice.energy_taxable_value),
+            "gst_amount": str(invoice.total_tax),
+            "gateway_fee": str(invoice.gateway_charges) if invoice.gateway_charges else None,
+            "line_items": items,
+            "bill_total": str(invoice.total_amount),
+        }
+    if txn is not None and txn.energy_charge is not None:
+        gateway_taxable, gateway_gst = synthetic_fee_split(payment.amount_paid)
+        gst_total = (txn.gst_amount or Decimal("0")) + gateway_gst
+        energy_incl = (txn.energy_charge or Decimal("0")) + (txn.gst_amount or Decimal("0"))
+        gateway_incl = gateway_taxable + gateway_gst
+        items = [{"label": "Energy", "amount": str(energy_incl)}]
+        if gateway_incl > 0:
+            items.append({"label": "Gateway charges", "amount": str(gateway_incl)})
+        return {
+            "energy_consumed_kwh": txn.energy_consumed_kwh,
+            "energy_cost": str(txn.energy_charge),
+            "gst_amount": str(gst_total),
+            "gateway_fee": str(gateway_taxable),
+            "line_items": items,
+            "bill_total": str(energy_incl + gateway_incl),
+        }
+    return {
+        "energy_consumed_kwh": txn.energy_consumed_kwh if txn else None,
+        "energy_cost": None,
+        "gst_amount": None,
+        "gateway_fee": None,
+        "line_items": [],
+        "bill_total": None,
+    }
 
 
 @router.get("")
