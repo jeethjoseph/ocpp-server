@@ -59,6 +59,7 @@ export interface Charger {
   tariff_gst_percent?: number;
   tariff_per_kwh_all_in?: number;
   latest_error?: LatestErrorInfo;
+  connectors?: ConnectorInput[];
 }
 
 export interface ChargerCreate {
@@ -84,8 +85,22 @@ export interface ChargerUpdate {
   vendor?: string;
   latest_status?: string;
   external_charger_id?: string;
+  connector_type?: string;
   tariff_per_kwh_all_in?: number;
 }
+
+// Selectable connector types (must match backend ALLOWED_CONNECTOR_TYPES).
+// The socket subset (Socket/Type1/Type2/domestic) is untethered and can be
+// remote-started from Available; the rest are tethered/DC.
+export const CONNECTOR_TYPE_OPTIONS = [
+  "Type2",
+  "Type1",
+  "Socket",
+  "CCS",
+  "CHAdeMO",
+  "GB/T",
+  "domestic",
+] as const;
 
 export interface ChargerListResponse {
   data: Charger[];

@@ -109,7 +109,7 @@ export function TransactionCard({ txn, vpa }: { txn: QRTransactionItem; vpa: str
               <p className="text-xs text-muted-foreground">Energy</p>
               <p className="font-semibold text-card-foreground">
                 {txn.energy_consumed_kwh != null
-                  ? `${Number(txn.energy_consumed_kwh).toFixed(2)} kWh`
+                  ? `${Number(txn.energy_consumed_kwh).toFixed(3)} kWh`
                   : "N/A"}
               </p>
             </div>

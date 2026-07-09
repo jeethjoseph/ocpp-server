@@ -405,6 +405,7 @@ export interface LogQueryParams {
   end_date?: string;
   direction?: string;
   errors_only?: boolean;
+  correlation_id?: string;
   offset?: number;
   limit?: number;
 }
@@ -417,6 +418,7 @@ function buildLogQuery(params?: LogQueryParams): string {
   if (params?.end_date) sp.set("end_date", params.end_date);
   if (params?.direction) sp.set("direction", params.direction);
   if (params?.errors_only) sp.set("errors_only", "true");
+  if (params?.correlation_id) sp.set("correlation_id", params.correlation_id);
   if (params?.offset !== undefined) sp.set("offset", params.offset.toString());
   if (params?.limit) sp.set("limit", params.limit.toString());
   return sp.toString();

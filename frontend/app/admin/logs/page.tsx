@@ -1,6 +1,6 @@
 "use client";
 
-import React, { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams, usePathname } from "next/navigation";
 import Link from "next/link";
 import { toast } from "sonner";
@@ -11,7 +11,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { AlertTriangle, ArrowUpDown, Download } from "lucide-react";
-import { useLogs } from "@/lib/queries/logs";
+import { useLogs, useLogReply } from "@/lib/queries/logs";
 import { LogEntry, logService } from "@/lib/api-services";
 import { OCPP_ACTIONS } from "@/lib/ocpp-actions";
 import { useAuth } from "@/contexts/AuthContext";
@@ -360,19 +360,20 @@ function DirectionBadge({ direction }: { direction: "IN" | "OUT" }) {
   );
 }
 
-function LogRow({ log }: { log: LogEntry }) {
-  const payload = log.payload;
-  let body: React.ReactNode;
+// Shared frame renderer — used both for a log row's own payload and for its
+// lazily-fetched correlated reply, so the two render identically.
+function FrameBody({ payload }: { payload: LogEntry["payload"] }) {
   if (!payload) {
-    body = <span className="text-gray-500 dark:text-gray-400">No payload</span>;
-  } else if (Array.isArray(payload) && payload.length >= 4) {
+    return <span className="text-gray-500 dark:text-gray-400">No payload</span>;
+  }
+  if (Array.isArray(payload) && payload.length >= 4) {
     const [msgType, msgId, action, actualPayload] = payload;
     const kind = msgType === 2 ? "Call" : msgType === 3 ? "CallResult" : msgType === 4 ? "CallError" : "Unknown";
     // The 4th element is usually an object, but can be an array or primitive on
     // malformed/non-standard frames — guard before treating it as a record.
     const isRecord = typeof actualPayload === "object" && actualPayload !== null;
     const hasContent = isRecord ? Object.keys(actualPayload).length > 0 : actualPayload != null;
-    body = (
+    return (
       <div className="space-y-2">
         <div className="flex items-center gap-2 text-xs">
           <Badge variant="outline" className="text-xs">{kind}</Badge>
@@ -386,13 +387,61 @@ function LogRow({ log }: { log: LogEntry }) {
         )}
       </div>
     );
-  } else {
-    body = (
-      <pre className="text-xs bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-600 p-3 rounded overflow-x-auto max-w-2xl text-gray-900 dark:text-gray-100">
-        {JSON.stringify(payload, null, 2)}
-      </pre>
-    );
   }
+  return (
+    <pre className="text-xs bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-600 p-3 rounded overflow-x-auto max-w-2xl text-gray-900 dark:text-gray-100">
+      {JSON.stringify(payload, null, 2)}
+    </pre>
+  );
+}
+
+// A request frame is an OCPP CALL (wire type 2). Only requests have a reply,
+// so only they get the expand-to-reply affordance.
+function isRequestFrame(payload: LogEntry["payload"]): boolean {
+  return Array.isArray(payload) && payload[0] === 2;
+}
+
+function CorrelatedReply({ log }: { log: LogEntry }) {
+  const { data, isFetching } = useLogReply({
+    correlationId: log.correlation_id,
+    chargePointId: log.charge_point_id,
+    aroundIso: log.timestamp,
+    enabled: true,
+  });
+
+  // The window may include the request itself (same correlation_id); pick the
+  // reply frame — a CallResult (3) or CallError (4).
+  const reply = useMemo(
+    () =>
+      (data?.data ?? []).find(
+        (r) => Array.isArray(r.payload) && (r.payload[0] === 3 || r.payload[0] === 4)
+      ),
+    [data]
+  );
+
+  if (isFetching) {
+    return <span className="text-xs text-gray-500 dark:text-gray-400">Loading response…</span>;
+  }
+  if (!reply) {
+    return <span className="text-xs text-gray-500 dark:text-gray-400">No response recorded</span>;
+  }
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center gap-2">
+        <DirectionBadge direction={reply.direction} />
+        <span className="text-xs text-gray-500 dark:text-gray-400 whitespace-nowrap">
+          {/* Force IST regardless of the admin's browser timezone. See CLAUDE.md "Timestamps". */}
+          {new Date(reply.timestamp).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}
+        </span>
+      </div>
+      <FrameBody payload={reply.payload} />
+    </div>
+  );
+}
+
+function LogRow({ log }: { log: LogEntry }) {
+  const [expanded, setExpanded] = useState(false);
+  const canExpand = isRequestFrame(log.payload) && !!log.correlation_id;
 
   return (
     <div className="border border-gray-200 dark:border-gray-700 rounded-lg p-4 bg-white dark:bg-gray-800 shadow-sm">
@@ -419,7 +468,24 @@ function LogRow({ log }: { log: LogEntry }) {
           Correlation ID: {log.correlation_id}
         </div>
       )}
-      <div className="mt-2">{body}</div>
+      <div className="mt-2"><FrameBody payload={log.payload} /></div>
+
+      {canExpand && (
+        <div className="mt-3">
+          <button
+            type="button"
+            onClick={() => setExpanded((v) => !v)}
+            className="text-xs text-blue-600 dark:text-blue-400 hover:underline"
+          >
+            {expanded ? "▾ Hide response" : "▸ Show response"}
+          </button>
+          {expanded && (
+            <div className="mt-2 ml-3 pl-3 border-l-2 border-gray-200 dark:border-gray-700">
+              <CorrelatedReply log={log} />
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

@@ -27,6 +27,40 @@ export const useLogs = (params: {
   });
 };
 
+// Fetch the correlated reply (CallResult/CallError) for a single OCPP request.
+// Scoped by correlation_id + charge_point_id + a tight window around the request
+// timestamp: the window (a) beats the endpoint's default 24h bound for historical
+// rows and (b) disambiguates charger-reused messageIds across reboots (a boot_*
+// id is not globally unique). Lazy — only runs once the row is expanded.
+export const useLogReply = (params: {
+  correlationId: string | null;
+  chargePointId: string | null;
+  aroundIso: string;
+  enabled: boolean;
+}) => {
+  const { isAuthReady } = useAuth();
+  const { correlationId, chargePointId, aroundIso } = params;
+  const around = new Date(aroundIso).getTime();
+  const start_date = new Date(around - 5_000).toISOString();
+  const end_date = new Date(around + 120_000).toISOString();
+
+  return useQuery({
+    queryKey: ["logReply", correlationId, chargePointId, aroundIso],
+    queryFn: () =>
+      logService.getLogs({
+        correlation_id: correlationId ?? undefined,
+        charge_point_id: chargePointId ?? undefined,
+        start_date,
+        end_date,
+        limit: 20,
+      }),
+    enabled: isAuthReady && params.enabled && !!correlationId,
+    staleTime: 5 * 60 * 1000,
+    gcTime: 5 * 60 * 1000,
+    refetchOnWindowFocus: false,
+  });
+};
+
 export const useChargerTimeline = (
   chargePointId: string,
   params?: {

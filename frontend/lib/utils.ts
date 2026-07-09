@@ -5,12 +5,25 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
 }
 
+// Untethered connector types — the driver plugs in their own cable, so the
+// charger idles in "Available" until authorised and CAN be remote-started from
+// Available. Tethered/DC types (CCS, CHAdeMO, GB/T) transition to "Preparing"
+// when a vehicle is plugged in and must be started from there. Anything we don't
+// recognise defaults to tethered — we never auto-enable start-from-Available for
+// an unknown type. See socket-charger-classification issue 01.
+const SOCKET_CONNECTOR_TYPES = new Set(["socket", "type1", "type2", "domestic"]);
+
+function normalizeConnectorType(raw: string): string {
+  return raw.trim().toLowerCase().replace(/[\s_-]+/g, "");
+}
+
 export function isSocketCharger(
   connectors?: Array<{ connector_type: string }>
 ): boolean {
   return (
-    connectors?.some((c) => c.connector_type.toLowerCase() === "socket") ??
-    false
+    connectors?.some((c) =>
+      SOCKET_CONNECTOR_TYPES.has(normalizeConnectorType(c.connector_type))
+    ) ?? false
   );
 }
 

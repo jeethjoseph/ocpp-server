@@ -10,7 +10,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Table } from "@/components/ui/table";
 
-import { Charger, ChargerCreate, ChargerUpdate, Station } from "@/types/api";
+import { Charger, ChargerCreate, ChargerUpdate, Station, CONNECTOR_TYPE_OPTIONS } from "@/types/api";
 import {
   useChargers,
   useStations,
@@ -784,6 +784,7 @@ function EditChargerModal({ charger, onSubmit, onClose }: EditChargerModalProps)
     model: charger.model || "",
     vendor: charger.vendor || "",
     external_charger_id: charger.external_charger_id || "",
+    connector_type: charger.connectors?.[0]?.connector_type || "",
     tariff_per_kwh_all_in:
       charger.tariff_per_kwh_all_in != null
         ? Number(charger.tariff_per_kwh_all_in).toFixed(2)
@@ -797,6 +798,7 @@ function EditChargerModal({ charger, onSubmit, onClose }: EditChargerModalProps)
       model: formData.model || undefined,
       vendor: formData.vendor || undefined,
       external_charger_id: formData.external_charger_id || undefined,
+      connector_type: formData.connector_type || undefined,
       tariff_per_kwh_all_in: formData.tariff_per_kwh_all_in
         ? parseFloat(formData.tariff_per_kwh_all_in)
         : undefined,
@@ -866,6 +868,36 @@ function EditChargerModal({ charger, onSubmit, onClose }: EditChargerModalProps)
               placeholder="Unique identifier"
               className="w-full px-3 py-2 border border-border bg-input text-foreground rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 transition-colors"
             />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-card-foreground mb-1">
+              Connector Type
+            </label>
+            <select
+              value={formData.connector_type}
+              onChange={(e) =>
+                setFormData({ ...formData, connector_type: e.target.value })
+              }
+              className="w-full px-3 py-2 border border-border bg-input text-foreground rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 transition-colors">
+              {formData.connector_type &&
+                !CONNECTOR_TYPE_OPTIONS.includes(
+                  formData.connector_type as (typeof CONNECTOR_TYPE_OPTIONS)[number]
+                ) && (
+                  <option value={formData.connector_type}>
+                    {formData.connector_type}
+                  </option>
+                )}
+              {CONNECTOR_TYPE_OPTIONS.map((t) => (
+                <option key={t} value={t}>
+                  {t}
+                </option>
+              ))}
+            </select>
+            <p className="text-xs text-muted-foreground mt-1">
+              Socket / Type1 / Type2 / domestic can be started from Available;
+              CCS / CHAdeMO / GB/T must wait for a plugged-in vehicle (Preparing).
+            </p>
           </div>
 
           <div>

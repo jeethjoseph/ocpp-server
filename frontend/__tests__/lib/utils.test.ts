@@ -10,7 +10,33 @@ import { describe, it, expect } from "vitest";
 import {
   formatTariffRangeAllIn,
   breakdownAllInTariff,
+  isSocketCharger,
 } from "@/lib/utils";
+
+describe("isSocketCharger", () => {
+  const c = (t: string) => [{ connector_type: t }];
+  it("treats Type2 (the standard untethered AC socket) as a socket", () => {
+    expect(isSocketCharger(c("Type2"))).toBe(true);
+  });
+  it("treats Socket / Type1 / domestic as sockets (case + spacing insensitive)", () => {
+    expect(isSocketCharger(c("Socket"))).toBe(true);
+    expect(isSocketCharger(c("type 1"))).toBe(true);
+    expect(isSocketCharger(c("DOMESTIC"))).toBe(true);
+  });
+  it("treats CCS / CHAdeMO / GB-T (tethered/DC) as NOT sockets", () => {
+    expect(isSocketCharger(c("CCS"))).toBe(false);
+    expect(isSocketCharger(c("CHAdeMO"))).toBe(false);
+    expect(isSocketCharger(c("GB/T"))).toBe(false);
+  });
+  it("defaults unknown types and empty input to NOT a socket", () => {
+    expect(isSocketCharger(c("Frobnicator"))).toBe(false);
+    expect(isSocketCharger([])).toBe(false);
+    expect(isSocketCharger(undefined)).toBe(false);
+  });
+  it("is a socket if ANY connector is untethered", () => {
+    expect(isSocketCharger([{ connector_type: "CCS" }, { connector_type: "Type2" }])).toBe(true);
+  });
+});
 
 describe("formatTariffRangeAllIn", () => {
   it("returns N/A when both bounds are null", () => {
