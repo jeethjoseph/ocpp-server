@@ -12,6 +12,7 @@ import {
   Cpu,
   ScrollText,
   UserCog,
+  BarChart3,
 } from "lucide-react";
 import SidebarShell, { type NavItem } from "@/components/SidebarShell";
 import RouteErrorBoundary from "@/components/RouteErrorBoundary";
@@ -26,6 +27,7 @@ const adminItems: NavItem[] = [
   { name: "GST Filings", href: "/admin/gst-filings", icon: FileText },
   { name: "Firmware", href: "/admin/firmware", icon: Cpu },
   { name: "Logs", href: "/admin/logs", icon: ScrollText },
+  { name: "Reports", href: "/admin/reports", icon: BarChart3 },
   { name: "Users", href: "/admin/users", icon: UserCog },
 ];
 

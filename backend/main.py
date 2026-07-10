@@ -1636,11 +1636,12 @@ app.include_router(qr_codes.router)
 app.include_router(public_qr_transactions.router)
 app.include_router(public_qr_active_sessions.router)
 
-from routers import franchisees, franchisee_portal, invoices, admin_settlements
+from routers import franchisees, franchisee_portal, invoices, admin_settlements, reports
 app.include_router(franchisees.router)
 app.include_router(franchisee_portal.router)
 app.include_router(invoices.router)
 app.include_router(admin_settlements.router)
+app.include_router(reports.router)
 
 # OCPP WebSocket endpoint (connection management + message handling)
 from routers import ocpp_ws

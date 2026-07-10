@@ -3024,6 +3024,39 @@ lazily fetches its correlated reply via the additive `correlation_id` filter, sc
 default for historical rows and disambiguates charger-reused messageIds across reboots).
 Forward-only; `correlation_id` was already persisted, so no migration.
 
+#### Admin Reports (`backend/routers/reports.py`)
+
+The **Reports** surface (`/admin/reports`) hosts read-only product/business analytics.
+The first report is the **Churn Report** (`/admin/reports/churn`): a retention **cohort**
+analysis of **QR** customers, where a customer is keyed by `COALESCE(customer_vpa,
+customer_contact)` (UPI handle / phone) — appless QR customers are frequently not `User`
+rows, so this never keys on `user_id`. Rows are the cohort of customers whose *first*
+successful QR payment fell in a period; columns are periods-since-first; cells are the
+share of that cohort that paid again.
+
+```http
+GET /api/admin/reports/qr-churn?grain=week|month
+Authorization: Bearer {jwt_token}   # require_admin()
+→ { grain, generated_at, latest_period, max_offset,
+    summary: { customers, one_time, repeat, avg_sessions, avg_ltv,
+               median_ltv, successful_sessions, net_revenue, latest_period },
+    cohorts: [ { cohort, size, cells: [ { offset, active } ] } ] }
+```
+
+**Live, uncached — ADR 0025.** The aggregation runs on every request as raw SQL via
+`Tortoise.get_connection` (grain is whitelisted to `week`/`month`, selecting the
+`date_trunc` unit and a periods-elapsed offset expression — no user string reaches SQL).
+This was a deliberate choice over a snapshot table after measuring the cost on prod:
+**1.86 ms over 462 `qr_payment` rows**, fully in Postgres's buffer cache. Caching would be
+premature; revisit only past ~100k rows or ~100 ms (then bound the query per ADR 0014
+before adding a cache). The **"refresh only when asked"** behaviour and the **"last
+refreshed X ago"** label live entirely on the client — TanStack Query with
+`staleTime: Infinity` + an explicit Refresh button (`refetch()`), with `dataUpdatedAt`
+driving the label (rendered IST). Consequence: "last refreshed" is *per-viewer*, not a
+team-shared snapshot — accepted for a triage/insight report. Grain toggle defaults to
+weekly; monthly is the more honest read because charging cadence is monthly (weekly
+buckets scatter returners and understate retention). See `docs/adr/0025-live-uncached-admin-reports.md`.
+
 #### Station Management (`backend/routers/stations.py`)
 
 ##### List Stations
