@@ -19,7 +19,7 @@ def _make_charger(status: ChargerStatusEnum, connector_type: str,
                   power_kw: float, tariff_all_in: float | None):
     """Build a duck-typed charger that satisfies _aggregate_connectors."""
     tariff = (
-        SimpleNamespace(tariff_per_kwh_all_in=Decimal(str(tariff_all_in)))
+        SimpleNamespace(rate_gst_included=Decimal(str(tariff_all_in)))
         if tariff_all_in is not None else None
     )
     return SimpleNamespace(
@@ -56,8 +56,8 @@ async def test_aggregate_buckets_two_chargers_same_type():
     assert row.in_use_count == 1
     assert row.out_of_service_count == 0
     assert row.available_count == 1
-    assert row.min_tariff_all_in == 25.0
-    assert row.max_tariff_all_in == 25.0
+    assert row.min_tariff_gst_incl == 25.0
+    assert row.max_tariff_gst_incl == 25.0
 
 
 async def test_aggregate_faulted_and_unavailable_collapse_to_out_of_service():
@@ -81,20 +81,20 @@ async def test_aggregate_per_type_tariff_range():
     details, types = _aggregate_connectors(chargers, global_tariff=None)
     assert types == {"Type2", "Socket"}
     by_type = {d.connector_type: d for d in details}
-    assert by_type["Type2"].min_tariff_all_in == 22.0
-    assert by_type["Type2"].max_tariff_all_in == 25.0
-    assert by_type["Socket"].min_tariff_all_in == 20.0
-    assert by_type["Socket"].max_tariff_all_in == 20.0
+    assert by_type["Type2"].min_tariff_gst_incl == 22.0
+    assert by_type["Type2"].max_tariff_gst_incl == 25.0
+    assert by_type["Socket"].min_tariff_gst_incl == 20.0
+    assert by_type["Socket"].max_tariff_gst_incl == 20.0
 
 
 async def test_aggregate_falls_back_to_global_tariff():
-    global_tariff = SimpleNamespace(tariff_per_kwh_all_in=Decimal("18.50"))
+    global_tariff = SimpleNamespace(rate_gst_included=Decimal("18.50"))
     chargers = [
         _make_charger(ChargerStatusEnum.AVAILABLE, "Type2", 7.4, tariff_all_in=None),
     ]
     details, _ = _aggregate_connectors(chargers, global_tariff=global_tariff)
-    assert details[0].min_tariff_all_in == 18.5
-    assert details[0].max_tariff_all_in == 18.5
+    assert details[0].min_tariff_gst_incl == 18.5
+    assert details[0].max_tariff_gst_incl == 18.5
 
 
 async def test_aggregate_no_tariffs_at_all():
@@ -102,5 +102,5 @@ async def test_aggregate_no_tariffs_at_all():
         _make_charger(ChargerStatusEnum.AVAILABLE, "Type2", 7.4, tariff_all_in=None),
     ]
     details, _ = _aggregate_connectors(chargers, global_tariff=None)
-    assert details[0].min_tariff_all_in is None
-    assert details[0].max_tariff_all_in is None
+    assert details[0].min_tariff_gst_incl is None
+    assert details[0].max_tariff_gst_incl is None

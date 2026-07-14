@@ -353,36 +353,35 @@ class DatabaseSeeder:
         print("💵 Creating tariffs...")
         
         # Global default tariff. Seed data mirrors production semantics
-        # (post-ADR 0003): pick an all-in customer-facing rate first, then
-        # back-derive rate_per_kwh so the runtime identity check passes.
-        from core.config import RAZORPAY_PLATFORM_FEE_PERCENT
-        from services.tariff_utils import back_derive_rate_per_kwh
+        # (ADR 0026): pick a GST-inclusive, gateway-exclusive customer-facing
+        # rate first, then back-calc the base rate_per_kwh.
+        from services.tariff_utils import back_calc_base_rate
 
         gst = Decimal("18.00")
-        all_in_global = Decimal("0.41")  # ≈ ₹0.35/kWh excl, post-fee + GST
-        rate_global = back_derive_rate_per_kwh(all_in_global, gst, RAZORPAY_PLATFORM_FEE_PERCENT)
+        gst_incl_global = Decimal("0.41")  # ≈ ₹0.35/kWh base + 18% GST
+        rate_global = back_calc_base_rate(gst_incl_global, gst)
         await Tariff.create(
             rate_per_kwh=rate_global,
-            tariff_per_kwh_all_in=all_in_global,
+            rate_gst_included=gst_incl_global,
             gst_percent=gst,
             is_global=True,
         )
-        print(f"  ✅ Created global tariff: ₹{all_in_global}/kWh all-in (rate_per_kwh={rate_global})")
+        print(f"  ✅ Created global tariff: ₹{gst_incl_global}/kWh (GST-incl); base rate_per_kwh={rate_global}")
 
-        # Specific tariffs for some chargers — pick all_in in a plausible
-        # range, then back-derive.
+        # Specific tariffs for some chargers — pick a GST-inclusive rate in a
+        # plausible range, then back-calc.
         premium_chargers = random.sample(self.chargers, min(3, len(self.chargers)))
         for charger in premium_chargers:
-            all_in = Decimal(random.uniform(0.30, 0.60)).quantize(Decimal('0.01'))
-            rate = back_derive_rate_per_kwh(all_in, gst, RAZORPAY_PLATFORM_FEE_PERCENT)
+            gst_incl = Decimal(random.uniform(0.30, 0.60)).quantize(Decimal('0.01'))
+            rate = back_calc_base_rate(gst_incl, gst)
             await Tariff.create(
                 charger=charger,
                 rate_per_kwh=rate,
-                tariff_per_kwh_all_in=all_in,
+                rate_gst_included=gst_incl,
                 gst_percent=gst,
                 is_global=False,
             )
-            print(f"  ✅ Created specific tariff for {charger.charge_point_string_id}: ₹{all_in}/kWh all-in")
+            print(f"  ✅ Created specific tariff for {charger.charge_point_string_id}: ₹{gst_incl}/kWh (GST-incl)")
 
     async def create_charging_transactions(self):
         """Create realistic charging transactions with history"""

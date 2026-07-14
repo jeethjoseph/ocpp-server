@@ -57,10 +57,14 @@ async def _reconcile_existing_open_transaction(charge_point_id, charger, meter_s
     """
     from models import Transaction, TransactionStatusEnum
     from services.transaction_finalizer import is_resume_too_stale
+    # PENDING_STOP is deliberately EXCLUDED: a txn mid-normal-stop is already
+    # being finalized by the StopTransaction path, so superseding it here would
+    # race that path into a double-finalize/double-bill (the finalizer's
+    # idempotency guard only short-circuits on TERMINAL states). A genuinely
+    # stuck PENDING_STOP is caught by the disconnect/stale-suspended sweeps.
     open_states = [
         TransactionStatusEnum.STARTED, TransactionStatusEnum.PENDING_START,
         TransactionStatusEnum.RUNNING, TransactionStatusEnum.SUSPENDED,
-        TransactionStatusEnum.PENDING_STOP,
     ]
     existing = await Transaction.filter(
         charger_id=charger.id, transaction_status__in=open_states,
@@ -96,8 +100,16 @@ async def _reconcile_existing_open_transaction(charge_point_id, charger, meter_s
         f"♻️ StartTransaction from {charge_point_id}: superseding stale open "
         f"transaction {existing.id} (status={existing.transaction_status}, gap={gap}s)"
     )
+    # Finalize the stale orphan OFF the StartTransaction hot path: its billing
+    # can include a Razorpay refund network call, and blocking the new session's
+    # Accepted on that couples session-start latency to Razorpay. The orphan is a
+    # different row from the new txn, so the fresh session proceeds immediately;
+    # finalize_stopped_transaction is idempotent so a concurrent sweep is safe.
     from services.transaction_finalizer import finalize_stopped_transaction
-    await finalize_stopped_transaction(existing, "SUPERSEDED_BY_NEW_START")
+    safe_create_task(
+        finalize_stopped_transaction(existing, "SUPERSEDED_BY_NEW_START"),
+        name=f"supersede-finalize-{existing.id}",
+    )
     return None
 
 # Socket charger grace period (seconds) before failing txn on Available status
@@ -1761,21 +1773,10 @@ async def startup_event():
             "gst_invoice row will be created."
         )
 
-    # ADR 0001 + issue 03: synthetic platform fee drives all customer-facing
-    # math. Validate at startup across four bands (≤0 fail / 0–5 ok / 5–10 warn
-    # / >10 fail) so a misconfigured deploy never reaches a real user.
-    from core.config import RAZORPAY_PLATFORM_FEE_PERCENT, validate_platform_fee_percent
-    validate_platform_fee_percent(RAZORPAY_PLATFORM_FEE_PERCENT, logger)
-
-    # Tariff back-calc identity check (issue 02): catch the scenario where
-    # RAZORPAY_PLATFORM_FEE_PERCENT was changed AFTER migration 36 ran, leaving
-    # legacy-backfilled rows violating the identity until operators re-save them.
-    # Non-fatal — startup proceeds and operators are nudged via the warning.
-    from services.tariff_drift_check import warn_on_tariff_identity_drift
-    try:
-        await warn_on_tariff_identity_drift(RAZORPAY_PLATFORM_FEE_PERCENT, logger)
-    except Exception as e:
-        logger.warning("Tariff identity check failed (non-fatal): %s", e)
+    # ADR 0026: the tariff excludes the gateway and the base rate is a simple
+    # back-calc of the operator-typed GST-inclusive rate — there is no synthetic
+    # platform-fee identity left to validate or police, so the startup
+    # fee-percent validation and the tariff-drift checker were removed.
 
     if not os.getenv("AWS_S3_INVOICE_BUCKET"):
         logger.warning(

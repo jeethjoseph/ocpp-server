@@ -1,7 +1,10 @@
 # This file is to aggregate all CRUD operations related to OCPP logs and charger connections.
 import datetime
+import logging
 from typing import List, Optional, Tuple
 from models import OCPPLog, Charger, AuditLog, WebhookEvent
+
+logger = logging.getLogger("ocpp-server")
 
 
 ###
@@ -50,6 +53,15 @@ async def log_audit_event(
     changes: dict | None = None,
 ) -> AuditLog:
     """Append an audit log entry. Actor fields extracted from User object if provided."""
+    # Drift guard: every action must be registered in the single source of truth
+    # (core.audit_actions). Warn (never block) at runtime; test_audit_actions
+    # fails the build if a new action isn't registered. See that module.
+    from core.audit_actions import AUDIT_ACTIONS
+    if action not in AUDIT_ACTIONS:
+        logger.warning(
+            "Unregistered audit action %r — add it to core.audit_actions.AUDIT_ACTIONS "
+            "(and the frontend dropdown if it is a charger/transaction action).", action,
+        )
     return await AuditLog.create(
         actor_type=actor_type,
         actor_id=actor.id if actor else None,

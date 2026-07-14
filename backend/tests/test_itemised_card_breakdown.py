@@ -3,7 +3,7 @@
 `_customer_breakdown` returns tax-inclusive per-line `line_items` (Energy, Gateway
 charges) plus a `bill_total` mirroring the invoice's Line total column, summing to
 `amount_paid − refund`. Verified for the invoice path (reuses the shared
-`build_invoice_line_items`), the pre-invoice synthetic fallback, and the no-billing
+`build_invoice_line_items`), the pre-invoice actual-fee fallback, and the no-billing
 case.
 """
 from decimal import Decimal
@@ -54,12 +54,17 @@ def test_fallback_without_invoice_returns_line_items():
         energy_consumed_kwh=Decimal("3.065"),
         energy_charge=Decimal("63.64"), gst_amount=Decimal("11.46"),
     )
-    b = _customer_breakdown(SimpleNamespace(amount_paid=Decimal("100.00")), txn=txn, invoice=None)
+    # No invoice yet: fallback reads the ACTUAL fee off the payment row (ADR 0026).
+    payment = SimpleNamespace(
+        amount_paid=Decimal("100.00"),
+        razorpay_commission=Decimal("0.99"), razorpay_gst=Decimal("0.18"),
+    )
+    b = _customer_breakdown(payment, txn=txn, invoice=None)
     assert b["line_items"] == [
         {"label": "Energy", "amount": "75.10"},
-        {"label": "Gateway charges", "amount": "2.00"},
+        {"label": "Gateway charges", "amount": "1.17"},  # 0.99 + 0.18 actual gateway
     ]
-    assert b["bill_total"] == "77.10"
+    assert b["bill_total"] == "76.27"
 
 
 def test_no_billing_returns_empty_line_items():

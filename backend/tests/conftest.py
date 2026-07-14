@@ -217,7 +217,7 @@ async def test_tariff(test_charger):
     return await Tariff.create(
         charger=test_charger,
         rate_per_kwh=Decimal("15.00"),
-        tariff_per_kwh_all_in=Decimal("17.7000"),  # 15 × 1.18 — migration-equivalent backfill
+        rate_gst_included=Decimal("17.7000"),  # 15 × 1.18 (base × GST); ADR 0026
         gst_percent=Decimal("18.00"),
         is_global=False,
     )

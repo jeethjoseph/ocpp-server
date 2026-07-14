@@ -7,15 +7,32 @@ Crucially, the per-line SGST/CGST are a **display allocation of the total-level 
 ## Column semantics
 
 - **Rate** (Energy) is the **GST- and gateway-exclusive** per-kWh figure — derived on the page as `energy_taxable_value ÷ energy_consumed_kwh`, which equals `rate_per_kwh`. It is *not* the customer-facing All-in tariff. With additive per-line tax columns and a separate gateway line, the pre-tax rate is the only value whose arithmetic closes (`Rate × Qty + SGST + CGST = Line total`); putting the all-in rate here would double-count the GST and gateway that are itemised elsewhere. This reverses the prior glossary rule that `rate_per_kwh` is "never shown to customers" — see CONTEXT.md. The All-in tariff remains the number shown on the QR/stations screens at pay time.
-- **Rate** (Gateway) shows the flat percentage the gateway fee represents (e.g. `2%`), derived from the invoice's own synthetic split — `(gateway_charges + gateway_gst) ÷ transaction_amount × 100` — so legacy invoices keep their historical rate rather than picking up today's config. **Qty** (Gateway) is the **amount paid** (`transaction_amount`). This makes the gateway line read as "2% of ₹150" — more legible than a bare taxable value.
+- **Rate** (Gateway) shows the **pre-tax** percentage the gateway commission represents — `gateway_charges ÷ transaction_amount × 100` (e.g. `0.99%`). **Qty** (Gateway) is the **amount paid** (`transaction_amount`), so `Rate% × Qty = Taxable Value` (`gateway_charges`) and the SGST/CGST columns add the tax on top — **exactly the Energy row's convention**. This makes the gateway line read as "0.99% of ₹100 = ₹0.99 taxable, + tax". Amended 2026-07-14 (ADR 0026): previously the Rate was the *tax-inclusive* `(gateway_charges + gateway_gst) ÷ transaction_amount`, which was defensible only under the old synthetic all-in fee — with the actual-fee commission/GST split it double-counted the GST already shown in the tax columns and no longer matched the (allocation-rounded) Line total.
 - **Line total** is tax-inclusive: `taxable + SGST + CGST` (or `+ IGST`).
-- Consequence: the Rate column is deliberately **non-uniform**. For Energy, `Rate × Qty` is the *pre-tax* taxable (tax added by the columns); for Gateway, `Rate% × Qty` is the *tax-inclusive* line total (the synthetic 2% is all-in, so tax is already embedded). The `2% × paid` figure is a **nominal descriptor** — the authoritative gateway amount is the Line total, which can differ from `2% × paid` by the ADR-0017 allocation residual (visible only when there is a Round Off; nil in the common `round_off == 0` case).
+- Consequence: the Rate column is now **uniform** — for both Energy and Gateway, `Rate × Qty = Taxable Value` (pre-tax) and the tax columns add SGST/CGST. The Line total is the authoritative per-line amount; the displayed per-line tax is an ADR-0017 allocation of the stored total-level tax, so `Rate × Qty + SGST + CGST` can differ from a naive `Rate × Qty × (1+gst)` by the allocation residual (which the footer Round Off absorbs; nil in the common `round_off == 0` case).
 - **Sub Total** is shown in the footer only when there is a **Round Off** to explain; when `round_off == 0` it would merely duplicate TOTAL, so it is omitted.
 - **Charged-on** and **Duration** are session attributes, not line attributes — they move to the invoice metadata block above the table, not into the line columns.
 
 ## Tax allocation rule
 
 For each tax head, the Energy line takes `round(energy_taxable × rate%)` and the Gateway line takes `stored_total − energy_line` — the residual always lands on the gateway line, so the two lines sum to the stored total to the paisa. The grand total remains `total_taxable + total_tax + round_off = total_amount` (= `amount_paid − refund` for QR), with **Round Off** and **TOTAL** shown in the footer beneath the line-item table.
+
+## Amendment — 2026-07-14: pre-tax line items + tax aggregate (PDF)
+
+The **PDF** line-item table no longer carries per-line SGST/CGST columns or a Line-total column. It is now a **pre-tax** table — `HSN · Item · Unit Price · Qty · Taxable Value` — and the tax is shown as a single **aggregate block** below it: `Taxable Value → CGST @ x% / SGST @ x% (or IGST @ x% inter-state) → Round Off (only when non-zero) → TOTAL`, read directly from the stored total-level `cgst_amount`/`sgst_amount`/`igst_amount`/`round_off`/`total_amount`. This **removes the per-line tax display allocation entirely** from the PDF (the ADR-0017 stored totals are shown as-is). Consequences of this amendment:
+
+- The **Rate** column is renamed **Unit Price**; the Energy cell keeps the `₹x.xx/kWh` form.
+- The **Gateway charges** line shows only its **Taxable Value** — no Unit Price, no Qty (its GST is in the aggregate). This retires the previous "Gateway Rate = % of amount paid" descriptor and the pre-tax-vs-tax-inclusive Rate discussion below (both moot once there is no gateway Rate cell).
+- `build_invoice_line_items` is **unchanged** — it still computes per-line `taxes`/`line_total` for the **web `/my-charges` receipt card**, which continues to show tax-inclusive per-item totals. Only `generate_pdf` changed; PDF and card layouts intentionally diverge.
+- **Legacy invoices** re-render correctly (the aggregate reads their stored tax totals; the pre-tax lines read stored `energy_taxable_value` / `gateway_charges`).
+
+The per-line-tax column semantics described in "Column semantics" / "Tax allocation rule" below now apply **only to the web receipt card**, not the PDF.
+
+## Amendment — 2026-07-14: ₹ symbol, units, and font
+
+Every monetary figure on the PDF (Rate, the money Qty, Taxable Value, each tax head, Line total, Sub Total / Round Off / TOTAL, Transaction/Refund amounts, and the "Tariff quoted" note) now carries the **₹** symbol; the Energy **Qty** carries its **kWh** unit (e.g. `0.910 kWh`), and the Energy **Rate** reads `₹21.19/kWh`. The Gateway **Rate** stays a bare `%` (it is a ratio, not money) and its Qty is `₹<amount paid>`.
+
+Because the ReportLab base fonts (Helvetica, Vera) predate the ₹ glyph (U+20B9) and render it as a missing-glyph box, the invoice PDF is rendered in **DejaVu Sans** (regular + bold) — a ₹-capable, Helvetica-alike sans-serif from the `fonts-dejavu-core` apt package baked into the backend image. Registration in `invoice_service.generate_pdf` is best-effort with a Helvetica fallback so a missing font never crashes invoice generation (₹ would then box, caught by the build-parity check).
 
 ## No schema change
 

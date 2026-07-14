@@ -27,7 +27,15 @@ router = APIRouter(prefix="/api/admin/reports", tags=["reports"])
 # parked analytics/refund_churn study uses. Appless QR customers are often not
 # `User` rows, so we never key on user_id here.
 _CK = "COALESCE(NULLIF(customer_vpa,''), NULLIF(customer_contact,''))"
-_SUCCESS = "status IN ('PAID','CHARGING','COMPLETED','REFUNDED')"
+# A qr_payment counts toward retention/LTV only when the customer was NET-CHARGED
+# for real energy — `amount_paid` minus any refund is positive. This excludes
+# fully-refunded / zero-energy sessions (no service delivered — they would
+# otherwise INFLATE retention) while correctly KEEPING the common partial-refund
+# case (unused prepaid credit returned), which ends in status REFUNDED. A
+# status-only predicate was wrong on both ends: it counted full refunds as
+# retention, and a naive `REFUNDED` exclusion would have dropped the majority of
+# real QR sessions. Consistent with the `net = amount_paid − refund` used below.
+_SUCCESS = "(amount_paid - COALESCE(refund_amount, 0)) > 0"
 
 # Cohort calendar periods are IST periods: `created_at` is stored UTC, but this
 # is an India-only business, so a period boundary is an IST midnight. Without

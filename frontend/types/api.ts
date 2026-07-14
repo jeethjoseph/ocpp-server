@@ -57,7 +57,9 @@ export interface Charger {
   updated_at: string;
   tariff_per_kwh?: number;
   tariff_gst_percent?: number;
-  tariff_per_kwh_all_in?: number;
+  // GST-inclusive, gateway-EXCLUSIVE per-kWh rate (ADR 0026). Renamed from
+  // tariff_per_kwh_all_in — the gateway fee is no longer baked into the tariff.
+  rate_gst_included?: number;
   latest_error?: LatestErrorInfo;
   connectors?: ConnectorInput[];
 }
@@ -70,7 +72,7 @@ export interface ChargerCreate {
   serial_number?: string;
   external_charger_id?: string;
   connectors: ConnectorInput[];
-  tariff_per_kwh_all_in?: number;
+  rate_gst_included?: number;
 }
 
 export interface ConnectorInput {
@@ -86,7 +88,7 @@ export interface ChargerUpdate {
   latest_status?: string;
   external_charger_id?: string;
   connector_type?: string;
-  tariff_per_kwh_all_in?: number;
+  rate_gst_included?: number;
 }
 
 // Selectable connector types (must match backend ALLOWED_CONNECTOR_TYPES).

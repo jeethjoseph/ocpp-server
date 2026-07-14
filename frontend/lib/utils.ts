@@ -58,8 +58,8 @@ export function formatTariffRangeAllIn(
   if (minAllIn == null && maxAllIn == null) return "N/A";
   const lo = (minAllIn ?? maxAllIn) as number;
   const hi = (maxAllIn ?? minAllIn) as number;
-  if (Math.abs(lo - hi) < 0.005) return `₹${lo.toFixed(2)}/kWh (all-inclusive)`;
-  return `₹${lo.toFixed(2)}–₹${hi.toFixed(2)}/kWh (all-inclusive)`;
+  if (Math.abs(lo - hi) < 0.005) return `₹${lo.toFixed(2)}/kWh (incl. GST)`;
+  return `₹${lo.toFixed(2)}–₹${hi.toFixed(2)}/kWh (incl. GST)`;
 }
 
 export function formatTariffBare(
@@ -74,22 +74,22 @@ export function formatTariffBare(
 }
 
 /**
- * Mirror of `services/tariff_utils.back_derive_rate_per_kwh` for the admin
- * tariff-form live preview. Given an all-in per-kWh rate, returns the
- * three-line breakdown the operator sees as they type. ADR 0003.
+ * Back-derivation for the admin tariff-form live preview. Given a
+ * GST-inclusive, gateway-EXCLUSIVE per-kWh rate, returns the two-line
+ * breakdown the operator sees as they type. ADR 0026.
  *
- * Math: gateway fee deducted first (2% of all-in), then GST backed out
- * of the remainder. Result components sum back to `allIn` (within rounding).
+ * Math: base rate is the GST-inclusive figure with GST backed out —
+ * `ratePerKwh = rateGstIncluded / (1 + gst%/100)`. There is NO gateway
+ * component in the tariff; the Razorpay gateway fee is a separate, variable
+ * line billed on top and is not known at tariff-entry time. The two returned
+ * components sum back to `rateGstIncluded` (within rounding).
  */
-export function breakdownAllInTariff(
-  allIn: number,
+export function breakdownGstIncludedTariff(
+  rateGstIncluded: number,
   gstPercent = 18,
-  feePercent = 2,
-): { ratePerKwh: number; gatewayPerKwh: number; gstPerKwh: number } | null {
-  if (!Number.isFinite(allIn) || allIn <= 0) return null;
-  const gatewayPerKwh = allIn * (feePercent / 100);
-  const postGateway = allIn - gatewayPerKwh; // still includes GST
-  const ratePerKwh = postGateway / (1 + gstPercent / 100);
-  const gstPerKwh = postGateway - ratePerKwh;
-  return { ratePerKwh, gatewayPerKwh, gstPerKwh };
+): { ratePerKwh: number; gstPerKwh: number } | null {
+  if (!Number.isFinite(rateGstIncluded) || rateGstIncluded <= 0) return null;
+  const ratePerKwh = rateGstIncluded / (1 + gstPercent / 100);
+  const gstPerKwh = rateGstIncluded - ratePerKwh;
+  return { ratePerKwh, gstPerKwh };
 }

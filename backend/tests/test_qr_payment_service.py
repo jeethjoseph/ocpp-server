@@ -21,7 +21,6 @@ from services.qr_payment_service import (
     QRPaymentService, find_or_create_user_from_payment,
     _ensure_actual_fee_captured,
 )
-from services.tariff_utils import synthetic_platform_fee, synthetic_fee_split
 from services.razorpay_service import (
     RazorpayAlreadyRefundedError,
     RazorpayRefundBelowMinimumError,
@@ -85,7 +84,7 @@ async def qr_tariff(qr_charger):
     return await Tariff.create(
         charger=qr_charger,
         rate_per_kwh=Decimal("15.00"),
-        tariff_per_kwh_all_in=Decimal("17.7000"),  # 15 × 1.18
+        rate_gst_included=Decimal("17.7000"),  # 15 × 1.18
         gst_percent=Decimal("18.00"),
         is_global=False,
     )
@@ -1138,8 +1137,9 @@ async def test_qr_payment_stores_webhook_fee(client, qr_charger, qr_code, qr_tar
 
 
 @pytest.mark.asyncio
-async def test_qr_payment_no_fee_in_webhook_uses_fallback(client, qr_charger, qr_code, qr_tariff):
-    """QR payment without fee/tax in webhook falls back to estimate during refund."""
+async def test_qr_payment_no_fee_in_webhook_records_unavailable(client, qr_charger, qr_code, qr_tariff):
+    """QR payment without fee/tax in webhook, and with Razorpay's API silent,
+    records ₹0 with fee_source 'unavailable' — no synthetic estimate (ADR 0026)."""
     payload = _webhook_payload("pay_NOFEE001", "qr_TEST123", 10000)
 
     mock_razorpay = MagicMock()
@@ -1160,39 +1160,9 @@ async def test_qr_payment_no_fee_in_webhook_uses_fallback(client, qr_charger, qr
 
     qr = await QRPayment.filter(razorpay_payment_id="pay_NOFEE001").first()
     assert qr is not None
-    # No fee in webhook + API returned None → falls back to 2% estimate
-    assert qr.fee_source == "estimated"
-    assert qr.platform_fee == Decimal("2.00")  # 2% of ₹100
-
-
-# ============================================================================
-# Synthetic platform fee helpers (ADR 0001)
-# ============================================================================
-
-def test_synthetic_platform_fee_is_2_percent_of_amount_paid():
-    """Synthetic fee = amount_paid × 2%, quantized to 2dp."""
-    assert synthetic_platform_fee(Decimal("500.00")) == Decimal("10.00")
-    assert synthetic_platform_fee(Decimal("100.00")) == Decimal("2.00")
-    assert synthetic_platform_fee(Decimal("250.00")) == Decimal("5.00")
-    # Odd amount that rounds
-    assert synthetic_platform_fee(Decimal("99.99")) == Decimal("2.00")
-
-
-def test_synthetic_fee_split_is_all_in_commission_plus_gst():
-    """Synthetic fee is all-in: commission = total/1.18, GST = total − commission."""
-    commission, gst = synthetic_fee_split(Decimal("500.00"))
-    # 500 × 0.02 = 10.00 total → commission = 10/1.18 = 8.47, GST = 1.53
-    assert commission == Decimal("8.47")
-    assert gst == Decimal("1.53")
-    assert commission + gst == synthetic_platform_fee(Decimal("500.00"))
-
-
-def test_synthetic_fee_split_components_sum_to_total():
-    """For a range of payment amounts the (commission, GST) pair must sum to total."""
-    for amount in [Decimal("50"), Decimal("100"), Decimal("237.50"), Decimal("1000")]:
-        total = synthetic_platform_fee(amount)
-        commission, gst = synthetic_fee_split(amount)
-        assert commission + gst == total, f"Mismatch at amount={amount}"
+    # No fee in webhook + API returned None → record ₹0, source 'unavailable'
+    assert qr.fee_source == "unavailable"
+    assert qr.platform_fee == Decimal("0.00")
 
 
 # ============================================================================
@@ -1274,10 +1244,12 @@ async def test_ensure_actual_fee_fetches_from_api_when_unset(client, qr_charger,
 
 
 @pytest.mark.asyncio
-async def test_ensure_actual_fee_falls_back_to_synthetic_when_api_silent(
+async def test_ensure_actual_fee_records_zero_when_api_silent(
     client, qr_charger, qr_code
 ):
-    """When webhook + API both unavailable, fall back to the synthetic 2% split."""
+    """When webhook + API both unavailable, record ₹0 and mark the fee source
+    'unavailable' — VoltLync absorbs the unobserved gateway cost. There is NO
+    synthetic estimate any more (ADR 0026)."""
     import uuid
     user = await User.create(
         email=f"est_{uuid.uuid4().hex[:6]}@voltlync.test",
@@ -1304,11 +1276,10 @@ async def test_ensure_actual_fee_falls_back_to_synthetic_when_api_silent(
     with patch("services.qr_payment_service.razorpay_service", mock_razorpay):
         await _ensure_actual_fee_captured(qr_payment)
 
-    assert qr_payment.platform_fee == Decimal("2.00")
-    assert qr_payment.fee_source == "estimated"
-    # 2.00 all-in → commission = 2/1.18 ≈ 1.69, GST = 0.31
-    assert qr_payment.razorpay_commission == Decimal("1.69")
-    assert qr_payment.razorpay_gst == Decimal("0.31")
+    assert qr_payment.platform_fee == Decimal("0.00")
+    assert qr_payment.fee_source == "unavailable"
+    assert qr_payment.razorpay_commission == Decimal("0.00")
+    assert qr_payment.razorpay_gst == Decimal("0.00")
     assert qr_payment.razorpay_commission + qr_payment.razorpay_gst == qr_payment.platform_fee
 
 
@@ -1376,11 +1347,10 @@ async def _make_qr_billing_fixture(qr_charger, qr_code, qr_tariff, energy_consum
 async def test_qr_billing_caps_energy_at_budget(client, qr_charger, qr_code, qr_tariff, caplog):
     """Over-consumption is capped at the budgeted pre-tax ceiling.
 
-    Synthetic fee (ADR 0001): amount_paid=20 → fee=20×2%=₹0.40 →
-    budget_incl_tax=19.60 → budget_excl_tax=19.60/1.18=16.61. Driving 5.0 kWh
-    at ₹15/kWh would cost ₹75 uncapped, so this firmly tests the cap.
-    The fixture's actual platform_fee=0.24 is ignored — billing math uses
-    synthetic.
+    Actual gateway fee (ADR 0026): amount_paid=20, fixture platform_fee=0.24 →
+    budget_incl_tax = 20 − 0.24 = 19.76 → capped_energy_excl_tax = 19.76/1.18 =
+    16.75, capped_gst = 19.76 − 16.75 = 3.01. Driving 5.0 kWh at ₹15/kWh would
+    cost ₹75 uncapped, so this firmly tests the cap.
     """
     import logging
     _, txn, qr_payment = await _make_qr_billing_fixture(
@@ -1395,8 +1365,8 @@ async def test_qr_billing_caps_energy_at_budget(client, qr_charger, qr_code, qr_
     await qr_payment.refresh_from_db()
     await txn.refresh_from_db()
 
-    expected_billable_excl_tax = Decimal("16.61")  # (20 - 0.40) / 1.18 rounded
-    expected_gst = (expected_billable_excl_tax * Decimal("18") / Decimal("100")).quantize(Decimal("0.01"))
+    expected_billable_excl_tax = Decimal("16.75")  # (20 - 0.24) / 1.18 rounded
+    expected_gst = Decimal("3.01")  # budget_incl_tax − capped_energy = 19.76 − 16.75
 
     assert qr_payment.energy_cost == expected_billable_excl_tax
     assert qr_payment.gst_amount == expected_gst
@@ -1416,7 +1386,8 @@ async def test_qr_billing_under_budget_is_unchanged(client, qr_charger, qr_code,
     """Under-budget consumption is unaffected by the cap (regression guard).
 
     0.5 kWh × ₹15 = ₹7.50 + GST ₹1.35 = ₹8.85, which is well under the
-    ₹19.76 budget. Cap should not kick in; refund should flow.
+    ₹19.76 budget (amount_paid − actual gateway fee 0.24). Cap should not kick
+    in; refund should flow.
     """
     _, txn, qr_payment = await _make_qr_billing_fixture(
         qr_charger, qr_code, qr_tariff, energy_consumed_kwh=0.5
@@ -1439,11 +1410,9 @@ async def test_qr_billing_under_budget_is_unchanged(client, qr_charger, qr_code,
 
     assert qr_payment.energy_cost == Decimal("7.50")
     assert qr_payment.gst_amount == Decimal("1.35")
-    # Refund = 20 - synthetic_fee(0.40) - 7.50 - 1.35 = 10.75 (ADR 0001).
-    # Every customer sees the same 2% deduction regardless of what Razorpay
-    # actually charged on this payment (₹0.24 = 1.2% in this fixture). The
-    # ₹0.16 delta vs. actual is platform P&L variance.
-    assert qr_payment.refund_amount == Decimal("10.75")
+    # Refund = 20 - energy(7.50) - gst(1.35) - actual gateway fee(0.24) = 10.91
+    # (ADR 0026 — the ACTUAL Razorpay fee, not a synthetic 2%).
+    assert qr_payment.refund_amount == Decimal("10.91")
     assert txn.energy_charge == Decimal("7.50")
 
 
@@ -1452,10 +1421,10 @@ async def test_qr_billing_tiny_positive_balance_is_refunded(client, qr_charger, 
     """Even sub-rupee positive balances are refunded — the historical
     MINIMUM_REFUND_AMOUNT threshold has been removed.
 
-    Synthetic fee (ADR 0001): amount_paid=20 → fee=₹0.40 → budget=₹19.60.
-    Driving 1.106 kWh × ₹15 = ₹16.59 + GST ₹2.99 = ₹19.58 leaves a ₹0.02
-    positive balance — well below the old ₹1 threshold. The session must
-    still issue a Razorpay refund.
+    Actual gateway fee (ADR 0026): amount_paid=20, platform_fee=0.24.
+    Driving 1.106 kWh × ₹15 = ₹16.59 + GST ₹2.99 = ₹19.58, leaving
+    20 − 19.58 − 0.24 = ₹0.18 — well below the old ₹1 threshold. The session
+    must still issue a Razorpay refund.
     """
     _, txn, qr_payment = await _make_qr_billing_fixture(
         qr_charger, qr_code, qr_tariff, energy_consumed_kwh=1.106,
@@ -1486,21 +1455,22 @@ async def test_qr_billing_tiny_positive_balance_is_refunded(client, qr_charger, 
 
 
 # ============================================================================
-# Synthetic-vs-actual end-to-end (ADR 0001 acceptance test)
+# Actual-gateway end-to-end (ADR 0026 acceptance test)
 # ============================================================================
 
 @pytest.mark.asyncio
-async def test_synthetic_drives_billing_and_invoice_while_actual_lands_on_row(
+async def test_actual_gateway_fee_drives_billing_and_invoice(
     client, qr_charger, qr_code, monkeypatch
 ):
-    """End-to-end: a QR session where Razorpay actually charged 1.5% on a
-    ₹500 payment, but the synthetic 2% drives budget + invoice gateway lines.
+    """End-to-end: a QR session where Razorpay actually charged ₹7.50 on a
+    ₹500 payment. The ACTUAL fee drives the budget, the refund, AND the invoice
+    gateway lines (ADR 0026 — no synthetic 2% anywhere).
 
     Asserts:
-      - QRPayment.platform_fee preserved as ₹7.50 (the actual 1.5% Razorpay fee)
-      - Invoice gateway_charges = ₹8.47 (synthetic 2% commission split)
-      - Invoice gateway_gst = ₹1.53 (synthetic 2% GST split)
-      - Budget cap consistent with synthetic, NOT actual
+      - QRPayment.platform_fee preserved as ₹7.50 (the actual Razorpay fee)
+      - Invoice gateway_charges = ₹6.36 (actual razorpay_commission)
+      - Invoice gateway_gst = ₹1.14 (actual razorpay_gst)
+      - refund deducts the actual ₹7.50, not a synthetic ₹10
     """
     import uuid
     from services import invoice_service as _svc
@@ -1516,7 +1486,7 @@ async def test_synthetic_drives_billing_and_invoice_while_actual_lands_on_row(
     await Tariff.create(
         charger=qr_charger,
         rate_per_kwh=Decimal("20.00"),
-        tariff_per_kwh_all_in=Decimal("23.6000"),  # 20 × 1.18
+        rate_gst_included=Decimal("23.6000"),  # 20 × 1.18
         gst_percent=Decimal("18.00"),
         hsn_sac_code="996749",
         is_global=False,
@@ -1526,8 +1496,8 @@ async def test_synthetic_drives_billing_and_invoice_while_actual_lands_on_row(
         phone_number=f"9{uuid.uuid4().int % 1000000000:09d}",
         rfid_card_id=f"RFID_{uuid.uuid4().hex[:12]}",
     )
-    # Drive 10 kWh — well under budget. amount_paid=500, synthetic fee=₹10,
-    # budget_incl_tax=₹490, budget_excl_tax=₹490/1.18=₹415.25, kWh_cap=20.76.
+    # Drive 10 kWh — well under budget. amount_paid=500, actual fee=₹7.50,
+    # budget_incl_tax=₹492.50, budget_excl_tax=₹492.50/1.18=₹417.37, kWh_cap≈20.87.
     txn = await Transaction.create(
         user=user, charger=qr_charger,
         energy_consumed_kwh=10.0,
@@ -1574,31 +1544,29 @@ async def test_synthetic_drives_billing_and_invoice_while_actual_lands_on_row(
     assert qr_payment.razorpay_gst == Decimal("1.14")
     assert qr_payment.fee_source == "webhook"
 
-    # Billing math used synthetic 2% (₹10), not actual ₹7.50.
+    # Billing math uses the ACTUAL ₹7.50 gateway fee (ADR 0026).
     # energy_cost = 10 × 20 = ₹200, gst = 36, total energy_incl_tax = ₹236.
-    # refund = 500 - 200 - 36 - 10(synthetic) = ₹254 (NOT 500-200-36-7.50=256.50)
+    # refund = 500 - 200 - 36 - 7.50(actual) = ₹256.50
     assert qr_payment.energy_cost == Decimal("200.00")
     assert qr_payment.gst_amount == Decimal("36.00")
-    assert qr_payment.refund_amount == Decimal("254.00")
+    assert qr_payment.refund_amount == Decimal("256.50")
 
-    # Invoice generation snapshots synthetic split on gateway lines.
+    # Invoice generation snapshots the ACTUAL Razorpay fee on the gateway lines.
     invoice = await InvoiceService.generate_invoice(txn.id)
     assert invoice is not None
-    # Synthetic split of ₹500: total=₹10.00, commission=₹8.47, GST=₹1.53.
-    assert invoice.gateway_charges == Decimal("8.47")
-    assert invoice.gateway_gst == Decimal("1.53")
-    # Total taxable = energy(₹200) + gateway_commission(₹8.47) = ₹208.47
-    assert invoice.total_taxable_value == Decimal("208.47")
-    # CGST/SGST computed independently from ₹208.47 at 9% → ₹18.76 each = ₹37.52
-    # (equal halves), with a ₹0.01 Round Off vs the billing tax ₹37.53. ADR 0017.
-    assert invoice.cgst_amount == invoice.sgst_amount == Decimal("18.76")
-    assert invoice.total_tax == Decimal("37.52")
-    assert invoice.round_off == Decimal("0.01")
-    assert invoice.total_tax + invoice.round_off == Decimal("37.53")
-    # The QRPayment row's actual razorpay_commission/_gst stay distinct from
-    # the invoice's snapshotted synthetic values.
-    assert qr_payment.razorpay_commission != invoice.gateway_charges
-    assert qr_payment.razorpay_gst != invoice.gateway_gst
+    # Actual fee split: commission=₹6.36, GST=₹1.14.
+    assert invoice.gateway_charges == qr_payment.razorpay_commission == Decimal("6.36")
+    assert invoice.gateway_gst == qr_payment.razorpay_gst == Decimal("1.14")
+    # Total taxable = energy(₹200) + gateway_commission(₹6.36) = ₹206.36
+    assert invoice.total_taxable_value == Decimal("206.36")
+    # CGST/SGST computed independently from ₹206.36 at 9% → ₹18.57 each = ₹37.14
+    # (equal halves), reconciling exactly to the billing tax ₹37.14. ADR 0017.
+    assert invoice.cgst_amount == invoice.sgst_amount == Decimal("18.57")
+    assert invoice.total_tax == Decimal("37.14")
+    assert invoice.total_tax + invoice.round_off == Decimal("37.14")
+    # The invoice gateway lines now equal the QRPayment row's actual fee.
+    assert qr_payment.razorpay_commission == invoice.gateway_charges
+    assert qr_payment.razorpay_gst == invoice.gateway_gst
 
 
 # ============================================================================

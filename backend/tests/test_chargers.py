@@ -474,15 +474,15 @@ class TestChargerEndpoints:
         self, client_admin: AsyncClient, test_charger, test_tariff
     ):
         """List endpoint populates tariff_per_kwh, tariff_gst_percent, and the
-        operator-set tariff_per_kwh_all_in (post-ADR 0003)."""
+        operator-set rate_gst_included (post-ADR 0003)."""
         response = await client_admin.get("/api/admin/chargers")
         assert response.status_code == status.HTTP_200_OK
         data = response.json()
         row = next(c for c in data["data"] if c["id"] == test_charger.id)
         assert row["tariff_per_kwh"] == pytest.approx(15.0, rel=1e-6)
         assert row["tariff_gst_percent"] == pytest.approx(18.0, rel=1e-6)
-        # Fixture sets tariff_per_kwh_all_in to 17.70 (= 15 × 1.18, migration-equivalent)
-        assert row["tariff_per_kwh_all_in"] == pytest.approx(17.70, rel=1e-6)
+        # Fixture sets rate_gst_included to 17.70 (= 15 × 1.18, migration-equivalent)
+        assert row["rate_gst_included"] == pytest.approx(17.70, rel=1e-6)
         # Legacy field is gone from responses.
         assert "tariff_per_kwh_incl_tax" not in row
 
@@ -490,29 +490,29 @@ class TestChargerEndpoints:
     async def test_update_charger_with_all_in_tariff_back_derives_rate(
         self, client_admin: AsyncClient, test_charger, test_tariff
     ):
-        """Updating with tariff_per_kwh_all_in back-derives rate_per_kwh
-        server-side. ADR 0003 acceptance criterion."""
+        """Updating with rate_gst_included back-calculates rate_per_kwh
+        server-side. ADR 0026 acceptance criterion."""
         response = await client_admin.put(
             f"/api/admin/chargers/{test_charger.id}",
-            json={"tariff_per_kwh_all_in": 30.00},
+            json={"rate_gst_included": 30.00},
         )
         assert response.status_code == status.HTTP_200_OK
-        # 30 × 0.98 / 1.18 = 24.9152542... → 24.9153 (4dp, ROUND_HALF_UP)
+        # 30 / 1.18 = 25.4237288... → 25.4237 (4dp, ROUND_HALF_UP)
         tariff = await Tariff.filter(charger_id=test_charger.id).first()
         assert tariff is not None
-        assert tariff.tariff_per_kwh_all_in == Decimal("30.0000")
-        assert tariff.rate_per_kwh == Decimal("24.9153")
+        assert tariff.rate_gst_included == Decimal("30.0000")
+        assert tariff.rate_per_kwh == Decimal("25.4237")
         assert tariff.gst_percent == Decimal("18.00")
-        assert response.json()["charger"]["tariff_per_kwh_all_in"] == pytest.approx(30.0, rel=1e-6)
+        assert response.json()["charger"]["rate_gst_included"] == pytest.approx(30.0, rel=1e-6)
 
     @pytest.mark.asyncio
     async def test_update_charger_validates_all_in_lower_bound(
         self, client_admin: AsyncClient, test_charger
     ):
-        """tariff_per_kwh_all_in below ₹1.0 returns 422."""
+        """rate_gst_included below ₹1.0 returns 422."""
         response = await client_admin.put(
             f"/api/admin/chargers/{test_charger.id}",
-            json={"tariff_per_kwh_all_in": 0.5},
+            json={"rate_gst_included": 0.5},
         )
         assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
 
@@ -520,10 +520,10 @@ class TestChargerEndpoints:
     async def test_update_charger_validates_all_in_upper_bound(
         self, client_admin: AsyncClient, test_charger
     ):
-        """tariff_per_kwh_all_in above ₹100.0 returns 422."""
+        """rate_gst_included above ₹100.0 returns 422."""
         response = await client_admin.put(
             f"/api/admin/chargers/{test_charger.id}",
-            json={"tariff_per_kwh_all_in": 150.0},
+            json={"rate_gst_included": 150.0},
         )
         assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
 
@@ -546,21 +546,21 @@ class TestChargerEndpoints:
     async def test_create_charger_with_all_in_tariff(
         self, client_admin: AsyncClient, test_station
     ):
-        """Creating a charger with tariff_per_kwh_all_in back-derives rate_per_kwh."""
+        """Creating a charger with rate_gst_included back-calculates rate_per_kwh."""
         payload = {
             "station_id": test_station.id,
             "name": "All-in Charger",
             "connectors": [{"connector_id": 1, "connector_type": "Type2", "max_power_kw": 22.0}],
-            "tariff_per_kwh_all_in": 25.0,
+            "rate_gst_included": 25.0,
         }
         response = await client_admin.post("/api/admin/chargers", json=payload)
         assert response.status_code == status.HTTP_201_CREATED
         charger_id = response.json()["charger"]["id"]
         tariff = await Tariff.filter(charger_id=charger_id).first()
         assert tariff is not None
-        # 25 × 0.98 / 1.18 = 20.7627 (4dp)
-        assert tariff.rate_per_kwh == Decimal("20.7627")
-        assert tariff.tariff_per_kwh_all_in == Decimal("25.0000")
+        # 25 / 1.18 = 21.1864 (4dp)
+        assert tariff.rate_per_kwh == Decimal("21.1864")
+        assert tariff.rate_gst_included == Decimal("25.0000")
 
     # ========================================================================
     # Transactional atomicity (issue 05 / M6)
@@ -591,7 +591,7 @@ class TestChargerEndpoints:
             "connectors": [
                 {"connector_id": 1, "connector_type": "Type2", "max_power_kw": 22.0}
             ],
-            "tariff_per_kwh_all_in": 25.0,
+            "rate_gst_included": 25.0,
         }
 
         # Patch Tariff.create to raise — simulates a DB constraint blowing up
@@ -641,7 +641,7 @@ class TestChargerEndpoints:
                 {"connector_id": 1, "connector_type": "Type2", "max_power_kw": 22.0},
                 {"connector_id": 2, "connector_type": "CCS", "max_power_kw": 50.0},
             ],
-            "tariff_per_kwh_all_in": 18.0,
+            "rate_gst_included": 18.0,
         }
         response = await client_admin.post("/api/admin/chargers", json=payload)
         assert response.status_code == status.HTTP_201_CREATED

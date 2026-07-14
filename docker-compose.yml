@@ -71,7 +71,6 @@ services:
       - FRANCHISEE_PAYOUT_RETRY_INTERVAL_SECONDS=${FRANCHISEE_PAYOUT_RETRY_INTERVAL_SECONDS:-600}
       - STUCK_PAYOUT_CHECK_INTERVAL_SECONDS=${STUCK_PAYOUT_CHECK_INTERVAL_SECONDS:-3600}
       - STUCK_PAYOUT_THRESHOLD_HOURS=${STUCK_PAYOUT_THRESHOLD_HOURS:-24}
-      - RAZORPAY_PLATFORM_FEE_PERCENT=${RAZORPAY_PLATFORM_FEE_PERCENT:-2.0}
       # Razorpay instant refund kill-switch (ADR 0002). When true,
       # _full_refund requests speed=optimum so customers see refunds in
       # minutes; VoltLync absorbs Razorpay's per-refund instant fee.

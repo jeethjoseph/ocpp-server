@@ -20,7 +20,7 @@ export function ChargerRow({ detail }: { detail: ConnectorDetail }) {
   if (out_of_service_count > 0) statusParts.push(`${out_of_service_count} out of service`);
   const statusLine = statusParts.join(" · ") || "Status unknown";
 
-  const tariff = formatTariffBare(detail.min_tariff_all_in, detail.max_tariff_all_in);
+  const tariff = formatTariffBare(detail.min_tariff_gst_incl, detail.max_tariff_gst_incl);
 
   return (
     <div className="p-2 bg-muted/50 rounded space-y-1">

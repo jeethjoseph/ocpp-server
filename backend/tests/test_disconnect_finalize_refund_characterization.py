@@ -122,9 +122,10 @@ async def test_repro_stale_reading_under_bills(client):
     Note the branch: finalize marks the txn STOPPED (not FAILED), so the
     de-minimis fault-refund band (status==FAILED and 0<energy<0.5) does NOT
     fire. Instead the normal partial-refund formula runs against 0.37 kWh:
-      refund = paid - energy_cost(0.37) - gst - platform_fee.
-    With no tariff wired here energy_cost=0, so refund = 27.50 - 0.55 = 26.95 —
-    a near-total refund for a full physical charge."""
+      refund = paid - energy_cost(0.37) - gst - gateway_fee.
+    With no tariff wired here energy_cost=0, and the gateway is the ACTUAL fee
+    (₹0.52, ADR 0026), so refund = 27.50 - 0.52 = 26.98 — a near-total refund
+    for a full physical charge."""
     txn, qr_payment = await _make_qr_session(last_reading_kwh="0.370")
 
     rp = await _finalize_disconnect(txn)
@@ -135,5 +136,5 @@ async def test_repro_stale_reading_under_bills(client):
     await qr_payment.refresh_from_db()
     rp.refund_payment.assert_called_once()
     # Near-total refund driven entirely by the stale pre-disconnect reading.
-    assert qr_payment.refund_amount == Decimal("26.95")
+    assert qr_payment.refund_amount == Decimal("26.98")
     assert qr_payment.refund_amount > AMOUNT_PAID * Decimal("0.9")

@@ -1,5 +1,7 @@
 # Charger WebSocket authentication via OCPP 1.6 Security Profile 2
 
+> **Status: PROPOSED — NOT YET IMPLEMENTED (as of 2026-07-14).** This ADR records the intended design. No code exists yet: there is no `Charger.auth_key_hash` column, no `REQUIRE_CHARGER_AUTH` flag, and no handshake authentication on the OCPP connect path — chargers currently connect unauthenticated. Written in the present tense below to describe the target design; do not read it as shipped.
+
 Chargers authenticate their OCPP WebSocket connection with **HTTP Basic Auth over the existing WSS transport** — OCPP 1.6 **Security Profile 2**. Each `Charger` has a per-unit secret (the **Charger Auth Key**); the server stores only a **SHA-256 hash** in `Charger.auth_key_hash`. The connection is authenticated **during the WebSocket handshake, before `websocket.accept()`**, and the Basic Auth **username MUST equal the `{charge_point_id}` in the URL path**. Enforcement is **per-charger** on `auth_key_hash` presence, with a global `REQUIRE_CHARGER_AUTH` flag to close the migration window.
 
 ## Context

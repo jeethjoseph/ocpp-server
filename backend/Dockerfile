@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     curl \
     gosu \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 # AWS RDS global CA bundle for verify-full TLS to managed Postgres.

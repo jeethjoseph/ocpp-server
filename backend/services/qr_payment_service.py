@@ -9,7 +9,6 @@ from typing import NamedTuple, Optional, Tuple, Dict
 
 from tortoise.transactions import in_transaction
 
-from core.config import RAZORPAY_PLATFORM_FEE_PERCENT  # noqa: F401  (re-exported for backwards compat)
 from models import (
     User, Wallet, Charger, Transaction, QRPayment, ChargerQRCode, MeterValue,
     QRPaymentStatusEnum, AuthProviderEnum, ChargerStatusEnum,
@@ -46,7 +45,6 @@ from services.razorpay_service import (
     RazorpayIdempotencyConflictError,
     extract_fee_from_payment,
 )
-from services.tariff_utils import synthetic_platform_fee, synthetic_fee_split
 from services.wallet_service import WalletService
 from services.billing_rules import (
     MIN_BILLABLE_ENERGY_KWH,
@@ -61,8 +59,7 @@ from utils import safe_create_task, mask_vpa, mask_phone, mask_payment_id, mask_
 
 logger = logging.getLogger(__name__)
 
-# QR-specific configuration. The project-level RAZORPAY_PLATFORM_FEE_PERCENT
-# lives in core.config; see the import above.
+# QR-specific configuration.
 QR_PAYMENT_PENDING_TIMEOUT = int(os.getenv("QR_PAYMENT_PENDING_TIMEOUT", "300"))
 
 SYSTEM_GUEST_EMAIL = "guest@system.powerlync.com"
@@ -162,13 +159,17 @@ def _refund_semaphore() -> asyncio.Semaphore:
 
 
 async def _ensure_actual_fee_captured(qr_payment: QRPayment) -> None:
-    """Side-effect writer: ensure the actual Razorpay fee lives on the row.
+    """Side-effect writer: ensure the ACTUAL Razorpay gateway fee lives on the
+    row. Post-ADR 0026 this fee is customer-facing — it is the gateway line on
+    the invoice, is reserved out of the budget cap, and is deducted in the
+    refund and the settlement ledger.
 
-    Priority for sourcing the actual fee: existing stored value (webhook/api) >
-    Razorpay API fetch > 2% estimate fallback. Updates `qr_payment.platform_fee`,
-    `razorpay_commission`, `razorpay_gst`, and `fee_source` in place; caller must
-    save. Used only for ops/reconciliation. NEVER drives customer-facing math —
-    see ADR 0001.
+    Priority: existing stored value (webhook/api) > Razorpay API fetch > ₹0.
+    Updates `platform_fee`, `razorpay_commission`, `razorpay_gst`, `fee_source`
+    in place; caller must save. There is NO synthetic estimate any more: if we
+    genuinely cannot source the fee, we record ₹0 and VoltLync absorbs the
+    unknown gateway cost rather than fabricating a customer charge (the phantom
+    -fee trap — see ADR 0026 and known-issues #1).
     """
     if qr_payment.fee_source in ("webhook", "api") and qr_payment.platform_fee is not None:
         return
@@ -182,15 +183,12 @@ async def _ensure_actual_fee_captured(qr_payment: QRPayment) -> None:
         qr_payment.fee_source = "api"
         return
 
-    # Fallback when Razorpay neither delivered the fee in the webhook nor
-    # exposes it via the payment-fetch API — estimate using the same synthetic
-    # split so the row stays internally consistent.
-    estimated = synthetic_platform_fee(qr_payment.amount_paid)
-    commission, gst_on_fee = synthetic_fee_split(qr_payment.amount_paid)
-    qr_payment.platform_fee = estimated
-    qr_payment.razorpay_commission = commission
-    qr_payment.razorpay_gst = gst_on_fee
-    qr_payment.fee_source = "estimated"
+    # No fee signal from Razorpay — do NOT invent one. Record ₹0; VoltLync
+    # absorbs any real gateway cost we couldn't observe.
+    qr_payment.platform_fee = Decimal("0.00")
+    qr_payment.razorpay_commission = Decimal("0.00")
+    qr_payment.razorpay_gst = Decimal("0.00")
+    qr_payment.fee_source = "unavailable"
 
 
 async def ensure_guest_user():
@@ -669,16 +667,17 @@ class QRPaymentService:
         tariff = await WalletService.get_applicable_tariff(charger_id)
         tariff_rate = tariff.rate_per_kwh if tariff else Decimal('0')
         gst_percent = tariff.gst_percent if tariff else Decimal('18')
-        # Budget cap uses the synthetic platform fee, not the actual Razorpay
-        # fee — see ADR 0001. Customers get a predictable contract regardless
-        # of Razorpay's pricing of the moment.
-        platform_fee = synthetic_platform_fee(qr_payment.amount_paid)
+        # Budget cap reserves the ACTUAL gateway fee (₹0 for zero-MDR UPI) so
+        # the session's final refund can never go negative and force VoltLync
+        # to eat the gateway. ADR 0026. The fee is captured at qr_code.credited
+        # time; ensure it's on the row before we read it.
         await _ensure_actual_fee_captured(qr_payment)
+        gateway_fee = qr_payment.platform_fee or Decimal("0")
         # Store budget as an integer paise value — Decimal money should
         # never round-trip through float in Redis. Consumers read this
         # back as Decimal via ``Decimal(...) / Decimal("100")``.
         budget_limit_paise = int(
-            ((qr_payment.amount_paid - platform_fee) * Decimal("100"))
+            ((qr_payment.amount_paid - gateway_fee) * Decimal("100"))
             .quantize(Decimal("1"), rounding=ROUND_HALF_UP)
         )
         await qr_payment.save()
@@ -686,13 +685,11 @@ class QRPaymentService:
         transaction = await Transaction.filter(id=transaction_id).first()
 
         # Decimal fields are serialized as strings (not float) so reads round-trip
-        # without precision loss. Readers parse via `Decimal(value)`. Legacy
-        # in-flight cache rows (pre-2026-05-21) wrote floats — readers continue
-        # to accept those via `Decimal(str(value))` for one TTL window.
+        # without precision loss. Readers parse via `Decimal(value)`.
         session_data = {
             "qr_payment_id": qr_payment.id,
             "amount_paid": str(qr_payment.amount_paid),
-            "platform_fee": str(platform_fee),
+            "gateway_fee": str(gateway_fee),
             "budget_limit_paise": budget_limit_paise,
             "tariff_rate": str(tariff_rate),
             "gst_percent": str(gst_percent),
@@ -737,11 +734,11 @@ class QRPaymentService:
         tariff = await WalletService.get_applicable_tariff(qr_payment.charger_id)
         tariff_rate = tariff.rate_per_kwh if tariff else Decimal('0')
         gst_percent = tariff.gst_percent if tariff else Decimal('18')
-        platform_fee = synthetic_platform_fee(qr_payment.amount_paid)
         await _ensure_actual_fee_captured(qr_payment)
+        gateway_fee = qr_payment.platform_fee or Decimal("0")
         await qr_payment.save()
         budget_limit_paise = int(
-            ((qr_payment.amount_paid - platform_fee) * Decimal("100"))
+            ((qr_payment.amount_paid - gateway_fee) * Decimal("100"))
             .quantize(Decimal("1"), rounding=ROUND_HALF_UP)
         )
 
@@ -749,7 +746,7 @@ class QRPaymentService:
         session = {
             "qr_payment_id": qr_payment.id,
             "amount_paid": str(qr_payment.amount_paid),
-            "platform_fee": str(platform_fee),
+            "gateway_fee": str(gateway_fee),
             "budget_limit_paise": budget_limit_paise,
             "tariff_rate": str(tariff_rate),
             "gst_percent": str(gst_percent),
@@ -923,58 +920,57 @@ class QRPaymentService:
     @staticmethod
     def _compute_qr_energy_cost(
         transaction_id: int, amount_paid: Decimal, energy_kwh,
-        tariff_rate: Decimal, gst_percent: Decimal,
+        tariff_rate: Decimal, gst_percent: Decimal, gateway_fee: Decimal,
     ) -> Tuple[Decimal, Decimal]:
-        """Compute ``(energy_cost, gst_amount)`` for a billable QR session,
-        capping billable energy at the budgeted pre-tax ceiling. Returns
-        ``(0, 0)`` when there is no tariff rate. Pure (apart from over-cap
-        metric/log emission)."""
+        """Compute ``(energy_cost, gst_amount)`` for a billable QR session.
+
+        Energy is billed directly at the base rate: ``energy_cost = kWh × base_rate``
+        (never a residual after subtracting the gateway — ADR 0026). Billable
+        energy is capped so the customer is never charged beyond what they paid
+        minus the actual gateway: ``energy_incl_gst ≤ amount_paid − gateway_fee``.
+        The charger keeps delivering for a few seconds after RemoteStopTransaction,
+        so metered kWh can overshoot; the over-delivery is absorbed by VoltLync
+        rather than forcing a negative refund. Returns ``(0, 0)`` when there is
+        no tariff rate. Pure apart from over-cap metric/log emission."""
         if not tariff_rate:
             return Decimal('0.00'), Decimal('0.00')
 
-        uncapped_energy_cost = (Decimal(str(energy_kwh)) * tariff_rate).quantize(
-            Decimal('0.01'), rounding=ROUND_HALF_UP
-        )
-        # Cap billable energy at the budgeted pre-tax ceiling. The budget
-        # enforced in Redis is `amount_paid - platform_fee` (tax-inclusive).
-        # The charger keeps delivering for a few seconds after we send
-        # RemoteStopTransaction, so the metered kWh can overshoot the
-        # budget. Without this cap, the customer would be billed for
-        # energy they never paid for and the refund would clamp to zero,
-        # silently shifting the GST liability onto VoltLync.
-        platform_fee = synthetic_platform_fee(amount_paid)
-        budget_incl_tax = amount_paid - platform_fee
         gst_multiplier = Decimal('1') + (gst_percent / Decimal('100'))
-        budget_excl_tax = (budget_incl_tax / gst_multiplier).quantize(
+        energy_cost = (Decimal(str(energy_kwh)) * tariff_rate).quantize(
             Decimal('0.01'), rounding=ROUND_HALF_UP
         )
-        energy_cost = min(uncapped_energy_cost, budget_excl_tax)
-        if uncapped_energy_cost > budget_excl_tax:
+        gst_amount = (energy_cost * gst_percent / Decimal('100')).quantize(
+            Decimal('0.01'), rounding=ROUND_HALF_UP
+        )
+
+        # Cap the tax-inclusive energy charge at the reserved budget.
+        budget_incl_tax = amount_paid - gateway_fee
+        if energy_cost + gst_amount > budget_incl_tax:
+            capped_energy_cost = (budget_incl_tax / gst_multiplier).quantize(
+                Decimal('0.01'), rounding=ROUND_HALF_UP
+            )
+            capped_gst = budget_incl_tax - capped_energy_cost
             over_kwh = float(
-                Decimal(str(energy_kwh)) - (budget_excl_tax / tariff_rate)
+                Decimal(str(energy_kwh)) - (capped_energy_cost / tariff_rate)
             )
             logger.warning(
                 "QR over-consumption capped for txn %s: "
                 "delivered=%.3fkWh, billable=%.3fkWh, over_delivery=%.3fkWh, "
                 "uncapped_cost=₹%s, capped_cost=₹%s",
                 transaction_id, energy_kwh,
-                float(budget_excl_tax / tariff_rate), over_kwh,
-                uncapped_energy_cost, energy_cost,
+                float(capped_energy_cost / tariff_rate), over_kwh,
+                energy_cost, capped_energy_cost,
             )
-            # Emit metrics so ops can quantify how much electricity is
-            # being absorbed past the budget. A non-zero rate here is a
-            # signal to tighten the auto-stop reaction time.
             MetricsCollector.increment_counter("Custom/QR/OverConsumptionCapped")
             MetricsCollector.record_metric("Custom/QR/OverDeliveryKwh", over_kwh)
-        gst_amount = (energy_cost * gst_percent / Decimal('100')).quantize(
-            Decimal('0.01'), rounding=ROUND_HALF_UP
-        )
+            return capped_energy_cost, capped_gst
         return energy_cost, gst_amount
 
     @staticmethod
     async def process_qr_session_billing(transaction_id: int):
         """
-        Called after StopTransaction. Calculate energy cost, platform fee, and issue refund.
+        Called after StopTransaction. Bill energy at the base rate, take the
+        ACTUAL gateway fee as a separate line, and refund the remainder. ADR 0026.
         """
         qr_payment = await QRPayment.filter(
             transaction_id=transaction_id,
@@ -996,33 +992,33 @@ class QRPaymentService:
         tariff = await WalletService.get_applicable_tariff(qr_payment.charger_id)
         tariff_rate = tariff.rate_per_kwh if tariff else Decimal('0')
         gst_percent = tariff.gst_percent if tariff else Decimal('18')
-        # Final billing uses the synthetic platform fee for budget cap AND
-        # over-payment refund — same rule as the budget side, so the customer
-        # never feels the variance with Razorpay's actual fee. See ADR 0001.
-        platform_fee = synthetic_platform_fee(qr_payment.amount_paid)
+        # The gateway is the ACTUAL Razorpay fee, deducted from the refund and
+        # surfaced as its own invoice line — never folded into the tariff. ADR 0026.
         await _ensure_actual_fee_captured(qr_payment)
+        gateway_fee = qr_payment.platform_fee or Decimal('0')
 
         energy_cost, gst_amount = QRPaymentService._compute_qr_energy_cost(
-            transaction_id, qr_payment.amount_paid, energy_kwh, tariff_rate, gst_percent,
+            transaction_id, qr_payment.amount_paid, energy_kwh, tariff_rate,
+            gst_percent, gateway_fee,
         )
 
-        refund = max(Decimal('0'), qr_payment.amount_paid - energy_cost - gst_amount - platform_fee)
+        refund = max(Decimal('0'), qr_payment.amount_paid - energy_cost - gst_amount - gateway_fee)
         await QRPaymentService._finalize_qr_billing(
             transaction_id, qr_payment, energy_cost, gst_amount, gst_percent,
-            platform_fee, refund,
+            gateway_fee, refund,
         )
 
     @staticmethod
     async def _finalize_qr_billing(
         transaction_id: int, qr_payment: QRPayment, energy_cost: Decimal,
-        gst_amount: Decimal, gst_percent: Decimal, platform_fee: Decimal,
+        gst_amount: Decimal, gst_percent: Decimal, gateway_fee: Decimal,
         refund: Decimal,
     ) -> None:
         """Persist the billing breakdown, issue any positive unused-credit
         refund, clear the Redis session, and emit the billing-completed audit
-        event. ``platform_fee`` here is the *synthetic* fee used for the refund
-        math + log/audit — it is NOT written to ``qr_payment.platform_fee``
-        (that holds the actual Razorpay fee, ADR 0001).
+        event. ``gateway_fee`` here is the ACTUAL Razorpay fee already captured
+        onto ``qr_payment.platform_fee`` — post-ADR 0026 the customer-facing
+        gateway and the stored actual fee are the same value.
 
         Claim-marker (ADR 0018): T1 persists the billing breakdown and, when a
         refund is due, CLAIMS it (status -> REFUND_IN_PROGRESS) atomically under
@@ -1044,8 +1040,8 @@ class QRPaymentService:
 
             # Carry the actual-fee capture made on the pre-lock object
             # (_ensure_actual_fee_captured mutates in place and does NOT save,
-            # so the freshly-locked row doesn't have it yet). ADR 0001 — actual
-            # fee, never the synthetic platform_fee.
+            # so the freshly-locked row doesn't have it yet). ADR 0026 — this
+            # actual fee IS the customer-facing gateway.
             locked.platform_fee = qr_payment.platform_fee
             locked.razorpay_commission = qr_payment.razorpay_commission
             locked.razorpay_gst = qr_payment.razorpay_gst
@@ -1075,7 +1071,7 @@ class QRPaymentService:
             logger.info(
                 f"QR billing for txn {transaction_id}: "
                 f"paid=₹{locked.amount_paid}, energy_cost=₹{energy_cost}, "
-                f"GST({gst_percent}%)=₹{gst_amount}, platform_fee=₹{platform_fee}, refund=₹{refund}"
+                f"GST({gst_percent}%)=₹{gst_amount}, gateway_fee=₹{gateway_fee}, refund=₹{refund}"
             )
 
             await locked.save()
@@ -1098,7 +1094,7 @@ class QRPaymentService:
             changes={
                 "energy_cost": float(energy_cost),
                 "gst_amount": float(gst_amount),
-                "platform_fee": float(platform_fee),
+                "gateway_fee": float(gateway_fee),
                 "refund_amount": float(final.refund_amount or 0),
                 "status": final.status.value,
             },

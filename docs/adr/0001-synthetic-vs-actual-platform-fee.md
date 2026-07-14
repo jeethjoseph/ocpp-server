@@ -1,5 +1,13 @@
 # Use a fixed synthetic 2% platform fee for billing math; capture the actual Razorpay fee separately for ops
 
+> **Status: SUPERSEDED by [ADR 0026](0026-tariff-excludes-gateway-actual-fee.md) (2026-07-13).**
+> The synthetic platform fee is retired. The gateway is now the *actual*
+> webhook-reported Razorpay fee, billed as a separate customer line and used
+> for the budget cap, refund, invoice gateway line, AND the settlement ledger
+> (the 2026-05-29 synthetic-ledger amendment below is also reversed — safe
+> because the gateway now cancels out of the franchisee payout). The rest of
+> this ADR is retained for historical context only.
+
 Razorpay's platform fee on UPI payments varies in practice (typically 0–2%, sometimes higher depending on the instrument and Razorpay's pricing of the moment). We previously fed the webhook-captured **actual** fee into both the QR-session budget cap and the GST invoice's gateway-charges line, which meant the per-kWh price a customer effectively paid wobbled with Razorpay's daily pricing. We now use a fixed percentage (default 2%, env var `RAZORPAY_PLATFORM_FEE_PERCENT`) — the **synthetic platform fee** — for every customer-facing calculation: budget cap, over-payment refund, and invoice gateway-charges line. The real webhook fee continues to land on the `QRPayment` row (`platform_fee`, `razorpay_commission`, `razorpay_gst`) and is used only for reconciliation, ops dashboards, and the nightly drift detector. The variance between the two — sometimes positive, sometimes negative — is absorbed by VoltLync's P&L.
 
 The 2% is treated as all-in: commission = `× 2/118`, GST on commission = `× 2 × 18/118`. This matches the existing fee-estimator convention in `_resolve_platform_fee` and lets future maintainers see one consistent split everywhere.

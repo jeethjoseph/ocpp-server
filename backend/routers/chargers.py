@@ -7,14 +7,14 @@ from datetime import datetime, timedelta, timezone
 import uuid
 import logging
 
-from core.config import RAZORPAY_PLATFORM_FEE_PERCENT, wallet_charging_enabled
+from core.config import wallet_charging_enabled
 from core.roles import INTERNAL_ROLES
 from models import Charger, ChargingStation, Connector, Transaction, OCPPLog, User, ChargerError, Tariff
 from tortoise.exceptions import IntegrityError
 from tortoise.transactions import in_transaction
 from auth_middleware import require_admin, require_user_or_admin
 from crud import log_audit_event
-from services.tariff_utils import back_derive_rate_per_kwh
+from services.tariff_utils import back_calc_base_rate
 
 logger = logging.getLogger(__name__)
 
@@ -25,9 +25,9 @@ class ConnectorInput(BaseModel):
     max_power_kw: Optional[float] = None
 
 class ChargerCreate(BaseModel):
-    """ADR 0003: tariff is operator-typed as the all-inclusive per-kWh rate
-    (`tariff_per_kwh_all_in`). The legacy `tariff_per_kwh` / `tariff_per_kwh_incl_tax`
-    request fields are rejected via `extra='forbid'`."""
+    """ADR 0026: tariff is operator-typed as the GST-inclusive, gateway-exclusive
+    per-kWh rate (`rate_gst_included`). Legacy tariff request fields are rejected
+    via `extra='forbid'`."""
     model_config = {"extra": "forbid"}
 
     station_id: int
@@ -37,9 +37,9 @@ class ChargerCreate(BaseModel):
     serial_number: Optional[str] = None
     external_charger_id: Optional[str] = None
     connectors: List[ConnectorInput]
-    tariff_per_kwh_all_in: Optional[float] = Field(
+    rate_gst_included: Optional[float] = Field(
         None, ge=1.0, le=100.0,
-        description="All-inclusive per-kWh tariff (incl. GST + 2% gateway fee). 1.0–100.0.",
+        description="GST-inclusive, gateway-exclusive per-kWh tariff. 1.0–100.0. See ADR 0026.",
     )
 
 
@@ -64,9 +64,9 @@ class ChargerUpdate(BaseModel):
     # Editable so an admin can correct a mis-provisioned charger. Validated
     # against ALLOWED_CONNECTOR_TYPES; applied to the charger's connector(s).
     connector_type: Optional[str] = None
-    tariff_per_kwh_all_in: Optional[float] = Field(
+    rate_gst_included: Optional[float] = Field(
         None, ge=1.0, le=100.0,
-        description="All-inclusive per-kWh tariff (incl. GST + 2% gateway fee). 1.0–100.0.",
+        description="GST-inclusive, gateway-exclusive per-kWh tariff. 1.0–100.0. See ADR 0026.",
     )
 
 class LatestErrorInfo(BaseModel):
@@ -96,7 +96,7 @@ class ChargerResponse(BaseModel):
     updated_at: datetime
     tariff_per_kwh: Optional[float] = None  # back-derived; internal billing math
     tariff_gst_percent: Optional[float] = None
-    tariff_per_kwh_all_in: Optional[float] = None  # operator-set, customer-displayed
+    rate_gst_included: Optional[float] = None  # operator-set, customer-displayed (GST-incl, gateway-excl)
     latest_error: Optional[LatestErrorInfo] = None
     connectors: List["ConnectorResponse"] = []
 
@@ -216,7 +216,7 @@ def charger_to_response(
 
     tariff_rate = float(tariff.rate_per_kwh) if tariff else None
     tariff_gst = float(tariff.gst_percent) if tariff else None
-    tariff_all_in = float(tariff.tariff_per_kwh_all_in) if tariff else None
+    tariff_gst_incl = float(tariff.rate_gst_included) if tariff else None
 
     return ChargerResponse(
         id=charger.id,
@@ -241,7 +241,7 @@ def charger_to_response(
         latest_error=error_info,
         tariff_per_kwh=tariff_rate,
         tariff_gst_percent=tariff_gst,
-        tariff_per_kwh_all_in=tariff_all_in,
+        rate_gst_included=tariff_gst_incl,
         connectors=[
             ConnectorResponse.model_validate(c, from_attributes=True)
             for c in (connectors or [])
@@ -396,18 +396,18 @@ async def create_charger(charger_data: ChargerCreate, admin_user: User = Depends
                     max_power_kw=connector_input.max_power_kw
                 )
 
-            # Create charger-specific tariff if provided.
-            # The operator types the all-inclusive per-kWh rate; we back-derive
-            # rate_per_kwh server-side and persist both. ADR 0003.
-            if charger_data.tariff_per_kwh_all_in is not None:
+            # Create charger-specific tariff if provided. The operator types
+            # the GST-inclusive, gateway-exclusive rate; we back-calc the base
+            # rate server-side and persist both. ADR 0026.
+            if charger_data.rate_gst_included is not None:
                 gst_default = Tariff._meta.fields_map["gst_percent"].default
                 gst = Decimal(str(gst_default))
-                all_in = Decimal(str(charger_data.tariff_per_kwh_all_in))
-                rate = back_derive_rate_per_kwh(all_in, gst, RAZORPAY_PLATFORM_FEE_PERCENT)
+                gst_incl = Decimal(str(charger_data.rate_gst_included))
+                rate = back_calc_base_rate(gst_incl, gst)
                 await Tariff.create(
                     charger=charger,
                     rate_per_kwh=rate,
-                    tariff_per_kwh_all_in=all_in,
+                    rate_gst_included=gst_incl,
                     gst_percent=gst,
                 )
 
@@ -524,7 +524,7 @@ async def get_charger_details(charger_id: int, user: User = Depends(require_user
     
     return response
 
-async def _upsert_charger_tariff(charger_id: int, all_in_value) -> None:
+async def _upsert_charger_tariff(charger_id: int, gst_incl_value) -> None:
     """Create or update the single charger-specific tariff, race-safe.
 
     Preserves the existing GST rate if a tariff already exists, else the model
@@ -538,9 +538,9 @@ async def _upsert_charger_tariff(charger_id: int, all_in_value) -> None:
         gst = existing.gst_percent
     else:
         gst = Decimal(str(Tariff._meta.fields_map["gst_percent"].default))
-    all_in = Decimal(str(all_in_value))
-    rate = back_derive_rate_per_kwh(all_in, gst, RAZORPAY_PLATFORM_FEE_PERCENT)
-    defaults = {"rate_per_kwh": rate, "tariff_per_kwh_all_in": all_in, "gst_percent": gst}
+    gst_incl = Decimal(str(gst_incl_value))
+    rate = back_calc_base_rate(gst_incl, gst)
+    defaults = {"rate_per_kwh": rate, "rate_gst_included": gst_incl, "gst_percent": gst}
     try:
         await Tariff.update_or_create(defaults=defaults, charger_id=charger_id)
     except IntegrityError:
@@ -568,11 +568,11 @@ async def update_charger(charger_id: int, update_data: ChargerUpdate, admin_user
     # Update only provided fields
     update_dict = update_data.model_dump(exclude_unset=True)
 
-    # Tariff is handled out-of-band — back-derive rate_per_kwh from the
-    # operator-typed all-in value and persist both columns. ADR 0003.
-    tariff_per_kwh_all_in = update_dict.pop("tariff_per_kwh_all_in", None)
-    if tariff_per_kwh_all_in is not None:
-        await _upsert_charger_tariff(charger_id, tariff_per_kwh_all_in)
+    # Tariff is handled out-of-band — back-calc the base rate from the
+    # operator-typed GST-inclusive value and persist both columns. ADR 0026.
+    rate_gst_included = update_dict.pop("rate_gst_included", None)
+    if rate_gst_included is not None:
+        await _upsert_charger_tariff(charger_id, rate_gst_included)
 
     # Connector type lives on the connector row(s), not the charger. Validate and
     # apply to all of this charger's connectors so socket-vs-tethered gating is
@@ -584,6 +584,17 @@ async def update_charger(charger_id: int, update_data: ChargerUpdate, admin_user
         await Connector.filter(charger_id=charger_id).update(
             connector_type=connector_type.strip()
         )
+        # Keep the in-memory socket-classification cache coherent. The hot-path
+        # StatusNotification handler reads connector_type from
+        # connected_charge_points (populated only at BootNotification), so
+        # without this refresh socket-vs-tethered gating would keep using the
+        # OLD type for a currently-connected charger until it reboots.
+        from core.connection_manager import connection_manager
+        cached = connection_manager.connected_charge_points.get(
+            charger.charge_point_string_id
+        )
+        if cached is not None:
+            cached["connector_type"] = connector_type.strip()
 
     for field, value in update_dict.items():
         setattr(charger, field, value)

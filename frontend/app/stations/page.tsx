@@ -164,8 +164,8 @@ export default function StationsPage() {
                           
                           <div className="text-sm font-medium text-gray-900">
                             {formatTariffRangeAllIn(
-                              station.min_price_per_kwh_all_in,
-                              station.max_price_per_kwh_all_in,
+                              station.min_price_per_kwh_gst_incl,
+                              station.max_price_per_kwh_gst_incl,
                             )}
                           </div>
                         </div>
@@ -252,8 +252,8 @@ export default function StationsPage() {
                               </span>
                             </div>
                             <div className="mt-1 text-xs text-gray-700 text-right">
-                              {charger.tariff_per_kwh_all_in != null
-                                ? `₹${Number(charger.tariff_per_kwh_all_in).toFixed(2)}/kWh (all-inclusive)`
+                              {charger.rate_gst_included != null
+                                ? `₹${Number(charger.rate_gst_included).toFixed(2)}/kWh (incl. GST)`
                                 : 'Tariff: N/A'}
                             </div>
                           </div>

@@ -39,10 +39,24 @@ the settled-state ₹0.
    (refunded less) gets that money. It sits in the nodal balance
    unattributed.
 
-**Why deferred:** Per-transaction amounts are small (paise to a few
+**Update (2026-07-13, ADR 0026):** the webhook fee is now the *operative*
+customer-facing gateway (it is the invoice gateway line, the reserved budget,
+the refund deduction, and the settlement `pg_fee`) — the synthetic 2% is
+retired. This **narrows** the issue rather than fixing it:
+- **Franchisee under-payment is GONE.** The gateway is added to the customer
+  bill and subtracted in both the refund and `pg_fee`, so it cancels out of
+  the franchisee payout entirely — the franchisee pool is `energy_kWh ×
+  base_rate` regardless of the fee value.
+- **Customer over-refund residual PERSISTS** but flips sign harmlessly: when the
+  webhook over-states the settled fee (zero-MDR UPI ≤ ₹2000), we bill the
+  customer a gateway line larger than Razorpay actually charged, i.e. the
+  customer is *under-refunded* by that residual (paise to ~₹2). VoltLync retains
+  it. We accept this — the webhook is the only per-payment fee signal available
+  at billing time and some payments genuinely carry a real fee.
+
+**Why deferred (original):** Per-transaction amounts are small (paise to a few
 rupees on ₹10–₹200 sessions). Customer-facing visibility is low
-(refund delta is on the order of ₹0.10). Settlement delta to
-franchisee is similarly small. We accept this drift while the QR /
+(refund delta is on the order of ₹0.10). We accept this drift while the QR /
 Route flow is in pilot.
 
 **Fix when revisited:** Change priority order in

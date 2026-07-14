@@ -27,7 +27,6 @@ from models import (
     WalletTransaction,
     TransactionTypeEnum,
 )
-from services.tariff_utils import synthetic_platform_fee
 
 logger = logging.getLogger("ocpp-server")
 
@@ -167,13 +166,20 @@ class FranchiseeSettlementService:
             payment_method = "QR_UPI"
             gross_amount = qr_payment.amount_paid
             refund_amount = qr_payment.refund_amount or Decimal("0")
-            # Ledger uses synthetic 2% so net_excl_gst matches the customer's
-            # invoice energy_taxable line. The actual Razorpay commission/GST
-            # stays on `qr_payment` for ops reconciliation; VoltLync absorbs
-            # 100% of the actual-vs-synthetic variance. ADR 0001 amendment.
-            pg_fee = synthetic_platform_fee(gross_amount)
+            # Ledger uses the ACTUAL gateway fee (ADR 0026), the same value on
+            # the customer's invoice gateway line and deducted from the refund.
+            # Because the gateway is added to the bill and subtracted here, it
+            # cancels out of the franchisee payout — net_excl_gst equals the
+            # invoice energy_taxable line (= energy_kWh × base_rate). Reverses
+            # ADR 0001's synthetic-ledger amendment (safe: fee now cancels).
+            pg_fee = (qr_payment.platform_fee or Decimal("0"))
             gst_collected = qr_payment.gst_amount or Decimal("0")
             razorpay_payment_id = qr_payment.razorpay_payment_id
+            # Reporting snapshot only — payout is driven by net_excl_gst, not this
+            # rate. In the rare over-consumption-capped case `energy` is the full
+            # metered kWh while `energy_cost` is the capped charge, so this rate
+            # reads slightly below the tariff base rate and disagrees with the
+            # invoice's billable-kWh rate. Accepted (ADR 0026 residual #4).
             tariff_rate = qr_payment.energy_cost / Decimal(str(energy)) if qr_payment.energy_cost and energy else Decimal("0")
         else:
             payment_method = "WALLET"

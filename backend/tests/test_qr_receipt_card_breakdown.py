@@ -2,8 +2,10 @@
 
 Per bill-card-consistency issue 01, the customer card must show the same
 reconciled numbers as the PDF: energy_cost + gateway_fee + gst_amount must equal
-amount_paid − refund, and the actual Razorpay commission (qr_payment.platform_fee)
-must never be exposed to the customer (ADR 0001).
+amount_paid − refund. Post-ADR 0026 the gateway line is the ACTUAL Razorpay fee
+(razorpay_commission + razorpay_gst) — the same value the invoice carries — not a
+synthetic split of amount_paid. The raw ops fields (platform_fee / fee_source)
+are still never surfaced to the customer.
 """
 import uuid
 from decimal import Decimal
@@ -48,25 +50,30 @@ def test_breakdown_from_invoice_reconciles_and_hides_real_fee():
     assert "platform_fee" not in b and "razorpay_commission" not in b
 
 
-def test_breakdown_synthetic_fallback_reconciles_without_invoice():
+def test_breakdown_actual_fee_fallback_reconciles_without_invoice():
     txn = SimpleNamespace(
         energy_consumed_kwh=Decimal("3.065"),
         energy_charge=Decimal("63.64"),
         gst_amount=Decimal("11.46"),
     )
-    payment = SimpleNamespace(amount_paid=Decimal("100.00"))
+    # No invoice yet: the fallback reads the ACTUAL fee off the payment row
+    # (ADR 0026) — commission 0.99 + gst 0.18 = 1.17 gateway.
+    payment = SimpleNamespace(
+        amount_paid=Decimal("100.00"),
+        razorpay_commission=Decimal("0.99"),
+        razorpay_gst=Decimal("0.18"),
+    )
     b = _customer_breakdown(payment, txn=txn, invoice=None)
-    # synthetic split of ₹100 = 1.69 gateway + 0.31 GST → GST 11.46 + 0.31 = 11.77
-    assert b["gateway_fee"] == "1.69"
-    assert b["gst_amount"] == "11.77"
+    assert b["gateway_fee"] == "0.99"
+    assert b["gst_amount"] == "11.64"  # 11.46 energy GST + 0.18 gateway GST
     total = Decimal(b["energy_cost"]) + Decimal(b["gateway_fee"]) + Decimal(b["gst_amount"])
-    assert total == Decimal("77.10")
+    assert total == Decimal("76.27")
     # Fallback still yields itemised line totals summing to bill_total.
     assert b["line_items"] == [
-        {"label": "Energy", "amount": "75.10"},        # 63.64 + 11.46 energy GST
-        {"label": "Gateway charges", "amount": "2.00"},  # 1.69 + 0.31 gateway GST
+        {"label": "Energy", "amount": "75.10"},          # 63.64 + 11.46 energy GST
+        {"label": "Gateway charges", "amount": "1.17"},  # 0.99 + 0.18 gateway GST
     ]
-    assert b["bill_total"] == "77.10"
+    assert b["bill_total"] == "76.27"
 
 
 def test_breakdown_no_billing_returns_nulls():
@@ -99,10 +106,12 @@ async def test_endpoint_hides_razorpay_fee_and_reconciles(client):
         energy_consumed_kwh=Decimal("3.065"), energy_charge=Decimal("63.64"),
         gst_amount=Decimal("11.46"),
     )
+    # refund_amount is consistent with the ACTUAL fee (ADR 0026):
+    # 100 − energy 63.64 − energy-GST 11.46 − gateway 1.17 = 23.73.
     p = await QRPayment.create(
         charger=charger, charger_qr_code=qr, user=user, transaction=txn,
         razorpay_payment_id=f"pay_{uuid.uuid4().hex[:12]}", razorpay_qr_code_id=qr.razorpay_qr_code_id,
-        amount_paid=Decimal("100.00"), refund_amount=Decimal("22.90"), customer_vpa=vpa,
+        amount_paid=Decimal("100.00"), refund_amount=Decimal("23.73"), customer_vpa=vpa,
         status=QRPaymentStatusEnum.REFUNDED,
         platform_fee=Decimal("1.17"), razorpay_commission=Decimal("0.99"),
         razorpay_gst=Decimal("0.18"), fee_source="webhook",
@@ -115,11 +124,11 @@ async def test_endpoint_hides_razorpay_fee_and_reconciles(client):
     assert "platform_fee" not in row
     assert "razorpay_commission" not in row
     assert "fee_source" not in row
-    # Synthetic gateway fee shown; card reconciles to what the customer paid net.
-    assert row["gateway_fee"] == "1.69"
-    assert row["gst_amount"] == "11.77"
+    # Actual gateway fee (commission) shown; card reconciles to net paid.
+    assert row["gateway_fee"] == "0.99"
+    assert row["gst_amount"] == "11.64"  # 11.46 energy GST + 0.18 gateway GST
     net = Decimal(row["energy_cost"]) + Decimal(row["gateway_fee"]) + Decimal(row["gst_amount"])
-    assert net == Decimal(row["amount_paid"]) - Decimal(row["refund_amount"])  # 77.10 == 100 − 22.90
+    assert net == Decimal(row["amount_paid"]) - Decimal(row["refund_amount"])  # 76.27 == 100 − 23.73
     # Itemised line totals sum to bill_total, which equals amount_paid − refund.
     assert [i["label"] for i in row["line_items"]] == ["Energy", "Gateway charges"]
     assert sum(Decimal(i["amount"]) for i in row["line_items"]) == Decimal(row["bill_total"])

@@ -23,7 +23,6 @@ from services.qr_payment_service import QR_PAYMENT_PENDING_TIMEOUT
 from services.qr_session_state import (
     ACTIVE_TXN_STATES, WAITING, customer_sub_state,
 )
-from services.tariff_utils import synthetic_platform_fee
 
 
 logger = logging.getLogger(__name__)
@@ -63,15 +62,16 @@ async def _resolve_session_context(qr_payment: QRPayment, txn: Transaction) -> d
         tariff = await Tariff.filter(is_global=True).first()
     tariff_rate = Decimal(tariff.rate_per_kwh) if tariff else Decimal("0")
     gst_percent = Decimal(tariff.gst_percent) if tariff else Decimal("18")
-    platform_fee = synthetic_platform_fee(qr_payment.amount_paid)
+    # Budget reserves the ACTUAL gateway fee (ADR 0026); ₹0 for zero-MDR UPI.
+    gateway_fee = Decimal(qr_payment.platform_fee) if qr_payment.platform_fee else Decimal("0")
     budget_limit_paise = int(
-        ((qr_payment.amount_paid - platform_fee) * Decimal("100"))
+        ((qr_payment.amount_paid - gateway_fee) * Decimal("100"))
         .quantize(Decimal("1"))
     )
     return {
         "tariff_rate": str(tariff_rate),
         "gst_percent": str(gst_percent),
-        "platform_fee": str(platform_fee),
+        "gateway_fee": str(gateway_fee),
         "budget_limit_paise": budget_limit_paise,
         "start_meter_kwh": str(txn.start_meter_kwh) if txn.start_meter_kwh else "0",
     }
@@ -115,15 +115,19 @@ async def _compute_live_kpis(qr_payment: QRPayment, txn: Transaction) -> dict:
 
     tariff_rate = Decimal(str(ctx["tariff_rate"]))
     gst_percent = Decimal(str(ctx["gst_percent"]))
-    platform_fee = Decimal(str(ctx["platform_fee"]))
+    # `gateway_fee` replaced the legacy `platform_fee` cache key (ADR 0026).
+    # Tolerate an in-flight session whose Redis row was written by pre-deploy
+    # code (old key) so it isn't dropped from the customer's active view until
+    # StopTransaction; drains within one TTL window.
+    gateway_fee = Decimal(str(ctx.get("gateway_fee", ctx.get("platform_fee", "0"))))
     start_kwh = Decimal(str(ctx["start_meter_kwh"]))
 
     if reading_kwh is None:
         return {
             "energy_kwh": "0.000",
-            "spent_so_far": str(platform_fee.quantize(Decimal("0.01"))),
+            "spent_so_far": str(gateway_fee.quantize(Decimal("0.01"))),
             "refund_if_stopped_now": str(
-                (qr_payment.amount_paid - platform_fee).quantize(Decimal("0.01"))
+                (qr_payment.amount_paid - gateway_fee).quantize(Decimal("0.01"))
             ),
             "power_kw": None,
         }
@@ -131,7 +135,7 @@ async def _compute_live_kpis(qr_payment: QRPayment, txn: Transaction) -> dict:
     energy_kwh = max(Decimal("0"), reading_kwh - start_kwh)
     energy_cost = energy_kwh * tariff_rate
     gst_amount = energy_cost * gst_percent / Decimal("100")
-    spent_so_far = (energy_cost + gst_amount + platform_fee).quantize(Decimal("0.01"))
+    spent_so_far = (energy_cost + gst_amount + gateway_fee).quantize(Decimal("0.01"))
     refund = max(Decimal("0"), qr_payment.amount_paid - spent_so_far).quantize(Decimal("0.01"))
 
     return {

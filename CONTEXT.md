@@ -19,7 +19,7 @@ A session funded by **one or more** UPI payments scanned from the charger's QR s
 _Avoid_: guest session, anonymous session; assuming one QR Session ⇒ exactly one `QRPayment` (it is now **1:N** — see [[stacked-qr-payment]]).
 
 **Stacked QR payment** / **QR budget top-up**:
-An additional `QRPayment` made by the **same payer** (matched on `customer_vpa`, falling back to `customer_contact`/phone) against a charger that is **already CHARGING**, which **extends the QR Session's budget instead of being rejected**. Replaces the prior "charger busy ⇒ reject + full-refund" behavior *for the same payer only* — a **different** payer scanning a busy charger still gets reject + full-refund. The session's spendable budget is the **sum** of every linked payment's net amount (`amount_paid − synthetic_platform_fee`, per [[adr-0001-synthetic-vs-actual-platform-fee]]); charging continues with **no StopTransaction** at the seam. Relationship `QRPayment → Transaction` is therefore **1:N** (one billable OCPP transaction funded by N payments), a deliberate relaxation of the old 1:1 (see [[adr-0021-stackable-qr-budget]]).
+An additional `QRPayment` made by the **same payer** (matched on `customer_vpa`, falling back to `customer_contact`/phone) against a charger that is **already CHARGING**, which **extends the QR Session's budget instead of being rejected**. Replaces the prior "charger busy ⇒ reject + full-refund" behavior *for the same payer only* — a **different** payer scanning a busy charger still gets reject + full-refund. The session's spendable budget is the **sum** of every linked payment's net amount (`amount_paid − gateway_fee`, the actual Razorpay fee per [[adr-0026-tariff-excludes-gateway-actual-fee]]); charging continues with **no StopTransaction** at the seam. Relationship `QRPayment → Transaction` is therefore **1:N** (one billable OCPP transaction funded by N payments), a deliberate relaxation of the old 1:1 (see [[adr-0021-stackable-qr-budget]]).
 _Avoid_: "continuation transaction" / "segment" — there is exactly one `Transaction`; stacking tops up its budget, it does not spawn new transactions. _Avoid_: calling a different-payer concurrent payment a stack — that is still a rejected **concurrent payment**.
 
 **LIFO refund allocation**:
@@ -101,26 +101,22 @@ _Avoid_: treating "PENDING" alone as "in progress" — the attempt count is what
 
 ### Tariffs and pricing
 
-**All-in tariff** / **All-inclusive tariff**:
-Per-kWh price the operator types and the customer sees. Includes BOTH GST and the **Synthetic platform fee**. Stored on `Tariff.tariff_per_kwh_all_in`.
-_Avoid_: incl-tax tariff, gross tariff, retail tariff.
+**Tariff** / **GST-included rate**:
+The GST-inclusive, **gateway-exclusive** per-kWh energy price the operator types and the customer sees on QR/stations/map screens. Stored on `Tariff.rate_gst_included` — the operator-typed **source of truth**. The gateway is **not** part of the Tariff; it is a separate **Gateway fee** line disclosed at payment/invoice time.
+_Avoid_: all-in tariff, all-inclusive tariff (retired 2026-07-13 — the gateway is no longer folded in), incl-tax tariff, gross tariff.
 
-**`rate_per_kwh`**:
-Back-derived GST- and gateway-exclusive per-kWh figure used by line-item billing math. Equals `all_in × (1 - fee_pct/100) / (1 + gst_pct/100)`. **Shown to customers as the "Rate" of the Energy line on the itemised GST Invoice (2026-07-09)** — it is the only per-kWh value that reconciles against additive per-line SGST/CGST columns and a separate gateway line. Not shown on non-invoice customer surfaces (QR/stations screens show the **All-in tariff**). Previously "never shown to customers"; the itemised-invoice redesign reverses that. See [[adr-0024-itemised-gst-invoice-layout]].
-_Avoid_: base rate, excl-tax tariff (both ambiguous post-2026-05-18).
+**Base rate**:
+The GST- and gateway-exclusive per-kWh energy price, **back-calculated** from the **Tariff** as `rate_gst_included / (1 + gst_pct/100)` and stored on `Tariff.rate_per_kwh` (retained column). Drives line-item billing (`energy_cost = kWh × base_rate`) and is shown as the "Rate" of the Energy line on the itemised **GST Invoice**. A constant per tariff — never varies per bill. See [[adr-0026-tariff-excludes-gateway-actual-fee]].
+_Avoid_: rate_per_kwh (that is the column name; "base rate" is the domain term — promoted from the avoid-list 2026-07-13), excl-tax tariff.
 
 ### Fees and budget
 
-**Synthetic platform fee**:
-Fixed percentage (default 2%, set via `RAZORPAY_PLATFORM_FEE_PERCENT`) of `amount_paid` on a **QR Payment**. Used for budget cap, over-payment refund, and the invoice's gateway-charges line. Treated as all-in: commission = `× 2/118`, GST on commission = `× 2 × 18/118`.
-_Avoid_: platform fee (overloaded), gateway fee (also overloaded).
-
-**Actual platform fee**:
-Razorpay's real deduction on a captured payment, sourced from the payment webhook or the Razorpay API. Stored on `QRPayment.platform_fee` / `razorpay_commission` / `razorpay_gst`. Used only for ops, reconciliation, and the drift detector — never for customer-facing math AND (post 2026-05-29) never for the franchisee settlement ledger either. See ADR 0001 amendment.
-_Avoid_: real fee, captured fee.
+**Gateway fee**:
+Razorpay's actual processing charge on a captured **QR Payment**, as reported by the `qr_code.credited` webhook, sized on `amount_paid` (the full prepay). A **customer-borne, separate line** on the **GST Invoice** — never folded into the **Tariff** — and reserved out of the **Budget cap**. Often ₹0 in practice (UPI P2M ≤ ₹2000 is zero-MDR per NPCI/RBI), but never *assumed* zero — the webhook value is authoritative. Because it is passed through (added to what the customer pays, subtracted in both refund and settlement), it **cancels out of the franchisee's payout**. Stored on `QRPayment.platform_fee` / `razorpay_commission` / `razorpay_gst`. Known drift: the webhook value can over-state the settled fee for zero-MDR UPI ([[known-issues]] #1); VoltLync accepts the small customer-refund residual.
+_Avoid_: synthetic platform fee (retired 2026-07-13 — the fee is the actual webhook figure now), assumed fee, platform fee (was overloaded).
 
 **Budget cap**:
-Redis-cached upper bound on energy a **QR Session** can deliver. Equals `(amount_paid - synthetic_fee) / (1 + gst_pct/100) / rate_per_kwh`. Enforced from the MeterValues handler by dispatching `RemoteStopTransaction` when consumption crosses the cap.
+Redis-cached upper bound on energy a **QR Session** can deliver. Equals `(amount_paid − gateway_fee) / (rate_per_kwh × (1 + gst_pct/100))`, using the **actual Gateway fee** reserved at StartTransaction (₹0 for zero-MDR UPI). Enforced from the MeterValues handler by dispatching `RemoteStopTransaction` when consumption crosses the cap.
 _Avoid_: limit, cap.
 
 ### Billing artefacts
@@ -215,23 +211,24 @@ _Avoid_: treating the cohort as `User`-keyed (it is not — appless QR customers
 
 - A **Charging Session** is funded by either a **Wallet** (debit at finalize) or a **QR Payment** (prepaid, refund-on-finalize).
 - **Funding source is determined at StartTransaction, not at initiation.** The `on_start_transaction` handler resolves the `User` by `rfid_card_id` (the idTag — the app's RemoteStart sends `user.rfid_card_id` as the idTag, so app-started and card-tapped sessions are indistinguishable at this layer), then: if a **QR Payment** links to the transaction it is a **QR Session**; otherwise, if the user has a **Wallet**, it is a **Wallet Session**. Consequence: nothing about *how* a session was triggered (app remote-start, deep-link API call, or local RFID tap) changes its funding — so any control that must prevent wallet-funded sessions has to act on this decision, not on the frontend.
-- A **QR Payment** carries both an **Actual platform fee** (truth from Razorpay) and a **Synthetic platform fee** (policy, fixed). They are not expected to be equal; variance is absorbed entirely by VoltLync. Post 2026-05-29, both the **GST Invoice** gateway-charges line AND the **`commission_ledger_entry.pg_fee_amount`** use the Synthetic figure; the franchisee is shielded from Razorpay's instantaneous fee schedule.
+- A **QR Payment**'s **Gateway fee** (actual, webhook-reported) is a customer-borne pass-through: it is added to what the customer pays and subtracted in both the refund and the settlement ledger, so it **cancels out of the franchisee's payout** — the franchisee's pool is `energy_kWh × base_rate`, independent of Razorpay's fee. Both the **GST Invoice** gateway line and **`commission_ledger_entry.pg_fee_amount`** use this actual figure (reverses the 2026-05-29 synthetic-ledger amendment; safe because the fee now cancels).
 - A **billable**, non-internal **Charging Session** produces exactly one **GST Invoice** and exactly one **Settlement Entry**. Billable = delivered `energy > 0` AND not a **Fault-refund Session** — i.e. any **COMPLETED** session with energy (from the first Wh), or a **FAILED** session with `energy ≥ 0.5 kWh`. A **Non-billable Session** (Zero-energy, or FAILED + sub-0.5) produces neither. See [[adr-0013-de-minimis-energy-waiver]] amendment.
-- A **Tariff** stores both `tariff_per_kwh_all_in` (display) and `rate_per_kwh` (math); writes update both, reads pick the one that fits the surface.
-- The **Budget cap** is computed against the **Synthetic platform fee**, never the **Actual platform fee**, to give customers a predictable contract.
+- A **Tariff**'s source of truth is the **Base rate** (`rate_per_kwh`); the displayed GST-inclusive **Tariff** is `base_rate × (1 + gst%)`, and the **Gateway fee** is never part of it.
+- The **Budget cap** reserves the **actual Gateway fee** (₹0 for zero-MDR UPI), computed at StartTransaction, so a session's final refund can never go negative.
 
 ## Example dialogue
 
-> **Dev:** "If Razorpay actually charges us 1.5% on a UPI payment, do we record it as the platform fee?"
-> **Domain expert:** "Yes — the 1.5% lands in the **Actual platform fee** fields on the `QRPayment` row, for reconciliation. But the invoice's gateway-charges line and the budget cap both use the **Synthetic platform fee** of 2%, regardless. The 0.5% variance is VoltLync's P&L."
+> **Dev:** "A ₹100 UPI QR payment — the webhook says the fee is ₹2, but UPI P2M under ₹2000 is zero-MDR. What do we charge the customer?"
+> **Domain expert:** "We bill the webhook value as the **Gateway fee** — it's the only per-payment signal we have at billing time, and some payments genuinely do carry a fee. It sits as its own line on the invoice, separate from the energy **Tariff**. For a zero-MDR payment the settled fee turns out to be ₹0, so the customer is over-refunded by the webhook amount — a small residual we accept ([[known-issues]] #1). The franchisee is untouched either way; the fee cancels out of their payout."
 
 > **Dev:** "If a customer pays ₹500 and the charger reports zero kWh delivered, what's the refund?"
 > **Domain expert:** "Full ₹500. **Zero-energy session** — no service rendered, no GST invoice issued, VoltLync absorbs Razorpay's processing fees as a loss."
 
-> **Dev:** "Why is the all-in tariff displayed exactly ₹25 but the invoice line shows ₹24.50?"
-> **Domain expert:** "The invoice's per-kWh rate is GST-only because the gateway fee is itemised as its own line. Adding the 2% into the per-kWh rate would double-count against the gateway line. Customer-facing displays show the **All-in tariff**; the invoice shows the components."
+> **Dev:** "The operator typed ₹11.80 for the tariff, but the invoice's Energy line shows a rate of ₹10.00. Which is right?"
+> **Domain expert:** "Both. ₹11.80 is the **Tariff** — the GST-inclusive energy price the operator sets and the customer sees. We back-derive the **Base rate** of ₹10.00 (`11.80 / 1.18`) for the invoice's Energy line, which is taxed separately. Neither number contains the gateway; the **Gateway fee** is its own line, shown only when a fee actually applies."
 
 ## Flagged ambiguities
 
 - "platform fee" used to be overloaded for both the real Razorpay deduction and the policy figure — resolved 2026-05-18 by introducing **Actual platform fee** and **Synthetic platform fee** as distinct terms.
 - "incl. tax" tariff was ambiguous after the gateway-fee policy change — resolved 2026-05-18 by retiring `tariff_per_kwh_incl_tax` in favour of **All-in tariff** (`tariff_per_kwh_all_in`), which explicitly includes both GST and the synthetic gateway fee.
+- **"all-in tariff" and "synthetic platform fee" retired 2026-07-13.** The gateway is no longer folded into the tariff: the **Tariff** is now GST-inclusive but **gateway-exclusive** (energy only), and the **Gateway fee** is the *actual* webhook-reported Razorpay charge shown as a separate customer-facing line. "Base rate" was promoted from the avoid-list to the canonical term for `rate_per_kwh`. The gateway is a customer-borne pass-through that cancels out of the franchisee's payout. See [[adr-0026-tariff-excludes-gateway-actual-fee]].

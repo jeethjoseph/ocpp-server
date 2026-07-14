@@ -84,11 +84,12 @@ def test_calculate_settlement_tds_on_post_commission_base():
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# ADR 0001 amendment (2026-05-29) — settlement ledger uses synthetic pg_fee.
+# ADR 0026 — settlement ledger uses the ACTUAL Razorpay gateway fee.
 # Tests below guard:
-#   • ledger.pg_fee_amount == synthetic 2%, regardless of actual Razorpay fee
-#   • ledger.net_excl_gst == invoice.energy_taxable_value (the motivation)
-#   • behaviour holds whether actual > synthetic or actual < synthetic
+#   • ledger.pg_fee_amount == qr_payment.platform_fee (the actual fee)
+#   • ledger.net_excl_gst == invoice.energy_taxable_value (the gateway is added
+#     to the bill and subtracted here, so it cancels and net_excl_gst == the
+#     energy taxable line regardless of the actual fee)
 #   • wallet path unchanged (pg_fee stays 0)
 # ───────────────────────────────────────────────────────────────────────────
 
@@ -147,6 +148,12 @@ async def _build_qr_session(
         total_billed=energy_cost + gst_amount,
         transaction_status=TransactionStatusEnum.COMPLETED,
     )
+    # ADR 0026: the ACTUAL Razorpay fee (commission + GST) is stored on
+    # platform_fee and IS the settlement pg_fee. refund is derived from the
+    # prepaid invariant so it holds exactly:
+    #   amount_paid = energy_cost + gst + platform_fee + refund.
+    platform_fee = actual_commission + actual_gst
+    refund_amount = amount_paid - energy_cost - gst_amount - platform_fee
     await QRPayment.create(
         transaction=txn,
         charger=charger,
@@ -156,83 +163,78 @@ async def _build_qr_session(
         amount_paid=amount_paid,
         energy_cost=energy_cost,
         gst_amount=gst_amount,
+        platform_fee=platform_fee,
         razorpay_commission=actual_commission,
         razorpay_gst=actual_gst,
+        refund_amount=refund_amount,
         status=QRPaymentStatusEnum.COMPLETED,
     )
     return txn
 
 
 @pytest.mark.asyncio
-async def test_process_settlement_qr_uses_synthetic_pg_fee(
+async def test_process_settlement_qr_uses_actual_pg_fee(
     client, test_franchisee, test_charger, test_user, test_tariff, test_station,
 ):
-    """ADR 0001 amendment regression guard (actual > synthetic case).
+    """ADR 0026: the ledger pg_fee is the ACTUAL Razorpay fee on the QRPayment.
 
-    ₹45 QR session where Razorpay actually charged ₹1.09 (~2.42%). The
-    ledger must still record the synthetic ₹0.90, and net_excl_gst must
-    match the invoice's energy_taxable_value (₹37.37) — not the
-    actual-fee-derived ₹37.18 that the pre-amendment code would have
-    produced.
+    ₹45.19 QR session where Razorpay actually charged ₹1.09. The ledger records
+    the actual ₹1.09, and net_excl_gst equals the invoice's energy_taxable_value
+    (₹37.37) because the gateway is added to the bill and subtracted here.
     """
     from services.franchisee_settlement_service import FranchiseeSettlementService
 
     txn = await _build_qr_session(
         test_franchisee, test_station, test_charger, test_user,
-        amount_paid=Decimal("45.00"),
+        amount_paid=Decimal("45.19"),
         energy_kwh=Decimal("2.250"),
         energy_cost=Decimal("37.37"),
         gst_amount=Decimal("6.73"),
         actual_commission=Decimal("0.92"),
-        actual_gst=Decimal("0.17"),  # actual total ₹1.09 vs synthetic ₹0.90
+        actual_gst=Decimal("0.17"),  # actual total ₹1.09
     )
 
     entry = await FranchiseeSettlementService.process_settlement(txn.id)
 
     assert entry is not None
-    # 2% of 45 = 0.90, regardless of the 1.09 actual sitting on QRPayment.
-    assert entry.pg_fee_amount == Decimal("0.90"), (
-        f"expected synthetic 0.90, got {entry.pg_fee_amount}"
+    # The actual ₹1.09 fee on the QRPayment row.
+    assert entry.pg_fee_amount == Decimal("1.09"), (
+        f"expected actual 1.09, got {entry.pg_fee_amount}"
     )
-    # net_excl_gst now matches the invoice's energy_taxable_value exactly.
+    # net_excl_gst matches the invoice's energy_taxable_value exactly (gateway
+    # cancels).
     assert entry.net_excl_gst == Decimal("37.37")
 
 
 @pytest.mark.asyncio
-async def test_process_settlement_qr_synthetic_when_actual_below_2pct(
+async def test_process_settlement_qr_net_excl_gst_stable_across_actual_fee(
     client, test_franchisee, test_charger, test_user, test_tariff, test_station,
 ):
-    """ADR 0001 amendment regression guard (actual < synthetic case).
-
-    ~57% of staging txns fall here. Pre-amendment, when Razorpay charged
-    less than 2%, the splittable pool grew and franchisee got a bonus.
-    Post-amendment, VoltLync pockets the surplus; the franchisee's pool
-    is locked to synthetic 2% regardless. The ledger must record
-    synthetic 0.90 even though actual is only ₹0.30.
+    """ADR 0026: because the gateway is added to the bill and subtracted in the
+    ledger, net_excl_gst (and therefore the franchisee payout) is stable across
+    different actual fees — here a low ₹0.30 fee.
     """
     from services.franchisee_settlement_service import FranchiseeSettlementService
 
     txn = await _build_qr_session(
         test_franchisee, test_station, test_charger, test_user,
-        amount_paid=Decimal("45.00"),
+        amount_paid=Decimal("44.40"),
         energy_kwh=Decimal("2.250"),
         energy_cost=Decimal("37.37"),
         gst_amount=Decimal("6.73"),
         actual_commission=Decimal("0.25"),
-        actual_gst=Decimal("0.05"),  # actual ₹0.30 vs synthetic ₹0.90
+        actual_gst=Decimal("0.05"),  # actual ₹0.30
     )
 
     entry = await FranchiseeSettlementService.process_settlement(txn.id)
 
     assert entry is not None
-    assert entry.pg_fee_amount == Decimal("0.90"), (
-        f"expected synthetic 0.90 even when actual is lower, "
-        f"got {entry.pg_fee_amount}"
+    assert entry.pg_fee_amount == Decimal("0.30"), (
+        f"expected the actual 0.30 fee, got {entry.pg_fee_amount}"
     )
     assert entry.net_excl_gst == Decimal("37.37")
-    # Franchisee payout is identical to the actual > synthetic case — that's
-    # the whole point of the policy: a stable per-session payout regardless
-    # of Razorpay's instantaneous fee.
+    # Franchisee payout is identical to the higher-fee case — the gateway
+    # cancels, so the per-session payout is stable regardless of the fee.
     # 37.37 × 0.80 (commission@20% from test_franchisee) = 29.90 (earning)
     # 29.90 × 0.10 (tds) = 2.99 → payout = 26.91
     assert entry.franchisee_payout == Decimal("26.91")
@@ -245,8 +247,8 @@ async def test_qr_ledger_agrees_with_invoice_revenue_pool(
 ):
     """The motivating test: invoice gateway-charges line and ledger
     pg_fee_amount must be the same number, and invoice energy_taxable_value
-    must equal ledger net_excl_gst. This was the stated reason for the
-    ADR 0001 amendment — if this ever fails, the amendment is broken.
+    must equal ledger net_excl_gst. This is the stated reason for the ADR 0026
+    actual-fee model — if this ever fails, the model is broken.
 
     Explicit GSTInvoice + GSTInvoiceCounter cleanup at the end because the
     project-wide conftest cleanup list omits both (every other test that
@@ -273,7 +275,7 @@ async def test_qr_ledger_agrees_with_invoice_revenue_pool(
 
     txn = await _build_qr_session(
         test_franchisee, test_station, test_charger, test_user,
-        amount_paid=Decimal("45.00"),
+        amount_paid=Decimal("45.19"),
         energy_kwh=Decimal("2.250"),
         energy_cost=Decimal("37.37"),
         gst_amount=Decimal("6.73"),
@@ -289,11 +291,11 @@ async def test_qr_ledger_agrees_with_invoice_revenue_pool(
         assert invoice is not None
 
         # Gateway line: invoice's gateway_charges + gateway_gst equals the
-        # ledger's pg_fee_amount, both being the synthetic 2% of ₹45 = ₹0.90.
+        # ledger's pg_fee_amount, both being the actual Razorpay fee ₹1.09.
         invoice_gateway_total = (
             invoice.gateway_charges + (invoice.gateway_gst or Decimal("0"))
         )
-        assert invoice_gateway_total == entry.pg_fee_amount == Decimal("0.90"), (
+        assert invoice_gateway_total == entry.pg_fee_amount == Decimal("1.09"), (
             f"invoice gateway total {invoice_gateway_total} != "
             f"ledger pg_fee {entry.pg_fee_amount}"
         )
@@ -311,22 +313,15 @@ async def test_qr_ledger_agrees_with_invoice_revenue_pool(
 
 
 @pytest.mark.asyncio
-async def test_process_settlement_qr_honours_non_default_synthetic_percent(
-    client, monkeypatch,
+async def test_process_settlement_qr_pg_fee_tracks_actual_on_large_session(
+    client,
     test_franchisee, test_charger, test_user, test_tariff, test_station,
 ):
-    """Regression guard: the policy is NOT hard-coded to 2%.
-
-    `synthetic_platform_fee` reads `RAZORPAY_PLATFORM_FEE_PERCENT` at import
-    time as a module-level constant; if ops bumps it (e.g. to 3% after
-    Razorpay re-rates UPI), the settlement ledger must follow without code
-    changes. Patches the module constant and re-verifies pg_fee_amount.
+    """ADR 0026: the ledger pg_fee simply tracks whatever Razorpay actually
+    charged — no configurable percent. A ₹100 session with an actual ₹1.00 fee
+    records pg_fee ₹1.00, and net_excl_gst still equals the energy taxable line.
     """
-    from decimal import Decimal as _D
-    from services import tariff_utils as _tu
     from services.franchisee_settlement_service import FranchiseeSettlementService
-
-    monkeypatch.setattr(_tu, "RAZORPAY_PLATFORM_FEE_PERCENT", _D("3.0"))
 
     txn = await _build_qr_session(
         test_franchisee, test_station, test_charger, test_user,
@@ -335,17 +330,17 @@ async def test_process_settlement_qr_honours_non_default_synthetic_percent(
         energy_cost=Decimal("82.20"),
         gst_amount=Decimal("14.80"),
         actual_commission=Decimal("0.85"),
-        actual_gst=Decimal("0.15"),  # actual ₹1.00 — irrelevant; we want 3% synthetic
+        actual_gst=Decimal("0.15"),  # actual ₹1.00
     )
 
     entry = await FranchiseeSettlementService.process_settlement(txn.id)
 
     assert entry is not None
-    # 3% of ₹100 = ₹3.00, not the ₹2.00 the default would have produced.
-    assert entry.pg_fee_amount == Decimal("3.00"), (
-        f"expected synthetic 3.00 after monkey-patching the percent, "
-        f"got {entry.pg_fee_amount}"
+    # The actual ₹1.00 fee, verbatim.
+    assert entry.pg_fee_amount == Decimal("1.00"), (
+        f"expected actual 1.00, got {entry.pg_fee_amount}"
     )
+    assert entry.net_excl_gst == Decimal("82.20")
 
 
 @pytest.mark.asyncio

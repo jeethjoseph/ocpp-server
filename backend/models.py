@@ -355,14 +355,15 @@ class Tariff(Model):
     # Postgres treats NULLs as distinct, so global tariffs (charger_id IS NULL,
     # is_global=True) may coexist. See upsert-race-hardening issue 01.
     charger = fields.ForeignKeyField("models.Charger", related_name="tariffs", null=True)
-    # Internal back-derived rate, used by line-item billing math only.
-    # Equals `tariff_per_kwh_all_in × (1 - fee_pct/100) / (1 + gst_pct/100)`.
-    # Never customer-facing — see ADR 0003.
+    # Back-calculated base rate (GST- and gateway-exclusive), used by line-item
+    # billing math and shown as the Energy-line "Rate" on the itemised invoice.
+    # Equals `rate_gst_included / (1 + gst_pct/100)`. See ADR 0026.
     rate_per_kwh = fields.DecimalField(max_digits=8, decimal_places=4)
-    # Operator-typed, customer-displayed all-inclusive rate (incl. GST and
-    # the synthetic 2% gateway fee). Source of truth for the customer-facing
-    # tariff display. See ADR 0003.
-    tariff_per_kwh_all_in = fields.DecimalField(max_digits=10, decimal_places=4)
+    # Operator-typed, customer-displayed GST-inclusive, GATEWAY-EXCLUSIVE energy
+    # price. Source of truth for the customer-facing tariff display. The gateway
+    # is a separate actual line, never folded in. See ADR 0026 (renamed from
+    # tariff_per_kwh_all_in, which baked in a synthetic 2% gateway).
+    rate_gst_included = fields.DecimalField(max_digits=10, decimal_places=4)
     gst_percent = fields.DecimalField(max_digits=5, decimal_places=2, default=18.00)
     hsn_sac_code = fields.CharField(max_length=10, null=True)
     is_global = fields.BooleanField(default=False)
@@ -624,7 +625,7 @@ class QRPayment(Model):
     platform_fee = fields.DecimalField(max_digits=10, decimal_places=2, null=True)
     razorpay_commission = fields.DecimalField(max_digits=10, decimal_places=2, null=True)  # Base Razorpay commission (fee - tax), rupees
     razorpay_gst = fields.DecimalField(max_digits=10, decimal_places=2, null=True)         # GST on Razorpay commission (tax), rupees
-    fee_source = fields.CharField(max_length=20, null=True)                                 # 'webhook', 'api', or 'estimated'
+    fee_source = fields.CharField(max_length=20, null=True)                                 # 'webhook', 'api', or 'unavailable' (ADR 0026; was 'estimated')
     refund_amount = fields.DecimalField(max_digits=10, decimal_places=2, null=True)
     razorpay_refund_id = fields.CharField(max_length=255, null=True, index=True)
     razorpay_refund_speed_processed = fields.CharField(max_length=20, null=True)
@@ -954,12 +955,15 @@ class GSTInvoice(Model):
     # GST-only-effective per-kWh rate, derived from (energy_taxable + energy_tax) / billable_kwh.
     # Used by line-item reconciliation on the PDF for legacy invoices.
     tariff_rate_incl_tax = fields.DecimalField(max_digits=10, decimal_places=2)
-    # Snapshot of the operator-set, customer-displayed all-inclusive per-kWh
-    # rate (Tariff.tariff_per_kwh_all_in) at the moment of issuance. Mirrors
-    # what the customer saw on the QR / stations screen when they paid.
-    # Nullable for backwards compat with pre-2026-05-19 invoices; the PDF
-    # falls back to `tariff_rate_incl_tax` when this is NULL. See ADR 0003.
-    tariff_per_kwh_all_in = fields.DecimalField(max_digits=10, decimal_places=4, null=True)
+    # Snapshot of the operator-set, customer-displayed GST-inclusive per-kWh
+    # tariff (Tariff.rate_gst_included) at the moment of issuance. Mirrors what
+    # the customer saw on the QR / stations screen when they paid. Nullable for
+    # backwards compat with pre-2026-05-19 invoices; the PDF falls back to
+    # `tariff_rate_incl_tax` when NULL. Renamed from tariff_per_kwh_all_in
+    # (ADR 0026); pre-2026-07 rows hold the old gateway-inclusive value, which
+    # is fine — invoices are immutable and each PDF re-renders from its own
+    # stored component fields.
+    rate_gst_included = fields.DecimalField(max_digits=10, decimal_places=4, null=True)
     charged_on = fields.DatetimeField(null=True)
     duration_seconds = fields.IntField(null=True)
     hsn_sac_code = fields.CharField(max_length=10, default="996749")

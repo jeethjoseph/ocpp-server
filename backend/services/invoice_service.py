@@ -35,7 +35,6 @@ from core.roles import INTERNAL_ROLES
 from utils import to_ist
 from services.wallet_service import WalletService
 from services.monitoring_service import MetricsCollector
-from services.tariff_utils import synthetic_fee_split
 
 logger = logging.getLogger("ocpp-server")
 
@@ -54,6 +53,40 @@ VOLTLYNC_GSTIN = os.getenv("VOLTLYNC_GSTIN", "")
 VOLTLYNC_ADDRESS = os.getenv("VOLTLYNC_ADDRESS", "")
 VOLTLYNC_STATE = os.getenv("VOLTLYNC_STATE", "Kerala")
 VOLTLYNC_STATE_CODE = os.getenv("VOLTLYNC_STATE_CODE", "32")
+
+# The invoice PDF renders the ₹ (U+20B9) symbol on every amount, which the
+# built-in ReportLab fonts (Helvetica, Vera) lack — they predate the glyph. We
+# register DejaVu Sans (a ₹-capable, Helvetica-alike sans-serif shipped by the
+# `fonts-dejavu-core` apt package baked into the backend image). Registration is
+# best-effort: if the font is unavailable we fall back to Helvetica so invoice
+# generation — a critical path — never crashes; ₹ would then render as a box,
+# caught by the build-parity check. `₹` symbol: keep this file UTF-8.
+_DEJAVU_DIR = Path("/usr/share/fonts/truetype/dejavu")
+RUPEE = "₹"
+INVOICE_FONT = "Helvetica"
+INVOICE_FONT_BOLD = "Helvetica-Bold"
+
+
+def _register_invoice_fonts() -> None:
+    """Register DejaVu Sans + Bold once and point the module font constants at
+    them. Idempotent and exception-safe (Helvetica fallback on any failure)."""
+    global INVOICE_FONT, INVOICE_FONT_BOLD
+    try:
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        if "DejaVuSans" not in pdfmetrics.getRegisteredFontNames():
+            pdfmetrics.registerFont(TTFont("DejaVuSans", str(_DEJAVU_DIR / "DejaVuSans.ttf")))
+            pdfmetrics.registerFont(TTFont("DejaVuSans-Bold", str(_DEJAVU_DIR / "DejaVuSans-Bold.ttf")))
+            pdfmetrics.registerFontFamily(
+                "DejaVuSans", normal="DejaVuSans", bold="DejaVuSans-Bold",
+            )
+        INVOICE_FONT, INVOICE_FONT_BOLD = "DejaVuSans", "DejaVuSans-Bold"
+    except Exception as e:  # pragma: no cover - font-availability guard
+        logger.warning(
+            "DejaVu font registration failed (%s); invoice PDF falls back to "
+            "Helvetica and the ₹ symbol will not render.", e,
+        )
+        INVOICE_FONT, INVOICE_FONT_BOLD = "Helvetica", "Helvetica-Bold"
 
 def _get_financial_year(dt: datetime) -> str:
     """Return FY string like '2026-27'. Indian FY runs Apr-Mar."""
@@ -391,10 +424,11 @@ class InvoiceService:
             # two separate lines on the PDF.
             transaction_amount = qr_payment.amount_paid or Decimal("0")
             refund_amount = qr_payment.refund_amount or Decimal("0")
-            # Gateway charges on the invoice use the SYNTHETIC 2% split,
-            # not Razorpay's actual fee — see ADR 0001. The QRPayment row's
-            # razorpay_commission/razorpay_gst keep the actual values for ops.
-            gateway_taxable, gateway_tax = synthetic_fee_split(transaction_amount)
+            # Gateway charges on the invoice are the ACTUAL Razorpay fee stored
+            # on the QRPayment row (razorpay_commission = taxable, razorpay_gst =
+            # tax) — the same value billed and reserved from the refund. ADR 0026.
+            gateway_taxable = qr_payment.razorpay_commission or Decimal("0")
+            gateway_tax = qr_payment.razorpay_gst or Decimal("0")
             series = "QR"
         else:
             payment_method = "WALLET"
@@ -511,8 +545,8 @@ class InvoiceService:
             # no Tariff row resolves; the note is then omitted. The itemised
             # table's Rate column is derived (energy_taxable ÷ kWh), independent
             # of this snapshot, so legacy invoices still render a correct Rate.
-            tariff_per_kwh_all_in=(
-                tariff.tariff_per_kwh_all_in if tariff else None
+            rate_gst_included=(
+                tariff.rate_gst_included if tariff else None
             ),
             charged_on=txn.start_time,
             duration_seconds=duration_seconds,
@@ -577,14 +611,15 @@ class InvoiceService:
             leftMargin=15*mm,
             rightMargin=15*mm,
         )
+        _register_invoice_fonts()
         styles = getSampleStyleSheet()
         elements = []
 
-        title_style = ParagraphStyle("InvTitle", parent=styles["Heading2"], fontSize=12, textColor=colors.black, alignment=1)
-        subtitle_style = ParagraphStyle("InvSub", parent=styles["Normal"], fontSize=8, textColor=colors.grey)
-        bold_style = ParagraphStyle("Bold", parent=styles["Normal"], fontSize=9, fontName="Helvetica-Bold")
-        normal_style = ParagraphStyle("Norm", parent=styles["Normal"], fontSize=9)
-        small_style = ParagraphStyle("Small", parent=styles["Normal"], fontSize=7, textColor=colors.grey)
+        title_style = ParagraphStyle("InvTitle", parent=styles["Heading2"], fontSize=12, textColor=colors.black, alignment=1, fontName=INVOICE_FONT_BOLD)
+        subtitle_style = ParagraphStyle("InvSub", parent=styles["Normal"], fontSize=8, textColor=colors.grey, fontName=INVOICE_FONT)
+        bold_style = ParagraphStyle("Bold", parent=styles["Normal"], fontSize=9, fontName=INVOICE_FONT_BOLD)
+        normal_style = ParagraphStyle("Norm", parent=styles["Normal"], fontSize=9, fontName=INVOICE_FONT)
+        small_style = ParagraphStyle("Small", parent=styles["Normal"], fontSize=7, textColor=colors.grey, fontName=INVOICE_FONT)
 
         # Document-type caption. The voltNOW header overlay already brands the
         # page, so this is a discreet centred label rather than a large title.
@@ -667,81 +702,96 @@ class InvoiceService:
         if duration_str:
             charging_meta += f"&nbsp;&nbsp;·&nbsp;&nbsp;<b>Duration:</b> {duration_str}"
         elements.append(Paragraph(charging_meta, normal_style))
-        # All-in tariff the customer was quoted at pay time (ADR 0003), shown so
-        # the GST-exclusive per-kWh Rate in the table below isn't mistaken for a
-        # price change (ADR 0024 consequence).
-        if invoice.tariff_per_kwh_all_in is not None:
+        # GST-inclusive tariff the customer was quoted at pay time (ADR 0026),
+        # shown so the GST-exclusive per-kWh Rate in the table below isn't
+        # mistaken for a price change (ADR 0024 consequence). The gateway is a
+        # separate line, never part of this figure.
+        if invoice.rate_gst_included is not None:
             elements.append(Paragraph(
-                f"Tariff quoted (all-inclusive): {invoice.tariff_per_kwh_all_in:.2f} / kWh",
+                f"Tariff quoted (incl. GST): {RUPEE}{invoice.rate_gst_included:.2f} / kWh",
                 small_style,
             ))
         elements.append(Spacer(1, 3*mm))
 
-        # Itemised line-item table (ADR 0024): HSN · Item · Rate · Qty · tax
-        # heads · Line total. Per-line tax is a display allocation of the stored
-        # total-level tax; inter-state collapses SGST+CGST into one IGST column.
+        # Itemised line-item table (ADR 0024, amended 2026-07-14): pre-tax
+        # HSN · Item · Unit Price · Qty · Taxable Value. Per-line SGST/CGST and
+        # the Line-total column were removed in favour of a single tax aggregate
+        # below the table. The Gateway line carries only its taxable value — no
+        # unit price or quantity.
         line_items = build_invoice_line_items(invoice)
-        tax_heads = ["IGST"] if invoice.is_inter_state else ["SGST", "CGST"]
-        header = ["HSN", "ITEM", "RATE", "QTY", "TAXABLE\nVALUE"] + tax_heads + ["LINE TOTAL"]
+        has_gateway = any(it["label"] != "Energy" for it in line_items)
+        header = ["HSN", "ITEM", "UNIT PRICE", "QTY", "TAXABLE\nVALUE"]
         rows = [header]
-        for it in line_items:
+        span_styles = []
+        for row_idx, it in enumerate(line_items, start=1):
             if it["label"] == "Energy":
-                # GST-exclusive per-kWh rate against kWh delivered.
-                rate_str = f"{it['rate']:.2f}/kWh"
-                qty_str = _format_energy_billed_kwh(it["qty"])
+                # GST-exclusive per-kWh unit price (₹/kWh) against kWh delivered.
+                unit_price = f"{RUPEE}{it['rate']:.2f}/kWh"
+                qty_str = f"{_format_energy_billed_kwh(it['qty'])} kWh"
             else:
-                # Gateway is a flat % of the amount paid — show the nominal rate
-                # (derived from the invoice's own synthetic split so legacy
-                # invoices keep their historical %) against the paid amount as qty.
-                paid = invoice.transaction_amount or Decimal("0")
-                gw_all_in = (invoice.gateway_charges or Decimal("0")) + (invoice.gateway_gst or Decimal("0"))
-                pct = (
-                    (gw_all_in / paid * Decimal("100")).quantize(TWO_DP, ROUND_HALF_UP)
-                    if paid > 0 else Decimal("0")
-                )
-                rate_str = f"{pct.normalize():f}%"
-                qty_str = f"{paid:.2f}"
+                # Gateway charges: only a taxable value (its GST folds into the
+                # aggregate below). There is no per-unit price or quantity, so
+                # merge Item · Unit Price · Qty into one right-aligned cell so the
+                # label sits beside its taxable value.
+                unit_price = ""
+                qty_str = ""
+                span_styles.append(("SPAN", (1, row_idx), (3, row_idx)))
+                span_styles.append(("ALIGN", (1, row_idx), (3, row_idx), "RIGHT"))
             rows.append(
-                [it["hsn"], it["label"], rate_str, qty_str, f"{it['taxable']:.2f}"]
-                + [f"{amt:.2f}" for (_, _, amt) in it["taxes"]]
-                + [f"{it['line_total']:.2f}"]
+                [it["hsn"], it["label"], unit_price, qty_str, f"{RUPEE}{it['taxable']:.2f}"]
             )
 
         # Fill the full body width (page minus the 15mm L/R margins). Weights
         # are relative; scaled to the available frame so the table spans edge to
         # edge rather than floating at its intrinsic width.
         avail = A4[0] - 30 * mm
-        weights = (
-            [0.9, 2.3, 1.5, 1.3, 1.4, 1.3, 1.5] if invoice.is_inter_state
-            else [0.9, 2.2, 1.4, 1.2, 1.3, 1.0, 1.0, 1.3]
-        )
+        weights = [0.9, 2.6, 1.7, 1.5, 1.5]  # HSN · Item · Unit Price · Qty · Taxable
         wsum = sum(weights)
         col_widths = [w / wsum * avail for w in weights]
         t = Table(rows, colWidths=col_widths)
         t.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E8F5E9")),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTNAME", (0, 0), (-1, -1), INVOICE_FONT),
+            ("FONTNAME", (0, 0), (-1, 0), INVOICE_FONT_BOLD),
             ("FONTSIZE", (0, 0), (-1, -1), 8),
             ("ALIGN", (2, 0), (-1, -1), "RIGHT"),
             ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ("TOPPADDING", (0, 0), (-1, -1), 4),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ]))
+        ] + span_styles))
         t.hAlign = "LEFT"  # align the table with the rest of the document body
         elements.append(t)
         elements.append(Spacer(1, 3*mm))
 
-        # Totals footer (ADR 0024): the Line total column sums to Sub Total; the
-        # ADR 0017 paisa residual is the Round Off; TOTAL reconciles to
-        # amount_paid − refund for QR. Sub Total is shown only when there is a
-        # Round Off to explain — otherwise it just duplicates TOTAL.
-        footer_rows = []
+        # Tax aggregate + totals (ADR 0024, amended 2026-07-14): a single block
+        # summing the pre-tax lines and adding the stored total-level tax, rather
+        # than per-line SGST/CGST columns. Inter-state shows one IGST line; the
+        # ADR-0017 paisa residual is the Round Off (shown only when non-zero);
+        # TOTAL reconciles to amount_paid − refund for QR.
+        def _rate_pct(rate) -> str:
+            return f"{(rate or Decimal('0')).normalize():f}"
+
+        footer_rows = [
+            ["Taxable Value:", f"{RUPEE}{(invoice.total_taxable_value or Decimal('0')):.2f}"],
+        ]
+        if invoice.is_inter_state:
+            footer_rows.append([
+                f"IGST @ {_rate_pct(invoice.igst_rate)}%:",
+                f"{RUPEE}{(invoice.igst_amount or Decimal('0')):.2f}",
+            ])
+        else:
+            footer_rows.append([
+                f"CGST @ {_rate_pct(invoice.cgst_rate)}%:",
+                f"{RUPEE}{(invoice.cgst_amount or Decimal('0')):.2f}",
+            ])
+            footer_rows.append([
+                f"SGST @ {_rate_pct(invoice.sgst_rate)}%:",
+                f"{RUPEE}{(invoice.sgst_amount or Decimal('0')):.2f}",
+            ])
         if invoice.round_off and invoice.round_off != 0:
-            sub_total = sum((it["line_total"] for it in line_items), Decimal("0"))
-            footer_rows.append(["Sub Total:", f"{sub_total:.2f}"])
-            footer_rows.append(["Round Off:", f"{invoice.round_off:.2f}"])
-        footer_rows.append(["TOTAL", f"{invoice.total_amount:.2f}"])
+            footer_rows.append(["Round Off:", f"{RUPEE}{invoice.round_off:.2f}"])
+        footer_rows.append(["TOTAL", f"{RUPEE}{invoice.total_amount:.2f}"])
 
         # Full-width footer so the rule above TOTAL spans the same width as the
         # line-item table rather than floating at an intrinsic width.
@@ -750,7 +800,8 @@ class InvoiceService:
             ("ALIGN", (0, 0), (0, -1), "RIGHT"),
             ("ALIGN", (1, 0), (1, -1), "RIGHT"),
             ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+            ("FONTNAME", (0, 0), (-1, -1), INVOICE_FONT),
+            ("FONTNAME", (0, -1), (-1, -1), INVOICE_FONT_BOLD),
             ("LINEABOVE", (0, -1), (-1, -1), 1, colors.black),
             ("TOPPADDING", (0, 0), (-1, -1), 2),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
@@ -758,6 +809,18 @@ class InvoiceService:
         t.hAlign = "LEFT"
         elements.append(t)
         elements.append(Spacer(1, 3*mm))
+
+        # Gateway-charges explanatory note — only when the invoice carries a
+        # gateway line (QR sessions with a fee; wallet/zero-fee invoices omit it).
+        if has_gateway:
+            elements.append(Paragraph(
+                "Gateway charges are calculated based on the transaction amount. "
+                "The applicable percentage varies depending on the payment method "
+                "and is charged as per the actual rates specified by the payment "
+                "gateway provider.",
+                small_style,
+            ))
+            elements.append(Spacer(1, 3*mm))
 
         # Amount in words
         if invoice.amount_in_words:
@@ -771,12 +834,12 @@ class InvoiceService:
         # `refund_amount` is whatever was returned to the customer.
         pay_text = f"<b>Payment Method:</b> {invoice.payment_method or ''}"
         if invoice.transaction_amount:
-            pay_text += f"&nbsp;&nbsp;&nbsp;&nbsp;<b>Transaction Amount:</b> {invoice.transaction_amount:.2f}"
+            pay_text += f"&nbsp;&nbsp;&nbsp;&nbsp;<b>Transaction Amount:</b> {RUPEE}{invoice.transaction_amount:.2f}"
         elements.append(Paragraph(pay_text, normal_style))
 
         if invoice.refund_amount and invoice.refund_amount > 0:
             elements.append(Paragraph(
-                f"<b>Refund Amount:</b> {invoice.refund_amount:.2f}",
+                f"<b>Refund Amount:</b> {RUPEE}{invoice.refund_amount:.2f}",
                 normal_style,
             ))
             elements.append(Paragraph(

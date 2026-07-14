@@ -275,8 +275,8 @@ export default function StationMap({ stations, userLocation, onStationSelect, on
                     <span className="text-gray-600">Price:</span>
                     <span className="font-medium text-right">
                       {formatTariffRangeAllIn(
-                        station.min_price_per_kwh_all_in,
-                        station.max_price_per_kwh_all_in,
+                        station.min_price_per_kwh_gst_incl,
+                        station.max_price_per_kwh_gst_incl,
                       )}
                     </span>
                   </div>

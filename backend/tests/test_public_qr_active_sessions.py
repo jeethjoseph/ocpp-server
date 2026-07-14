@@ -46,7 +46,7 @@ async def active_charger(active_station):
     await Tariff.create(
         charger=charger,
         rate_per_kwh=Decimal("20.00"),
-        tariff_per_kwh_all_in=Decimal("24.0816"),
+        rate_gst_included=Decimal("23.6000"),  # 20.00 base × 1.18
         gst_percent=Decimal("18.00"),
         is_global=False,
     )
@@ -71,8 +71,13 @@ async def _user():
 
 
 async def _qr_payment(charger, qr_code, *, status: QRPaymentStatusEnum, vpa: str = VPA,
-                     amount: Decimal = Decimal("50.00")) -> QRPayment:
+                     amount: Decimal = Decimal("50.00"),
+                     platform_fee: Decimal = Decimal("0")) -> QRPayment:
+    """`platform_fee` is the ACTUAL Razorpay gateway fee reserved from the
+    budget and reflected in spent_so_far / refund_if_stopped_now (ADR 0026).
+    Split into commission (fee / 1.18) + gst so the row is internally consistent."""
     user = await _user()
+    commission = (platform_fee / Decimal("1.18")).quantize(Decimal("0.01")) if platform_fee else Decimal("0")
     return await QRPayment.create(
         charger=charger,
         charger_qr_code=qr_code,
@@ -82,6 +87,10 @@ async def _qr_payment(charger, qr_code, *, status: QRPaymentStatusEnum, vpa: str
         amount_paid=amount,
         customer_vpa=vpa,
         status=status,
+        platform_fee=platform_fee,
+        razorpay_commission=commission,
+        razorpay_gst=platform_fee - commission,
+        fee_source="webhook" if platform_fee else None,
     )
 
 
@@ -142,6 +151,7 @@ async def test_endpoint_charging_state_with_meter_value(
 ):
     payment = await _qr_payment(
         active_charger, active_qr_code, status=QRPaymentStatusEnum.CHARGING,
+        platform_fee=Decimal("1.00"),
     )
     user = await payment.user
     txn = await _transaction(
@@ -150,7 +160,7 @@ async def test_endpoint_charging_state_with_meter_value(
     payment.transaction_id = txn.id
     await payment.save()
 
-    # Customer has used 1.500 kWh so far at 20/kWh + 18% GST + ₹1 synthetic fee
+    # Customer has used 1.500 kWh so far at 20/kWh + 18% GST + ₹1 actual gateway fee
     # = 1.5 * 20 = 30, GST = 5.40, + 1.00 = 36.40 spent, refund ≈ 13.60
     await MeterValue.create(
         transaction_id=txn.id,
@@ -267,6 +277,7 @@ async def test_endpoint_uses_cached_meter_snapshot_without_db_query(
 
     payment = await _qr_payment(
         active_charger, active_qr_code, status=QRPaymentStatusEnum.CHARGING,
+        platform_fee=Decimal("1.00"),
     )
     user = await payment.user
     txn = await _transaction(
@@ -292,7 +303,7 @@ async def test_endpoint_uses_cached_meter_snapshot_without_db_query(
     assert resp.status_code == 200
     entry = resp.json()["data"][0]
     assert entry["sub_state"] == "charging"
-    # 0.500 kWh × 20 = 10, GST = 1.80, + 1.00 synthetic fee = 12.80 spent.
+    # 0.500 kWh × 20 = 10, GST = 1.80, + 1.00 actual gateway fee = 12.80 spent.
     assert entry["energy_kwh"] == "0.500"
     assert entry["spent_so_far"] == "12.80"
     assert entry["refund_if_stopped_now"] == "37.20"
@@ -308,6 +319,7 @@ async def test_endpoint_cache_miss_uses_db_fallback(
     """
     payment = await _qr_payment(
         active_charger, active_qr_code, status=QRPaymentStatusEnum.CHARGING,
+        platform_fee=Decimal("1.00"),
     )
     user = await payment.user
     txn = await _transaction(
@@ -326,7 +338,7 @@ async def test_endpoint_cache_miss_uses_db_fallback(
     assert resp.status_code == 200
     entry = resp.json()["data"][0]
     assert entry["sub_state"] == "charging"
-    # 0.500 kWh × 20 = 10, GST = 1.80, + 1.00 synthetic fee = 12.80 spent.
+    # 0.500 kWh × 20 = 10, GST = 1.80, + 1.00 actual gateway fee = 12.80 spent.
     assert entry["energy_kwh"] == "0.500"
     assert entry["spent_so_far"] == "12.80"
     assert entry["refund_if_stopped_now"] == "37.20"

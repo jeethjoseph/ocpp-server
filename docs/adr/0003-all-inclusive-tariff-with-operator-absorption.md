@@ -1,5 +1,13 @@
 # Tariffs are stored and displayed as "all-inclusive"; `rate_per_kwh` is back-derived
 
+> **Status: SUPERSEDED by [ADR 0026](0026-tariff-excludes-gateway-actual-fee.md) (2026-07-13).**
+> The tariff no longer includes the gateway. `Tariff.tariff_per_kwh_all_in` was
+> renamed to `rate_gst_included` and now means **GST-inclusive, gateway-exclusive**;
+> `rate_per_kwh` is back-calculated as `rate_gst_included / (1 + gst%/100)` (no
+> gateway factor). The "exact only at full consumption" distortion this ADR
+> accepted is eliminated — energy is billed directly at the base rate. The rest
+> of this ADR is retained for historical context only.
+
 Customer-facing tariffs are now expressed as a single **all-in** number — the per-kWh price a customer effectively pays at full budget consumption, inclusive of both GST and the synthetic 2% gateway fee. A new column `Tariff.tariff_per_kwh_all_in` is the operator-typed source of truth; the existing `Tariff.rate_per_kwh` is back-derived on save as `all_in × 0.98 / 1.18` and used only for internal line-item math. The previous `tariff_per_kwh_incl_tax` API field is **replaced** (not aliased) by `tariff_per_kwh_all_in` — keeping both around would invite "wrong number in new component" bugs given the term overlap. The customer-facing UI label changes from `(incl. GST)` to `(all-inclusive)`.
 
 ## Migration

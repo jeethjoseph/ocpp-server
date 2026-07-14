@@ -10,7 +10,6 @@ from redis_manager import redis_manager
 from routers.invoices import serve_invoice_pdf
 from services.invoice_service import build_invoice_line_items
 from services.qr_payment_service import is_below_minimum_reason
-from services.tariff_utils import synthetic_fee_split
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/public/qr-transactions", tags=["Public QR Transactions"])
@@ -60,7 +59,10 @@ def _customer_breakdown(payment, txn, invoice):
             "bill_total": str(invoice.total_amount),
         }
     if txn is not None and txn.energy_charge is not None:
-        gateway_taxable, gateway_gst = synthetic_fee_split(payment.amount_paid)
+        # Gateway is the ACTUAL Razorpay fee stored on the QR payment (ADR 0026),
+        # not a synthetic split of amount_paid.
+        gateway_taxable = payment.razorpay_commission or Decimal("0")
+        gateway_gst = payment.razorpay_gst or Decimal("0")
         gst_total = (txn.gst_amount or Decimal("0")) + gateway_gst
         energy_incl = (txn.energy_charge or Decimal("0")) + (txn.gst_amount or Decimal("0"))
         gateway_incl = gateway_taxable + gateway_gst

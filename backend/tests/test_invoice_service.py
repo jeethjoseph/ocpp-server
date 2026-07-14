@@ -59,7 +59,7 @@ async def _make_session(
     await Tariff.create(
         charger=charger,
         rate_per_kwh=rate,
-        tariff_per_kwh_all_in=(rate * (Decimal("1") + gst_percent / Decimal("100"))).quantize(Decimal("0.0001")),
+        rate_gst_included=(rate * (Decimal("1") + gst_percent / Decimal("100"))).quantize(Decimal("0.0001")),
         gst_percent=gst_percent,
         is_global=False,
         hsn_sac_code="996749",
@@ -93,10 +93,10 @@ async def _make_session(
             is_active=True,
         )
         # platform_fee / razorpay_commission / razorpay_gst on the row are the
-        # ACTUAL Razorpay fee (₹0.24 = 1.2% here) per ADR 0001. refund_amount
-        # is computed against the SYNTHETIC fee (₹0.40 = 2%) so the prepaid
+        # ACTUAL Razorpay fee (₹0.24 = commission ₹0.20 + GST ₹0.04) per ADR
+        # 0026. refund_amount is computed against that ACTUAL fee so the prepaid
         # invariant total_amount + refund_amount == amount_paid holds against
-        # the invoice (which uses synthetic gateway charges).
+        # the invoice (whose gateway line now uses the actual Razorpay fee).
         qr_payment = await QRPayment.create(
             razorpay_payment_id=f"pay_{_uuid.uuid4().hex[:10]}",
             razorpay_qr_code_id=qr_code.razorpay_qr_code_id,
@@ -112,7 +112,7 @@ async def _make_session(
             razorpay_commission=Decimal("0.20"),
             razorpay_gst=Decimal("0.04"),
             refund_amount=(
-                Decimal("20.00") - energy_charge - gst_amount - Decimal("0.40")
+                Decimal("20.00") - energy_charge - gst_amount - Decimal("0.24")
             ),
             status=QRPaymentStatusEnum.REFUNDED,
         )
@@ -172,48 +172,47 @@ async def test_qr_invoice_shows_gross_payment_and_refund_separately(client):
 
 @pytest.mark.asyncio
 async def test_invoice_snapshots_operator_set_all_in_tariff(client):
-    """generate_invoice snapshots the operator's `tariff_per_kwh_all_in` onto
+    """generate_invoice snapshots the operator's `rate_gst_included` onto
     the GSTInvoice row at issuance so the PDF can show the customer the same
     rate they saw on the QR / stations screen when they paid — even if the
-    operator later changes the tariff. Migration 38 added the column. See
-    ADR 0003 and the 2026-05-19 invoice-display fix."""
-    # _make_session sets the Tariff with rate=20 and gst=18, so all_in is
-    # auto-computed by the helper as rate × 1.18 = 23.6000.
+    operator later changes the tariff. See ADR 0026 (column renamed from
+    tariff_per_kwh_all_in) and the 2026-05-19 invoice-display fix."""
+    # _make_session sets the Tariff with rate=20 and gst=18, so rate_gst_included
+    # is auto-computed by the helper as rate × 1.18 = 23.6000.
     _, _, txn, _, _ = await _make_session(with_qr=True)
 
     invoice = await InvoiceService.generate_invoice(txn.id)
 
     assert invoice is not None
-    assert invoice.tariff_per_kwh_all_in == Decimal("23.6000"), (
-        "Invoice should snapshot Tariff.tariff_per_kwh_all_in verbatim "
+    assert invoice.rate_gst_included == Decimal("23.6000"), (
+        "Invoice should snapshot Tariff.rate_gst_included verbatim "
         "(not derived from amounts)."
     )
 
 
 @pytest.mark.asyncio
-async def test_qr_invoice_gateway_line_uses_synthetic_2_percent(client):
-    """Gateway line on the invoice is the SYNTHETIC 2% of amount_paid, NOT
-    the actual Razorpay fee on the QRPayment row. See ADR 0001.
+async def test_qr_invoice_gateway_line_uses_actual_razorpay_fee(client):
+    """Gateway line on the invoice is the ACTUAL Razorpay fee stored on the
+    QRPayment row (razorpay_commission = taxable, razorpay_gst = tax), NOT a
+    synthetic 2% of amount_paid. See ADR 0026.
 
-    For amount_paid=₹20, synthetic total=₹0.40 → commission=₹0.34, GST=₹0.06.
-    The qr_payment row still carries the actual fee (₹0.24 in this fixture)
-    for ops/reconciliation — only the invoice surface uses the synthetic split.
+    For this fixture: commission=₹0.20, GST=₹0.04 (actual fee ₹0.24).
     """
     _, _, txn, _, qr_payment = await _make_session(with_qr=True)
 
     invoice = await InvoiceService.generate_invoice(txn.id)
 
-    # Synthetic split of amount_paid=₹20: total=₹0.40, commission=₹0.34, GST=₹0.06
-    assert invoice.gateway_charges == Decimal("0.34")
+    # Invoice gateway line == actual Razorpay fee from the QRPayment row.
+    assert invoice.gateway_charges == qr_payment.razorpay_commission
+    assert invoice.gateway_charges == Decimal("0.20")
+    assert invoice.gateway_gst == qr_payment.razorpay_gst
+    assert invoice.gateway_gst == Decimal("0.04")
     assert (
         invoice.total_taxable_value
-        == txn.energy_charge + Decimal("0.34")
+        == txn.energy_charge + Decimal("0.20")
     )
     assert invoice.cgst_amount == invoice.sgst_amount  # equal halves (ADR 0017)
-    assert invoice.total_tax + invoice.round_off == txn.gst_amount + Decimal("0.06")
-    # Actual Razorpay fee on the QRPayment row is untouched
-    assert qr_payment.razorpay_commission == Decimal("0.20")
-    assert qr_payment.razorpay_gst == Decimal("0.04")
+    assert invoice.total_tax + invoice.round_off == txn.gst_amount + Decimal("0.04")
 
 
 @pytest.mark.asyncio
@@ -549,18 +548,17 @@ async def test_partial_refund_session_still_issues_invoice(client):
 
 
 @pytest.mark.asyncio
-async def test_invoice_gateway_gst_uses_synthetic_split(client):
-    """generate_invoice writes gateway_gst from the synthetic 2% split,
-    NOT from qr_payment.razorpay_gst. Wallet sessions (no qr_payment) leave
-    gateway_gst NULL. See ADR 0001."""
+async def test_invoice_gateway_gst_uses_actual_razorpay_gst(client):
+    """generate_invoice writes gateway_gst from the ACTUAL Razorpay fee on the
+    QRPayment row (qr_payment.razorpay_gst), NOT a synthetic 2% split. Wallet
+    sessions (no qr_payment) leave gateway_gst NULL. See ADR 0026."""
     _, _, qr_txn, _, qr_payment = await _make_session(with_qr=True)
     qr_invoice = await InvoiceService.generate_invoice(qr_txn.id)
 
     assert qr_invoice is not None
-    # Synthetic GST on amount_paid=₹20 → ₹0.06, not the row's ₹0.04
-    assert qr_invoice.gateway_gst == Decimal("0.06")
-    # Row's actual fee is unchanged
-    assert qr_payment.razorpay_gst == Decimal("0.04")
+    # Invoice gateway_gst == actual Razorpay GST from the QRPayment row (₹0.04)
+    assert qr_invoice.gateway_gst == qr_payment.razorpay_gst
+    assert qr_invoice.gateway_gst == Decimal("0.04")
 
     _, _, wallet_txn, _, _ = await _make_session()
     wallet_invoice = await InvoiceService.generate_invoice(wallet_txn.id)

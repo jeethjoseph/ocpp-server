@@ -35,14 +35,24 @@ def no_qr_calls():
 
 @pytest.fixture(autouse=True)
 def no_background_tasks():
-    """Neutralize fire-and-forget tasks (settlement/invoice/metrics) so they don't
-    outlive the test loop."""
-    def fake_create_task(coro, *a, **k):
+    """The reconcile now finalizes a superseded orphan OFF the hot path via
+    `main.safe_create_task` (so a Razorpay refund can't delay session start), so
+    that task must actually RUN for the orphan to reach STOPPED. But the
+    fire-and-forget tasks scheduled INSIDE the finalizer (audit/metrics/cleanup,
+    `services.transaction_finalizer.safe_create_task`) are neutralized so they
+    don't outlive the test loop."""
+    import asyncio
+
+    def run_task(coro, *a, **k):
+        return asyncio.ensure_future(coro)
+
+    def kill_task(coro, *a, **k):
         if hasattr(coro, "close"):
             coro.close()
         return MagicMock()
-    with patch("main.safe_create_task", side_effect=fake_create_task), \
-         patch("services.transaction_finalizer.safe_create_task", side_effect=fake_create_task):
+
+    with patch("main.safe_create_task", side_effect=run_task), \
+         patch("services.transaction_finalizer.safe_create_task", side_effect=kill_task):
         yield
 
 
@@ -76,6 +86,21 @@ async def _backdate_start_time(txn_id: int, when: datetime) -> None:
     await Transaction.filter(id=txn_id).update(start_time=when)
 
 
+async def _await_status(txn_id: int, status, timeout: float = 2.0):
+    """Wait for a transaction to reach `status`. The reconcile finalizes a
+    superseded orphan OFF the StartTransaction hot path (safe_create_task), so
+    the orphan reaches STOPPED shortly after the response returns, not inline."""
+    import asyncio
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        txn = await Transaction.get(id=txn_id)
+        if txn.transaction_status == status:
+            return txn
+        await asyncio.sleep(0.02)
+    return await Transaction.get(id=txn_id)
+
+
 @pytest.mark.asyncio
 async def test_suspended_orphan_is_superseded_and_new_accepted(client, test_charger):
     """The txn 870/871 fix: a SUSPENDED orphan is finalized and the new session
@@ -91,7 +116,7 @@ async def test_suspended_orphan_is_superseded_and_new_accepted(client, test_char
     result = await _start(test_charger.charge_point_string_id, rfid, meter_start=5000)
 
     assert result.id_tag_info["status"] == "Accepted"
-    refreshed = await Transaction.get(id=orphan.id)
+    refreshed = await _await_status(orphan.id, TransactionStatusEnum.STOPPED)
     assert refreshed.transaction_status == TransactionStatusEnum.STOPPED
     assert refreshed.stop_reason == "SUPERSEDED_BY_NEW_START"
     assert result.transaction_id != orphan.id
@@ -113,7 +138,7 @@ async def test_stale_running_orphan_is_superseded(client, test_charger):
     result = await _start(test_charger.charge_point_string_id, rfid, meter_start=5000)
 
     assert result.id_tag_info["status"] == "Accepted"
-    refreshed = await Transaction.get(id=stale.id)
+    refreshed = await _await_status(stale.id, TransactionStatusEnum.STOPPED)
     assert refreshed.transaction_status == TransactionStatusEnum.STOPPED
     assert await _open_count(test_charger) == 1
 

@@ -19,7 +19,7 @@ import {
   useCreateCharger,
   useUpdateCharger,
 } from "@/lib/queries/chargers";
-import { PLATFORM_FEE_PERCENT, DEFAULT_GST_PERCENT } from "@/lib/constants";
+import { DEFAULT_GST_PERCENT } from "@/lib/constants";
 import { TariffBreakdownPreview } from "@/components/TariffBreakdownPreview";
 
 export default function AdminChargersPage() {
@@ -350,12 +350,12 @@ export default function AdminChargersPage() {
                           {station?.name || "Unknown"}
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm">
-                          {charger.tariff_per_kwh_all_in != null ? (
+                          {charger.rate_gst_included != null ? (
                             <div className="flex flex-col">
                               <span className="text-card-foreground font-medium">
-                                ₹{Number(charger.tariff_per_kwh_all_in).toFixed(2)}/kWh
+                                ₹{Number(charger.rate_gst_included).toFixed(2)}/kWh
                               </span>
-                              <span className="text-xs text-muted-foreground">(all-inclusive)</span>
+                              <span className="text-xs text-muted-foreground">(incl. GST)</span>
                             </div>
                           ) : (
                             <span className="text-xs text-muted-foreground">—</span>
@@ -492,7 +492,7 @@ function ChargerModal({ stations, onSubmit, onClose }: ChargerModalProps) {
     vendor: "",
     serial_number: "",
     external_charger_id: "",
-    tariff_per_kwh_all_in: "",
+    rate_gst_included: "",
     connectors: [
       { connector_id: 1, connector_type: "Type2", max_power_kw: 22 },
     ],
@@ -507,8 +507,8 @@ function ChargerModal({ stations, onSubmit, onClose }: ChargerModalProps) {
       vendor: formData.vendor || undefined,
       serial_number: formData.serial_number || undefined,
       external_charger_id: formData.external_charger_id || undefined,
-      tariff_per_kwh_all_in: formData.tariff_per_kwh_all_in
-        ? parseFloat(formData.tariff_per_kwh_all_in)
+      rate_gst_included: formData.rate_gst_included
+        ? parseFloat(formData.rate_gst_included)
         : undefined,
     });
   };
@@ -648,24 +648,24 @@ function ChargerModal({ stations, onSubmit, onClose }: ChargerModalProps) {
 
           <div>
             <label className="block text-sm font-medium text-card-foreground mb-1">
-              Tariff (₹/kWh, all-inclusive)
+              Tariff (₹/kWh, incl. GST)
             </label>
             <input
               type="number"
               step="0.01"
               min="1"
               max="100"
-              value={formData.tariff_per_kwh_all_in}
+              value={formData.rate_gst_included}
               onChange={(e) =>
-                setFormData({ ...formData, tariff_per_kwh_all_in: e.target.value })
+                setFormData({ ...formData, rate_gst_included: e.target.value })
               }
               placeholder="Leave empty to use global tariff (1.0–100.0)"
               className="w-full px-3 py-2 border border-border bg-input text-foreground rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 transition-colors"
             />
             <p className="text-xs text-muted-foreground mt-1">
-              The customer sees this number. Includes GST and the 2% gateway fee.
+              The customer sees this number. Includes GST; the Razorpay gateway fee is billed separately on top.
             </p>
-            <TariffBreakdownPreview value={formData.tariff_per_kwh_all_in} feePercent={PLATFORM_FEE_PERCENT} gstPercent={DEFAULT_GST_PERCENT} />
+            <TariffBreakdownPreview value={formData.rate_gst_included} gstPercent={DEFAULT_GST_PERCENT} />
           </div>
 
           <div>
@@ -785,9 +785,9 @@ function EditChargerModal({ charger, onSubmit, onClose }: EditChargerModalProps)
     vendor: charger.vendor || "",
     external_charger_id: charger.external_charger_id || "",
     connector_type: charger.connectors?.[0]?.connector_type || "",
-    tariff_per_kwh_all_in:
-      charger.tariff_per_kwh_all_in != null
-        ? Number(charger.tariff_per_kwh_all_in).toFixed(2)
+    rate_gst_included:
+      charger.rate_gst_included != null
+        ? Number(charger.rate_gst_included).toFixed(2)
         : "",
   });
 
@@ -799,8 +799,8 @@ function EditChargerModal({ charger, onSubmit, onClose }: EditChargerModalProps)
       vendor: formData.vendor || undefined,
       external_charger_id: formData.external_charger_id || undefined,
       connector_type: formData.connector_type || undefined,
-      tariff_per_kwh_all_in: formData.tariff_per_kwh_all_in
-        ? parseFloat(formData.tariff_per_kwh_all_in)
+      rate_gst_included: formData.rate_gst_included
+        ? parseFloat(formData.rate_gst_included)
         : undefined,
     });
   };
@@ -902,24 +902,24 @@ function EditChargerModal({ charger, onSubmit, onClose }: EditChargerModalProps)
 
           <div>
             <label className="block text-sm font-medium text-card-foreground mb-1">
-              Tariff (₹/kWh, all-inclusive)
+              Tariff (₹/kWh, incl. GST)
             </label>
             <input
               type="number"
               step="0.01"
               min="1"
               max="100"
-              value={formData.tariff_per_kwh_all_in}
+              value={formData.rate_gst_included}
               onChange={(e) =>
-                setFormData({ ...formData, tariff_per_kwh_all_in: e.target.value })
+                setFormData({ ...formData, rate_gst_included: e.target.value })
               }
               placeholder="Leave empty to use global tariff (1.0–100.0)"
               className="w-full px-3 py-2 border border-border bg-input text-foreground rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 transition-colors"
             />
             <p className="text-xs text-muted-foreground mt-1">
-              The customer sees this number. Includes GST and the 2% gateway fee.
+              The customer sees this number. Includes GST; the Razorpay gateway fee is billed separately on top.
             </p>
-            <TariffBreakdownPreview value={formData.tariff_per_kwh_all_in} feePercent={PLATFORM_FEE_PERCENT} gstPercent={DEFAULT_GST_PERCENT} />
+            <TariffBreakdownPreview value={formData.rate_gst_included} gstPercent={DEFAULT_GST_PERCENT} />
           </div>
 
           <div className="flex justify-end space-x-3 pt-4">

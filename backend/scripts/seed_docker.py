@@ -214,10 +214,14 @@ class DockerSeeder:
 
     async def create_tariff(self):
         print("💵 Creating tariff...")
+        # self.tariff_rate is the GST-exclusive base rate; derive the
+        # customer-facing GST-inclusive tariff (ADR 0026).
+        gst_incl = (Decimal(str(self.tariff_rate)) * (Decimal("1") + Decimal(str(self.gst_percent)) / Decimal("100"))).quantize(Decimal("0.0001"))
         tariff, created = await Tariff.get_or_create(
             is_global=True,
             defaults={
                 "rate_per_kwh": self.tariff_rate,
+                "rate_gst_included": gst_incl,
                 "gst_percent": self.gst_percent,
                 "hsn_sac_code": "998714",
             },

@@ -16,23 +16,27 @@ interface ChargerAuditLogProps {
 }
 
 const ACTOR_TYPES = ["", "admin", "system", "ocpp", "webhook", "user"] as const;
+// Source of truth: backend `core.audit_actions.charger_timeline_actions()`.
+// `test_audit_actions.test_frontend_dropdown_matches_charger_timeline_registry`
+// fails the build if this list drifts from the actions the backend emits.
+// Keep sorted (charger.* then transaction.*), leading "" = All actions.
 const ACTION_OPTIONS = [
   "",
-  "charger.connected",
-  "charger.disconnected",
-  "charger.connection_rejected",
-  "charger.created",
-  "charger.updated",
-  "charger.deleted",
   "charger.availability_changed",
+  "charger.connected",
+  "charger.connection_rejected",
+  "charger.create_failed",
+  "charger.created",
+  "charger.deleted",
+  "charger.disconnected",
   "charger.reset",
-  "charger.status_changed",
-  "charger.force_stopped",
+  "charger.updated",
+  "transaction.finalized",
+  "transaction.force_stopped",
+  "transaction.resume_blocked",
+  "transaction.resumed",
   "transaction.status_changed",
   "transaction.suspended",
-  "transaction.suspended_timeout",
-  "transaction.resumed",
-  "transaction.force_stopped",
 ] as const;
 
 const actorTypeBadge = (actorType: string) => {
@@ -61,12 +65,14 @@ const actionLabel = (action: string) => {
     updated: "bg-indigo-100 text-indigo-800 dark:bg-indigo-900/30 dark:text-indigo-300",
     deleted: "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300",
     reset: "bg-orange-100 text-orange-800 dark:bg-orange-900/30 dark:text-orange-300",
+    create_failed: "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300",
     availability_changed: "bg-teal-100 text-teal-800 dark:bg-teal-900/30 dark:text-teal-300",
     status_changed: "bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300",
     force_stopped: "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300",
     suspended: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300",
-    suspended_timeout: "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300",
     resumed: "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300",
+    finalized: "bg-slate-100 text-slate-800 dark:bg-slate-800/50 dark:text-slate-300",
+    resume_blocked: "bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300",
   };
   return (
     <Badge variant="outline" className={styles[verb] || "border-gray-300 dark:border-gray-600"}>
