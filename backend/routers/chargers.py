@@ -9,12 +9,13 @@ import logging
 
 from core.config import wallet_charging_enabled
 from core.roles import INTERNAL_ROLES
-from models import Charger, ChargingStation, Connector, Transaction, OCPPLog, User, ChargerError, Tariff
+from models import Charger, ChargingStation, Connector, ConnectorTypeEnum, Transaction, OCPPLog, User, ChargerError, Tariff
 from tortoise.exceptions import IntegrityError
 from tortoise.transactions import in_transaction
 from auth_middleware import require_admin, require_user_or_admin
 from crud import log_audit_event
 from services.tariff_utils import back_calc_base_rate
+from services.charger_type_service import canonical_connector_type
 
 logger = logging.getLogger(__name__)
 
@@ -43,12 +44,11 @@ class ChargerCreate(BaseModel):
     )
 
 
-# Selectable connector types for the admin Edit Charger form. The socket subset
-# (see services.charger_type_service.SOCKET_CONNECTOR_TYPES) is untethered and
-# start-from-Available; the rest are tethered/DC. Kept as canonical display
-# strings; validation is case-insensitive.
-ALLOWED_CONNECTOR_TYPES = ["Type2", "Type1", "Socket", "CCS", "CHAdeMO", "GB/T", "domestic"]
-_ALLOWED_CONNECTOR_TYPES_LC = {t.lower() for t in ALLOWED_CONNECTOR_TYPES}
+# Selectable connector types for the admin Charger forms — derived from the
+# canonical enum. Physical behavior per type (start gate, suspend window) is
+# declared in services.charger_type_service.CONNECTOR_TRAITS. Validation and
+# canonicalization ("type 2" -> "Type2") go through canonical_connector_type.
+ALLOWED_CONNECTOR_TYPES = [m.value for m in ConnectorTypeEnum]
 
 
 class ChargerUpdate(BaseModel):
@@ -367,9 +367,18 @@ async def create_charger(charger_data: ChargerCreate, admin_user: User = Depends
     if not station:
         raise HTTPException(status_code=404, detail="Station not found")
     
+    # Validate + canonicalize connector types up front ("type 2" -> "Type2")
+    # so an invalid type fails fast before any row is written.
+    canonical_types = []
+    for connector_input in charger_data.connectors:
+        canonical_type = canonical_connector_type(connector_input.connector_type)
+        if canonical_type is None:
+            raise HTTPException(status_code=400, detail="Invalid connector type")
+        canonical_types.append(canonical_type)
+
     # Generate unique charge point ID
     charge_point_id = str(uuid.uuid4())
-    
+
     try:
         # All three writes (Charger + Connectors + Tariff) must succeed or fail
         # together — otherwise a partial-failure scenario leaves an orphan
@@ -388,11 +397,11 @@ async def create_charger(charger_data: ChargerCreate, admin_user: User = Depends
                 latest_status="Unavailable"
             )
 
-            for connector_input in charger_data.connectors:
+            for connector_input, canonical_type in zip(charger_data.connectors, canonical_types):
                 await Connector.create(
                     charger_id=charger.id,
                     connector_id=connector_input.connector_id,
-                    connector_type=connector_input.connector_type,
+                    connector_type=canonical_type,
                     max_power_kw=connector_input.max_power_kw
                 )
 
@@ -579,10 +588,11 @@ async def update_charger(charger_id: int, update_data: ChargerUpdate, admin_user
     # correct. See socket-charger-classification issue 01.
     connector_type = update_dict.pop("connector_type", None)
     if connector_type is not None:
-        if connector_type.strip().lower() not in _ALLOWED_CONNECTOR_TYPES_LC:
+        canonical_type = canonical_connector_type(connector_type)
+        if canonical_type is None:
             raise HTTPException(status_code=400, detail="Invalid connector type")
         await Connector.filter(charger_id=charger_id).update(
-            connector_type=connector_type.strip()
+            connector_type=canonical_type
         )
         # Keep the in-memory socket-classification cache coherent. The hot-path
         # StatusNotification handler reads connector_type from
@@ -594,7 +604,7 @@ async def update_charger(charger_id: int, update_data: ChargerUpdate, admin_user
             charger.charge_point_string_id
         )
         if cached is not None:
-            cached["connector_type"] = connector_type.strip()
+            cached["connector_type"] = canonical_type.value
 
     for field, value in update_dict.items():
         setattr(charger, field, value)
@@ -670,13 +680,13 @@ async def remote_start_charging(charger_id: int, connector_id: int = 1, user: Us
     if not charger:
         raise HTTPException(status_code=404, detail="Charger not found")
     
-    # Check if charger status is suitable for remote start
-    # Socket chargers may not transition to Preparing (no CP signal), allow Available
-    from services.charger_type_service import is_socket_charger
-    charger_is_socket = await is_socket_charger(charger.charge_point_string_id)
-    allowed_statuses = {"Preparing", "Available"} if charger_is_socket else {"Preparing"}
+    # Check if charger status is suitable for remote start. Socket chargers may
+    # not transition to Preparing (no CP signal) — the shared startable-statuses
+    # helper widens the gate to Available for them (charger_type_service).
+    from services.charger_type_service import startable_statuses_for_charger
+    allowed_statuses = await startable_statuses_for_charger(charger.charge_point_string_id)
     if charger.latest_status not in allowed_statuses:
-        expected = "Preparing or Available" if charger_is_socket else "Preparing"
+        expected = "Preparing or Available" if len(allowed_statuses) > 1 else "Preparing"
         raise HTTPException(status_code=409, detail=f"Cannot start charging. Charger status is {charger.latest_status}, should be {expected}")
     
     # Check if charger is connected (via Redis - works across all workers)

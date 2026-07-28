@@ -88,7 +88,12 @@ async def get_active_session(
     """Get current user's active charging session(s), if any.
 
     Lightweight endpoint for HomeScreen polling. Returns only active
-    sessions (RUNNING, STARTED, PENDING_START) with minimal fields.
+    sessions (RUNNING, STARTED, PENDING_START, SUSPENDED) with minimal fields.
+
+    SUSPENDED is deliberately included: a session held through a charger
+    disconnect (up to 12h on latching connectors, ADR 0027) is still the
+    customer's live, paid session — hiding it while the public QR endpoint
+    shows it as PAUSED contradicts the customer's reality.
 
     Note: This route must appear before dynamic '/{user_id}' routes to avoid
     path-matching conflicts that could incorrectly enforce ADMIN access.
@@ -100,6 +105,7 @@ async def get_active_session(
                 TransactionStatusEnum.RUNNING.value,
                 TransactionStatusEnum.STARTED.value,
                 TransactionStatusEnum.PENDING_START.value,
+                TransactionStatusEnum.SUSPENDED.value,
             ]
         ).prefetch_related('charger__station').order_by('-created_at')
 

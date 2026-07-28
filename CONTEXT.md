@@ -61,9 +61,15 @@ A single charging unit identified by its OCPP `charge_point_string_id`. State is
 **Connector**:
 A physical plug on a `Charger`, modelled as a `Connector` row. **Working invariant (2026-05-21):** every `Charger` in our fleet has exactly one `Connector` (= one OCPI EVSE). The data model permits N:1 but no current deployment uses it, and no per-connector OCPP state is tracked. Carries `max_power_kw` plus the OCPI-native columns (`ocpi_standard`, `ocpi_format`, `ocpi_power_type`, `max_voltage`, `max_amperage`) that are the **source of truth for the [[ocpi-feed]]** (see [[adr-0016-connector-ocpi-normalization]]).
 
-**Plug type**:
-The customer-facing label for a connector's physical type, rendered from the **display-only** `Connector.connector_type` free-text (Type2, Socket, CCS, …). Customer-facing groupings on the station map and modal are by **plug type**, but the underlying counts are charger-level — see [[ui-station-modal-chargers]] for the rendering rule.
-_Avoid_: treating `connector_type` as authoritative for anything machine-read — it is cosmetic; the OCPI `standard` (`ocpi_standard`) is the source of truth (see [[adr-0016-connector-ocpi-normalization]]). _Avoid_: "connector" as a customer-facing label when you mean "charger of plug type X". Renamed in the public station modal 2026-05-21 to avoid the conflation.
+**Plug type** / **Connector type**:
+`Connector.connector_type` — a `ConnectorTypeEnum` (`Type2`, `Type1`, `Socket`, `CCS`, `CHAdeMO`, `GB/T`, `domestic`; enum-enforced since 2026-07-23, previously free text). It is **load-bearing on two orthogonal physical axes**, declared per-type in `charger_type_service.CONNECTOR_TRAITS` (see [[adr-0027-per-connector-type-suspend-windows]]):
+- `starts_from_available` — no Control Pilot signal ⇒ the charger idles in `Available` and remote start is allowed from `Available` as well as `Preparing` (`Socket`, `domestic`, `Type1`, `Type2`). The shared `startable_statuses` helper is the ONLY start-gate implementation.
+- `latching` — the cable locks into the vehicle inlet ⇒ a disconnected session is held for the LONG suspend window (`Type1`, `Type2`, `CCS`, `CHAdeMO`, `GB/T`); unlatched sockets get the short window. **Type2 is why these are two axes**: socket-like on the start gate, latched on the window.
+Unknown types resolve to the safe side of both axes (Preparing-only, short window). For the [[ocpi-feed]], `ocpi_standard` remains the source of truth (see [[adr-0016-connector-ocpi-normalization]]).
+_Avoid_: "connector" as a customer-facing label when you mean "charger of plug type X". Renamed in the public station modal 2026-05-21 to avoid the conflation.
+
+**Suspend window**:
+How long a mid-session charger disconnect (or reboot) is held `SUSPENDED` awaiting reconnect before force-finalize. **Per-connector-type, keyed on the `latching` trait: 12h latched / 45min unlatched** — values in the git-tracked `backend/policy.py`, NOT env vars (see [[adr-0027-per-connector-type-suspend-windows]]). The same window applies on BOTH suspension paths: the disconnect timer and the post-boot timer armed by BootNotification (the old 300s post-boot timer is retired — a reboot must never shorten the promised grace window). The stale-suspended sweep and resume-staleness guard derive their cutoffs per-transaction (window + 60s buffer), preserving the [[adr-0022-resume-staleness-threshold-derived]] invariant per-row.
 
 ### Charger connection security
 

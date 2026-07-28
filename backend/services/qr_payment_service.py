@@ -466,12 +466,11 @@ class QRPaymentService:
     ) -> None:
         """Decide what to do with an accepted PAID payment: start now, wait for
         plug-in, or refund if the charger is offline."""
-        # Socket chargers may remain Available (no CP signal for Preparing)
-        from services.charger_type_service import is_socket_charger as _is_socket
+        # Socket chargers may remain Available (no CP signal for Preparing) —
+        # the shared startable-statuses helper widens the gate for them.
+        from services.charger_type_service import startable_statuses_for_charger
         is_connected = await redis_manager.is_charger_connected(charger.charge_point_string_id)
-        start_statuses = {ChargerStatusEnum.PREPARING}
-        if await _is_socket(charger.charge_point_string_id):
-            start_statuses.add(ChargerStatusEnum.AVAILABLE)
+        start_statuses = await startable_statuses_for_charger(charger.charge_point_string_id)
 
         if charger.latest_status in start_statuses and is_connected:
             # Start charging immediately
@@ -610,7 +609,7 @@ class QRPaymentService:
     @staticmethod
     async def handle_payment_without_plug(charger_id: int, qr_payment_id: int):
         """Wait for charger to enter a startable state, then start. Timeout -> refund."""
-        from services.charger_type_service import is_socket_charger as _is_socket
+        from services.charger_type_service import startable_statuses_for_charger
         timeout = QR_PAYMENT_PENDING_TIMEOUT
         poll_interval = 10
         elapsed = 0
@@ -628,10 +627,9 @@ class QRPaymentService:
                 return  # Already handled
 
             # Socket chargers may stay Available (no CP signal for Preparing)
-            start_statuses = {ChargerStatusEnum.PREPARING}
-            if await _is_socket(charger.charge_point_string_id):
-                start_statuses.add(ChargerStatusEnum.AVAILABLE)
-
+            start_statuses = await startable_statuses_for_charger(
+                charger.charge_point_string_id
+            )
             if charger.latest_status in start_statuses:
                 user = await User.filter(id=qr_payment.user_id).first()
                 if user:

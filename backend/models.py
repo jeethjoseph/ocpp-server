@@ -31,6 +31,18 @@ class ChargerAvailabilityEnum(str, enum.Enum):
     OPERATIVE = "Operative"
     INOPERATIVE = "Inoperative"
 
+class ConnectorTypeEnum(str, enum.Enum):
+    """Canonical connector types. Physical behavior (start gate, suspend
+    window) is declared per-type in services.charger_type_service.CONNECTOR_TRAITS
+    — every member here MUST have a traits row there (test-enforced)."""
+    TYPE2 = "Type2"
+    TYPE1 = "Type1"
+    SOCKET = "Socket"
+    CCS = "CCS"
+    CHADEMO = "CHAdeMO"
+    GBT = "GB/T"
+    DOMESTIC = "domestic"
+
 class TransactionStatusEnum(str, enum.Enum):
     STARTED = "STARTED"
     PENDING_START = "PENDING_START"
@@ -338,7 +350,9 @@ class Connector(Model):
     id = fields.IntField(pk=True)
     charger = fields.ForeignKeyField("models.Charger", related_name="connectors")
     connector_id = fields.IntField()
-    connector_type = fields.CharField(max_length=255)
+    # max_length kept at 255 so the column definition is unchanged from the
+    # free-text era (no data migration needed; live data is already canonical).
+    connector_type = fields.CharEnumField(ConnectorTypeEnum, max_length=255)
     max_power_kw = fields.FloatField(null=True)
     
     class Meta:

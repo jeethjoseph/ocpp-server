@@ -202,8 +202,12 @@ class TestSweepStaleSuspendedTransactions:
     async def test_sweeps_old_suspended_transaction(
         self, client, test_charger, test_user, test_tariff, test_wallet
     ):
-        # Use cutoff well past max_timeout (180 + 300 + 60 = 540s)
-        old_suspended_at = datetime.now(timezone.utc) - timedelta(seconds=600)
+        # test_charger is Type2 (latched, ADR 0027) — use a suspended_at well
+        # past its 12h window + buffer so the sweep fires.
+        from policy import SUSPEND_WINDOW_LATCHED_SECONDS, STALE_SUSPENDED_BUFFER_SECONDS
+        old_suspended_at = datetime.now(timezone.utc) - timedelta(
+            seconds=SUSPEND_WINDOW_LATCHED_SECONDS + STALE_SUSPENDED_BUFFER_SECONDS + 60
+        )
         txn = await Transaction.create(
             charger=test_charger,
             user=test_user,

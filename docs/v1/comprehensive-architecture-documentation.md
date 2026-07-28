@@ -440,7 +440,7 @@ total_billed = energy_charge + gst_amount         # Wallet deducts total_billed
 - Automatic retry for BILLING_FAILED transactions
 - **QR Refund Retry**: Retries REFUND_FAILED QR payments via Razorpay
 - **Orphaned QR Cleanup**: Detects and refunds QR payments stuck in PAID status (no transaction linked)
-- **Stale Suspended Cleanup**: Delegates to `disconnect_handler.finalize_stale_suspended_transactions("SUSPENDED_TIMEOUT")` (shared backstop; cutoff = `max(DISCONNECT_SUSPEND_TIMEOUT, SUSPEND_TIMEOUT) + 60`). Runs every cycle, so it also catches SUSPENDED txns whose in-memory timer died without a full restart. **Do not give this its own cutoff** — see the disconnect-handler section for the 2026-06-18 incident where a private 5-min cutoff here killed disconnect-suspended sessions inside their 30-min reconnect window.
+- **Stale Suspended Cleanup**: Delegates to `disconnect_handler.finalize_stale_suspended_transactions("SUSPENDED_TIMEOUT")` (shared backstop; per-row cutoff = each txn's own per-connector-type window + 60, ADR 0027). Runs every cycle, so it also catches SUSPENDED txns whose in-memory timer died without a full restart. **Do not give this its own cutoff** — see the disconnect-handler section for the 2026-06-18 incident where a private 5-min cutoff here killed disconnect-suspended sessions inside their 30-min reconnect window.
 - Comprehensive error logging with per-item error handling (one failure doesn't block others)
 
 **Recent Enhancement**: Zero Charged Transaction Handling
@@ -746,20 +746,27 @@ await start_data_retention_service(
 
 **Key Functions**:
 ```python
+async def suspend_window_seconds_for_charge_point(charge_point_id: str) -> int
+async def suspend_window_seconds_for_transaction(transaction) -> int
+    """Per-connector-type window (ADR 0027): 12h for latching connectors
+    (Type2/Type1/CCS/CHAdeMO/GB-T -- cable locked into the car), 45min for
+    unlatched sockets and unknown types. Values in git-tracked policy.py."""
+
 async def suspend_transactions_on_disconnect(charge_point_id: str) -> None
     """Called by ConnectionManager on charger disconnect. Suspends all active
-    transactions (RUNNING, STARTED, PENDING_START, PENDING_STOP) and starts
-    a configurable timeout for each."""
+    transactions (RUNNING, STARTED, PENDING_START, PENDING_STOP) and arms the
+    charger's per-type window for each."""
 
-def stale_suspended_cutoff_seconds() -> int
-    """Longest legitimate suspend window + buffer:
-    max(DISCONNECT_SUSPEND_TIMEOUT, SUSPEND_TIMEOUT) + 60. A backstop sweep must
-    wait this long because a SUSPENDED row doesn't record which window applies."""
+async def stale_suspended_cutoff_seconds_for(transaction) -> int
+    """Per-transaction staleness cutoff: the txn's own suspend window + 60s
+    buffer. Derived, so the backstop always fires after that row's primary
+    timer (ADR 0022 invariant, per-row)."""
 
 async def finalize_stale_suspended_transactions(stop_reason: str) -> int
-    """Shared stale-suspended backstop. Finds SUSPENDED txns older than the
-    cutoff and finalizes each via transaction_finalizer. Used by BOTH the startup
-    sweep and the recurring billing-retry sweep so their cutoff can't drift."""
+    """Shared stale-suspended backstop. Pre-filters SUSPENDED txns at the
+    shortest cutoff, then checks each row against its OWN per-type cutoff and
+    finalizes via transaction_finalizer. Used by BOTH the startup sweep and the
+    recurring billing-retry sweep so their cutoff can't drift."""
 
 async def sweep_stale_suspended_transactions() -> None
     """Safety net called once at server startup. Thin wrapper over
@@ -767,14 +774,14 @@ async def sweep_stale_suspended_transactions() -> None
     covers server restarts where in-memory timeout tasks were lost."""
 ```
 
-> ⚠️ **Stale-suspended cutoff incident (2026-06-18)**: `billing_retry_service` once ran its own stale-suspended cleanup with a private cutoff of `SUSPEND_TIMEOUT_SECONDS` (5 min), ignoring the 30-min `DISCONNECT_SUSPEND_TIMEOUT`. On its 30-min cycle it force-stopped disconnect-suspended sessions ~5–9 min after a transient blip — inside the intended reconnect grace. Confirmed on prod txn 949: suspended 06:08:51Z, swept 06:17:36Z (8m45s), charger reconnected 06:27:27Z (18.5 min, inside the 30-min window) but already finalized+refunded. Fix: both sweeps now share `finalize_stale_suspended_transactions` with the `max(...)+60` cutoff. Regression test: `tests/test_billing_retry_stale_suspended.py`. Lesson: a backstop must always wait the LONGEST primary window, never a shorter one.
+> ⚠️ **Stale-suspended cutoff incident (2026-06-18)**: `billing_retry_service` once ran its own stale-suspended cleanup with a private cutoff of `SUSPEND_TIMEOUT_SECONDS` (5 min), ignoring the 30-min `DISCONNECT_SUSPEND_TIMEOUT`. On its 30-min cycle it force-stopped disconnect-suspended sessions ~5–9 min after a transient blip — inside the intended reconnect grace. Confirmed on prod txn 949: suspended 06:08:51Z, swept 06:17:36Z (8m45s), charger reconnected 06:27:27Z (18.5 min, inside the 30-min window) but already finalized+refunded. Fix: both sweeps now share `finalize_stale_suspended_transactions`; since ADR 0027 the cutoff is per-row (each txn's own per-type window + 60). Regression test: `tests/test_billing_retry_stale_suspended.py`. Lesson: a backstop must always wait at least that row's primary window, never a shorter one.
 
 **Disconnect Flow**:
 1. Heartbeat monitor detects charger silence (120s inactivity)
 2. `ConnectionManager.force_disconnect()` fires registered callbacks
 3. `suspend_transactions_on_disconnect()` sets all active transactions to SUSPENDED, records `suspended_at`
-4. Starts a `DISCONNECT_SUSPEND_TIMEOUT` (default 180s) timer per transaction
-5. **If charger reconnects** (BootNotification): timeout is invalidated via CAS guard (`suspended_at` comparison), and a new resume window starts
+4. Starts the connector type's suspend-window timer per transaction (12h latched / 45min unlatched, ADR 0027)
+5. **If charger reconnects** (BootNotification): timeout is invalidated via CAS guard (`suspended_at` comparison), and a fresh timer with the SAME per-type window starts -- the old 300s post-boot timer is retired (it silently shortened the promised grace; 9 sessions killed fleet-wide at ~300s, and ~41% of prod reconnects arrive via BootNotification)
 6. **If timeout expires**: transaction is auto-stopped with `stop_reason=DISCONNECT_TIMEOUT`, energy is calculated from the last MeterValue, and billing is processed
 
 **Auto-Stop Billing** — delegated to `transaction_finalizer.finalize_stopped_transaction` (see below):
@@ -795,16 +802,19 @@ A naive disconnect cap would falsely terminate legitimate long sessions on flaky
 - Zeroed by `zero_energy_watchdog.check_zero_energy` whenever MeterValues show real energy advancing
 - Popped from the dict on transaction finalization
 
-If the counter reaches `MAX_RESETS_WITHOUT_PROGRESS` (default 3), BootNotification stops resetting `suspended_at` and lets the existing timer fire. This caps the worst-case stuck-time at `3 × DISCONNECT_SUSPEND_TIMEOUT_SECONDS` for genuinely broken sessions while allowing healthy long sessions to flap freely.
+If the counter reaches `MAX_RESETS_WITHOUT_PROGRESS` (default 3), BootNotification stops resetting `suspended_at` and lets the existing timer fire. This caps the worst-case stuck-time at 3 × the connector type's suspend window (36h worst case on latched connectors -- accepted in ADR 0027) for genuinely broken sessions while allowing healthy long sessions to flap freely.
 
 **Configuration**:
-| Variable | Default | Purpose |
+| Value | Where | Purpose |
 |----------|---------|---------|
-| `DISCONNECT_SUSPEND_TIMEOUT_SECONDS` | 180 (**staging & prod: 1800**) | Seconds to wait after disconnect before auto-stopping |
-| `SUSPEND_TIMEOUT_SECONDS` | 300 | Resume window after BootNotification resets the timeout |
-| `MAX_DISCONNECT_RESETS_WITHOUT_PROGRESS` | 3 | Max BootNotification resets allowed without energy progress |
+| `SUSPEND_WINDOW_LATCHED_SECONDS = 43200` | `backend/policy.py` (git-tracked) | Suspend window for latching connectors (Type2/Type1/CCS/CHAdeMO/GB-T) |
+| `SUSPEND_WINDOW_UNLATCHED_SECONDS = 2700` | `backend/policy.py` (git-tracked) | Suspend window for unlatched sockets + unknown types |
+| `STALE_SUSPENDED_BUFFER_SECONDS = 60` | `backend/policy.py` (git-tracked) | Buffer added to a txn's window to form the sweep/guard cutoff |
+| `MAX_DISCONNECT_RESETS_WITHOUT_PROGRESS` | env, default 3 | Max BootNotification resets allowed without energy progress |
 
-> ✅ **Timing invariant (now structural — ADR 0022, 2026-07-06)**: the resume staleness guard's threshold is **derived** from the disconnect window (`stale_suspended_cutoff_seconds()` = `max(DISCONNECT_SUSPEND_TIMEOUT, SUSPEND_TIMEOUT)+60`), so it can never be misordered below `DISCONNECT_SUSPEND_TIMEOUT_SECONDS`. The standalone `MAX_RESUME_GAP_SECONDS` env var was retired. This replaces the fragile 2026-06-09 hotfix (hand-raise 900→2100) — the misconfig that force-finalized chargers reconnecting in the 15–30 min window is now unrepresentable, and no startup `validate_timing_invariants()` is needed for it.
+> The former `DISCONNECT_SUSPEND_TIMEOUT_SECONDS` / `SUSPEND_TIMEOUT_SECONDS` env vars are **retired** (ADR 0027): these are policy values, identical across envs, and every incident in this area (txn 870 inversion, the 180-vs-1800 compose drift) came from env-var invisibility. No env override exists by design.
+
+> ✅ **Timing invariant (structural, per-row — ADR 0022 + ADR 0027)**: the resume staleness guard's threshold is **derived per transaction** (`stale_suspended_cutoff_seconds_for(txn)` = that txn's own per-type window + 60), so it can never be misordered below that transaction's primary timer. The standalone `MAX_RESUME_GAP_SECONDS` env var was retired 2026-07-06 (ADR 0022); the windows went per-connector-type 2026-07-23 (ADR 0027). Effective cutoffs: latched 43260s, unlatched 2760s.
 
 **Integration Points**:
 - `ConnectionManager.register_on_disconnect()` -- wires up the callback
@@ -860,7 +870,7 @@ Returns `(is_stale, gap_seconds)`. The gap is computed against the most recent o
 
 A txn with no signals at all returns `(False, None)` — the helper defers to the caller's existing state checks rather than refusing speculatively.
 
-**Threshold**: `MAX_RESUME_GAP_SECONDS` — code default **900** (15 min); **staging & prod run 2100** (35 min) as of 2026-06-09. It must sit *above* the longest primary finalize timer so the guard never races it, yet small enough to limit overcharging when it does fire. **Invariant: `MAX_RESUME_GAP_SECONDS` MUST exceed `DISCONNECT_SUSPEND_TIMEOUT_SECONDS`.** This broke in prod/staging when the disconnect timeout was widened to 1800 while the gap stayed at the 900 default — chargers reconnecting in the 15–30 min window were force-finalized `STALE_RECONNECT` instead of resuming. Fixed by raising the gap to 2100. The ordering is **not enforced at startup** today; a `validate_timing_invariants()` boot check is the proposed durable safeguard. (Historical note: the original "comfortably above the 360s startup sweep cutoff" rationale assumed the 180s disconnect default — it does not survive a widened disconnect timeout, which is why the invariant must be stated against `DISCONNECT_SUSPEND_TIMEOUT_SECONDS`, not a fixed number.)
+**Threshold**: derived per-transaction — `stale_suspended_cutoff_seconds_for(txn)` = the transaction's own per-connector-type suspend window + 60s (latched 43260s / unlatched 2760s; ADR 0022 + ADR 0027). The guard-fires-after-primary ordering is **structural**: the cutoff is defined as own-window + buffer, so no configuration can invert it. (History: this was once the standalone `MAX_RESUME_GAP_SECONDS` env var, whose 900-vs-1800 inversion force-finalized chargers reconnecting in the 15-30 min window — hotfixed 2026-06-09 by raising to 2100, made unrepresentable by ADR 0022's derivation, and made per-type by ADR 0027.)
 
 **Call sites and behavior on stale**:
 | Call site | Action when stale |
@@ -2263,8 +2273,8 @@ async def on_boot_notification(self, charge_point_vendor, charge_point_model, **
 - Validates charger registration in database
 - Sets 30-second heartbeat interval
 - Updates charger firmware_version, vendor, model from BootNotification payload
-- **Transaction Suspend/Resume**: On disconnect, `disconnect_handler.py` suspends active transactions with a 180s timeout (`DISCONNECT_SUSPEND_TIMEOUT_SECONDS`). On BootNotification, already-SUSPENDED transactions get their timeout reset (CAS guard invalidates old timeout), and a new 300s resume window starts (`SUSPEND_TIMEOUT_SECONDS`). Still-active transactions (edge case) are suspended as before. Auto-stop with billing + QR refund on timeout expiry. The per-txn loop body is extracted into `_handle_ongoing_transaction_on_boot()` for testability.
-- **Resume staleness guard**: every BootNotification per-txn handler call (and the MeterValues + GetLastMeterValue resume points) goes through `transaction_finalizer.is_resume_too_stale()` first. If the gap exceeds `MAX_RESUME_GAP_SECONDS` (code default 900s; staging/prod 2100s), the txn is finalized with stop_reason `STALE_RECONNECT` instead of being suspended/resumed. This is defense-in-depth for the case where the disconnect handler silently failed to mark SUSPENDED — see the "Resume Staleness Guard" subsection under Transaction Finalizer above (incl. the `MAX_RESUME_GAP_SECONDS > DISCONNECT_SUSPEND_TIMEOUT_SECONDS` invariant).
+- **Transaction Suspend/Resume**: On disconnect, `disconnect_handler.py` suspends active transactions with the connector type's suspend window (12h latched / 45min unlatched, `backend/policy.py`, ADR 0027). On BootNotification, already-SUSPENDED transactions get their timeout reset (CAS guard invalidates old timeout), and a fresh timer with the SAME per-type window starts (the old 300s post-boot window is retired). Still-active transactions (edge case) are suspended as before. Auto-stop with billing + QR refund on timeout expiry. The per-txn loop body is extracted into `_handle_ongoing_transaction_on_boot()` for testability.
+- **Resume staleness guard**: every BootNotification per-txn handler call (and the MeterValues + GetLastMeterValue resume points) goes through `transaction_finalizer.is_resume_too_stale()` first. If the gap exceeds the transaction's derived cutoff (its own per-connector-type suspend window + 60s — ADR 0022 + ADR 0027), the txn is finalized with stop_reason `STALE_RECONNECT` instead of being suspended/resumed. This is defense-in-depth for the case where the disconnect handler silently failed to mark SUSPENDED — see the "Resume Staleness Guard" subsection under Transaction Finalizer above.
 - Resume fields tracked: `suspended_at`, `resumed_at`, `resume_count`
 - Comprehensive connection logging
 
@@ -4947,7 +4957,7 @@ const useInfiniteTransactions = () => {
 
 **Current Behavior**:
 - On `BootNotification`, ongoing transactions are marked `SUSPENDED` (not FAILED)
-- A background `_suspend_timeout` task waits `SUSPEND_TIMEOUT_SECONDS` (default 300s)
+- A background `_suspend_timeout` task waits the connector type's suspend window (12h latched / 45min unlatched — ADR 0027; formerly a fixed 300s)
 - If the charger resumes the transaction (sends MeterValues or StartTransaction for same id_tag), the transaction is resumed to RUNNING
 - If the timeout fires while still SUSPENDED: transaction is auto-stopped with energy calculation from last MeterValue, wallet billing, and QR payment billing/refund
 - Handles double-boot race conditions via `suspended_at` timestamp comparison
@@ -5136,9 +5146,8 @@ RAZORPAY_KEY_ID=rzp_live_...
 RAZORPAY_KEY_SECRET=...
 RAZORPAY_PLATFORM_FEE_PERCENT=2.0  # Authoritative synthetic rate for customer-facing math (ADR 0001)
 
-# Transaction Suspend/Resume
-DISCONNECT_SUSPEND_TIMEOUT_SECONDS=180  # Timeout after charger disconnect (before marking STOPPED)
-SUSPEND_TIMEOUT_SECONDS=300              # Timeout after BootNotification (resume window)
+# Transaction Suspend/Resume: per-connector-type windows live in git-tracked
+# backend/policy.py, not env vars (ADR 0027)
 
 # Monitoring
 SENTRY_ENABLED=true
@@ -5391,7 +5400,7 @@ CORS_ORIGINS = [
   - Auto-stop processes full wallet billing + QR payment billing/refund
   - ConnectionManager `register_on_disconnect()` callback hook fires on `force_disconnect()`
 - **Migration**: `8_20260305050220_add_transaction_resume_fields.py`
-- **Configuration**: `DISCONNECT_SUSPEND_TIMEOUT_SECONDS` (default 180), `SUSPEND_TIMEOUT_SECONDS` (default 300)
+- **Configuration**: per-connector-type suspend windows in `backend/policy.py` (ADR 0027; the original env vars are retired)
 - **Files Added**:
   - `backend/services/disconnect_handler.py` - Transaction suspension, timeout, auto-stop with billing
   - `backend/simulators/ocpp_simulator_disconnect.py` - Synchronous simulator with 3 test modes (no-reconnect, reconnect, no-transaction)

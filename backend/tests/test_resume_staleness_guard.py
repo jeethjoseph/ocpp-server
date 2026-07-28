@@ -2,10 +2,14 @@
 
 The guard is a defense-in-depth mechanism that refuses to resume a transaction
 whose last known activity is older than the derived stale-suspended cutoff
-(`stale_suspended_cutoff_seconds()`, ADR 0022), even if the upstream disconnect
-handler failed to mark it SUSPENDED in time. The threshold is derived from the
-disconnect window, not a separate env var, so it can never be misordered below
-the disconnect timer.
+(`stale_suspended_cutoff_seconds_for(txn)`, ADR 0022 + ADR 0027), even if the
+upstream disconnect handler failed to mark it SUSPENDED in time. The threshold
+is derived per-transaction from the connector type's suspend window (policy.py),
+not a separate env var, so it can never be misordered below the primary timer.
+
+NOTE: the `test_charger` fixture has a Type2 (latching) connector, so its
+derived cutoff is the LATCHED window (12h) + buffer. Staleness fixtures below
+use 13h-old activity where they previously used 1h.
 
 Two layers tested:
 1. The pure helper `is_resume_too_stale` (unit tests)
@@ -26,13 +30,19 @@ from services import transaction_finalizer
 from services.transaction_finalizer import is_resume_too_stale
 from services.disconnect_handler import (
     _disconnect_reset_count,
-    stale_suspended_cutoff_seconds,
-    DISCONNECT_SUSPEND_TIMEOUT,
+    stale_suspended_cutoff_seconds_for,
+    suspend_window_seconds_for_transaction,
+)
+from policy import (
+    SUSPEND_WINDOW_LATCHED_SECONDS,
+    SUSPEND_WINDOW_UNLATCHED_SECONDS,
+    STALE_SUSPENDED_BUFFER_SECONDS,
 )
 from models import Transaction, TransactionStatusEnum, MeterValue
 
-# The staleness threshold is now DERIVED from the disconnect window (ADR 0022).
-THRESHOLD = stale_suspended_cutoff_seconds()
+# The staleness threshold is DERIVED per-transaction from the connector type's
+# suspend window (ADR 0022 + ADR 0027). test_charger is Type2 -> latched window.
+THRESHOLD = SUSPEND_WINDOW_LATCHED_SECONDS + STALE_SUSPENDED_BUFFER_SECONDS
 
 
 @pytest.fixture(autouse=True)
@@ -119,7 +129,7 @@ class TestIsResumeTooStale:
     ):
         """Charger has been ticking meter values even after a stale suspended_at —
         not stale, latest activity wins."""
-        old = datetime.now(timezone.utc) - timedelta(hours=2)
+        old = datetime.now(timezone.utc) - timedelta(hours=13)
         txn = await Transaction.create(
             charger=test_charger,
             user=test_user,
@@ -161,7 +171,7 @@ class TestIsResumeTooStale:
             reading_kwh=5.0,
             measurand="Energy.Active.Import.Register",
         )
-        ancient = datetime.now(timezone.utc) - timedelta(hours=3)
+        ancient = datetime.now(timezone.utc) - timedelta(hours=13)
         await _set_meter_value_created_at(mv.id, ancient)
 
         is_stale, gap = await is_resume_too_stale(txn)
@@ -208,7 +218,7 @@ class TestIsResumeTooStale:
     ):
         """Boundary check: a 200s gap is fresh at the derived cutoff but stale
         once the derived cutoff is lowered below it. The threshold follows
-        stale_suspended_cutoff_seconds(), not a standalone env var."""
+        stale_suspended_cutoff_seconds_for(txn), not a standalone env var."""
         suspended_at = datetime.now(timezone.utc) - timedelta(seconds=200)
         txn = await Transaction.create(
             charger=test_charger,
@@ -218,44 +228,79 @@ class TestIsResumeTooStale:
             start_meter_kwh=0.0,
         )
 
-        # Derived cutoff (>= 360s in test env) — 200s is fresh
+        # Derived cutoff (latched window + buffer) — 200s is fresh
         assert THRESHOLD > 200
         is_stale, _ = await is_resume_too_stale(txn)
         assert is_stale is False
 
         # Lower the DERIVED cutoff below 200s — 200s is now stale. Patch the
         # source of truth; is_resume_too_stale imports it fresh on each call.
+        async def fake_cutoff(_txn):
+            return 100
         monkeypatch.setattr(
-            "services.disconnect_handler.stale_suspended_cutoff_seconds",
-            lambda: 100,
+            "services.disconnect_handler.stale_suspended_cutoff_seconds_for",
+            fake_cutoff,
         )
         is_stale, gap = await is_resume_too_stale(txn)
         assert is_stale is True
         assert gap > 100
 
     @pytest.mark.asyncio
-    async def test_derived_cutoff_exceeds_disconnect_timer(
-        self, client, test_charger, test_user
+    async def test_derived_cutoff_exceeds_primary_window_per_type(
+        self, client, test_charger, test_user, test_station
     ):
-        """ADR 0022 invariant regression: the derived staleness cutoff is
-        guaranteed larger than the disconnect timer, so a charger reconnecting
-        just past the disconnect window (the txn 870 case) is NOT refused as
-        stale — it resumes. Under the old misconfigured MAX_RESUME_GAP_SECONDS
-        (900 < 1800) this would have been finalized STALE_RECONNECT."""
-        assert stale_suspended_cutoff_seconds() > DISCONNECT_SUSPEND_TIMEOUT
-        suspended_at = datetime.now(timezone.utc) - timedelta(
-            seconds=DISCONNECT_SUSPEND_TIMEOUT + 30
-        )
-        txn = await Transaction.create(
+        """ADR 0022 invariant regression, now asserted PER CONNECTOR TYPE
+        (ADR 0027): each transaction's derived staleness cutoff is guaranteed
+        larger than its own primary suspend window, so a charger reconnecting
+        just inside its window (the txn 870 case) is NOT refused as stale."""
+        import uuid
+        from models import Charger, Connector
+
+        # Latched (Type2, via test_charger): 12h window
+        latched_txn = await Transaction.create(
             charger=test_charger,
             user=test_user,
             transaction_status=TransactionStatusEnum.SUSPENDED,
-            suspended_at=suspended_at,
+            suspended_at=datetime.now(timezone.utc)
+            - timedelta(seconds=SUSPEND_WINDOW_LATCHED_SECONDS - 30),
             start_meter_kwh=0.0,
         )
-        is_stale, gap = await is_resume_too_stale(txn)
+        assert await suspend_window_seconds_for_transaction(latched_txn) == \
+            SUSPEND_WINDOW_LATCHED_SECONDS
+        assert await stale_suspended_cutoff_seconds_for(latched_txn) > \
+            SUSPEND_WINDOW_LATCHED_SECONDS
+        is_stale, _ = await is_resume_too_stale(latched_txn)
         assert is_stale is False
-        assert gap > DISCONNECT_SUSPEND_TIMEOUT
+
+        # Unlatched (Socket): 45min window
+        socket_charger = await Charger.create(
+            charge_point_string_id=str(uuid.uuid4()),
+            station_id=test_station.id,
+            name="Socket Charger",
+            latest_status="Available",
+        )
+        await Connector.create(
+            charger_id=socket_charger.id, connector_id=1, connector_type="Socket"
+        )
+        socket_txn = await Transaction.create(
+            charger=socket_charger,
+            user=test_user,
+            transaction_status=TransactionStatusEnum.SUSPENDED,
+            suspended_at=datetime.now(timezone.utc)
+            - timedelta(seconds=SUSPEND_WINDOW_UNLATCHED_SECONDS - 30),
+            start_meter_kwh=0.0,
+        )
+        assert await suspend_window_seconds_for_transaction(socket_txn) == \
+            SUSPEND_WINDOW_UNLATCHED_SECONDS
+        assert await stale_suspended_cutoff_seconds_for(socket_txn) > \
+            SUSPEND_WINDOW_UNLATCHED_SECONDS
+        is_stale, _ = await is_resume_too_stale(socket_txn)
+        assert is_stale is False
+
+        # And the socket cutoff must NOT leak onto the latched txn: a Type2
+        # txn well past the SOCKET window is still fresh under its own window.
+        assert SUSPEND_WINDOW_LATCHED_SECONDS - 30 > \
+            SUSPEND_WINDOW_UNLATCHED_SECONDS + STALE_SUSPENDED_BUFFER_SECONDS
 
 
 # ============================================================================
@@ -280,7 +325,8 @@ class TestBootNotificationStalenessGuard:
         self, client, test_charger, test_user, test_tariff, test_wallet
     ):
         """Plan agent's high-risk regression: a still-RUNNING txn whose last
-        meter value is from 1h ago must be finalized, not suspended+resumed."""
+        meter value is from 13h ago (past the Type2 latched window) must be
+        finalized, not suspended+resumed."""
         from main import ChargePoint
         txn = await Transaction.create(
             charger=test_charger,
@@ -294,7 +340,7 @@ class TestBootNotificationStalenessGuard:
             reading_kwh=5.0,
             measurand="Energy.Active.Import.Register",
         )
-        ancient = datetime.now(timezone.utc) - timedelta(hours=1)
+        ancient = datetime.now(timezone.utc) - timedelta(hours=13)
         await _set_meter_value_created_at(mv.id, ancient)
         await _set_transaction_start_time(txn.id, ancient)
 
@@ -315,9 +361,10 @@ class TestBootNotificationStalenessGuard:
         self, client, test_charger, test_user, test_tariff, test_wallet
     ):
         """Plan agent's IF-branch catch: a SUSPENDED txn whose suspended_at
-        is from 1h ago must be finalized, not have suspended_at refreshed."""
+        is from 13h ago (past the Type2 latched window) must be finalized,
+        not have suspended_at refreshed."""
         from main import ChargePoint
-        old = datetime.now(timezone.utc) - timedelta(hours=1)
+        old = datetime.now(timezone.utc) - timedelta(hours=13)
         txn = await Transaction.create(
             charger=test_charger,
             user=test_user,

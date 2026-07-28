@@ -32,7 +32,10 @@ import logging
 import json
 
 # Transaction resume constants
-SUSPEND_TIMEOUT_SECONDS = int(os.environ.get("SUSPEND_TIMEOUT_SECONDS", "300"))
+# Post-boot suspend windows are per-connector-type and derived from policy.py
+# via disconnect_handler.suspend_window_seconds_for_charge_point — see ADR 0027.
+# The old SUSPEND_TIMEOUT_SECONDS env var (300s) is retired: a reboot must never
+# shorten the reconnect grace window the disconnect path promised.
 
 # StartTransaction reconcile (ADR 0022 / RCA issue 04): when a new session starts
 # on a charger that still has an open transaction, classify the old one. Last
@@ -343,7 +346,8 @@ class ChargePoint(OcppChargePoint):
         # A BootNotification means the charger rebooted. Handle ongoing transactions:
         # - Already SUSPENDED (from disconnect): reset suspended_at to extend window
         # - Still RUNNING/STARTED/etc (edge case): suspend them
-        # In both cases, start a SUSPEND_TIMEOUT_SECONDS timeout for resume.
+        # In both cases, arm the connector-type suspend window for resume — the
+        # SAME window the disconnect path uses, never a shorter one (ADR 0027).
         try:
             ongoing_transactions = await Transaction.filter(
                 charger__charge_point_string_id=self.id,
@@ -544,10 +548,15 @@ class ChargePoint(OcppChargePoint):
             },
         ))
 
-        # Start resume timeout — will auto-stop if charger doesn't resume
-        safe_create_task(self._suspend_timeout(transaction.id, now, SUSPEND_TIMEOUT_SECONDS))
+        # Start resume timeout — will auto-stop if charger doesn't resume.
+        # Window = the connector type's suspend window (never shorter than the
+        # disconnect window it replaces — the 300s post-boot timer killed 9
+        # sessions fleet-wide; see ADR 0027).
+        from services.disconnect_handler import suspend_window_seconds_for_charge_point
+        post_boot_window = await suspend_window_seconds_for_charge_point(self.id)
+        safe_create_task(self._suspend_timeout(transaction.id, now, post_boot_window))
 
-    async def _suspend_timeout(self, transaction_id: int, original_suspended_at, timeout_seconds: int = 300):
+    async def _suspend_timeout(self, transaction_id: int, original_suspended_at, timeout_seconds: int):
         """Auto-stop a SUSPENDED transaction if the charger doesn't resume it in time."""
         try:
             await asyncio.sleep(timeout_seconds)

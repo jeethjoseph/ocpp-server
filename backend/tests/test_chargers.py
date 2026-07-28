@@ -49,10 +49,11 @@ class TestChargerEndpoints:
         assert "ocpp_url" in data
         assert data["ocpp_url"].endswith(data["charger"]["charge_point_string_id"])
         
-        # Verify connectors were created
+        # Verify connectors were created — input "CCS2" canonicalizes to the
+        # enum value "CCS" on persist (charger_type_service alias table).
         connectors = await Connector.filter(charger_id=data["charger"]["id"]).all()
         assert len(connectors) == 2
-        assert connectors[0].connector_type in ["CCS2", "CHAdeMO"]
+        assert connectors[0].connector_type in ["CCS", "CHAdeMO"]
     
     @pytest.mark.asyncio
     async def test_create_charger_station_not_found(self, client_admin: AsyncClient):
