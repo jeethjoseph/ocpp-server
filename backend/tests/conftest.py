@@ -253,8 +253,12 @@ async def test_franchisee():
     from decimal import Decimal
     import random
     from models import Franchisee, FranchiseeStatusEnum
+    from services.franchisee_code_service import allocate_invoice_code
     suffix = random.randint(100000000, 999999999)
     return await Franchisee.create(
+        # Allocated exactly as the create endpoint does. Without it,
+        # get_next_invoice_number raises rather than mint a malformed number.
+        invoice_code=await allocate_invoice_code(),
         business_name=f"Test Franchisee {suffix}",
         contact_name="Test Contact",
         contact_email=f"franchisee_{suffix}@voltlync.test",

@@ -347,9 +347,14 @@ async def _make_franchisee(business_name="Some Franchisee Pvt Ltd",
     from datetime import date
     from decimal import Decimal as D
     from models import Franchisee, FranchiseeStatusEnum
+    from services.franchisee_code_service import allocate_invoice_code
     import uuid as _uuid
     suffix = _uuid.uuid4().hex[:6]
     return await Franchisee.create(
+        # Allocated the same way the create endpoint does. A franchisee without
+        # an invoice_code cannot be billed — get_next_invoice_number raises
+        # rather than mint a malformed number.
+        invoice_code=await allocate_invoice_code(),
         business_name=business_name,
         contact_name=f"Contact {suffix}",
         contact_email=f"{suffix}@franchisee.test",
@@ -369,7 +374,7 @@ async def _make_franchisee(business_name="Some Franchisee Pvt Ltd",
 async def test_franchisee_owned_station_invoice_has_voltlync_supplier(client):
     """Sessions at franchisee-owned stations: VoltLync remains the GST supplier,
     the franchisee is snapshotted as the operator (for the 'Operated by' block),
-    and the invoice number carries the F{franchisee_id} segment."""
+    and the invoice number carries the franchisee's stable invoice_code."""
     franchisee = await _make_franchisee()
 
     _, _, txn, _, _ = await _make_session(franchisee=franchisee)
@@ -386,7 +391,10 @@ async def test_franchisee_owned_station_invoice_has_voltlync_supplier(client):
     assert invoice.franchisee_gstin == "29ZZZZZ9999Z1Z5"
     assert invoice.franchisee_state_code == "29"
     # Invoice number carries the F{id} segment per substore model
-    assert invoice.invoice_number.startswith(f"VL/F{franchisee.id}/WAL/")
+    # Carries the franchisee's stable invoice_code, not its primary key —
+    # the PK was per-database and collided across the two registers.
+    assert invoice.invoice_number.startswith(f"{franchisee.invoice_code}/W/")
+    assert len(invoice.invoice_number) == 16
 
 
 @pytest.mark.asyncio
@@ -401,7 +409,10 @@ async def test_voltlync_owned_station_invoice_no_franchisee_block(client):
     assert invoice.franchisee_id is None
     assert invoice.franchisee_business_name is None
     assert invoice.franchisee_gstin is None
-    assert invoice.invoice_number.startswith("VL/WAL/")
+    # VoltLync-owned stations bill under the reserved F0000 code (ADR: issue 02).
+    # Was "VL/WAL/..." before the 16-character Rule 46(b) reformat.
+    assert invoice.invoice_number.startswith("F0000/W/")
+    assert len(invoice.invoice_number) == 16
     assert "/F" not in invoice.invoice_number
 
 
@@ -427,8 +438,9 @@ async def test_per_franchisee_counter_isolation(client):
     assert inv_a1.invoice_number.endswith("/00001")
     assert inv_a2.invoice_number.endswith("/00002")
     assert inv_b1.invoice_number.endswith("/00001")
-    assert f"/F{franchisee_a.id}/" in inv_a1.invoice_number
-    assert f"/F{franchisee_b.id}/" in inv_b1.invoice_number
+    assert inv_a1.invoice_number.startswith(f"{franchisee_a.invoice_code}/")
+    assert inv_b1.invoice_number.startswith(f"{franchisee_b.invoice_code}/")
+    assert franchisee_a.invoice_code != franchisee_b.invoice_code
 
 
 @pytest.mark.asyncio
