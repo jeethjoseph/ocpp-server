@@ -21,6 +21,7 @@ from crud import (
 from models import OCPPLog, Transaction, TransactionStatusEnum, MeterValue
 from services.wallet_service import WalletService
 from services.wallet_session_service import WalletSessionService
+from core.supplier_identity import SupplierIdentityError, validate_supplier_identity
 from redis_manager import redis_manager
 from core.connection_manager import connection_manager
 from utils import safe_create_task, mask_id_tag, mask_email
@@ -1769,17 +1770,38 @@ async def startup_event():
     await init_db()
     await redis_manager.connect()
 
-    # Compliance preflight: GST invoices cannot be issued without a supplier
-    # GSTIN (CGST Rule 46). Surface this loudly at boot rather than silently
-    # at per-session issuance time, so a misconfigured deploy doesn't accrue
-    # un-invoiced sessions for hours before anyone notices.
-    if not os.getenv("VOLTLYNC_GSTIN"):
-        logger.error(
-            "STARTUP WARNING: VOLTLYNC_GSTIN is not configured. "
-            "Customer-facing GST invoices will NOT be issued until this is "
-            "set (see backend/services/invoice_service.py:generate_invoice). "
-            "All charging sessions will complete and be billed, but no "
-            "gst_invoice row will be created."
+    # Compliance preflight: refuse to serve with an absent or incoherent
+    # supplier identity. This was a warning until 2026-08 and it is why 1,287
+    # invoices carried another registered person's GSTIN for four months —
+    # a warning nobody reads is indistinguishable from no check at all.
+    # Aborting is the correct failure mode: a boot that fails is a five-minute
+    # config fix, while a boot that succeeds mints defective tax invoices at
+    # roughly eleven a day across both registers.
+    # Enforced where invoices are real, warned where they are not. Staging is
+    # NOT exempt: it shares production's GSTIN and financial year and has
+    # issued the majority of our tax invoices to real customers. Only local
+    # development degrades to a warning — blocking it would push developers to
+    # paste in a plausible-looking GSTIN, which is the defect, not the fix.
+    _identity_env = os.getenv("ENVIRONMENT", "development").strip().lower()
+    try:
+        validate_supplier_identity(
+            gstin=os.getenv("VOLTLYNC_GSTIN"),
+            business_name=os.getenv("VOLTLYNC_BUSINESS_NAME"),
+            state_code=os.getenv("VOLTLYNC_STATE_CODE"),
+            entity_type=os.getenv("VOLTLYNC_ENTITY_TYPE"),
+        )
+        logger.info("✅ Supplier identity validated for GST invoicing")
+    except SupplierIdentityError as e:
+        if _identity_env in ("production", "prod", "staging"):
+            logger.critical(
+                "STARTUP ABORTED: supplier identity is invalid in %s. %s",
+                _identity_env, e,
+            )
+            raise
+        logger.warning(
+            "Supplier identity invalid (%s) — continuing because ENVIRONMENT=%s. "
+            "GST invoices issued here are not valid documents. %s",
+            type(e).__name__, _identity_env, e,
         )
 
     # ADR 0026: the tariff excludes the gateway and the base rate is a simple
