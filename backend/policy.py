@@ -34,3 +34,66 @@ SUSPEND_WINDOW_UNLATCHED_SECONDS = 2700   # 45 min — deliberate cable-security
 # guard. Derived (window + buffer), never configured independently, so the
 # guard/sweep can never fire before the primary timer (ADR 0022 invariant).
 STALE_SUSPENDED_BUFFER_SECONDS = 60
+
+
+# --- Franchisee invoice-code blocks: cross-environment collision guard ---
+#
+# The customer-facing GST Invoice number embeds a franchisee identifier. That
+# identifier used to be `Franchisee.id` — a per-database autoincrement — so
+# production and staging, which share one GSTIN and one financial year,
+# independently minted the same value. It produced two duplicate invoice
+# numbers (VL/F2/QR/202627/00001 and /00002, issued to different franchisees
+# in each register) and would have produced more: production was three
+# franchisees away from minting F5, already live on staging with 878 invoices.
+#
+# `Franchisee.invoice_code` replaces the primary key in the invoice number. Each
+# environment may only mint from its own block, so two databases cannot collide
+# without coordinating — no shared counter, no network call, no discipline.
+# A CHECK constraint on the column enforces the block; this map is only the
+# source the allocator reads.
+#
+# Blocks are deliberately NOT an environment letter in the invoice number: the
+# serial is a Rule 46(b) statutory field and "staging" has no business on a tax
+# invoice. Contrast the Charger Code (ADR 0028), which IS env-prefixed because
+# it is a display alias with no statutory meaning. Same problem, two mechanisms,
+# for that reason.
+#
+# Staging's block is closed: it has five franchisees, only two of which ever
+# issued an invoice, and it will not gain more.
+FRANCHISEE_CODE_BLOCKS = {
+    "production": (1, 8999),
+    "staging": (9000, 9999),
+    "development": (9000, 9999),
+}
+
+# Reserved for VoltLync-owned stations (`Franchisee` is NULL on the invoice).
+VOLTLYNC_OWNED_INVOICE_CODE = "F0000"
+
+# Offset applied to `Franchisee.id` when backfilling existing rows, so a code
+# can be read back to the franchisee's old `VL/F{id}/` invoice series. Staging
+# keeps the id in the last digits (id 5 -> F9005) precisely so support can
+# correlate an old number with a new one without a lookup. Only ever used by
+# the backfill; new rows are allocated by scanning the block.
+FRANCHISEE_CODE_BACKFILL_OFFSET = {
+    "production": 0,      # id 1 -> F0001
+    "staging": 9000,      # id 5 -> F9005
+    "development": 9000,
+}
+
+
+def franchisee_code_backfill_offset(environment: str) -> int:
+    return FRANCHISEE_CODE_BACKFILL_OFFSET.get(
+        (environment or "").strip().lower(), FRANCHISEE_CODE_BACKFILL_OFFSET["staging"]
+    )
+
+
+def franchisee_code_block(environment: str) -> tuple[int, int]:
+    """Inclusive (low, high) code range this environment may allocate from.
+
+    Unknown environments resolve to the staging block, never production's —
+    the same fail-safe direction as ADR 0028's prefix map, so a misconfigured
+    box cannot mint a code production might later issue.
+    """
+    return FRANCHISEE_CODE_BLOCKS.get(
+        (environment or "").strip().lower(), FRANCHISEE_CODE_BLOCKS["staging"]
+    )

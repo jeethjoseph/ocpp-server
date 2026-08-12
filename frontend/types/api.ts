@@ -667,6 +667,10 @@ export interface Franchisee {
   contact_email: string;
   contact_phone: string;
   address?: string | null;
+  /** Stable code embedded in this franchisee's GST invoice numbers
+   *  (F0001/Q/26/00001). Allocated once at onboarding; null only for rows
+   *  predating the backfill. */
+  invoice_code?: string | null;
   pan_number?: string | null;
   gstin?: string | null;
   tan_number?: string | null;

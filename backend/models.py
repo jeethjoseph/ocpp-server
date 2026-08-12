@@ -677,6 +677,15 @@ class Franchisee(Model):
     contact_phone = fields.CharField(max_length=20)
     address = fields.TextField(null=True)
 
+    # Stable, globally-unique identifier embedded in the customer-facing GST
+    # Invoice number (`F0001/Q/26/00001`). Deliberately NOT the primary key:
+    # PKs are per-database autoincrements, and production and staging share one
+    # GSTIN, so PK-derived numbers collided across registers. Allocated once at
+    # onboarding from this environment's block (policy.FRANCHISEE_CODE_BLOCKS)
+    # and never reused. `F0000` is reserved for VoltLync-owned stations.
+    # Nullable only so the Aerich migration can add-then-backfill.
+    invoice_code = fields.CharField(max_length=5, unique=True, null=True)
+
     # Tax/Legal (populated during KYC or by admin)
     pan_number = fields.CharField(max_length=10, unique=True, null=True)
     gstin = fields.CharField(max_length=15, unique=True, null=True)
