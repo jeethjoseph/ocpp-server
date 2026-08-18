@@ -10,6 +10,7 @@ those into S3 and clears the fallback.
 import logging
 import os
 import hashlib
+import re
 from functools import lru_cache
 from typing import BinaryIO, Optional
 
@@ -86,6 +87,56 @@ def build_firmware_s3_key(version: str, filename: str) -> str:
     safe_version = "".join(c if c.isalnum() or c in "._-" else "_" for c in version)
     safe_filename = "".join(c if c.isalnum() or c in "._-" else "_" for c in filename)
     return f"firmware/{safe_version}/{safe_filename}"
+
+
+# ============ Diagnostic Bundles (ADR 0029) ============
+#
+# A separate bucket from firmware, deliberately: Bundles carry a 90-day
+# lifecycle rule where firmware images are kept indefinitely, and they may
+# contain charger-side PII, so they warrant their own access policy.
+
+
+def diagnostics_bucket() -> Optional[str]:
+    """Configured Diagnostic Bundle bucket, or None when S3 is not wired up.
+
+    Returns None rather than raising so callers can fall back to local disk,
+    matching the firmware uploader's S3-or-disk branching.
+    """
+    return os.getenv("AWS_S3_DIAGNOSTICS_BUCKET") or None
+
+
+def build_diagnostic_bundle_s3_key(charger_id: str, received_at, bundle_seq) -> str:
+    """S3 key for a Bundle: diagnostics/{charger}/{YYYY}/{MM}/{DD}/{stamp}-seq{n}.txt
+
+    Per-charger, date-partitioned, as specified in ADR 0029. `charger_id` is
+    slugged because it originates in an untrusted request header.
+    """
+    safe_charger = "".join(c if c.isalnum() or c in "._-" else "_" for c in (charger_id or "unknown"))[:64]
+    # Collapse dot runs so a hostile charger_id can never yield a ".." segment.
+    # Harmless in S3 (keys are flat strings) but not once a key is used as a
+    # local filename on download — see ADR 0029 on not trusting charger input.
+    safe_charger = re.sub(r"\.{2,}", "_", safe_charger).strip(".") or "unknown"
+    safe_seq = "".join(c if c.isalnum() else "_" for c in str(bundle_seq if bundle_seq is not None else "na"))[:16]
+    stamp = received_at.strftime("%Y%m%dT%H%M%S%fZ")
+    return (
+        f"diagnostics/{safe_charger or 'unknown'}/{received_at:%Y/%m/%d}/"
+        f"{stamp}-seq{safe_seq}.txt"
+    )
+
+
+def upload_diagnostic_bundle_to_s3(s3_key: str, body: bytes) -> None:
+    """Upload a Diagnostic Bundle body to the diagnostics bucket."""
+    bucket = diagnostics_bucket()
+    if not bucket:
+        raise RuntimeError("AWS_S3_DIAGNOSTICS_BUCKET is not configured")
+    _s3_client().put_object(
+        Bucket=bucket,
+        Key=s3_key,
+        Body=body,
+        ContentType="text/plain; charset=utf-8",
+        ServerSideEncryption="AES256",
+    )
+    logger.info("📟 Uploaded diagnostic bundle to s3://%s/%s (%d bytes)", bucket, s3_key, len(body))
 
 
 # ============ Checksums ============
