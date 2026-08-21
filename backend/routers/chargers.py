@@ -16,6 +16,7 @@ from auth_middleware import require_admin, require_user_or_admin
 from crud import log_audit_event
 from services.tariff_utils import back_calc_base_rate
 from services.charger_type_service import canonical_connector_type
+from services import charger_auth_service
 
 logger = logging.getLogger(__name__)
 
@@ -1244,3 +1245,70 @@ async def get_charger_latest_error(
         return None
 
     return ChargerErrorResponse.model_validate(latest, from_attributes=True)
+
+# ============ Charger Auth Key provisioning (ADR 0020 / ADR 0029) ============
+
+class AuthKeyResponse(BaseModel):
+    charge_point_string_id: str
+    auth_key: str
+    rotated: bool
+    warning: str
+
+
+@router.post("/{charger_id}/auth-key", response_model=AuthKeyResponse)
+async def provision_charger_auth_key(
+    charger_id: int,
+    admin_user: User = Depends(require_admin()),
+):
+    """Generate or rotate a charger's **Charger Auth Key**, revealing it once.
+
+    The plaintext is returned in this response and never again — only its
+    SHA-256 is stored. A lost key is rotated, not recovered.
+
+    Rotation has **no grace overlap**: the old hash is replaced immediately, so
+    the charger fails authentication until the new key is loaded onto it.
+    Delivery onto the unit is charger-side tooling's job, not the server's.
+
+    Currently gates **Diagnostic Bundle upload** only. The OCPP WebSocket
+    handshake does not consult this key yet (ADR 0020 remains PROPOSED).
+    """
+    charger = await Charger.get_or_none(id=charger_id)
+    if not charger:
+        raise HTTPException(status_code=404, detail="Charger not found")
+
+    rotated = bool(charger.auth_key_hash)
+    plaintext = charger_auth_service.generate_auth_key()
+    charger.auth_key_hash = charger_auth_service.hash_auth_key(plaintext)
+    await charger.save(update_fields=["auth_key_hash", "updated_at"])
+
+    # Two explicit calls rather than a ternary on `action=`: the audit-registry
+    # drift guard (tests/test_audit_actions.py) scans for the literal that
+    # follows `action=`, so a ternary would hide one action from it.
+    if rotated:
+        await log_audit_event(
+            action="charger.auth_rotated",
+            entity_type="charger",
+            entity_id=charger.charge_point_string_id,
+            actor_type="admin",
+            actor=admin_user,
+        )
+    else:
+        await log_audit_event(
+            action="charger.auth_provisioned",
+            entity_type="charger",
+            entity_id=charger.charge_point_string_id,
+            actor_type="admin",
+            actor=admin_user,
+        )
+    # Deliberately logs the outcome and the charger, never the key.
+    logger.info(
+        "🔑 Charger Auth Key %s for %s by admin %s",
+        "rotated" if rotated else "provisioned", charger.charge_point_string_id, admin_user.id,
+    )
+
+    return AuthKeyResponse(
+        charge_point_string_id=charger.charge_point_string_id,
+        auth_key=plaintext,
+        rotated=rotated,
+        warning="Copy this key now — it is shown once and cannot be retrieved again.",
+    )

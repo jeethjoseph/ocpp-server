@@ -61,7 +61,7 @@ It **also uploads shortly after entering a fault state**, guarded by a firmware-
 **Fan-out on ingest: the file is archived, the lines are indexed.** One upload produces **two** artifacts answering two different questions, and neither substitutes for the other:
 
 - the **raw bundle in S3** plus its `DiagnosticBundle` row — the archive of record and the index *of bundles*, answering *"did I receive everything from this charger?"* via sequence numbers and the overflow counter;
-- the **individual log lines**, parsed and forwarded to **New Relic Logs**, tagged with charger code, station, bundle sequence, and severity — the index *of lines*, answering *"what actually happened?"* across the fleet.
+- the **individual log lines**, parsed and forwarded to **New Relic via OTLP** under a per-environment service identity (`VoltLync-Charger-Logs-Staging` / `-Production`), tagged with charger code, station, bundle sequence, and severity — the index *of lines*, answering *"what actually happened?"* across the fleet.
 
 Storing the bundle as an opaque blob was the initial default and is **rejected**. The most valuable questions are fleet-wide — *"which chargers show this AT failure?"*, *"did the four units that faulted last week share a signature?"*, *"alert me when any charger logs `WATCHDOG_RESET`"* — and a blob-per-charger archive answers **none** of them; you would download thirty files and grep locally. S3 treats object contents as an opaque byte stream, and device-blob archives reliably become write-only for exactly this reason.
 
@@ -95,10 +95,16 @@ Four ingest rules, each guarding a failure that is silent otherwise:
 - **A non-zero overflow count is a standalone alert signal.** It says a charger suddenly started logging much harder than normal, which nearly always means it is in trouble — actionable before anyone reads a trace line, and independent of bundle content.
 - **The overflow counter settles the buffer-sizing question empirically.** Nobody currently knows whether ~192 KB of usable EEPROM holds a day or an hour of this firmware's output. Routinely zero ⇒ the EEPROM was sufficient. Routinely large ⇒ that is measured production evidence for moving logs to a separate ~16 MB SPI NOR flash part, rather than an argument from first principles.
 - **Without a server-initiated flush, a misbehaving-but-not-faulting charger is invisible until the next nightly window.** Slow charging, intermittent drops, a customer complaint on a unit that never enters a fault state — none of these trigger an upload. Fault-triggered upload covers the incident case, not the "something is off" case. This is the main capability given up by declining both `GetDiagnostics` and the flush command.
-- **New Relic's Log API silently drops records with timestamps older than 48 hours.** Measured on account 7468195: a control record and one backdated 30h both landed (with the backdated timestamp preserved); one backdated 60h did not. **All three returned `HTTP 202 Accepted`** — the drop happens downstream and is invisible from the ingest response. This is why the cadence is 6-hourly. It also means the server **MUST compute record age and mark anything beyond ~47h as archive-only** on the `DiagnosticBundle` row, so the admin surface can say *"records before X are in S3 only"* rather than presenting a quietly incomplete index. A charger offline for more than two days will have its entire backlog land in S3 and never in New Relic.
+- **New Relic silently drops records with timestamps older than 48 hours — on both ingest paths.** Measured on account 7468195 against the Log API *and* OTLP independently: a control record and one backdated 30h both landed (with the backdated timestamp preserved exactly); one backdated 60h did not. **Every request returned success (`202` on the Log API, `200` on OTLP)** — the drop happens downstream and is invisible from the ingest response. This is why the cadence is 6-hourly. It also means the server **MUST compute record age and mark anything beyond ~47h as archive-only** on the `DiagnosticBundle` row, so the admin surface can say *"records before X are in S3 only"* rather than presenting a quietly incomplete index. A charger offline for more than two days will have its entire backlog land in S3 and never in New Relic.
 - **Retention is settled by measurement, not choice.** The `Logging` namespace on the account caps at **30 days**; the S3 lifecycle rule is 90. That is the hot/cold split: search recent records in New Relic, retrieve the raw bundle from S3 beyond it.
 - **Headroom is confirmed ample.** Current total ingest is ~30.9 GB/30d (Tracing 10.6, Metrics 9.5, Logging 9.4, APM 0.8, Browser 0.6) against the 100 GB free tier. Diagnostic Bundles add ~175 MB/month — **0.2% of the tier**. The account already ingests Logs from `OCPP-Server-Production` and `OCPP-Server-Staging`, so the product is live and no new integration is needed.
-- **Fan-out must use the Log API directly, not the Python APM agent.** The agent's log forwarding cannot set a historical timestamp, and these records are hours old by construction. POST to `log-api.newrelic.com/log/v1` with an explicit `timestamp` field. Batch at ~500 records per request with gzip: the API caps a payload at **1 MB**, and a full bundle is ~500–600 KB of JSON once attributes are attached — it fits, but without much margin.
+- **Fan-out goes over OTLP, not the Python APM agent and not the Log API.** The agent's log forwarding cannot set a historical timestamp, and these records are hours old by construction — so a direct POST is required either way. Between the two direct paths, **OTLP is chosen because it is the only one that separates charger traces from server logs at the entity level**, which is what keeps ~48,000 charger lines/day out of a staging application-log stream running ~240,000/day.
+
+  Measured on account 7468195: a record POSTed to `otlp.nr-data.net:4318/v1/logs` with resource attribute `service.name` comes back stamped `entity.name`, `entity.type: SERVICE`, `entity.guid`, and `instrumentation.provider: opentelemetry`, with custom attributes (`charger_code`, `bundle_seq`) intact. The same identity attributes sent to `log-api.newrelic.com/log/v1` are stored as **plain attributes with `entity.guid: None`** — the Log API does not synthesize entities. Charger logs therefore separate from the backend on the *same* `entity.name` field that already splits `OCPP-Server-Staging` from `OCPP-Server-Production`, rather than on a bespoke `logtype` discriminator.
+
+  No OpenTelemetry SDK is required — the payload is hand-built JSON over plain HTTP. Batch and compress: the ingest path caps a payload at **1 MB**, and a full bundle is ~500–600 KB of JSON once attributes are attached.
+
+  Caveat, untested: a *single* record stamps the entity identity but was not enough telemetry for the entity to become browsable in the entity explorer within the test window. The attribute-level separation works immediately regardless; a clickable entity page is expected once bundles flow continuously but has not been proven.
 - **Bundles are disposable by construction.** Because they are diagnostic-only, retention can be aggressive and durability requirements are low. See the `CONTEXT.md` **Diagnostic Bundle** entry for the non-metering exclusion, which is load-bearing: a second, unaudited copy of energy data would put this stream adjacent to GST invoicing and settlement, and it deliberately is not.
 - **If these units carry BG95/BG96 modems, each upload will drop the OCPP WSS connection** — the single-TLS-context limitation already documented for firmware downloads. Mitigation is known (schedule uploads in the IST small hours; reuse `firmware_update_service._mark_ws_drop_expected` so the disconnect does not fire `charger.disconnected` audit events and `OCPPWebSocketDisconnect` NR events). **The modem model is not yet confirmed** and should be before implementation.
 
@@ -120,4 +126,25 @@ Four ingest rules, each guarding a failure that is silent otherwise:
 
 ## Still open
 
-This ADR settles transport, authentication, the bundle header contract, delivery semantics, cadence, storage, and the admin surface. What remains is **not** design work but two facts to confirm with the hardware and firmware teams before implementation, both detailed in Consequences: **which modem** these units carry (it decides whether uploads need wrapping in `_mark_ws_drop_expected`), and whether the EEPROM ring buffer's **write head is wear-levelled** rather than kept at a fixed address. Who beyond ADMIN may read Bundles is not yet settled. Retention is now fixed by measurement — 30 days in New Relic, 90 in S3.
+Implemented as of 2026-08-19: the authenticated endpoint, the Charger Auth Key
+(column, provisioning, rotation, reveal-once), the `DiagnosticBundle` index with
+content-based idempotency, server-assigned epochs, gap and overflow accounting,
+New Relic loss events, server-side redaction ahead of the S3 write, Redis-backed
+rate limiting, the OTLP fan-out with per-segment clock reconstruction, and the
+admin panel.
+
+What remains is **not design work**:
+
+- **Deployment.** Staging still runs the pre-auth build. Cutover is ordered:
+  provision the test charger's key → hand it to the firmware team → switch
+  `.env.staging` → deploy. Deploying first would 401 a fleet mid-test.
+- **Prod bucket.** `voltlync-diagnostics-prod` is not created; the IAM policy
+  already covers its ARN, so no IAM change is needed.
+- **Fan-out enablement.** `DIAGNOSTIC_FANOUT_ENABLED` is off everywhere pending
+  firmware change C1 (the `TIME_SYNC` anchor). The parser accepts the current
+  free-text sync line as a fallback, so it degrades rather than breaking.
+- **Alert rules.** `DiagnosticBundleLoss` and `DiagnosticBundleEpochReset` are
+  emitted; no New Relic alert condition is wired to them yet.
+- **Key delivery.** The server generates and reveals the key once; getting it
+  onto the unit is still manual, and is the weakest link in the credential
+  design.

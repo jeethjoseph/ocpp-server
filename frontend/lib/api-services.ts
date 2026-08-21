@@ -1072,3 +1072,58 @@ export interface PortalQRCode {
   payee_display_name: string;
   created_at: string;
 }
+
+/**
+ * Diagnostic Bundle Service
+ *
+ * Charger firmware debug traces, uploaded over HTTPS outside the OCPP channel
+ * (ADR 0029). This surface answers *delivery* questions — did every bundle
+ * arrive, did the charger lose anything — and hands back the raw archive.
+ * Trace CONTENT is read in New Relic, not here.
+ */
+export interface DiagnosticBundle {
+  id: number;
+  charger_id: number;
+  charge_point_string_id: string;
+  epoch: number;
+  bundle_seq: number;
+  boot: number | null;
+  first_record: number | null;
+  last_record: number | null;
+  overflow: number | null;
+  overflow_delta: number;
+  gap_records: number;
+  size_bytes: number;
+  line_count: number;
+  header_valid: boolean;
+  received_at_ist: string;
+  lossy: boolean;
+}
+
+export interface ChargerAuthKey {
+  charge_point_string_id: string;
+  auth_key: string;
+  rotated: boolean;
+  warning: string;
+}
+
+export const diagnosticBundleService = {
+  /** Recent bundles for one charger, newest first. */
+  list: (chargerId: number, limit = 50) =>
+    api.get<DiagnosticBundle[]>(
+      `/api/admin/diagnostics/chargers/${chargerId}/bundles?limit=${limit}`
+    ),
+
+  /** Short-lived presigned S3 URL for the raw bundle. */
+  downloadUrl: (bundleId: number) =>
+    api.get<{ url: string; expires_in: number; s3_key: string }>(
+      `/api/admin/diagnostics/bundles/${bundleId}/download`
+    ),
+
+  /**
+   * Generate or rotate the charger's auth key.
+   * The plaintext is returned ONCE and is never retrievable again.
+   */
+  provisionAuthKey: (chargerId: number) =>
+    api.post<ChargerAuthKey>(`/api/admin/chargers/${chargerId}/auth-key`, {}),
+};

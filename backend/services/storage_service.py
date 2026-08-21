@@ -124,6 +124,21 @@ def build_diagnostic_bundle_s3_key(charger_id: str, received_at, bundle_seq) -> 
     )
 
 
+def generate_diagnostic_bundle_url(s3_key: str, expires_in: int = 900) -> str:
+    """Presigned GET for an archived Bundle.
+
+    Short TTL by default: Bundles may carry charger-side PII, so a link handed
+    to an admin should not outlive the click. Unlike firmware URLs there is no
+    retry window to span — a human is downloading it now.
+    """
+    bucket = diagnostics_bucket()
+    if not bucket:
+        raise RuntimeError("AWS_S3_DIAGNOSTICS_BUCKET is not configured")
+    return _s3_client().generate_presigned_url(
+        "get_object", Params={"Bucket": bucket, "Key": s3_key}, ExpiresIn=expires_in
+    )
+
+
 def upload_diagnostic_bundle_to_s3(s3_key: str, body: bytes) -> None:
     """Upload a Diagnostic Bundle body to the diagnostics bucket."""
     bucket = diagnostics_bucket()

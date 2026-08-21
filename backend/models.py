@@ -339,6 +339,20 @@ class Charger(Model):
     )
     last_heart_beat_time = fields.DatetimeField(null=True)
 
+    # SHA-256 of the Charger Auth Key — the per-unit machine credential from
+    # ADR 0020. Plaintext is revealed exactly once at provisioning and never
+    # stored; a lost key is rotated, never recovered. SHA-256 rather than
+    # bcrypt is deliberate: a high-entropy 20-byte machine secret checked on
+    # every reconnect wants a fast hash.
+    #
+    # Nullable, and null is load-bearing per environment:
+    #   - Diagnostic Bundle upload (ADR 0029) REJECTS a null-hash charger —
+    #     there is no installed base on that endpoint, so it is enforced from
+    #     day one.
+    #   - The OCPP WebSocket handshake does NOT yet consult this column;
+    #     ADR 0020 remains PROPOSED and chargers still connect unauthenticated.
+    auth_key_hash = fields.CharField(max_length=64, null=True)
+
     # Relationships
     tariffs: fields.ReverseRelation["Tariff"]
     connectors: fields.ReverseRelation["Connector"]
@@ -513,6 +527,54 @@ class SignalQuality(Model):
 
     class Meta:
         table = "signal_quality"
+
+
+class DiagnosticBundle(Model):
+    """One Diagnostic Bundle upload — the index over the S3 archive (ADR 0029).
+
+    The row exists to answer *"did we receive everything from this charger?"*.
+    The trace content itself lives in S3; this table holds only what is needed
+    to detect loss, which the bundle body cannot tell us on its own.
+
+    Two loss modes are distinguished, because they have opposite remedies:
+      * ``gap_records`` > 0 with ``overflow_delta`` == 0 — a bundle never
+        arrived (network/retry problem).
+      * ``overflow_delta`` > 0 — the charger's ring buffer wrapped and ate
+        records before they could be delivered (it logged faster than it
+        uploaded).
+    """
+    id = fields.IntField(pk=True)
+    created_at = fields.DatetimeField(auto_now_add=True, index=True)
+    charger = fields.ForeignKeyField("models.Charger", related_name="diagnostic_bundles", index=True)
+
+    # Server-assigned. Incremented when a charger's bundle_seq moves backwards,
+    # which means the unit was reflashed or its EEPROM cleared. Without this a
+    # post-reflash bundle would collide with a historical one and be silently
+    # dropped as a duplicate — the worst outcome for a loss-detection system.
+    epoch = fields.IntField(default=0)
+
+    # Firmware-reported header fields (#VLTDIAG/1).
+    bundle_seq = fields.IntField()
+    boot = fields.IntField(null=True)
+    first_record = fields.IntField(null=True)
+    last_record = fields.IntField(null=True)
+    overflow = fields.IntField(null=True)
+
+    # Derived on ingest by comparing against this charger's previous bundle.
+    overflow_delta = fields.IntField(default=0)
+    gap_records = fields.IntField(default=0)
+
+    s3_key = fields.CharField(max_length=512)
+    size_bytes = fields.IntField()
+    line_count = fields.IntField(default=0)
+    header_valid = fields.BooleanField(default=True)
+
+    class Meta:
+        table = "diagnostic_bundle"
+        # Idempotency key. A charger that retries after a lost response re-sends
+        # the same bundle; the retry must be a no-op, not a duplicate archive.
+        unique_together = (("charger", "epoch", "bundle_seq"),)
+
 
 class ChargerError(Model):
     """

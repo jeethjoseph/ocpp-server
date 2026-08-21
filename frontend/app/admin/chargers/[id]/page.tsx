@@ -12,6 +12,7 @@ import Link from "next/link";
 import { toast } from "sonner";
 import { isSocketCharger as checkSocketCharger } from "@/lib/utils";
 import ChargerAuditLog from "@/components/ChargerAuditLog";
+import DiagnosticBundles from "@/components/DiagnosticBundles";
 import MeterValuesChart from "@/components/MeterValuesChart";
 import ModemTemperatureCard from "@/components/ModemTemperatureCard";
 import {
@@ -1029,6 +1030,10 @@ export default function ChargerDetailPage() {
             </Link>
           </div>
         )}
+
+        {/* Diagnostic Bundles — delivery status + raw archive (ADR 0029).
+            Trace content is searched in New Relic, not here. */}
+        {charger && <DiagnosticBundles chargerId={charger.id} />}
 
         {/* Audit Log Section */}
         {charger && (

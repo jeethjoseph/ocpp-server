@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from utils import safe_create_task
 
-from models import SignalQuality, OCPPLog
+from models import SignalQuality, OCPPLog, DiagnosticBundle
 
 logger = logging.getLogger(__name__)
 
@@ -109,14 +109,39 @@ class DataRetentionService:
             # Clean up old OCPP logs
             ocpp_logs_deleted = await self._cleanup_ocpp_logs(cutoff_date)
 
+            # Clean up Diagnostic Bundle index rows
+            bundles_deleted = await self._cleanup_diagnostic_bundles(cutoff_date)
+
             logger.info(
                 f"✅ Data retention cleanup complete: "
                 f"deleted {signal_quality_deleted} signal_quality records, "
-                f"{ocpp_logs_deleted} OCPP log records"
+                f"{ocpp_logs_deleted} OCPP log records, "
+                f"{bundles_deleted} diagnostic bundle records"
             )
 
         except Exception as e:
             logger.error(f"❌ Error during data cleanup: {e}", exc_info=True)
+
+    async def _cleanup_diagnostic_bundles(self, cutoff_date: datetime) -> int:
+        """Delete Diagnostic Bundle index rows older than the cutoff (batched).
+
+        Must track the S3 lifecycle rule on the diagnostics bucket, which also
+        expires at 90 days. Without this the index outlives the objects it
+        points at, so the admin panel keeps listing bundles whose download link
+        resolves to a deleted object — a silent, monotonically growing lie.
+        Only the row goes; S3 expires the body on its own schedule.
+        """
+        try:
+            count = await _delete_old_in_batches(DiagnosticBundle, cutoff_date)
+            if count == 0:
+                logger.info("🗑️  No old diagnostic bundle records to delete")
+            else:
+                logger.info(f"🗑️  Deleted {count} diagnostic bundle records older than {self.retention_days} days")
+            return count
+
+        except Exception as e:
+            logger.error(f"❌ Error cleaning up diagnostic bundles: {e}", exc_info=True)
+            return 0
 
     async def _cleanup_signal_quality(self, cutoff_date: datetime) -> int:
         """Delete signal quality records older than cutoff date (batched)"""

@@ -1658,11 +1658,10 @@ app.include_router(qr_codes.router)
 app.include_router(public_qr_transactions.router)
 app.include_router(public_qr_active_sessions.router)
 
-# Diagnostic Bundle upload stub (ADR 0029) — staging-only transport probe,
-# gated off unless DIAGNOSTIC_BUNDLE_STUB_ENABLED=true. Remove with the module
-# once the real endpoint lands.
+# Diagnostic Bundle upload (ADR 0029) — authenticated charger-facing endpoint.
 from routers import diagnostics
 app.include_router(diagnostics.router)
+app.include_router(diagnostics.admin_router)
 
 from routers import franchisees, franchisee_portal, invoices, admin_settlements, reports
 app.include_router(franchisees.router)

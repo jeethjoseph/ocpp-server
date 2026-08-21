@@ -18,6 +18,8 @@ from __future__ import annotations
 # Grouped by entity namespace purely for readability; the flat frozenset below
 # is the contract. Keep each list alphabetically sorted.
 _CHARGER = [
+    "charger.auth_provisioned",
+    "charger.auth_rotated",
     "charger.availability_changed",
     "charger.connected",
     "charger.connection_rejected",
