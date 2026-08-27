@@ -5324,6 +5324,30 @@ CORS_ORIGINS = [
 
 ## Recent Changes & Updates
 
+### Diagnostic Bundle upload — headerless redesign (ADR 0030, 2026-08-27)
+
+**Feature.** Chargers POST their own firmware debug traces to `POST /api/diagnostics/bundles` over HTTPS, authenticated with HTTP Basic using the per-charger **Charger Auth Key** (ADR 0020, first consumer). The body is archived to a dedicated per-environment S3 bucket and fanned out to New Relic over OTLP as individual searchable lines. This is deliberately outside OCPP — no `GetDiagnostics`, no `DataTransfer` (ADR 0029 has the reasoning).
+
+**What this release changed.** ADR 0029 put a header of counters on every bundle (`boot`, `seq`, `first`, `last`, `overflow`) and derived data-loss accounting from it. Every one of those fields needs the charger to persist a counter across a reboot, and the firmware team confirmed the hardware cannot — the EEPROM wear pattern that ADR 0029 §3.2 itself warns about. Eight days of staging data agreed: `boot` skipped values and reset to 1, `seq` stayed constant across four genuinely different bundles, and `overflow` was emitted negative (`4294967295` = `-1` in two's complement) into an `INT` column, returning HTTP 500 on every upload for hours. Because a repeated `seq` reads as a reflash, the server-assigned epoch inflated to 11 in 15 bundles, and both loss functions bail on an epoch change — so **19,165 records the charger explicitly reported destroying were stored as `0`**.
+
+**Architecture after the change.** The header is deleted; the body is the whole contract.
+
+| Concern | Before | After |
+|---|---|---|
+| Identity | `(charger, epoch, bundle_seq)` | `SHA-256` of the raw body, leading `#VLTDIAG/` line stripped |
+| Reboot boundary | header `boot` | in-band `===== BOOT` marker |
+| Time | header `first`/`last` | per-segment `TIME_SYNC boot_ms=… utc=…`, resolved both directions |
+| Loss | `gap_records` + `overflow_delta` | UTC **loss window** + `ring_wrap_events` |
+
+- **`backend/services/diagnostic_markers.py`** (new) owns the marker parsing, extracted from `diagnostic_fanout` — which had been doing it correctly all along, but only on the derived New Relic view while the ingest path trusted the header.
+- **Retroactive anchoring.** `boot_ms` is monotonic within a boot, so one `TIME_SYNC` dates every record in that segment including those written *before* it. This is what lets an outage be reconstructed: log unanchored while the modem is down, sync on reconnect, and the whole preceding segment resolves. Confirmed on a real 196 KB bundle whose resolved window starts 11 s before its own first anchor.
+- **Index-before-archive.** The row is written before the S3 object; `archived_at` is set only after the put returns. Archive-first stranded 195 objects that no row pointed at and the retention sweep could never reclaim. The inverse hazard — a row outliving a missing object — is closed by `find_duplicate` filtering `archived_at__isnull=False`, so an unarchived **reservation** never answers a retry with a false 2xx.
+- **Response trimmed** ~700 B → ~120 B. The charger was writing our JSON response (including a `body_preview` of the bundle it had just sent) back into the ring buffer and re-uploading it.
+
+**Deliberately lost.** The cumulative count of records destroyed before delivery. ADR 0029's sharpest idea was distinguishing "lost in transit" from "buffer overwrote it" because they need opposite remedies; that distinction required a monotonic counter stored separately from the data it describes, and this hardware cannot keep one. A ring-wrap event signals overwriting is happening now, never how much. Gap resolution drops from records to minutes.
+
+**Migrations 53–56.** Superseded columns are nullable and no longer written but **not dropped** — expand/contract, so the historical values survive if the replacement underperforms. Env var `DIAGNOSTIC_GAP_THRESHOLD_SECONDS` (default 300, provisional — sampled from one unit during active traffic) added to all three compose files.
+
 ### Latest Release - March 2026 (Branch: 57-qr-based-appless-transaction)
 
 #### New Features Implemented

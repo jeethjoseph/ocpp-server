@@ -1,5 +1,8 @@
 # Diagnostic Bundle Upload — Firmware Specification
 
+> **Partly withdrawn (2026-08-27) — see [Required Changes v1.2](./diagnostic-bundle-required-changes-v1.2.md).**
+> §3.3 (delivered marker persisted across reboot), §3.4 (monotonic overflow counter) and §4.1 (the `#VLTDIAG/1` header line) are **withdrawn**: all three require the charger to keep a counter across a reboot, which the hardware cannot do. §3.1 (write-protected config block), §3.2 (wear levelling) and §2.2 (nothing metering, no credentials, no raw RFID) **still stand**. The CSMS now reads `===== BOOT`, `TIME_SYNC boot_ms=… utc=…` and the ring-wrap line from the body instead.
+
 **Version**: 1.0
 **Date**: 2026-08-18
 **Status**: Draft — for firmware team review. Section 9 lists items we still need answers on.
@@ -76,12 +79,16 @@ A head pointer kept at a fixed EEPROM address takes every single write. The part
 
 ### 3.3 Delivered marker
 
+> **WITHDRAWN 2026-08-27** — requires cross-reboot persistence the hardware cannot provide. The charger may re-send after a reboot; the CSMS de-duplicates on a content digest.
+
 Firmware **MUST** maintain a **delivered marker**: the record number up to which the CSMS has confirmed receipt. It **MUST** persist across reboot.
 
 - Records at or below the marker may be overwritten freely.
 - Records above the marker that get overwritten **MUST** increment the overflow counter (§3.4).
 
 ### 3.4 Overflow counter
+
+> **WITHDRAWN 2026-08-27** — same reason. The in-band `ring wrapped mid-upload` line replaces it as a *recency* signal; the cumulative total is not recoverable.
 
 Firmware **MUST** maintain a 32-bit **overflow counter**: the running total of records overwritten *before* they were delivered.
 
@@ -98,6 +105,8 @@ This counter is what turns silent data loss into a visible, alertable event. Wit
 A bundle is a **header line**, followed by log records.
 
 ### 4.1 Header line
+
+> **WITHDRAWN 2026-08-27** — the body is the whole contract. A bundle starts with its first log record.
 
 The first line of the body:
 

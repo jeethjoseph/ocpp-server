@@ -105,22 +105,28 @@ def diagnostics_bucket() -> Optional[str]:
     return os.getenv("AWS_S3_DIAGNOSTICS_BUCKET") or None
 
 
-def build_diagnostic_bundle_s3_key(charger_id: str, received_at, bundle_seq) -> str:
-    """S3 key for a Bundle: diagnostics/{charger}/{YYYY}/{MM}/{DD}/{stamp}-seq{n}.txt
+def build_diagnostic_bundle_s3_key(charger_id: str, received_at, content_sha256=None) -> str:
+    """S3 key for a Bundle: diagnostics/{charger}/{YYYY}/{MM}/{DD}/{stamp}-{hash8}.txt
 
     Per-charger, date-partitioned, as specified in ADR 0029. `charger_id` is
     slugged because it originates in an untrusted request header.
+
+    Suffixed with the content digest rather than the header sequence number
+    (ADR 0030): the firmware reuses a sequence across different bundles, so
+    `-seq2` appeared on dozens of distinct objects and identified none of them.
+    Existing objects keep their old `-seqN` keys — the key is stored on the row,
+    so historical bundles stay resolvable.
     """
     safe_charger = "".join(c if c.isalnum() or c in "._-" else "_" for c in (charger_id or "unknown"))[:64]
     # Collapse dot runs so a hostile charger_id can never yield a ".." segment.
     # Harmless in S3 (keys are flat strings) but not once a key is used as a
     # local filename on download — see ADR 0029 on not trusting charger input.
     safe_charger = re.sub(r"\.{2,}", "_", safe_charger).strip(".") or "unknown"
-    safe_seq = "".join(c if c.isalnum() else "_" for c in str(bundle_seq if bundle_seq is not None else "na"))[:16]
+    safe_suffix = "".join(c for c in str(content_sha256 or "") if c.isalnum())[:8] or "nohash"
     stamp = received_at.strftime("%Y%m%dT%H%M%S%fZ")
     return (
         f"diagnostics/{safe_charger or 'unknown'}/{received_at:%Y/%m/%d}/"
-        f"{stamp}-seq{safe_seq}.txt"
+        f"{stamp}-{safe_suffix}.txt"
     )
 
 

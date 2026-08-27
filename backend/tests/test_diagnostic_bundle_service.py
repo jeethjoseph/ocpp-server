@@ -25,119 +25,30 @@ def _prev(seq: int, epoch: int = 0, last: int | None = None, overflow: int | Non
 
 
 # --------------------------------------------------------------------------
-# Epoch — surviving a reflash
+# Removed with the bundle header (ADR 0030)
 # --------------------------------------------------------------------------
-
-def test_first_ever_bundle_starts_at_epoch_zero():
-    assert svc._resolve_epoch(None, 1) == (0, False)
-
-
-def test_normal_progression_keeps_the_epoch():
-    assert svc._resolve_epoch(_prev(seq=41), 42) == (0, False)
-
-
-def test_sequence_going_backwards_starts_a_new_epoch():
-    """A reflash or EEPROM clear restarts bundle_seq at 1. Without a new epoch
-    the charger's new data would collide with its historical bundles and be
-    dropped as duplicates — the worst outcome for a loss-detection system."""
-    assert svc._resolve_epoch(_prev(seq=42, epoch=0), 1) == (1, True)
-
-
-def test_repeating_the_same_sequence_also_regresses():
-    """Equal, not just lower: a charger reflashed at exactly the same seq must
-    not silently overwrite the previous epoch's row."""
-    assert svc._resolve_epoch(_prev(seq=42, epoch=3), 42) == (4, True)
-
-
-# --------------------------------------------------------------------------
-# Overflow delta — the buffer being outrun
-# --------------------------------------------------------------------------
-
-def test_overflow_delta_is_the_increase_since_the_last_bundle():
-    assert svc._overflow_delta(_prev(seq=1, overflow=100), 350, same_epoch=True) == 250
-
-
-def test_overflow_delta_survives_the_uint32_wrap():
-    """The firmware counter is a monotonic uint32. A naive subtraction across
-    the wrap point would report a hugely negative delta and hide real loss."""
-    prev = _prev(seq=1, overflow=(1 << 32) - 10)
-    assert svc._overflow_delta(prev, 5, same_epoch=True) == 15
-
-
-def test_overflow_delta_is_zero_across_an_epoch_boundary():
-    """After a reflash the counter restarts, so a cross-epoch delta is
-    meaningless rather than enormous."""
-    assert svc._overflow_delta(_prev(seq=9, overflow=5000), 3, same_epoch=False) == 0
-
-
-def test_overflow_delta_is_zero_without_a_baseline():
-    assert svc._overflow_delta(None, 500, same_epoch=True) == 0
-    assert svc._overflow_delta(_prev(seq=1, overflow=None), 500, same_epoch=True) == 0
-
-
-# --------------------------------------------------------------------------
-# Gap — a bundle that never arrived
-# --------------------------------------------------------------------------
-
-def test_contiguous_bundles_report_no_gap():
-    assert svc._gap_records(_prev(seq=1, last=100), first_record=101, same_epoch=True) == 0
-
-
-def test_missing_records_between_bundles_are_counted():
-    assert svc._gap_records(_prev(seq=1, last=100), first_record=140, same_epoch=True) == 39
-
-
-def test_overlapping_bundles_are_not_reported_as_negative_gap():
-    """A re-sent or overlapping range is not loss; clamp rather than report a
-    negative count that would corrupt any aggregate."""
-    assert svc._gap_records(_prev(seq=1, last=100), first_record=80, same_epoch=True) == 0
-
-
-def test_gap_is_zero_across_an_epoch_boundary():
-    assert svc._gap_records(_prev(seq=9, last=9000), first_record=1, same_epoch=False) == 0
-
-
-# --------------------------------------------------------------------------
-# The distinction that matters operationally
-# --------------------------------------------------------------------------
-
-def test_the_two_loss_causes_are_distinguishable():
-    """Same symptom, opposite remedy: a gap with no overflow means an upload
-    was lost (fix retries); overflow means the charger logged faster than it
-    uploaded (upload more often, or get bigger flash)."""
-    lost_upload = _prev(seq=1, last=100, overflow=7)
-    assert svc._gap_records(lost_upload, 140, True) == 39
-    assert svc._overflow_delta(lost_upload, 7, True) == 0
-
-    outrun_buffer = _prev(seq=1, last=100, overflow=7)
-    assert svc._gap_records(outrun_buffer, 101, True) == 0
-    assert svc._overflow_delta(outrun_buffer, 507, True) == 500
-
-
-# --------------------------------------------------------------------------
-# Retry vs reflash — the two look identical by sequence alone
-# --------------------------------------------------------------------------
-
-def _row(seq, boot, first, last):
-    return SimpleNamespace(bundle_seq=seq, boot=boot, first_record=first, last_record=last)
-
-
-def test_identical_resend_is_recognised_as_the_same_bundle():
-    """Regression: deciding on sequence alone made every retry look like a
-    reflash, which minted a new epoch and defeated idempotency — so a charger
-    retrying after a lost response would duplicate its archive every time."""
-    existing = _row(seq=4, boot=1, first=301, last=400)
-    header = {"seq": 4, "boot": 1, "first": 301, "last": 400}
-    assert svc._is_same_bundle(existing, header) is True
-
-
-def test_sequence_replay_with_different_content_is_not_a_duplicate():
-    """A reflashed unit restarts bundle_seq over genuinely new records. Treating
-    that as a duplicate would silently discard the charger's new data."""
-    existing = _row(seq=1, boot=1, first=1, last=100)
-    assert svc._is_same_bundle(existing, {"seq": 1, "boot": 9, "first": 1, "last": 50}) is False
-    assert svc._is_same_bundle(existing, {"seq": 1, "boot": 1, "first": 1, "last": 50}) is False
-    assert svc._is_same_bundle(existing, {"seq": 1, "boot": 1, "first": 5, "last": 100}) is False
+#
+# The epoch, overflow-delta and record-gap tests that lived here covered
+# `_resolve_epoch`, `_overflow_delta`, `_gap_records` and `_is_same_bundle`.
+# All four are deleted: they derived loss from a header of counters the charger
+# cannot persist across a reboot, and in the field not one of the five header
+# fields was ever correct.
+#
+# Where each intent went:
+#   * gap detection            -> `test_a_real_hole_is_measured_in_seconds` and
+#                                 friends, below, now measured in seconds of
+#                                 silence rather than record numbers
+#   * retry idempotency        -> the content-digest tests below
+#   * sequence-replay handling -> obsolete; identity no longer involves sequence
+#
+# One intent has NO replacement, deliberately. `test_the_two_loss_causes_are_
+# distinguishable` asserted ADR 0029's sharpest idea: that a gap with no
+# overflow (a bundle lost in transit) is distinguishable from a gap with
+# overflow (the buffer wrapped), because the two need opposite remedies.
+# Telling them apart required a monotonic counter held separately from the data
+# it describes. There is nowhere to keep one, so the distinction is gone and is
+# not approximated. A ring-wrap event now says loss is happening; nothing says
+# how much. See ADR 0030 "Consequences".
 
 
 # --------------------------------------------------------------------------
@@ -148,3 +59,159 @@ def test_sequence_replay_with_different_content_is_not_a_duplicate():
 # mocked: the behaviour under test IS the database constraint, and a test that
 # mocks it away proves nothing. See the integration check in the ADR notes —
 # two racing uploads must yield one row and no 500.
+
+
+# --------------------------------------------------------------------------
+# Content-hash identity (ADR 0030)
+# --------------------------------------------------------------------------
+#
+# The mechanism these replace keyed on `(epoch, bundle_seq)`. It failed in the
+# field because the firmware reuses a sequence number across genuinely different
+# bundles, so every retry read as a reflash.
+
+from services.diagnostic_markers import content_digest  # noqa: E402
+
+# Shape taken from three real staging retries of one logical bundle on
+# 2026-08-27: 460 byte-identical body lines, differing only in the header's
+# `last=`. Their raw SHA-256s were 49c2b4b8…, 20c5266c… and ecc2d1c8… — three
+# different digests for the same records.
+_BODY = "\n".join([
+    "I (376165) EC200U: RX CALLRESULT Heartbeat uid=hb_3311FF0D rtt=1236 ms",
+    "I (376185) CLOCK: TIME_SYNC boot_ms=375751 utc=2026-08-27T09:16:37Z src=Heartbeat",
+    "I (377435) EC200U: TX CALL StatusNotification uid=status_8E5A26F7",
+])
+_RETRY_1 = "#VLTDIAG/1 boot=55 seq=2 first=15207 last=15381 overflow=0\n" + _BODY
+_RETRY_2 = "#VLTDIAG/1 boot=55 seq=2 first=15207 last=15433 overflow=0\n" + _BODY
+_RETRY_3 = "#VLTDIAG/1 boot=55 seq=2 first=15207 last=15498 overflow=0\n" + _BODY
+
+
+def test_retries_of_one_bundle_share_a_digest_despite_a_moving_header():
+    """The regression that would have shipped.
+
+    Hashing the body as received makes every retry unique, because the header
+    is the one part that moves between attempts — so nothing would ever
+    de-duplicate, while synthetic fixtures that repeat the header verbatim
+    would still pass.
+    """
+    import hashlib
+    raw = {hashlib.sha256(b.encode()).hexdigest() for b in (_RETRY_1, _RETRY_2, _RETRY_3)}
+    assert len(raw) == 3                                    # as received: three bundles
+
+    digests = {content_digest(b) for b in (_RETRY_1, _RETRY_2, _RETRY_3)}
+    assert len(digests) == 1                                # as identified: one
+
+
+def test_a_headerless_body_hashes_the_same_as_one_still_carrying_a_header():
+    """The firmware drops the header on its own schedule (C6), so a unit
+    mid-rollout must not have its bundles re-archived as new."""
+    assert content_digest(_RETRY_1) == content_digest(_BODY)
+
+
+def test_different_records_produce_different_digests():
+    other = _BODY + "\nE (378000) relay: contactor feedback mismatch"
+    assert content_digest(_BODY) != content_digest(other)
+
+
+def test_digest_is_stable_against_our_own_redaction_policy():
+    """Identity is hashed pre-redaction on purpose.
+
+    Hashing the redacted body would rotate every historical digest the day a
+    pattern is added, making every previously-seen bundle look new.
+    """
+    from services import diagnostic_redaction
+
+    dirty = _BODY + "\nI (378000) ATM90E26: Meter E: 12.34567 kWh"
+    redacted, changed = diagnostic_redaction.redact_bundle(dirty)
+    assert diagnostic_redaction.redaction_occurred(changed)
+    assert redacted != dirty
+    # The digest the endpoint stores is taken from `dirty`, so it does not move.
+    assert content_digest(dirty) != content_digest(redacted)
+
+
+# --------------------------------------------------------------------------
+# Loss window (ADR 0030)
+# --------------------------------------------------------------------------
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+from routers import diagnostics as _diag  # noqa: E402
+
+
+def _b(first=None, last=None, approx=False, wraps=0):
+    return SimpleNamespace(first_utc=first, last_utc=last,
+                           time_approximate=approx, ring_wrap_events=wraps)
+
+
+_T = datetime(2026, 8, 27, 9, 0, 0, tzinfo=timezone.utc)
+
+
+def test_contiguous_bundles_report_no_silence():
+    prev = _b(last=_T)
+    cur = _b(first=_T + timedelta(seconds=2))
+    assert _diag._gap_before(cur, prev) == 2
+
+
+def test_a_real_hole_is_measured_in_seconds():
+    prev = _b(last=_T)
+    cur = _b(first=_T + timedelta(minutes=14, seconds=43))
+    assert _diag._gap_before(cur, prev) == 883
+
+
+def test_overlapping_bundles_do_not_report_negative_silence():
+    prev = _b(last=_T + timedelta(seconds=30))
+    cur = _b(first=_T)
+    assert _diag._gap_before(cur, prev) == 0
+
+
+def test_the_first_bundle_has_no_measurable_silence_before_it():
+    assert _diag._gap_before(_b(first=_T), None) is None
+
+
+def test_an_approximate_window_on_either_side_makes_the_gap_unknowable():
+    """Receipt time is an upper bound, not a measurement.
+
+    A gap computed against it would be invented — the records could be
+    arbitrarily old — so it must read as unknown rather than as zero or as a
+    number someone might alert on.
+    """
+    prev, cur = _b(last=_T), _b(first=_T + timedelta(hours=3))
+    assert _diag._gap_before(cur, prev) == 10800
+
+    assert _diag._gap_before(_b(first=_T + timedelta(hours=3), approx=True), prev) is None
+    assert _diag._gap_before(cur, _b(last=_T, approx=True)) is None
+
+
+def test_an_unanchored_bundle_has_no_gap():
+    assert _diag._gap_before(_b(first=None), _b(last=_T)) is None
+    assert _diag._gap_before(_b(first=_T), _b(last=None)) is None
+
+
+def test_gap_threshold_is_configurable(monkeypatch):
+    assert _diag._gap_threshold_seconds() == 300
+    monkeypatch.setenv("DIAGNOSTIC_GAP_THRESHOLD_SECONDS", "60")
+    assert _diag._gap_threshold_seconds() == 60
+
+
+def test_ring_wrap_alone_marks_a_bundle_lossy():
+    """The two loss modes remain separately visible, even though the cumulative
+    overwrite count is no longer obtainable (ADR 0030)."""
+    assert _diag._gap_before(_b(first=_T, wraps=4), None) is None   # no gap...
+    # ...but the wrap is still a loss signal in its own right, which is what
+    # `lossy` in the summary combines.
+    assert _b(first=_T, wraps=4).ring_wrap_events == 4
+
+
+# --------------------------------------------------------------------------
+# Reservation ordering (ADR 0030, issue 06)
+# --------------------------------------------------------------------------
+#
+# The row is written before the object, so a failed upload cannot strand an
+# object no row points at. That inverts the risk — a row can outlive a missing
+# object — and `archived_at` is what stops that becoming a durability lie.
+#
+# `reserve_bundle` / `mark_archived` / `find_duplicate` all query the database,
+# so their behaviour is covered by the DB-backed verification in the issue
+# rather than here: this module is deliberately DB-free (see the endpoint tests'
+# docstring on the cross-loop flake). The endpoint test
+# `test_s3_failure_is_not_reported_as_success` pins the observable that matters
+# — a failed archive must not mark the row delivered.

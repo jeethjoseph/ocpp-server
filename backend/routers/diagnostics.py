@@ -42,6 +42,7 @@ from services import (
     charger_auth_service,
     diagnostic_bundle_service,
     diagnostic_fanout,
+    diagnostic_markers,
     diagnostic_redaction,
     storage_service,
 )
@@ -50,9 +51,6 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/diagnostics", tags=["Diagnostic Bundles"])
 
-BUNDLE_MAGIC = "#VLTDIAG/1"
-_HEADER_INT_FIELDS = ("boot", "seq", "first", "last", "overflow")
-_BODY_PREVIEW_CHARS = 200
 
 # Per-charger upload rate limit. ADR 0029 sets ~6/hour: enough headroom for the
 # 6-hourly schedule plus retries and repeated fault-triggered uploads, tight
@@ -118,37 +116,6 @@ async def _rate_limited(charger_key: str) -> bool:
         return _rate_limited_in_process(charger_key)
 
 
-def _parse_bundle_header(first_line: str) -> tuple[dict, list[str]]:
-    """Parse the `#VLTDIAG/1 boot=.. seq=..` line. Returns (fields, warnings).
-
-    Never rejects: a malformed header still gets archived, because a bundle we
-    cannot parse is more useful on disk than discarded.
-    """
-    tokens = first_line.split()
-    if not tokens or tokens[0] != BUNDLE_MAGIC:
-        got = tokens[0] if tokens else "<empty>"
-        return {}, [f"first line is not a {BUNDLE_MAGIC} header (got {got!r})"]
-
-    fields: dict = {}
-    warnings: list[str] = []
-    for token in tokens[1:]:
-        key, sep, value = token.partition("=")
-        if not sep:
-            warnings.append(f"malformed header token {token!r}")
-            continue
-        fields[key] = value
-
-    for name in _HEADER_INT_FIELDS:
-        if name not in fields:
-            warnings.append(f"header is missing {name}=")
-            continue
-        try:
-            fields[name] = int(fields[name])
-        except ValueError:
-            warnings.append(f"header field {name}={fields[name]!r} is not an integer")
-    return fields, warnings
-
-
 def _decode_body(raw: bytes, content_encoding: Optional[str]) -> tuple[bytes, list[str]]:
     """Gunzip if the charger declared gzip. Returns (decoded, warnings)."""
     if (content_encoding or "").strip().lower() != "gzip":
@@ -169,19 +136,15 @@ async def _read_body(request: Request, limit: int) -> bytes:
     return raw
 
 
-async def _archive(charger_id: str, body: bytes, header: dict) -> str:
-    """Persist the bundle to S3 and return its key. Raises on failure.
+async def _archive(s3_key: str, body: bytes) -> None:
+    """Persist the bundle to S3 at a key already reserved. Raises on failure.
 
     Deliberately raises rather than degrading to local disk: the caller turns a
     failure into a 503 so the charger keeps its records and retries. A disk
     fallback here would let a 2xx claim a durability the bundle does not have.
     """
-    key = storage_service.build_diagnostic_bundle_s3_key(
-        charger_id, datetime.now(timezone.utc), header.get("seq")
-    )
     # boto3 is synchronous — keep it off the event loop.
-    await asyncio.to_thread(storage_service.upload_diagnostic_bundle_to_s3, key, body)
-    return key
+    await asyncio.to_thread(storage_service.upload_diagnostic_bundle_to_s3, s3_key, body)
 
 
 @router.post("/bundles")
@@ -214,9 +177,25 @@ async def receive_bundle(request: Request):
         text = body.decode("utf-8", errors="replace")
         warnings.append("body is not valid UTF-8 — decoded with replacement characters")
 
-    lines = text.splitlines()
-    header, header_warnings = _parse_bundle_header(lines[0] if lines else "")
-    warnings += header_warnings
+    # Identity, computed on the RAW body before redaction touches it — see
+    # `content_digest` for why both the timing and the header exclusion matter.
+    content_sha256 = diagnostic_markers.content_digest(text)
+
+    # When these records were actually written. Resolved from the body's own
+    # TIME_SYNC anchors, not from a header the charger cannot maintain across a
+    # reboot (ADR 0030). Receipt time is the caller's fallback, and is an upper
+    # bound rather than a measurement.
+    received_at = datetime.now(timezone.utc)
+    first_utc, last_utc, time_approximate = diagnostic_markers.resolve_window(
+        text, received_at
+    )
+    ring_wrap_events = diagnostic_markers.count_ring_wraps(text)
+    if ring_wrap_events:
+        logger.warning(
+            "📟 ⚠️  %s reported %s ring-wrap event(s) — the buffer is destroying "
+            "undelivered records. Recency signal only, not a total.",
+            charger.charge_point_string_id, ring_wrap_events,
+        )
 
     # Redact BEFORE archiving: S3 holds bundles for 90 days, so redacting only
     # on the search-index path would leave the sensitive copy in the archive.
@@ -230,34 +209,39 @@ async def receive_bundle(request: Request):
         )
     body = text.encode("utf-8")
 
-    # Check for a re-send BEFORE archiving. A lost response is the common
-    # failure on a cellular link, so a retry must not cost a second S3 object;
-    # returning the original key also lets the charger confirm what we hold.
-    duplicate = await diagnostic_bundle_service.find_duplicate(charger, header)
-    if duplicate is not None:
-        logger.info(
-            "📟 Re-send of seq=%s epoch=%s from %s — already archived at %s",
-            duplicate.bundle_seq, duplicate.epoch,
-            charger.charge_point_string_id, duplicate.s3_key,
-        )
-        return {
-            "ok": True,
-            "received_bytes": len(raw),
-            "line_count": max(len(lines) - 1, 0),
-            "header": header,
-            "header_valid": not header_warnings,
-            "stored_key": duplicate.s3_key,
-            "recorded": False,
-            "epoch": duplicate.epoch,
-            "overflow_delta": duplicate.overflow_delta,
-            "gap_records": duplicate.gap_records,
-            "indexed_lines": 0,
-            "archive_only_lines": 0,
-            "warnings": warnings,
-        }
+    # Counted after stripping any legacy header line, so a unit mid-rollout does
+    # not report one line more than a unit that already dropped it.
+    line_count = len(diagnostic_markers.strip_legacy_header(text).splitlines())
+
+    # Index BEFORE archiving, so a failure can never strand an object no row
+    # points at — the ordering that produced 195 orphans on staging in one
+    # morning, none of which the retention sweep could ever reclaim because it
+    # only deletes objects it has rows for.
+    #
+    # Compensating the other way round — archive, then delete on insert failure
+    # — was rejected: it needs an `s3:DeleteObject` grant that ADR 0029
+    # deliberately withholds so the application can never remove a bundle.
+    s3_key = storage_service.build_diagnostic_bundle_s3_key(
+        charger.charge_point_string_id, received_at, content_sha256
+    )
+    bundle, already_archived = await diagnostic_bundle_service.reserve_bundle(
+        charger=charger,
+        s3_key=s3_key,
+        size_bytes=len(body),
+        line_count=line_count,
+        content_sha256=content_sha256,
+        first_utc=first_utc,
+        last_utc=last_utc,
+        time_approximate=time_approximate,
+        ring_wrap_events=ring_wrap_events,
+    )
+    if already_archived:
+        # A retry after a lost response. Cheap and idempotent: no second object,
+        # and the original key lets the charger confirm what we hold.
+        return {"ok": True, "recorded": False, "stored_key": bundle.s3_key}
 
     try:
-        s3_key = await _archive(charger.charge_point_string_id, body, header)
+        await _archive(bundle.s3_key, body)
     except Exception as exc:
         logger.error(
             "📟 ❌ Diagnostic Bundle archive failed for %s: %s",
@@ -265,26 +249,21 @@ async def receive_bundle(request: Request):
         )
         # Genuine exception, so it belongs in Sentry rather than a threshold
         # alert: the archive is failing and every charger is being told to
-        # retry. Detected loss (overflow/gap) is a *measurement* and stays in
-        # New Relic; this is something that threw.
+        # retry. Detected loss is a *measurement* and stays in New Relic; this
+        # is something that threw.
         SentryHelper.capture_exception(exc, extra={
             "charger_id": charger.charge_point_string_id,
-            "bundle_seq": header.get("seq"),
+            "content_sha256": content_sha256,
             "stage": "s3_archive",
         })
+        # The row stays as an unarchived reservation: invisible to the duplicate
+        # check, so the charger is told to re-send rather than being falsely
+        # assured, and resumable by the next attempt rather than duplicated.
         raise HTTPException(
             status_code=503, detail="Could not archive bundle; retry later"
         ) from exc
 
-    line_count = max(len(lines) - 1, 0)
-    bundle, created = await diagnostic_bundle_service.record_bundle(
-        charger=charger,
-        header=header,
-        s3_key=s3_key,
-        size_bytes=len(body),
-        line_count=line_count,
-        header_valid=not header_warnings,
-    )
+    await diagnostic_bundle_service.mark_archived(bundle, charger)
 
     # Fan out to the search index only for genuinely new bundles — a retry must
     # not duplicate lines in New Relic. Best-effort by construction: the bundle
@@ -296,43 +275,29 @@ async def receive_bundle(request: Request):
     # advance its delivered marker and re-sends — the exact failure the
     # durability gate exists to prevent, reintroduced by a derived view that
     # was never allowed to affect the upload.
-    if created:
-        safe_create_task(
-            asyncio.to_thread(
-                diagnostic_fanout.forward_bundle,
-                text,
-                charger.charge_point_string_id,
-                header.get("seq"),
-                bundle.epoch if bundle else 0,
-            ),
-            name=f"diag-fanout-{charger.charge_point_string_id}",
-        )
+    safe_create_task(
+        asyncio.to_thread(
+            diagnostic_fanout.forward_bundle,
+            text,
+            charger.charge_point_string_id,
+            content_sha256,
+        ),
+        name=f"diag-fanout-{charger.charge_point_string_id}",
+    )
 
     logger.info(
-        "📟 Diagnostic Bundle: charger=%s bytes=%s decoded=%s lines=%s header=%s "
-        "s3_key=%s new=%s fanout=%s warnings=%s",
+        "📟 Diagnostic Bundle: charger=%s bytes=%s decoded=%s lines=%s "
+        "sha=%s window=%s..%s approx=%s wraps=%s s3_key=%s warnings=%s",
         charger.charge_point_string_id, len(raw), len(body), line_count,
-        header or "<none>", s3_key, created, "scheduled" if created else "skipped",
-        warnings or "none",
+        content_sha256[:12], first_utc, last_utc, time_approximate,
+        ring_wrap_events, bundle.s3_key, warnings or "none",
     )
 
     return {
         "ok": True,
-        "received_bytes": len(raw),
-        "decoded_bytes": len(body),
-        "line_count": line_count,
-        "header": header,
-        "header_valid": not header_warnings,
-        "body_preview": text[:_BODY_PREVIEW_CHARS],
-        "stored_key": s3_key,
-        # False means this bundle was already recorded — the charger is retrying
-        # after a lost response, and may safely advance its delivered marker.
-        "recorded": created,
-        "epoch": bundle.epoch if bundle else None,
-        "overflow_delta": bundle.overflow_delta if bundle else 0,
-        "gap_records": bundle.gap_records if bundle else 0,
-        "fanout": "scheduled" if created else "skipped",
-        "warnings": warnings,
+        # True: newly archived. The already-held case returned above with False.
+        "recorded": True,
+        "stored_key": bundle.s3_key,
     }
 
 
@@ -350,42 +315,70 @@ class BundleSummary(BaseModel):
     id: int
     charger_id: int
     charge_point_string_id: str
-    epoch: int
-    bundle_seq: int
-    boot: Optional[int]
-    first_record: Optional[int]
-    last_record: Optional[int]
-    overflow: Optional[int]
-    overflow_delta: int
-    gap_records: int
+    content_sha256: Optional[str]
     size_bytes: int
     line_count: int
-    header_valid: bool
     received_at_ist: str
+    # When the records were written, per the body's own clock anchors.
+    window_start_ist: Optional[str]
+    window_end_ist: Optional[str]
+    time_approximate: bool
+    # Silence between the previous bundle's end and this one's start. Derived at
+    # read time, never stored: a delayed bundle can arrive later and fill the
+    # hole, and with retries and reboots in play it will. The stored `gap_records`
+    # this replaces froze at zero for exactly that kind of reason.
+    gap_before_seconds: Optional[int]
+    ring_wrap_events: int
     lossy: bool
 
 
-def _to_summary(bundle) -> BundleSummary:
+def _gap_threshold_seconds() -> int:
+    """Silence longer than this is treated as a candidate loss window.
+
+    Provisional. The 300 s default derives from one unit during *active* OCPP
+    traffic (TIME_SYNC median 20 s, max 212 s). Heartbeat interval is per-charger
+    configurable and an idle unit may be far quieter, so the sample is from the
+    wrong operating state as well as being small — re-measure across several
+    chargers before wiring an alert to it (ADR 0030, "Still open").
+    """
+    return int(os.getenv("DIAGNOSTIC_GAP_THRESHOLD_SECONDS", "300"))
+
+
+def _gap_before(bundle, previous) -> Optional[int]:
+    """Seconds of silence before this bundle, or None if unknowable.
+
+    An approximate window on *either* side makes the arithmetic meaningless —
+    receipt time is an upper bound, so a gap computed against it would be
+    invented rather than measured.
+    """
+    if previous is None or bundle.first_utc is None or previous.last_utc is None:
+        return None
+    if bundle.time_approximate or previous.time_approximate:
+        return None
+    gap = (bundle.first_utc - previous.last_utc).total_seconds()
+    return int(gap) if gap > 0 else 0
+
+
+def _to_summary(bundle, previous=None) -> BundleSummary:
     from utils import to_ist
 
+    gap = _gap_before(bundle, previous)
     return BundleSummary(
         id=bundle.id,
         charger_id=bundle.charger_id,
         charge_point_string_id=bundle.charger.charge_point_string_id,
-        epoch=bundle.epoch,
-        bundle_seq=bundle.bundle_seq,
-        boot=bundle.boot,
-        first_record=bundle.first_record,
-        last_record=bundle.last_record,
-        overflow=bundle.overflow,
-        overflow_delta=bundle.overflow_delta,
-        gap_records=bundle.gap_records,
+        content_sha256=bundle.content_sha256,
         size_bytes=bundle.size_bytes,
         line_count=bundle.line_count,
-        header_valid=bundle.header_valid,
         # Stored UTC, rendered IST — the repo-wide rule for anything a human reads.
         received_at_ist=to_ist(bundle.created_at).isoformat(),
-        lossy=bool(bundle.overflow_delta or bundle.gap_records),
+        window_start_ist=to_ist(bundle.first_utc).isoformat() if bundle.first_utc else None,
+        window_end_ist=to_ist(bundle.last_utc).isoformat() if bundle.last_utc else None,
+        time_approximate=bundle.time_approximate,
+        gap_before_seconds=gap,
+        ring_wrap_events=bundle.ring_wrap_events,
+        lossy=bool((gap is not None and gap > _gap_threshold_seconds())
+                   or bundle.ring_wrap_events),
     )
 
 
@@ -398,13 +391,20 @@ async def list_charger_bundles(
     """Recent Diagnostic Bundles for one charger, newest first."""
     from models import DiagnosticBundle
 
+    # One extra row so the oldest bundle in the page still has a predecessor to
+    # measure its gap against; without it the last row would always read as
+    # having no silence before it.
     bundles = (
         await DiagnosticBundle.filter(charger_id=charger_id)
         .select_related("charger")
         .order_by("-created_at")
-        .limit(limit)
+        .limit(limit + 1)
     )
-    return [_to_summary(b) for b in bundles]
+    page = bundles[:limit]
+    return [
+        _to_summary(b, bundles[i + 1] if i + 1 < len(bundles) else None)
+        for i, b in enumerate(page)
+    ]
 
 
 @admin_router.get("/bundles/{bundle_id}/download")

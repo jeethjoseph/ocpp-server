@@ -105,6 +105,7 @@ services:
       # Line-level fan-out to New Relic over OTLP. Off by default: it needs the
       # firmware TIME_SYNC anchor to place lines in time (change C1).
       - DIAGNOSTIC_FANOUT_ENABLED=${DIAGNOSTIC_FANOUT_ENABLED:-false}
+      - DIAGNOSTIC_GAP_THRESHOLD_SECONDS=${DIAGNOSTIC_GAP_THRESHOLD_SECONDS:-300}
       # OCPP & Server Tuning
       - SOCKET_GRACE_PERIOD_SECONDS=${SOCKET_GRACE_PERIOD_SECONDS:-300}
       - ZERO_ENERGY_TIMEOUT_SECONDS=${ZERO_ENERGY_TIMEOUT_SECONDS:-7200}

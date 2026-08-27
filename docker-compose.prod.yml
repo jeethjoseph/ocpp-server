@@ -142,6 +142,7 @@ services:
       # Line-level fan-out to New Relic over OTLP. Off by default: it needs the
       # firmware TIME_SYNC anchor to place lines in time (change C1).
       - DIAGNOSTIC_FANOUT_ENABLED=${DIAGNOSTIC_FANOUT_ENABLED:-false}
+      - DIAGNOSTIC_GAP_THRESHOLD_SECONDS=${DIAGNOSTIC_GAP_THRESHOLD_SECONDS:-300}
       - CLEANUP_INTERVAL_HOURS=${CLEANUP_INTERVAL_HOURS:-24}
       # New Relic
       - NEW_RELIC_MONITOR_MODE=${NEW_RELIC_MONITOR_MODE:-true}

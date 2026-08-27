@@ -171,7 +171,7 @@ def test_successful_forward_batches_and_tags_records(monkeypatch):
     captured = []
     monkeypatch.setattr(fan, "_post", lambda p, k, e: captured.append(p) or 200)
 
-    summary = fan.forward_bundle(REAL_BUNDLE, "S006C02", 42, 3, received_at=datetime.now(timezone.utc))
+    summary = fan.forward_bundle(REAL_BUNDLE, "S006C02", "a1b2c3d4e5f6a1b2", received_at=datetime.now(timezone.utc))
     assert summary["forwarded"] > 0 and summary["batches"] == 1
 
     resource = captured[0]["resourceLogs"][0]["resource"]["attributes"]
@@ -180,7 +180,10 @@ def test_successful_forward_batches_and_tags_records(monkeypatch):
 
     attrs = captured[0]["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["attributes"]
     keys = {a["key"] for a in attrs}
-    assert {"charger_code", "subsystem", "bundle_seq", "epoch", "boot_segment"} <= keys
+    # `bundle_seq` + `epoch` were replaced by `bundle_sha` (ADR 0030): the
+    # firmware reused sequence numbers, so those attributes pointed at several
+    # different bundles at once and could not identify the source of a line.
+    assert {"charger_code", "subsystem", "bundle_sha", "boot_segment"} <= keys
 
 
 def test_untimestamped_lines_stay_beside_their_neighbours():

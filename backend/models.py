@@ -536,44 +536,92 @@ class DiagnosticBundle(Model):
     The trace content itself lives in S3; this table holds only what is needed
     to detect loss, which the bundle body cannot tell us on its own.
 
-    Two loss modes are distinguished, because they have opposite remedies:
-      * ``gap_records`` > 0 with ``overflow_delta`` == 0 — a bundle never
-        arrived (network/retry problem).
-      * ``overflow_delta`` > 0 — the charger's ring buffer wrapped and ate
-        records before they could be delivered (it logged faster than it
-        uploaded).
+    Loss is signalled two ways, and they are NOT the pair ADR 0029 described:
+      * a **silence window** — the span between the previous bundle's
+        ``last_utc`` and this one's ``first_utc`` — means records are missing.
+        Derived at read time, never stored, because a delayed bundle can arrive
+        later and fill the hole.
+      * ``ring_wrap_events`` > 0 means the charger's buffer overwrote records
+        before it could deliver them.
+
+    The cumulative "how many records were destroyed in total" figure that
+    ``overflow_delta`` carried is **gone and not approximated**. It required a
+    monotonic counter held separately from the data it describes, and the
+    charger cannot persist one across a reboot. See ADR 0030.
     """
     id = fields.IntField(pk=True)
     created_at = fields.DatetimeField(auto_now_add=True, index=True)
     charger = fields.ForeignKeyField("models.Charger", related_name="diagnostic_bundles", index=True)
 
-    # Server-assigned. Incremented when a charger's bundle_seq moves backwards,
-    # which means the unit was reflashed or its EEPROM cleared. Without this a
-    # post-reflash bundle would collide with a historical one and be silently
-    # dropped as a duplicate — the worst outcome for a loss-detection system.
-    epoch = fields.IntField(default=0)
+    # Superseded by the content digest (ADR 0030). Nullable and no longer
+    # written; dropped by a later migration once the UTC window has been
+    # observed on real traffic. Kept for now so historical values survive if
+    # the replacement underperforms.
+    # Superseded by the content digest (ADR 0030). Nullable and no longer
+    # written; dropped by a later migration once the UTC window has been
+    # observed on real traffic. Kept for now so historical values survive if
+    # the replacement underperforms.
+    epoch = fields.IntField(null=True)
 
     # Firmware-reported header fields (#VLTDIAG/1).
-    bundle_seq = fields.IntField()
+    bundle_seq = fields.IntField(null=True)
     boot = fields.IntField(null=True)
     first_record = fields.IntField(null=True)
     last_record = fields.IntField(null=True)
     overflow = fields.IntField(null=True)
 
     # Derived on ingest by comparing against this charger's previous bundle.
-    overflow_delta = fields.IntField(default=0)
-    gap_records = fields.IntField(default=0)
+    overflow_delta = fields.IntField(null=True)
+    gap_records = fields.IntField(null=True)
+
+    # When this bundle's records were actually written, reconstructed from the
+    # in-band TIME_SYNC anchors (ADR 0030). Null when nothing in the body
+    # anchored — a real state, not an error. `time_approximate` marks a window
+    # that fell back to receipt time, or one derived from only some segments;
+    # such a window must never be read as evidence of a loss gap.
+    first_utc = fields.DatetimeField(null=True)
+    last_utc = fields.DatetimeField(null=True)
+    time_approximate = fields.BooleanField(default=False)
+
+    # Count of in-band `ring wrapped mid-upload` lines. A RECENCY signal — the
+    # buffer is destroying undelivered records right now — never a running
+    # total. Cumulative overwrite accounting needs a counter in storage separate
+    # from the data it describes, which this hardware cannot keep (ADR 0030).
+    ring_wrap_events = fields.IntField(default=0)
+
+    # SHA-256 of the raw body with any legacy `#VLTDIAG/` line stripped — the
+    # bundle's identity (ADR 0030), replacing `(epoch, bundle_seq)`. Nullable
+    # because rows predating the change have no digest; Postgres treats NULLs as
+    # distinct, so those rows do not collide under the unique constraint.
+    content_sha256 = fields.CharField(max_length=64, null=True)
 
     s3_key = fields.CharField(max_length=512)
+
+    # Set only once the S3 object is confirmed durable (ADR 0030, issue 06).
+    #
+    # The row is written BEFORE the object, so a failed upload can never strand
+    # an object no row points at — the ordering that produced 195 orphans in one
+    # morning. That inverts the risk: a row can now outlive a missing object.
+    # `archived_at` is what keeps that from becoming a durability lie. A row
+    # with it NULL is a *reservation*, not a delivery: it is invisible to the
+    # duplicate check, so a charger retrying is told to re-send rather than
+    # being falsely assured we hold its records.
+    archived_at = fields.DatetimeField(null=True)
+
     size_bytes = fields.IntField()
     line_count = fields.IntField(default=0)
-    header_valid = fields.BooleanField(default=True)
+    header_valid = fields.BooleanField(null=True)
 
     class Meta:
         table = "diagnostic_bundle"
         # Idempotency key. A charger that retries after a lost response re-sends
         # the same bundle; the retry must be a no-op, not a duplicate archive.
-        unique_together = (("charger", "epoch", "bundle_seq"),)
+        # Keyed on content rather than sequence: the firmware reuses sequence
+        # numbers across genuinely different bundles, so a sequence key made
+        # every retry look like a reflash (ADR 0030).
+        # Content is the arbiter now; the sequence constraint is dropped because
+        # the firmware reuses sequence numbers across different bundles.
+        unique_together = (("charger", "content_sha256"),)
 
 
 class ChargerError(Model):

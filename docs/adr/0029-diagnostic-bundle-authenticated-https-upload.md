@@ -1,5 +1,7 @@
 # Chargers push Diagnostic Bundles over authenticated HTTPS, outside the OCPP channel — and that endpoint ships the Charger Auth Key ahead of ADR 0020
 
+> **Partly superseded (2026-08-27).** The **bundle header**, **epoch** and **loss accounting** sections below are replaced by [ADR 0030](0030-diagnostic-bundle-body-is-the-contract.md) — every header field required the charger to persist a counter across a reboot, which the hardware cannot do. The transport, Charger Auth Key authentication, S3 archive, durability gate, redaction, rate limiting, cadence and OTLP fan-out all still stand. The reasoning below is kept as history; do not implement the header from it.
+
 Charger-side firmware debug traces reach the CSMS as **Diagnostic Bundles**: opaque blobs POSTed by the charger to `app.voltlync.com` over HTTPS, authenticated with **HTTP Basic Auth** using the per-charger **Charger Auth Key**, and stored in S3. OCPP `GetDiagnostics` is deliberately **not** used, and neither is vendor `DataTransfer`. Uploads run **nightly with per-charger jitter plus on fault**, and every bundle carries a header — sequence number, record range, and a monotonic overflow counter — so that **data loss is visible rather than silent**. This endpoint is the **first consumer** of the Charger Auth Key: the credential specified by [ADR 0020](0020-charger-websocket-basic-auth.md) is provisioned fleet-wide as part of this work, while the OCPP WebSocket handshake **remains unauthenticated** for now.
 
 ## Context
