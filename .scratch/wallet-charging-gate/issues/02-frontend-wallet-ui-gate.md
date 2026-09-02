@@ -1,6 +1,6 @@
 # 02 — Frontend wallet UI gate (cosmetic)
 
-Status: ready-for-human
+Status: done
 
 ## Why
 
@@ -79,3 +79,9 @@ acceptable because re-enable is gated on a deliberate ledger deploy (ADR 0011).
   where the var is set `false` for real and verified in the deployed container
   (issue 03 checklist already covers it). Avoids a redundant second full build
   here; the gating logic reuses the proven `walletDisabled` path.
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo.
+
+Method, evidence and caveats: `.scratch/tracker-reconciliation/REPORT.md`.

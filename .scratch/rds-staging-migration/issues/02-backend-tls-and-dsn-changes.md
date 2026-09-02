@@ -1,4 +1,4 @@
-Status: ready-for-agent
+Status: done
 
 # Backend: bake RDS CA bundle into image, add SSL-aware DSN construction
 
@@ -97,3 +97,11 @@ Before merging this issue's PR:
 - Local dev verified working with no new env vars set
 - PR merged to `develop`
 - No changes to behavior in either staging or prod (because neither has `POSTGRES_SSL_MODE` set yet)
+
+## Comments
+
+**2026-09-01 — reconciled to `done` by tracker audit (bucket B re-check).** The audit
+flagged this as open because an artifact its acceptance criteria names is absent. Hand-
+verification shows the work landed differently: renamed during implementation — shipped as `DB_HOST` / `DB_SSL_MODE`, not the proposed `POSTGRES_*`. See `backend/db_ssl.py` and the CA bundle baked in `backend/Dockerfile`.
+
+Method: `.scratch/tracker-reconciliation/REPORT.md`.

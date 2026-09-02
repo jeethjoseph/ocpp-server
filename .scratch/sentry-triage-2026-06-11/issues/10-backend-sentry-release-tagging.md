@@ -1,6 +1,6 @@
 # Tag backend Sentry events with the real release instead of "dev"
 
-Status: ready-for-agent
+Status: done
 
 Observability gap surfaced during the 2026-06-11 Sentry triage: every backend event in this batch carried `release: dev`, while the frontend correctly reported `release: production-2026-06-08T10-04-28`. Without a real release on backend events, regression attribution ("which deploy introduced this?"), regression resolution, and release-health in Sentry are all unusable for `ocpp-backend`.
 
@@ -27,3 +27,9 @@ None - can start immediately.
 ## Comments
 
 **Implemented 2026-06-11.** `monitoring_service.py` release now resolves `SENTRY_RELEASE` → `GIT_COMMIT` → `{env}-{startup-timestamp}` (mirrors `next.config.ts`), with a startup warning when it falls back in a non-dev env. `GIT_COMMIT`/`SENTRY_RELEASE` added to `backend.environment:` in all three compose files and documented in `.env.{staging,prod}.example`. `make staging-rebuild` / `make prod-rebuild` now export `GIT_COMMIT=$(git rev-parse --short HEAD)` so compose stamps it in. Runtime-verified: with `GIT_COMMIT=abc1234` → release `abc1234`; unset → `staging-<ts>` + warning.
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo.
+
+Method, evidence and caveats: `.scratch/tracker-reconciliation/REPORT.md`.

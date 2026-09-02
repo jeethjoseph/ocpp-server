@@ -1,6 +1,6 @@
 # Docs: ADR status lines, known-issues narrowing, v1 context docs
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 
@@ -18,3 +18,11 @@ Bring the documentation in line with the shipped behavior (ADR 0026). ADR 0026, 
 - 03-qr-billing-energy-from-base-rate-actual-gateway.md
 - 04-qr-invoice-settlement-actual-gateway.md
 - 05-wallet-path-cleanup.md
+
+## Comments
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo: `docs/adr/0026-tariff*` + all-in narrative in `docs/v1/llm-context-document.md`
+
+Method and caveats: `.scratch/tracker-reconciliation/REPORT.md`.

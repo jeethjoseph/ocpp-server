@@ -1,6 +1,6 @@
 # Funding source flag and live QR budget tiles on charger detail
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 
@@ -52,3 +52,11 @@ Budget ₹490.00   Spent ₹12.34   Remaining ₹477.66
 ## Blocked by
 
 None — can start immediately.
+
+## Comments
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo: `funding_source` in `frontend/types/api.ts` and the charger detail page
+
+Method and caveats: `.scratch/tracker-reconciliation/REPORT.md`.

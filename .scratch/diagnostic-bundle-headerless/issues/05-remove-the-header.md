@@ -1,6 +1,6 @@
 # Stop parsing the bundle header and drop the seven header-derived columns
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 
@@ -62,3 +62,9 @@ big (196KB Aug21)  HTTP 200  138B resp  2698 lines  4 wraps
 retry1 / retry2    identical digest 6ee0f65a2ddd, 459 lines, 2 wraps
 response keys      ['ok', 'recorded', 'stored_key']
 ```
+
+**2026-09-01 — reconciled to `done` by tracker audit (bucket B re-check).** The audit
+flagged this as open because an artifact its acceptance criteria names is absent. Hand-
+verification shows the work landed differently: this is a *removal* issue — the absence of `BUNDLE_MAGIC` / `_UINT32` / `_HEADER_INT_FIELDS` is the proof it succeeded. Shipped in `e9e65a3` under `docs/adr/0030-diagnostic-bundle-body-is-the-contract.md`.
+
+Method: `.scratch/tracker-reconciliation/REPORT.md`.

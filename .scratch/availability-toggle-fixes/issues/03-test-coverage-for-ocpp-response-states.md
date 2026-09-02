@@ -1,6 +1,6 @@
 # Test coverage for ChangeAvailability OCPP response states + edge cases
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 
@@ -39,3 +39,11 @@ assert audit_row.changes["previous_status"] == "Available"
 ## Blocked by
 
 Issues 01 and 02 — the new tests assert against the new behavior (post-issue-02 validation + the response branching that issue 01 doesn't change at the backend level but does pin the contract).
+
+## Comments
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo: `backend/tests/test_chargers.py` covers ChangeAvailability response states
+
+Method and caveats: `.scratch/tracker-reconciliation/REPORT.md`.

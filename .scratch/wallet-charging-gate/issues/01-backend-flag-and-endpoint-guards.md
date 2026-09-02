@@ -1,6 +1,6 @@
 # 01 — Backend flag + endpoint guards (enforcement)
 
-Status: ready-for-human
+Status: done
 
 ## Why
 
@@ -73,3 +73,9 @@ or any QR path. This issue only blocks the *start* and *top-up* paths.
 Not done here (correct per slice boundary): frontend UI hide (issue 02), setting
 the flag `false` on staging/prod (issue 03), and the llm-context /
 comprehensive-architecture doc updates (defer to feature completion).
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo.
+
+Method, evidence and caveats: `.scratch/tracker-reconciliation/REPORT.md`.

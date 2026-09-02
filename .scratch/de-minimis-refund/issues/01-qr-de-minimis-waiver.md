@@ -1,6 +1,6 @@
 # QR de-minimis energy waiver (< 0.5 kWh → full refund, no bill)
 
-Status: ready-for-agent
+Status: done
 Type: AFK
 
 ## What to build
@@ -32,3 +32,9 @@ None - can start immediately
 ## Comments
 
 - **2026-06-20 — Implemented.** QR settlement widened to the 0.5 kWh cliff; shared MIN_BILLABLE_ENERGY_KWH constant; band-accurate reason. Tests added (de-minimis/cliff/band-accuracy) — full QR+wallet+e2e suites green (112 passed).
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo: de-minimis waiver logic in `backend/services/qr_payment_service.py`
+
+Method and caveats: `.scratch/tracker-reconciliation/REPORT.md`.

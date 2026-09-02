@@ -1,6 +1,6 @@
 # 05 — Update architecture + LLM-context docs for Reports
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 
@@ -23,3 +23,11 @@ Reference the ADR from slice 01 rather than duplicating its rationale.
 - 02 — Temperature aggregation endpoint (hourly/daily min-avg-max buckets)
 - 03 — Reports tab shell + Temperature subreport chart
 - 04 — Temperature report CSV export
+
+## Comments
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo: `docs/v1/llm-context-document.md` documents the Reports tab
+
+Method and caveats: `.scratch/tracker-reconciliation/REPORT.md`.
