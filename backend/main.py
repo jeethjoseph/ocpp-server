@@ -125,6 +125,7 @@ from routers import stations, chargers, transactions, auth, webhooks, users, pub
 # Import monitoring service
 from services.monitoring_service import (
     initialize_monitoring,
+    ignore_current_transaction,
     MetricsCollector,
     OCPPMetrics,
     SentryHelper,
@@ -149,6 +150,18 @@ else:
     for h in root.handlers:
         if not h.formatter:
             h.setFormatter(fmt)
+
+# The python-ocpp library logs every wire frame at INFO ("<id>: receive message
+# [2, ...]"). That exact frame is already persisted in full on the OCPP message
+# log row, which is what the Logs Console reads and what the ~90-day retention
+# window preserves — so forwarding it to New Relic duplicates the payload for
+# every single frame, roughly half of all log ingest.
+#
+# Drop the library to WARNING: protocol errors and warnings still surface, only
+# the routine per-frame chatter stops leaving the process. This targets the
+# library's own "ocpp" logger and does NOT touch this app's "ocpp-server"
+# logger below — a separate top-level logger, not a dotted child of "ocpp".
+logging.getLogger("ocpp").setLevel(logging.WARNING)
 
 # App-specific logger with custom formatter (propagate=False to avoid
 # duplicate output through root's handler)
@@ -1585,6 +1598,12 @@ async def health_check():
     Health check endpoint for monitoring systems
     Checks database and Redis connectivity
     """
+    # Keep the liveness probe out of APM. It runs every ~15s per environment
+    # and was the largest transaction on the account while carrying no
+    # diagnostic value beyond "the process is up". The checks below still run
+    # for real — this suppresses telemetry, not behaviour.
+    ignore_current_transaction()
+
     import time
     from starlette.responses import Response
     start_time = time.time()
