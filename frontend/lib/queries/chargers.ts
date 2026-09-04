@@ -112,12 +112,17 @@ export function useRemoteStart() {
     onSuccess: (_, variables) => {
       // Invalidate charger details to refetch latest status
       queryClient.invalidateQueries({ queryKey: chargerKeys.detail(variables.id) });
-      toast.success("Remote start command sent successfully. Waiting for charger to start charging...");
+      toast.success("Charger accepted the start command. Waiting for charging to begin...");
     },
     onError: (err) => {
       const errorMessage = err instanceof Error ? err.message : String(err);
       console.error("Remote start error:", errorMessage);
-      if (errorMessage.includes("409") || errorMessage.includes("not connected")) {
+      // Prefer the server's wording — a refusal and a disconnected charger are
+      // both 409, and only the server knows which happened.
+      const detail = serverDetail(err);
+      if (detail) {
+        toast.error(detail);
+      } else if (errorMessage.includes("409") || errorMessage.includes("not connected")) {
         toast.error("Charger not connected or not in correct state");
       } else {
         toast.error("Failed to start charging");
@@ -149,12 +154,17 @@ export function useRemoteStartByStringId() {
     onSuccess: () => {
       // Invalidate all charger queries to refetch latest status
       queryClient.invalidateQueries({ queryKey: chargerKeys.all });
-      toast.success("Remote start command sent successfully. Waiting for charger to start charging...");
+      toast.success("Charger accepted the start command. Waiting for charging to begin...");
     },
     onError: (err) => {
       const errorMessage = err instanceof Error ? err.message : String(err);
       console.error("Remote start error:", errorMessage);
-      if (errorMessage.includes("409") || errorMessage.includes("not connected")) {
+      // Prefer the server's wording — a refusal and a disconnected charger are
+      // both 409, and only the server knows which happened.
+      const detail = serverDetail(err);
+      if (detail) {
+        toast.error(detail);
+      } else if (errorMessage.includes("409") || errorMessage.includes("not connected")) {
         toast.error("Charger not connected or not in correct state");
       } else {
         toast.error("Failed to start charging");

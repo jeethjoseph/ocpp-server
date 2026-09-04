@@ -850,7 +850,7 @@ async def remote_start_by_string_id(
 
         # Send OCPP RemoteStartTransaction command
         from main import send_ocpp_request
-        success, response = await send_ocpp_request(
+        outcome = await send_ocpp_request(
             charger.charge_point_string_id,
             "RemoteStartTransaction",
             {
@@ -859,13 +859,33 @@ async def remote_start_by_string_id(
             }
         )
 
-        if not success:
-            raise HTTPException(status_code=500, detail=f"Remote start failed: {response}")
+        # The charger answered and declined. Not a 5xx — the system worked and
+        # the answer was no.
+        if outcome.is_refused:
+            logger.warning(
+                f"Charger refused start for {charger.charge_point_string_id} "
+                f"(status={outcome.status})"
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Charger declined the start command. It may be busy or the "
+                    "connector unavailable — please try again."
+                ),
+            )
+
+        # Was a 500, which reported an offline charger as a server fault and
+        # disagreed with the admin endpoint's 504 for the identical condition.
+        if outcome.is_unanswered:
+            raise HTTPException(
+                status_code=504,
+                detail="Charger did not respond in time. It may be offline — please try again.",
+            )
 
         return {
-            "message": "Remote start command sent successfully",
+            "message": "Remote start accepted by charger",
             "charger_id": charger.charge_point_string_id,
-            "response": response
+            "response": outcome.response
         }
 
     except HTTPException:

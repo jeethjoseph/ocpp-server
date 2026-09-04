@@ -250,7 +250,10 @@ class TestChargerEndpoints:
         await Charger.filter(id=test_charger.id).update(
             latest_status=ChargerStatusEnum.PREPARING
         )
-        mock_send_ocpp.return_value = (False, "OCPP timeout: RemoteStartTransaction")
+        from core.connection_manager import CommandOutcome
+        mock_send_ocpp.return_value = CommandOutcome(
+            False, "OCPP timeout: RemoteStartTransaction"
+        )
 
         response = await client_admin.post(
             f"/api/admin/chargers/{test_charger.id}/remote-start"
@@ -262,22 +265,33 @@ class TestChargerEndpoints:
     @pytest.mark.asyncio
     @patch("routers.chargers.is_charger_connected")
     @patch("main.send_ocpp_request")
-    async def test_remote_start_other_failure_returns_500(
+    async def test_remote_start_refused_returns_409(
         self, mock_send_ocpp, mock_connected, client_admin: AsyncClient, test_charger
     ):
-        """A non-timeout OCPP failure still surfaces as a 500 server error."""
+        """A charger that answers Rejected gets 409, not 500.
+
+        This test previously asserted 500 while mocking `(False, "Rejected")`,
+        which conflated a delivery failure with a refusal. They are different:
+        a refusal means the charger answered, and per CONTEXT.md -> Remote
+        commands that is an expected outcome, not a server fault.
+        """
         from models import ChargerStatusEnum
+        from core.connection_manager import CommandOutcome
+        from ocpp.v16 import call_result
         mock_connected.return_value = True
         await Charger.filter(id=test_charger.id).update(
             latest_status=ChargerStatusEnum.PREPARING
         )
-        mock_send_ocpp.return_value = (False, "Rejected")
+        mock_send_ocpp.return_value = CommandOutcome(
+            True, call_result.RemoteStartTransaction(status="Rejected")
+        )
 
         response = await client_admin.post(
             f"/api/admin/chargers/{test_charger.id}/remote-start"
         )
 
-        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+        assert response.status_code == status.HTTP_409_CONFLICT
+        assert "declined" in response.json()["detail"].lower()
 
     @pytest.mark.asyncio
     @patch('main.send_ocpp_request')
