@@ -81,6 +81,20 @@ _Avoid_: "charger password" (implies a low-entropy human secret and the wrong ha
 The rule deciding whether a connection is required to present a valid **Charger Auth Key**. **Per-charger**, keyed on `auth_key_hash` presence: null ⇒ *legacy mode* (connection allowed, logged as `charger.connection_insecure` — the migration burn-down signal); non-null ⇒ *enforced* (valid Basic Auth required, **username must equal the path `charge_point_id`**, else close `1008`). Auth is checked **before** the force-disconnect-stale-connection logic so an unauthenticated caller can never kick a live charger offline. Once the insecure count reaches zero fleet-wide, the global `REQUIRE_CHARGER_AUTH` flag closes the window by rejecting even null-hash chargers. See [[adr-0020-charger-websocket-basic-auth]].
 _Avoid_: "big-bang cutover" — enforcement is intentionally per-charger to avoid a flag-day outage across flaky-modem fleet.
 
+### Remote commands
+
+**Remote command**:
+An OCPP RPC this server initiates *towards* a charger over the open WebSocket — `RemoteStartTransaction`, `RemoteStopTransaction`, `Reset`, `ChangeAvailability`, `UpdateFirmware`, `DataTransfer`. Always server→charger. The charger's own calls (BootNotification, MeterValues, StatusNotification, …) are not remote commands; those land on the **OCPP message log**.
+
+**Command outcome**:
+What a **remote command** produced, as three mutually exclusive states: **Accepted** (the charger committed to act), **Refused** (the charger answered and declined), **Unanswered** (no reply inside the 30-second window). A charger that is not connected at all never produces a command outcome — connectivity is a pre-flight check answered before anything is sent.
+`Accepted` deliberately absorbs OCPP's `Scheduled` (`ChangeAvailability` only — "I will act when the current session ends"), because both are commitments to act and the one caller that sees `Scheduled` already treats it identically. The raw wire status stays reachable for callers that surface it verbatim.
+_Avoid_: "command result" — `CallResult` is already the OCPP messageTypeId-3 ack frame. "Success"/"failure" for the pair — a refusal is neither: the system worked correctly and the answer was no.
+
+**Refused** vs **Rejected**:
+Two different actors saying no, deliberately kept apart. **Refused** is the *charger* declining a **remote command**. **Rejected** is *this server* declining something — most visibly the `OCPPWebSocketRejected` **NR custom event** for a connect-time reject. The OCPP wire value for a charger's no is literally `"Rejected"`; it is translated to **Refused** at the transport boundary so the actor is unambiguous everywhere above it.
+_Avoid_: "rejected" for a charger's answer — it inverts the actor relative to the connect-time event of the same name.
+
 ### External interoperability (OCPI)
 
 **OCPI feed**:
