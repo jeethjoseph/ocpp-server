@@ -773,30 +773,51 @@ async def remote_stop_charging(charger_id: int, reason: Optional[str] = "Request
         logger.info(f"🛡️ Admin {user.email} stopping transaction {transaction.id} belonging to user {transaction.user_id}")
     
     # Send RemoteStopTransaction command
-    success, response = await send_ocpp_request(
+    outcome = await send_ocpp_request(
         charger.charge_point_string_id,
         "RemoteStopTransaction",
         {"transaction_id": transaction.id}
     )
-    
-    if success:
-        action_type = "Admin override stop" if is_admin and not is_owner else "Remote stop"
-        return {
-            "success": True,
-            "message": f"{action_type} command sent successfully",
-            "transaction_id": transaction.id,
-            "charger_id": charger_id,
-            "transaction_owner": transaction.user_id,
-            "stopped_by": user.id
-        }
-    else:
-        # Don't modify transaction state - let user know the command failed
-        error_msg = f"Failed to send stop command to charger: {response}"
-        logger.warning(f"Remote stop failed for transaction {transaction.id}: {error_msg}")
-        raise HTTPException(
-            status_code=409, 
-            detail=f"Unable to stop charging session. {error_msg}. Please try again or contact support."
+
+    # A refused stop is the dangerous case: the session is still live and still
+    # billing, so the operator must not be told it ended. Deliberately not a 5xx
+    # — the charger answered and declined, which is the system working.
+    if outcome.is_refused:
+        logger.warning(
+            f"Charger refused stop for transaction {transaction.id} "
+            f"(status={outcome.status})"
         )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Charger declined the stop command. The session is still running. "
+                "Try again, and use force-stop if it keeps refusing."
+            ),
+        )
+
+    if outcome.is_unanswered:
+        # Never delivered, or no reply in time — an upstream condition rather
+        # than a server fault, so 504 rather than a 500 that would spam Sentry.
+        logger.warning(
+            f"Remote stop unanswered for transaction {transaction.id}: {outcome.response}"
+        )
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                "Charger did not respond, so the session may still be running. "
+                "It may be offline — please try again."
+            ),
+        )
+
+    action_type = "Admin override stop" if is_admin and not is_owner else "Remote stop"
+    return {
+        "success": True,
+        "message": f"{action_type} accepted by charger",
+        "transaction_id": transaction.id,
+        "charger_id": charger_id,
+        "transaction_owner": transaction.user_id,
+        "stopped_by": user.id
+    }
 
 @router.post("/{charger_id}/change-availability", response_model=dict)
 async def change_charger_availability(

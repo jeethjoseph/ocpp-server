@@ -189,7 +189,14 @@ class TestChargerEndpoints:
             "websocket": MagicMock()
         }
         # Mock OCPP response
-        mock_send_ocpp.return_value = (True, {"status": "Accepted"})
+        # Must be a real CommandOutcome, not a bare tuple — handlers ask it
+        # questions (is_refused / is_unanswered), and a tuple mock would pass
+        # unpacking then blow up on the accessor.
+        from core.connection_manager import CommandOutcome
+        from ocpp.v16 import call_result
+        mock_send_ocpp.return_value = CommandOutcome(
+            True, call_result.RemoteStopTransaction(status="Accepted")
+        )
         response = await client_admin.post(
             f"/api/admin/chargers/{test_charger.id}/remote-stop",
             json={"reason": "Operator request"}
@@ -198,7 +205,7 @@ class TestChargerEndpoints:
         data = response.json()
         assert data["success"] is True
         # Endpoint message text changed when admin override path was added
-        assert "stop command sent" in data["message"].lower()
+        assert "accepted by charger" in data["message"].lower()
         # transaction_id is now an int in the response, not a string
         assert data["transaction_id"] == transaction.id
         # Verify OCPP command was called — payload key changed from
@@ -283,7 +290,14 @@ class TestChargerEndpoints:
         }
         
         # Mock OCPP response
-        mock_send_ocpp.return_value = (True, {"status": "Accepted"})
+        # Must be a real CommandOutcome, not a bare tuple — handlers ask it
+        # questions (is_refused / is_unanswered), and a tuple mock would pass
+        # unpacking then blow up on the accessor.
+        from core.connection_manager import CommandOutcome
+        from ocpp.v16 import call_result
+        mock_send_ocpp.return_value = CommandOutcome(
+            True, call_result.RemoteStartTransaction(status="Accepted")
+        )
         
         response = await client_admin.post(
             f"/api/admin/chargers/{test_charger.id}/change-availability?type=Inoperative&connector_id=0"

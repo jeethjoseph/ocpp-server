@@ -277,14 +277,36 @@ async def remote_stop(charger_id: int, auth=Depends(require_franchisee())):
         raise HTTPException(status_code=409, detail="No active session")
 
     from main import send_ocpp_request
-    success, response = await send_ocpp_request(
+    outcome = await send_ocpp_request(
         charger.charge_point_string_id,
         "RemoteStopTransaction",
         {"transaction_id": active_txn.id},
     )
-    if success:
-        return {"success": True, "message": "Stop command sent"}
-    raise HTTPException(status_code=500, detail=f"Stop failed: {response}")
+    if outcome.is_refused:
+        # Session is still live and still billing — never report this as sent.
+        logger.warning(
+            f"Charger refused stop for charger {charger_id} "
+            f"transaction {active_txn.id} (status={outcome.status})"
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Charger declined the stop command. The session is still "
+                "running — please try again."
+            ),
+        )
+    if outcome.is_unanswered:
+        # Was a 500, which reported an offline charger as a server fault and
+        # sent expected operational noise to Sentry.
+        logger.warning(f"Remote stop unanswered for charger {charger_id}: {outcome.response}")
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                "Charger did not respond, so the session may still be running. "
+                "It may be offline — please try again."
+            ),
+        )
+    return {"success": True, "message": "Stop accepted by charger"}
 
 
 @router.post("/chargers/{charger_id}/reset")

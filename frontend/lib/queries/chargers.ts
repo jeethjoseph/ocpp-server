@@ -7,6 +7,7 @@ import {
   type ChangeAvailabilityResponse,
 } from "@/lib/api-services";
 import { toast } from "sonner";
+import { serverDetail } from "@/lib/api-client";
 import { transactionKeys } from "./transactions";
 import { useAuth } from "@/contexts/AuthContext";
 
@@ -257,7 +258,13 @@ export function useRemoteStop() {
     onError: (err) => {
       const errorMessage = err instanceof Error ? err.message : String(err);
       console.error("Remote stop error:", errorMessage);
-      if (errorMessage.includes("409") || errorMessage.includes("not connected")) {
+      // Prefer the server's wording. A refused stop and a missing session are
+      // both 409, but only the server knows the session is still running —
+      // the old blanket "not connected" copy was wrong for a refusal.
+      const detail = serverDetail(err);
+      if (detail) {
+        toast.error(detail);
+      } else if (errorMessage.includes("409") || errorMessage.includes("not connected")) {
         toast.error("Charger not connected or no active session");
       } else {
         toast.error("Failed to initiate remote stop");
@@ -299,7 +306,13 @@ export function useRemoteStopByStringId() {
     onError: (err) => {
       const errorMessage = err instanceof Error ? err.message : String(err);
       console.error("Remote stop error:", errorMessage);
-      if (errorMessage.includes("409") || errorMessage.includes("not connected")) {
+      // Prefer the server's wording. A refused stop and a missing session are
+      // both 409, but only the server knows the session is still running —
+      // the old blanket "not connected" copy was wrong for a refusal.
+      const detail = serverDetail(err);
+      if (detail) {
+        toast.error(detail);
+      } else if (errorMessage.includes("409") || errorMessage.includes("not connected")) {
         toast.error("Charger not connected or no active session");
       } else {
         toast.error("Failed to initiate remote stop");

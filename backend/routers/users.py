@@ -913,21 +913,45 @@ async def remote_stop_by_string_id(
         # Send OCPP RemoteStopTransaction command
         from main import send_ocpp_request
         logger.info(f"User {current_user.email} requesting remote stop for charger {charger.charge_point_string_id}, transaction {transaction.id}")
-        success, response = await send_ocpp_request(
+        outcome = await send_ocpp_request(
             charger.charge_point_string_id,
             "RemoteStopTransaction",
             {"transaction_id": transaction.id}
         )
 
-        if not success:
-            logger.error(f"Remote stop failed for {charger.charge_point_string_id}: {response}")
-            raise HTTPException(status_code=409, detail=f"{response}")
+        # The charger answered and declined. The session is still live and still
+        # billing, so this must not read as success. Not a 5xx — a refusal is the
+        # system working correctly and the answer being no.
+        if outcome.is_refused:
+            logger.warning(
+                f"Charger refused stop for {charger.charge_point_string_id} "
+                f"transaction {transaction.id} (status={outcome.status})"
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Charger declined the stop command. Your session is still "
+                    "running — please try again."
+                ),
+            )
+
+        if outcome.is_unanswered:
+            logger.warning(
+                f"Remote stop unanswered for {charger.charge_point_string_id}: {outcome.response}"
+            )
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    "Charger did not respond, so your session may still be "
+                    "running. Please try again."
+                ),
+            )
 
         return {
-            "message": "Remote stop command sent successfully",
+            "message": "Remote stop accepted by charger",
             "charger_id": charger.charge_point_string_id,
             "transaction_id": transaction.id,
-            "response": response
+            "response": outcome.response
         }
 
     except HTTPException:
