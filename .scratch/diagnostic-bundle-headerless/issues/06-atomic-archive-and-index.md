@@ -1,6 +1,6 @@
 # Make the S3 archive and the index row succeed or fail together
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 
@@ -57,3 +57,5 @@ Option (2) stayed rejected: compensating after the fact needs `s3:DeleteObject`,
 Unit coverage of the DB-touching functions deliberately lives in that verification rather than in `test_diagnostic_bundle_service.py`, which is DB-free by design (the endpoint tests' docstring records the cross-loop flake that motivates it). The observable that matters is pinned in the endpoint suite: `test_s3_failure_is_not_reported_as_success` now also asserts `mark_archived` was **not** called.
 
 Suite: **77 passed** (79 minus the two source-inspection tests, removed as described above).
+
+**2026-09-08 — reconciled to `done` by tracker audit.** Every acceptance criterion was already ticked in this file; only the `Status:` line was never flipped, so the issue still advertised itself as available work. Hand-verified rather than grep-scored, per `.scratch/tracker-reconciliation/REPORT.md`: Shipped as the prescribed **option 1 (index first)**: `reserve_bundle` → `_archive` → `mark_archived`, with 503 on S3 failure. My first pass grepped for `in_transaction`/`delete_object` and wrongly read the absence as unfinished — the ordering *is* the mechanism, and `s3:DeleteObject` was deliberately never taken.

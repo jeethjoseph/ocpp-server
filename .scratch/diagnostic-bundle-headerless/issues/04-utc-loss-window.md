@@ -1,6 +1,6 @@
 # Loss accounting becomes a UTC window derived from in-band TIME_SYNC anchors
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 
@@ -61,3 +61,7 @@ Overwrite loss keeps its own signal: the firmware already logs `DiagUpload: body
 The receipt-time fallback this issue asked for already existed in `resolve_records` as `time_approx`; it is now surfaced on the row and explicitly tested.
 
 `_gap_before` returns **None, not 0**, when either side is approximate. A gap measured against receipt time would be invented rather than observed — receipt time is an upper bound and the records could be arbitrarily old. Suite: **92 passed**.
+
+**2026-09-08 — reconciled to `done` by tracker audit.** Every acceptance criterion was already ticked in this file; only the `Status:` line was never flipped, so the issue still advertised itself as available work. Hand-verified rather than grep-scored, per `.scratch/tracker-reconciliation/REPORT.md`: `first_utc` / `last_utc` on the model and populated by the service; `DIAGNOSTIC_GAP_THRESHOLD_SECONDS` (default 300) read in `diagnostics.py:344` and `diagnostic_bundle_service.py:223`, and present in all three compose files plus `.env.staging.example` / `.env.prod.example`.
+
+One loose end closed as part of this audit: the var was missing from `backend/.env.example` (step 1 of the CLAUDE.md env-var checklist) though present everywhere a deploy reads it. Added rather than left as a documented gap behind a `done`.

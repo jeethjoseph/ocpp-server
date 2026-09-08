@@ -2,6 +2,17 @@
 
 Status: ready-for-agent
 
+## ELI5
+
+The firmware team builds from a written document. That document still tells them to send
+a header we deleted — and to maintain counters the hardware physically cannot keep across a
+reboot, which is *why* we deleted it. Until the spec is updated, the next firmware release
+faithfully re-implements something the server stopped reading, and the two sides drift apart
+while both believe they are following the contract.
+
+The internal docs are already rewritten. The spec is the half that leaves the building, and
+it is still marked Version 1.0.
+
 ## What to build
 
 The written contract still describes the mechanism being deleted, and the firmware team works from it.
@@ -25,9 +36,9 @@ The written contract still describes the mechanism being deleted, and the firmwa
 
 ## Acceptance criteria
 
-- [x] Firmware spec at version 2.0 with §3.3, §3.4 and §4.1 marked withdrawn (not silently deleted — the firmware team needs to see what changed and why).
-- [x] Required in-band records documented with the exact formats shipped firmware already emits.
-- [x] §2.2 retained and reinforced, noting the observed under-matching.
+- [ ] Firmware spec at version 2.0 with §3.3, §3.4 and §4.1 marked withdrawn (not silently deleted — the firmware team needs to see what changed and why).
+- [ ] Required in-band records documented with the exact formats shipped firmware already emits.
+- [ ] §2.2 retained and reinforced, noting the observed under-matching.
 - [x] `CONTEXT.md` Diagnostic Bundle entry no longer describes a header; non-metering framing unchanged.
 - [x] ADR 0029 carries a pointer to ADR 0030; its body is otherwise untouched.
 - [x] Both `docs/v1/` documents updated.
@@ -47,3 +58,15 @@ The written contract still describes the mechanism being deleted, and the firmwa
 - **`docs/v1/llm-context-document.md`** and **`docs/v1/comprehensive-architecture-documentation.md`** — neither documented this feature at all (the pre-existing "diagnostic" hits were unrelated uses of the word), so both got a full entry rather than an edit.
 
 Each document states plainly what is **gone and not replaced** — the cumulative overwrite count — rather than implying the ring-wrap line substitutes for it.
+
+**2026-09-08 — audit: partially shipped, staying open.** The three checkboxes covering
+`docs/firmware/diagnostic-bundle-upload-spec.md` were ticked, but the file is untouched:
+still `**Version**: 1.0` at line 6 and still documenting `#VLTDIAG/1` at line 119. Unticked.
+
+Genuinely done (verified): `CONTEXT.md`'s Diagnostic Bundle entry is rewritten for the
+body-is-the-contract model with `bundle sequence` / `epoch` / `gap records` / `overflow delta`
+listed under _Avoid_; ADR 0029 carries the "Partly superseded (2026-08-27)" pointer to ADR 0030;
+both `docs/v1/` documents updated. Those three edits are **uncommitted in the working tree**.
+
+What remains is the half that leaves the building: the firmware team implements from the spec,
+and it still instructs them to emit a header we no longer read.

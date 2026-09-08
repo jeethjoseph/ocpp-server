@@ -1,6 +1,6 @@
 # Trim the Diagnostic Bundle upload response to a minimal ack
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 
@@ -60,3 +60,5 @@ This is independent of the rest of the header removal and can ship first.
 Verification: `pytest` across all six diagnostics files — **77 passed**.
 
 Note: the response-shape assertions here now also pin C7 in the firmware change doc — if the response grows again, `test_response_is_a_minimal_ack` fails.
+
+**2026-09-08 — reconciled to `done` by tracker audit.** Every acceptance criterion was already ticked in this file; only the `Status:` line was never flipped, so the issue still advertised itself as available work. Hand-verified rather than grep-scored, per `.scratch/tracker-reconciliation/REPORT.md`: `diagnostics.py:296` returns exactly `{ok, recorded, stored_key}`; `_BODY_PREVIEW_CHARS` absent from the repo.

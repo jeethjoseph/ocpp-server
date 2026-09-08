@@ -1,6 +1,6 @@
 # Extract the in-band marker parser out of the fan-out into a shared module
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 
@@ -55,3 +55,5 @@ Retroactive anchoring turned out to be **already implemented** in `resolve_recor
 Verification:
 - `pytest` across all six diagnostics files — **77 passed** (63 baseline + 14 new), no behaviour change to the fan-out.
 - Against real staging bundles: the 196 KB Aug-21 bundle parses to 4 segments / 2,697 records / 4 ring-wrap events, fully anchored, window 06:06:41.899 → 06:22:16.986 (15.6 min). The window **starts before that bundle's first `TIME_SYNC` at 06:06:53**, confirming retroactive anchoring on production data. The 33 KB Aug-27 bundle: 1 segment, 128 records, 0.7 min — matching an independent measurement of its `boot_ms` span (39.6 s).
+
+**2026-09-08 — reconciled to `done` by tracker audit.** Every acceptance criterion was already ticked in this file; only the `Status:` line was never flipped, so the issue still advertised itself as available work. Hand-verified rather than grep-scored, per `.scratch/tracker-reconciliation/REPORT.md`: `backend/services/diagnostic_markers.py` and `backend/tests/test_diagnostic_markers.py` both exist; `diagnostic_fanout.py` imports from the module rather than defining the regexes.
