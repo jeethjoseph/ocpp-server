@@ -1,6 +1,6 @@
 # Revise the firmware spec to v2 and update the domain docs
 
-Status: ready-for-agent
+Status: done
 
 ## ELI5
 
@@ -36,9 +36,9 @@ The written contract still describes the mechanism being deleted, and the firmwa
 
 ## Acceptance criteria
 
-- [ ] Firmware spec at version 2.0 with §3.3, §3.4 and §4.1 marked withdrawn (not silently deleted — the firmware team needs to see what changed and why).
-- [ ] Required in-band records documented with the exact formats shipped firmware already emits.
-- [ ] §2.2 retained and reinforced, noting the observed under-matching.
+- [x] Firmware spec at version 2.0 with §3.3, §3.4 and §4.1 marked withdrawn (not silently deleted — the firmware team needs to see what changed and why).
+- [x] Required in-band records documented with the exact formats shipped firmware already emits.
+- [x] §2.2 retained and reinforced, noting the observed under-matching.
 - [x] `CONTEXT.md` Diagnostic Bundle entry no longer describes a header; non-metering framing unchanged.
 - [x] ADR 0029 carries a pointer to ADR 0030; its body is otherwise untouched.
 - [x] Both `docs/v1/` documents updated.
@@ -70,3 +70,43 @@ both `docs/v1/` documents updated. Those three edits are **uncommitted in the wo
 
 What remains is the half that leaves the building: the firmware team implements from the spec,
 and it still instructs them to emit a header we no longer read.
+
+**2026-09-08 — spec revised to 2.0; issue closed.**
+
+`docs/firmware/diagnostic-bundle-upload-spec.md` is now **Version 2.0**. §3.3, §3.4 and §4.1
+are struck through in place rather than deleted, each carrying why it was withdrawn, and a
+banner at the top summarises the change in a table so the firmware team can see what moved
+without diffing. It also says plainly that the withdrawal costs them real work but that the
+replacement — §4.3 — should need no new code, because all three records already ship.
+
+New **§4.3 Required in-band records**, written from the parser rather than from memory
+(`services/diagnostic_markers.py` is the source of truth):
+
+- `===== BOOT` — matched case-insensitively, optional `n=<uint32>`, absence is fine and is
+  what ships today.
+- `TIME_SYNC boot_ms=<n> utc=<iso8601Z>` — both fields required. Documented *why* `boot_ms`
+  matters: it is what anchors records written **before** the sync, which is the case that
+  matters because a charger that cannot reach the network logs its failures with a dead clock.
+  The legacy `Time synced from heartbeat:` form is noted as accepted but non-anchoring.
+- The ring-wrap line — the substring `ring wrapped mid-upload` is called out as the contract,
+  with the surrounding text free-form, and it is stated that cumulative loss will not be asked
+  for again.
+
+§2.2 reinforced with the measured number: the server redactor is stripping **~28 meter values
+per bundle**, so firmware-side redaction is under-matching *today*. Framed as a backstop, not
+a licence to emit, and tied back to why it matters — it keeps a Bundle disposable observability
+data rather than unaudited legal-metrology data next to a GST Invoice.
+
+**Beyond the issue's scope, found while writing it:** §7's response table did not match the
+endpoint. It documented a `409` that `routers/diagnostics.py` never returns (duplicates come
+back `200` with `"recorded": false`) and omitted the `404` and `503` it does return. Corrected
+against the live code and marked as a correction, since firmware may have branched on `409`.
+Also added: the response is a minimal ack, and the body must not be written into the ring
+buffer — it costs buffer on every upload to store something already known, and feeds the next
+bundle its own previous ack.
+
+§9 questions 5 and 6 struck through as answered by shipped firmware; new question 9 asks the
+firmware team to flag any planned change to the three §4.3 formats, since a silent one now
+breaks identity, timing or loss detection with no error anywhere.
+
+§10 checklist regrouped by area, with the withdrawn items kept and struck through.
