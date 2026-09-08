@@ -44,7 +44,7 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
 ```
 
 **Backend**: Python FastAPI 0.115.12 with Tortoise ORM 0.25.1, Redis 6.2.0 for connection state + QR session caching, Clerk JWT (clerk-backend-api 3.1.11) + UPI_GUEST auth
-**Web Frontend**: Next.js 15.3.8 with TypeScript 5.x, React 19, TanStack Query 5.81.2 for state, role-based UI (Admin/User)
+**Web Frontend**: Next.js 16.3.3 (Active LTS) with TypeScript 5.x, React 19, TanStack Query 5.81.2 for state, role-based UI (Admin/User)
 **Mobile App**: Capacitor 7.4.4 + React 19 + Vite 7.2.4 for native iOS/Android apps with QR scanning, geolocation, payments
 **Database**: PostgreSQL with comprehensive schema for charging infrastructure + QR payment tracking
 **Protocol**: OCPP 1.6 via WebSocket with full message support
@@ -604,8 +604,40 @@ EV Chargers (OCPP 1.6) ←→ FastAPI Backend (Python) ←→ Next.js Frontend (
 
 ### Key Configuration
 - **`backend/requirements.txt`** - Python dependencies (FastAPI, python-ocpp, Tortoise ORM, etc.)
-- **`frontend/package.json`** - Node dependencies (Next.js 15, React 19, Clerk, TanStack Query, etc.)
+- **`frontend/package.json`** - Node dependencies (Next.js 16, React 19, Clerk, TanStack Query, etc.)
 - **`backend/pyproject.toml`** - pytest configuration and Aerich migration settings
+
+### Frontend build after the Next.js 16 upgrade (2026-08-28)
+
+Upgraded 15.3.8 → **16.3.3** (Active LTS). Next.js 15 reaches end-of-support on
+**2026-10-21**, which is what forced the jump rather than a patch to 15.5.x.
+
+Four behavioural changes matter for day-to-day work:
+
+- **`next build` no longer lints.** `next lint` was removed in 16 and the build
+  no longer runs ESLint, so the production build is NO LONGER a safety net for
+  `@typescript-eslint/no-unused-vars`, `react/no-unescaped-entities`, etc. Run
+  **`npm run lint` alongside `npm run build`** — a green build alone now proves
+  strictly less than it did on 15. (`CLAUDE.md`'s build-verification section
+  still describes the old behaviour.)
+- **`npm run lint` is now `eslint .`**, and `eslint.config.mjs` spreads the
+  native flat config from `eslint-config-next` 16. The old `FlatCompat` shim
+  throws `Converting circular structure to JSON` against v16 — don't reinstate it.
+- **Turbopack is the default bundler** for `next dev` and `next build`. The
+  build fails if it finds a webpack config; `@sentry/nextjs` ≥ 10.43 avoids
+  this by using the `runAfterProductionCompile` hook instead. If a future
+  dependency reintroduces a webpack config, the escape hatch is
+  `next build --webpack`.
+- **`middleware.ts` is deprecated in favour of `proxy.ts`** and logs a warning
+  on every build. Deliberately NOT migrated: `proxy` is Node-runtime-only with
+  no edge support, and `middleware.ts` runs a `clerkClient()` role lookup in
+  the request path. That is a behavioural change deserving its own review.
+
+`@clerk/nextjs` was also moved 6.37.1 → **6.39.6** to clear GHSA-vqx2-fgx2-5wq9
+(critical: middleware-based route-protection bypass) and GHSA-w24r-5266-9c3c
+(high: authorization bypass). Do not pin below 6.39.3. Note the backend's
+`require_admin()` remains the real authorization boundary — `middleware.ts` is
+defence-in-depth for UX.
 
 ---
 
@@ -1129,7 +1161,7 @@ GET /api/admin/logs/export - Streaming CSV (text/csv, StreamingResponse) of the 
 **Authentication**: Clerk 6.29.0 (web) / 5.56.1 (mobile) for JWT and role management + UPI_GUEST for appless users
 **Payment Gateway**: Razorpay SDK 2.0.0 (backend) + Razorpay Checkout.js (web) + capacitor-razorpay 1.3.0 (mobile) + UPI QR code generation + refunds
 **Database**: Tortoise ORM 0.25.1 (async) with PostgreSQL and SSL in production
-**Web Frontend**: Next.js 15.3.8 with App Router, TypeScript 5.x, React 19, TanStack Query 5.81.2, Shadcn/ui
+**Web Frontend**: Next.js 16.3.3 (Active LTS) with App Router, TypeScript 5.x, React 19, TanStack Query 5.81.2, Shadcn/ui
 **Mobile App**: Capacitor 7.4.4 + React 19 + Vite 7.2.4 + TypeScript 5.9 + TanStack Query 5.90.10
 **Backend**: FastAPI 0.115.12 with Uvicorn 0.34.3, Python-OCPP 2.0.0
 **Real-time**: Redis for connection state + QR session budget caching, TanStack Query polling for frontend/app updates

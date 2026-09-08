@@ -96,7 +96,7 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 ### Frontend Technologies (`/frontend/`)
 | Component | Technology | Version | Purpose |
 |-----------|------------|---------|---------|
-| **Framework** | Next.js | 15.3.8 | React-based frontend with App Router |
+| **Framework** | Next.js | 16.3.3 | React-based frontend with App Router (Active LTS) |
 | **Language** | TypeScript | 5.x | Type safety and developer experience |
 | **Runtime** | React | 19.0.0 | Latest React with concurrent features |
 | **Styling** | Tailwind CSS | v4 | Utility-first CSS framework |
@@ -943,7 +943,7 @@ All runbooks follow the same H2 structure (Symptom / What it means / When it's n
 ## Frontend Components
 
 ### Application Architecture
-**Framework**: Next.js 15.3.4 with App Router and React 19
+**Framework**: Next.js 16.3.3 with App Router and React 19
 **Pattern**: Server-first architecture with client components where needed
 
 ### Directory Structure (`frontend/`)
@@ -1567,7 +1567,7 @@ npx cap open android  # Open in Android Studio
 | **Build Tool** | Next.js | Vite |
 | **Native Features** | None | QR, GPS, Payments, Network |
 | **Deployment** | Vercel | App Stores |
-| **Framework** | Next.js 15 App Router | React 19 + React Router |
+| **Framework** | Next.js 16 App Router | React 19 + React Router |
 | **Bundle Size** | ~2MB (includes admin) | ~500KB (user only) |
 
 ---
@@ -5170,7 +5170,7 @@ CLEANUP_INTERVAL_HOURS=24
 
 ### Frontend Configuration
 - **Output**: `standalone` mode for Docker production builds
-- **Next.js 15.3.8** with App Router, React 19
+- **Next.js 16.3.3** with App Router, React 19
 - **Environment**: `NEXT_PUBLIC_API_URL`, `NEXT_PUBLIC_APP_URL`, `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`
 
 ### Database Management

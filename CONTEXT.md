@@ -95,6 +95,8 @@ How long a mid-session charger disconnect (or reboot) is held `SUSPENDED` awaiti
 ### Charger connection security
 
 **Charger Auth Key**:
+**Status (2026-08-18): partially shipped.** The key and its `Charger.auth_key_hash` column are being introduced by [[adr-0029-diagnostic-bundle-authenticated-https-upload]] to authenticate **Diagnostic Bundle** uploads over HTTPS. The OCPP WebSocket handshake described below is still **unauthenticated** — [[adr-0020-charger-websocket-basic-auth]] remains PROPOSED. Read the rest of this entry as the target design for the WSS half.
+
 The per-`Charger` secret that authenticates the OCPP WebSocket connection under **OCPP 1.6 Security Profile 2** (WSS transport + HTTP Basic Auth). A 20-byte random key; the charger presents it as the Basic Auth **password** with the `charge_point_string_id` as the **username** on the WSS upgrade. The server stores only a **SHA-256 hash** (`Charger.auth_key_hash`), never the plaintext — the plaintext is revealed exactly once at provisioning/rotation and loaded onto the unit by charger-side tooling (delivery is out of scope for the server). Lost key ⇒ rotate, never retrieve. SHA-256 (not bcrypt) is deliberate: the key is a high-entropy machine credential checked on every reconnect, so a fast hash is both sufficient and cheaper for flaky-modem reconnect churn. See [[adr-0020-charger-websocket-basic-auth]].
 _Avoid_: "charger password" (implies a low-entropy human secret and the wrong hashing choice); conflating it with **AuthorizationKey** (the OCPP config key the charger-side tool writes locally) — same value, different side.
 
@@ -217,6 +219,22 @@ A charger-emitted OCPP `DataTransfer` with `vendorId=VoltLync`, `messageId=Signa
 
 **Known ambiguity**: the table name is a misnomer post-temperature. A future rename to `charger_telemetry` (or similar) is on the table but not blocking. Until then, treat `signal_quality` as the canonical home for any modem-emitted telemetry, not strictly signal-quality fields.
 _Avoid_: confusing **Modem telemetry** with the (currently hypothetical) OCPP `Temperature` measurand sent inside `MeterValues.sampledValue`. The latter, if/when it appears, is per-transaction cable/socket/EV temperature and belongs on `meter_value` — see ADR 0009 "Consequences" for the orthogonality argument.
+
+**Diagnostic Bundle**:
+A body of **charger-side firmware debug traces** — boot messages, state-machine transitions, modem/AT failures, relay actuations, vendor fault detail — buffered in the charger's on-board EEPROM and uploaded periodically to the CSMS over **HTTPS POST**, outside the OCPP channel. Deliberately and strictly **non-metering**: no kWh, no meter readings, no tamper or calibration events. That exclusion is what keeps a Bundle disposable observability data rather than legal-metrology data adjacent to a **GST Invoice**.
+
+Newline-delimited UTF-8 records and nothing else. It carried a header of counters (`boot`, `seq`, `first`, `last`, `overflow`) until [[adr-0030-diagnostic-bundle-body-is-the-contract]] deleted it: every field required the charger to persist a counter across a reboot, which the hardware cannot do. **The body is the whole contract.** The CSMS reads three in-band markers from it — `===== BOOT`, `TIME_SYNC boot_ms=… utc=…`, and the ring-wrap line — and derives identity, time and loss from those. It is therefore *not* opaque: it is vendor-defined in content but parsed for delivery meaning, though never for domain meaning. Uploaded to `POST /api/diagnostics/bundles` under HTTP Basic Auth with the **Charger Auth Key**, and stored in S3; see [[adr-0029-diagnostic-bundle-authenticated-https-upload]].
+
+_Avoid_: **Diagnostics** / **GetDiagnostics** as if this were the OCPP mechanism — it deliberately is **not** (see the ADR). _Avoid_: "charger logs" unqualified, which collides with **OCPP message log** (that is CSMS-observed protocol traffic; a Bundle is the charger's own internal trace, which the CSMS otherwise never sees). _Avoid_: treating a Bundle as a source of truth for energy — `MeterValues` / `StopTransaction` are the audited billing path, and a second unaudited copy would be a liability, not an asset. _Avoid_: **bundle sequence** and **epoch** — both are retired; a Bundle is identified by the **content digest** of its records. _Avoid_: describing a Bundle as "opaque", which was true only while the CSMS ignored its contents.
+
+**Loss window**:
+The span between one Diagnostic Bundle's last record and the next one's first, measured in **UTC reconstructed from in-band `TIME_SYNC` anchors**. Silence longer than a configured threshold is the signal that records went missing. Derived at read time, never stored — a delayed bundle can arrive later and fill the hole.
+
+Replaces the record-number gap and overflow delta of [[adr-0029-diagnostic-bundle-authenticated-https-upload]], which needed counters the charger cannot keep. **Resolution is minutes, not records**, and the **cumulative count of records a charger destroyed before delivering them is no longer obtainable at all** — that needed a monotonic counter held separately from the data it describes. A **ring-wrap event** says overwriting is happening now; nothing says how much. Do not present either as a total. See [[adr-0030-diagnostic-bundle-body-is-the-contract]].
+_Avoid_: **gap records** / **overflow delta** — both retired with the header.
+
+**Reservation** (Diagnostic Bundle):
+An index row written **before** its S3 object, carrying a null `archived_at`. It exists so a failed upload cannot strand an object no row points at — the ordering that produced 195 unreclaimable objects on staging in one morning. A reservation is **not a delivery**: it is invisible to the duplicate check, so a charger retrying is told to re-send rather than falsely assured the CSMS holds its records. `archived_at` is set only once the S3 put returns.
 
 ### Admin transactions console
 
