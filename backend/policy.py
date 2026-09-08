@@ -52,11 +52,14 @@ STALE_SUSPENDED_BUFFER_SECONDS = 60
 # A CHECK constraint on the column enforces the block; this map is only the
 # source the allocator reads.
 #
-# Blocks are deliberately NOT an environment letter in the invoice number: the
-# serial is a Rule 46(b) statutory field and "staging" has no business on a tax
-# invoice. Contrast the Charger Code (ADR 0028), which IS env-prefixed because
-# it is a display alias with no statutory meaning. Same problem, two mechanisms,
-# for that reason.
+# Blocks are numeric rather than an environment letter for one reason: there is
+# no room for a letter. Rule 46(b) caps the invoice serial at sixteen characters
+# and "F0001/Q/26/00001" spends all sixteen, so the partition had to live inside
+# the digits. Contrast the Asset Code (ADR 0028), which solves the same problem
+# with a distinct per-environment series (VOW / VOWS) because it is NOT part of
+# the serial — it is voluntary descriptive content on the invoice, under no
+# statutory length or charset constraint, so it can afford the clearer
+# mechanism. Same reasoning, two mechanisms, because the budgets differ.
 #
 # Staging's block is closed: it has five franchisees, only two of which ever
 # issued an invoice, and it will not gain more.
@@ -91,9 +94,72 @@ def franchisee_code_block(environment: str) -> tuple[int, int]:
     """Inclusive (low, high) code range this environment may allocate from.
 
     Unknown environments resolve to the staging block, never production's —
-    the same fail-safe direction as ADR 0028's prefix map, so a misconfigured
+    the same fail-safe direction as ADR 0028's series map, so a misconfigured
     box cannot mint a code production might later issue.
     """
     return FRANCHISEE_CODE_BLOCKS.get(
         (environment or "").strip().lower(), FRANCHISEE_CODE_BLOCKS["staging"]
+    )
+
+
+# --- Asset Code series: the customer-facing charger identifier (ADR 0028) ---
+#
+# An Asset Code is an environment series plus a zero-padded integer: VOW0001 in
+# production, VOWS0001 in staging and development. It replaces the
+# charge_point_string_id UUID on every customer surface.
+#
+# The series exists for the same reason FRANCHISEE_CODE_BLOCKS does, and guards
+# the same hazard from the other side: staging serves real paying customers
+# (~11 GST invoices/day as of 2026-08), so both registers mint codes that a real
+# person reads off a real unit and quotes to support. Without a series split,
+# staging's VOW0004 and production's VOW0004 are the same string naming two
+# different chargers — the shape that produced the duplicate VL/F2/ invoice
+# numbers and the qr_payment_{PK} refund collision.
+#
+# Here the partition is a letter rather than a numeric block because, unlike the
+# GST invoice serial, an Asset Code is under no statutory length constraint. It
+# can afford the clearer mechanism.
+CHARGER_CODE_SERIES = {
+    "production": "VOW",
+    "staging": "VOWS",
+    "development": "VOWS",
+}
+
+# Minimum digit width. The code widens by itself past VOW9999 -> VOW10000: no
+# migration, no re-padding, no fleet re-stencil at the boundary. Codes are
+# consumed cumulatively (a retired unit keeps its code so its historical
+# invoices still resolve), so a fixed ceiling would eventually cost a
+# fleet-wide re-stencil plus a permanent discontinuity in the invoice record.
+# Lookup parses the integer rather than matching the string, which is what
+# makes a variable width safe.
+CHARGER_CODE_MIN_WIDTH = 4
+
+# The one place the Asset Code's shape is written down. The DB CHECK in
+# migration 58 is built from these, and so is every Python-side validation, so
+# a format change cannot land in one and not the other. Tests assert against
+# these rather than restating the regex, which is what makes them meaningful.
+CHARGER_CODE_FORMAT_PATTERN = f"^VOWS?[0-9]{{{CHARGER_CODE_MIN_WIDTH},}}$"
+
+
+def charger_code_series_pattern(environment: str) -> str:
+    """Regex accepting only the codes this environment may hold.
+
+    Note VOW is a strict prefix of VOWS, so production's pattern must not
+    accidentally admit a staging code. It does not: the character after `VOW`
+    is required to be a digit, and `S` is not.
+    """
+    series = charger_code_series(environment)
+    return f"^{series}[0-9]{{{CHARGER_CODE_MIN_WIDTH},}}$"
+
+
+def charger_code_series(environment: str) -> str:
+    """The Asset Code series this environment may mint.
+
+    Unknown, empty or None environments resolve to the STAGING series, never
+    production's. A misconfigured box must not be able to mint a
+    production-looking code — the failure is silent and the collision it
+    creates is permanent, because the code lands on issued GST invoices.
+    """
+    return CHARGER_CODE_SERIES.get(
+        (environment or "").strip().lower(), CHARGER_CODE_SERIES["staging"]
     )

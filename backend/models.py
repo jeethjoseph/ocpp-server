@@ -3,6 +3,7 @@ import enum
 from datetime import date
 from tortoise.models import Model
 from tortoise import fields
+from tortoise.signals import pre_save
 from tortoise.contrib.pydantic import pydantic_model_creator
 
 # Enums
@@ -30,6 +31,24 @@ class ChargerStatusEnum(str, enum.Enum):
 class ChargerAvailabilityEnum(str, enum.Enum):
     OPERATIVE = "Operative"
     INOPERATIVE = "Inoperative"
+
+class ChargerPurposeEnum(str, enum.Enum):
+    """What a charger is FOR — serviceability, not state and not identity.
+
+    Deliberately one enum rather than two booleans: every TEST unit is
+    non-public, so is_test + is_public would admit a bench unit advertised as
+    bookable, and the behaviours do not decompose anyway (TEST gates billing,
+    PRIVATE would gate only visibility).
+
+    PRIVATE (real hardware, real billing, not advertised) is in ADR 0028 but has
+    no instance in the fleet, so it is deliberately NOT declared here. Tortoise
+    renders a CharEnumField as a plain VARCHAR with no DB enum type or CHECK
+    (see migration 42 for `availability`), so declaring PRIVATE later needs no
+    data migration. Do not add it speculatively.
+    """
+
+    PUBLIC = "PUBLIC"
+    TEST = "TEST"
 
 class ConnectorTypeEnum(str, enum.Enum):
     """Canonical connector types. Physical behavior (start gate, suspend
@@ -337,6 +356,47 @@ class Charger(Model):
         ChargerAvailabilityEnum,
         default=ChargerAvailabilityEnum.OPERATIVE,
     )
+
+    # The Asset Code — the customer-facing identifier (ADR 0028). An
+    # environment series plus a zero-padded integer: VOW0001 production,
+    # VOWS0001 staging/development.
+    #
+    # System-allocated at creation, never typed, never reused, gaps never
+    # backfilled. It names the PHYSICAL UNIT, not a position, so it survives a
+    # station re-parent and a replacement unit brings its own rather than
+    # inheriting the dead one's. Bears no relationship to `name`.
+    #
+    # NOT NULL: every charger has a code, bench units included. Nothing about
+    # the code says what a unit is for — that is `purpose`. The rejected
+    # alternative (nullable for TEST, with a two-column CHECK and a
+    # mint-on-promotion path) lost on call-site count: 19 admin/franchisee
+    # surfaces render charger identity against 3 customer-facing ones, and
+    # admin surfaces are exactly where bench units appear, so a nullable code
+    # puts a null-branch everywhere it would actually be hit.
+    #
+    # Do not write to it directly — allocation goes through
+    # services.charger_code_service, and a code is immutable once assigned.
+    asset_code = fields.CharField(max_length=12, unique=True)
+
+    # Serviceability — orthogonal to BOTH `latest_status` (what the charger
+    # reports) and `availability` (what an admin commanded on serviceable
+    # hardware). Marking a bench unit Inoperative would conflate "temporarily
+    # withdrawn" with "not fleet hardware at all". See ADR 0008 and ADR 0028.
+    #
+    # The PUBLIC default is load-bearing: it makes every gate that reads this
+    # column FAIL OPEN, so a row missed by any backfill keeps billing and stays
+    # visible rather than silently going dark.
+    purpose = fields.CharEnumField(
+        ChargerPurposeEnum,
+        # Explicit, and wider than the longest declared member. Tortoise
+        # otherwise sizes the VARCHAR to the longest value it can see (6, for
+        # PUBLIC), which would make declaring ADR 0028's PRIVATE later an
+        # ALTER rather than the free change the ADR claims it is. Seven
+        # characters buys that promise for nothing.
+        max_length=7,
+        default=ChargerPurposeEnum.PUBLIC,
+    )
+
     last_heart_beat_time = fields.DatetimeField(null=True)
 
     # SHA-256 of the Charger Auth Key — the per-unit machine credential from
@@ -359,6 +419,31 @@ class Charger(Model):
 
     class Meta:
         table = "charger"
+
+@pre_save(Charger)
+async def allocate_asset_code(sender, instance: Charger, using_db, update_fields):
+    """Give every charger an Asset Code at insert time (ADR 0028).
+
+    Lives here rather than in the create endpoint so the invariant is
+    structural: no creation path — the admin API, a seed script, a future bulk
+    import or OCPI onboarding — can produce a charger without a code. That is
+    the same reasoning that makes the code system-allocated in the first place;
+    an invariant enforced only at one call site is an invariant with a
+    deadline.
+
+    Allocation comes from a Postgres sequence, so concurrent creates cannot
+    collide and there is no retry to get wrong. See migration 60.
+
+    Cheap on the hot path: chargers are saved constantly by the heartbeat and
+    StatusNotification handlers, and every one of those already has a code, so
+    this costs a single attribute check and returns.
+    """
+    if instance.asset_code:
+        return
+    from services.charger_code_service import next_asset_code
+
+    instance.asset_code = await next_asset_code(using_db=using_db)
+
 
 class Connector(Model):
     id = fields.IntField(pk=True)

@@ -16,7 +16,7 @@ from auth_middleware import require_admin, require_user_or_admin
 from crud import log_audit_event
 from services.tariff_utils import back_calc_base_rate
 from services.charger_type_service import canonical_connector_type
-from services import charger_auth_service
+from services import charger_auth_service, charger_code_service
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +91,12 @@ class ChargerResponse(BaseModel):
     # Admin-set availability ("Operative" | "Inoperative"). Distinct from
     # latest_status — the UI toggle reads THIS field. See ADR 0008.
     availability: str
+    # The customer-facing Asset Code (ADR 0028). Admin surfaces show it
+    # alongside charge_point_string_id, which stays visible here because ops
+    # needs the OCPP identity for log correlation and firmware deploys.
+    asset_code: Optional[str]
+    # Serviceability: PUBLIC | TEST. Drives the TEST badge in the admin UI.
+    purpose: str
     last_heart_beat_time: Optional[datetime]
     connection_status: bool
     # Whether a Charger Auth Key has been provisioned. A boolean, never the hash
@@ -240,6 +246,12 @@ def charger_to_response(
             if hasattr(charger.availability, "value")
             else str(charger.availability)
         ),
+        asset_code=charger.asset_code,
+        purpose=(
+            charger.purpose.value
+            if hasattr(charger.purpose, "value")
+            else str(charger.purpose)
+        ),
         last_heart_beat_time=charger.last_heart_beat_time,
         has_auth_key=bool(charger.auth_key_hash),
         created_at=charger.created_at,
@@ -365,6 +377,58 @@ async def list_chargers(
         limit=limit
     )
 
+
+
+async def _create_charger_rows(charger_data: "ChargerCreate", canonical_types, charge_point_id: str):
+    """Write the Charger, its Connectors and its Tariff as one unit.
+
+    All three writes must succeed or fail together — a partial failure would
+    leave an orphan charger row with no connectors or no tariff (issue 05 / M6).
+    The audit log deliberately stays OUTSIDE this, so the "operator tried"
+    trail survives a rollback.
+
+    No Asset Code handling here on purpose. The code is allocated by the
+    `allocate_asset_code` pre_save hook from a Postgres sequence, which is
+    concurrency-safe — so there is no collision to retry and no creation path
+    that can forget. See ADR 0028.
+    """
+    async with in_transaction():
+        charger = await Charger.create(
+            charge_point_string_id=charge_point_id,
+            external_charger_id=charger_data.external_charger_id,
+            station_id=charger_data.station_id,
+            name=charger_data.name,
+            model=charger_data.model,
+            vendor=charger_data.vendor,
+            serial_number=charger_data.serial_number,
+            latest_status="Unavailable"
+        )
+
+        for connector_input, canonical_type in zip(charger_data.connectors, canonical_types):
+            await Connector.create(
+                charger_id=charger.id,
+                connector_id=connector_input.connector_id,
+                connector_type=canonical_type,
+                max_power_kw=connector_input.max_power_kw
+            )
+
+        # Create charger-specific tariff if provided. The operator types the
+        # GST-inclusive, gateway-exclusive rate; we back-calc the base rate
+        # server-side and persist both. ADR 0026.
+        if charger_data.rate_gst_included is not None:
+            gst_default = Tariff._meta.fields_map["gst_percent"].default
+            gst = Decimal(str(gst_default))
+            gst_incl = Decimal(str(charger_data.rate_gst_included))
+            rate = back_calc_base_rate(gst_incl, gst)
+            await Tariff.create(
+                charger=charger,
+                rate_per_kwh=rate,
+                rate_gst_included=gst_incl,
+                gst_percent=gst,
+            )
+    return charger
+
+
 @router.post("", response_model=dict, status_code=201)
 async def create_charger(charger_data: ChargerCreate, admin_user: User = Depends(require_admin())):
     """Onboard a new charger"""
@@ -387,45 +451,9 @@ async def create_charger(charger_data: ChargerCreate, admin_user: User = Depends
     charge_point_id = str(uuid.uuid4())
 
     try:
-        # All three writes (Charger + Connectors + Tariff) must succeed or fail
-        # together — otherwise a partial-failure scenario leaves an orphan
-        # charger row with no connectors or no tariff. Issue 05 / M6.
-        # Audit log stays OUTSIDE the transaction so the "we attempted this"
-        # trail is preserved even on rollback.
-        async with in_transaction():
-            charger = await Charger.create(
-                charge_point_string_id=charge_point_id,
-                external_charger_id=charger_data.external_charger_id,
-                station_id=charger_data.station_id,
-                name=charger_data.name,
-                model=charger_data.model,
-                vendor=charger_data.vendor,
-                serial_number=charger_data.serial_number,
-                latest_status="Unavailable"
-            )
-
-            for connector_input, canonical_type in zip(charger_data.connectors, canonical_types):
-                await Connector.create(
-                    charger_id=charger.id,
-                    connector_id=connector_input.connector_id,
-                    connector_type=canonical_type,
-                    max_power_kw=connector_input.max_power_kw
-                )
-
-            # Create charger-specific tariff if provided. The operator types
-            # the GST-inclusive, gateway-exclusive rate; we back-calc the base
-            # rate server-side and persist both. ADR 0026.
-            if charger_data.rate_gst_included is not None:
-                gst_default = Tariff._meta.fields_map["gst_percent"].default
-                gst = Decimal(str(gst_default))
-                gst_incl = Decimal(str(charger_data.rate_gst_included))
-                rate = back_calc_base_rate(gst_incl, gst)
-                await Tariff.create(
-                    charger=charger,
-                    rate_per_kwh=rate,
-                    rate_gst_included=gst_incl,
-                    gst_percent=gst,
-                )
+        charger = await _create_charger_rows(
+            charger_data, canonical_types, charge_point_id,
+        )
 
         await log_audit_event(
             action="charger.created",

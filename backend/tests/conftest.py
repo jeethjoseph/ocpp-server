@@ -132,6 +132,18 @@ async def client() -> AsyncGenerator[AsyncClient, None]:
         else:
             await Tortoise.generate_schemas()
 
+        # Asset Code allocation reads a Postgres sequence (migration 60), and
+        # `generate_schemas` only builds what models.py declares — Tortoise has
+        # no sequence concept. Create it here so the `allocate_asset_code`
+        # pre_save hook works in tests exactly as it does in a real register.
+        # Reset per test, so codes are predictable rather than depending on how
+        # many chargers earlier tests happened to create.
+        from tortoise import connections as _seq_conn
+        await _seq_conn.get("default").execute_script(
+            "CREATE SEQUENCE IF NOT EXISTS charger_asset_code_seq;"
+            " SELECT setval('charger_asset_code_seq', 1, false);"
+        )
+
         # Clean up database before each test (order matters for FK constraints)
         from models import (
             WalletTransaction, MeterValue,
