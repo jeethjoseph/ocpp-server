@@ -7,21 +7,12 @@ disagreeing-fallback problem across three call-site families is exactly what
 ADR 0028 exists to end, and it returns the moment two callers each build the
 string themselves.
 """
-import logging
 import os
-import re
 
 from tortoise import connections
 
-from policy import (
-    CHARGER_CODE_FORMAT_PATTERN,
-    CHARGER_CODE_MIN_WIDTH,
-    charger_code_series,
-)
+from policy import CHARGER_CODE_MIN_WIDTH, charger_code_series
 
-logger = logging.getLogger(__name__)
-
-_FORMAT_RE = re.compile(CHARGER_CODE_FORMAT_PATTERN)
 
 def current_series() -> str:
     """The Asset Code series this register may mint."""
@@ -69,11 +60,6 @@ def parse_asset_code(raw: str, series: str | None = None) -> int | None:
             value = int(digits)
             return value if value >= 1 else None
     return None
-
-
-def is_valid_asset_code(value: str) -> bool:
-    """Whether a string is a well-formed Asset Code in ANY series."""
-    return bool(value) and bool(_FORMAT_RE.match(value))
 
 
 ASSET_CODE_SEQUENCE = "charger_asset_code_seq"
