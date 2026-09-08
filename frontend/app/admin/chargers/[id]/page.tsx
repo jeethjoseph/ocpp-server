@@ -1,7 +1,7 @@
 "use client";
 
 import { useParams } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -111,12 +111,17 @@ export default function ChargerDetailPage() {
   const { data: transactionData } = useAdminTransaction(transactionIdToShow || 0);
   const transaction = transactionData?.transaction;
 
-  // Track last known transaction ID for persistence
-  useEffect(() => {
+  // Track last known transaction ID for persistence. Derived during render
+  // with the previous-value pattern rather than an effect, so the sticky id is
+  // already correct in the same commit.
+  const [prevTransactionId, setPrevTransactionId] =
+    useState(currentTransactionId);
+  if (prevTransactionId !== currentTransactionId) {
+    setPrevTransactionId(currentTransactionId);
     if (currentTransactionId) {
       setLastTransactionId(currentTransactionId);
     }
-  }, [currentTransactionId]);
+  }
 
   // Meter values query - only enabled if there's a transaction
   const { data: meterValuesData } = useAdminTransactionMeterValues(

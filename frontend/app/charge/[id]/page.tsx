@@ -1,7 +1,7 @@
 "use client";
 
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -64,12 +64,17 @@ export default function UserChargePage() {
   const meterValues = meterValuesData?.meter_values || [];
   const latestMeterValue = meterValues[meterValues.length - 1];
 
-  useEffect(() => {
+  // Derived during render with the previous-value pattern rather than an
+  // effect, so both values are correct in the same commit.
+  const [prevTransactionId, setPrevTransactionId] =
+    useState(currentTransactionId);
+  if (prevTransactionId !== currentTransactionId) {
+    setPrevTransactionId(currentTransactionId);
     if (currentTransactionId) {
       setLastTransactionId(currentTransactionId);
     }
     setHasActiveTransaction(!!currentTransactionId);
-  }, [currentTransactionId]);
+  }
 
   // Clear transaction handler (like admin page)
   const clearTransaction = () => {

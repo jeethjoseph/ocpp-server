@@ -47,8 +47,14 @@ export default function StationsPage() {
         }
       );
     } else {
-      // Default location if geolocation not supported
-      setUserLocation({ lat: 37.7749, lng: -122.4194 });
+      // Geolocation unsupported: apply the fallback on a later tick so it is
+      // not a synchronous state write in the effect body
+      // (react-hooks/set-state-in-effect).
+      const timer = setTimeout(
+        () => setUserLocation({ lat: 37.7749, lng: -122.4194 }),
+        0
+      );
+      return () => clearTimeout(timer);
     }
   }, []);
 

@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { AdminOnly } from "@/components/RoleWrapper";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
@@ -117,10 +117,19 @@ export default function AdminFirmwarePage() {
     );
   };
 
+  // Reading the clock while rendering is impure (react-hooks/purity). Hold
+  // "now" in state and tick it once a minute — this also keeps the relative
+  // labels live instead of frozen at mount.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 60_000);
+    return () => clearInterval(id);
+  }, []);
+
   const formatRelative = (iso?: string): string => {
     if (!iso) return "—";
     const target = new Date(iso).getTime();
-    const diff = target - Date.now();
+    const diff = target - now;
     const absMin = Math.abs(diff) / 60000;
     if (absMin < 1) return diff > 0 ? "in <1m" : "<1m ago";
     if (absMin < 60) return `${diff > 0 ? "in " : ""}${Math.round(absMin)}m${diff > 0 ? "" : " ago"}`;

@@ -297,7 +297,7 @@ export interface RevenueBreakdown {
   tds_amount?: number | null;
 }
 
-export interface ApiResponse<T = any> {
+export interface ApiResponse<T = unknown> {
   success?: boolean;
   message: string;
   data?: T;
@@ -328,7 +328,7 @@ export interface UserDetail extends UserListItem {
   avatar_url?: string;
   terms_accepted_at?: string;
   preferred_language: string;
-  notification_preferences: Record<string, any>;
+  notification_preferences: Record<string, unknown>;
 }
 
 export interface UserListResponse {
@@ -358,12 +358,19 @@ export interface UserChargingTransaction {
   stop_reason?: string;
 }
 
+/**
+ * Free-form gateway metadata. Values are rendered directly into JSX, so the
+ * value type stays renderable rather than `unknown` — a bare `unknown` here
+ * fails the build at the render sites in admin/users/[id]/wallet.
+ */
+export type JsonMetadata = Record<string, string | number | boolean | null>;
+
 export interface UserWalletTransaction {
   id: number;
   amount: number;
   type: string;
   description?: string;
-  payment_metadata?: Record<string, any>;
+  payment_metadata?: JsonMetadata;
   created_at: string;
 }
 

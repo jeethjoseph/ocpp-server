@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useSyncExternalStore, useEffect } from "react";
 import dynamic from "next/dynamic";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -71,6 +71,16 @@ const VPA_LEGACY_KEY = "voltlync.lastVpa";
 const VPA_INPUT_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9.\-_]{0,253}@[a-zA-Z][a-zA-Z0-9]{1,}$/;
 // MUST stay in sync with VPA_PATTERN in backend/core/validators.py.
 
+// Nothing else in this tab mutates the key, so the subscription is inert —
+// the value is read once at mount and then owned by component state.
+function subscribeStoredVpa(): () => void {
+  return () => {};
+}
+
+function getServerVpaSnapshot(): string {
+  return "";
+}
+
 function readStoredVpa(): string {
   if (typeof window === "undefined") return "";
   try {
@@ -125,7 +135,18 @@ function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: numbe
 }
 
 export default function MyChargesPage() {
-  const [vpaInput, setVpaInput] = useState("");
+  // The stored VPA is an external store read only after mount.
+  // useSyncExternalStore gives SSR an explicit "" snapshot so the prerendered
+  // input matches the first client render, then the stored value takes over.
+  // Replaces a mount effect that called setState (react-hooks/set-state-in-effect).
+  const storedVpa = useSyncExternalStore(
+    subscribeStoredVpa,
+    readStoredVpa,
+    getServerVpaSnapshot
+  );
+  const [vpaOverride, setVpaOverride] = useState<string | null>(null);
+  const vpaInput = vpaOverride ?? storedVpa;
+  const setVpaInput = (next: string) => setVpaOverride(next);
   const [searchedVpa, setSearchedVpa] = useState("");
   const [statusFilter, setStatusFilter] = useState("ALL");
   const [currentPage, setCurrentPage] = useState(1);
@@ -150,12 +171,6 @@ export default function MyChargesPage() {
   const activeSessions = activeSessionsQuery.data?.data ?? [];
 
   const totalPages = data ? Math.ceil(data.total / limit) : 1;
-
-  // Pre-fill VPA from localStorage (but don't auto-search; the user taps to commit)
-  useEffect(() => {
-    const stored = readStoredVpa();
-    if (stored) setVpaInput(stored);
-  }, []);
 
   // Get user location
   useEffect(() => {
