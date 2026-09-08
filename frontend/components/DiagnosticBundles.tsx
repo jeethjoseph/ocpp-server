@@ -72,6 +72,28 @@ export default function DiagnosticBundles({ chargerId }: { chargerId: number }) 
       ? `${(bytes / 1024 / 1024).toFixed(1)} MB`
       : `${(bytes / 1024).toFixed(1)} KB`;
 
+  // The API already hands back IST-offset ISO strings, but the zone is passed
+  // explicitly anyway: rendering without it would follow the viewer's browser,
+  // which is not the same thing as IST (repo-wide rule, ADR 0012).
+  const formatIst = (iso: string) =>
+    new Date(iso).toLocaleString("en-IN", {
+      timeZone: "Asia/Kolkata",
+      hour12: false,
+    });
+
+  const formatIstTime = (iso: string) =>
+    new Date(iso).toLocaleTimeString("en-IN", {
+      timeZone: "Asia/Kolkata",
+      hour12: false,
+    });
+
+  const formatDuration = (seconds: number) =>
+    seconds >= 3600
+      ? `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`
+      : seconds >= 60
+        ? `${Math.floor(seconds / 60)}m ${seconds % 60}s`
+        : `${seconds}s`;
+
   return (
     <Card>
       <CardHeader className="flex flex-row items-center justify-between space-y-0">
@@ -128,8 +150,7 @@ export default function DiagnosticBundles({ chargerId }: { chargerId: number }) 
               <thead>
                 <tr className="border-b text-left text-xs uppercase text-muted-foreground">
                   <th className="py-2 pr-4">Received (IST)</th>
-                  <th className="py-2 pr-4">Seq</th>
-                  <th className="py-2 pr-4">Records</th>
+                  <th className="py-2 pr-4">Window (IST)</th>
                   <th className="py-2 pr-4">Size</th>
                   <th className="py-2 pr-4">Loss</th>
                   <th className="py-2" />
@@ -139,34 +160,66 @@ export default function DiagnosticBundles({ chargerId }: { chargerId: number }) 
                 {bundles.map((bundle) => (
                   <tr key={bundle.id} className="border-b last:border-0">
                     <td className="py-2 pr-4 font-mono text-xs">
-                      {new Date(bundle.received_at_ist).toLocaleString("en-IN", {
-                        timeZone: "Asia/Kolkata",
-                      })}
+                      {formatIst(bundle.received_at_ist)}
                     </td>
                     <td className="py-2 pr-4 font-mono text-xs tabular-nums">
-                      {bundle.epoch > 0 && (
-                        <span className="text-muted-foreground">
-                          e{bundle.epoch}/
+                      {/* When the records were written, not when they arrived.
+                          Null is a real state — nothing in the body anchored —
+                          so it is shown as such rather than as a zero. */}
+                      {bundle.window_start_ist && bundle.window_end_ist ? (
+                        <>
+                          {formatIstTime(bundle.window_start_ist)}–
+                          {formatIstTime(bundle.window_end_ist)}
+                          {bundle.time_approximate && (
+                            // Load-bearing: an approximate window fell back to
+                            // receipt time, and must never be read as evidence
+                            // of loss (ADR 0030).
+                            <span
+                              className="ml-1 text-muted-foreground"
+                              title="Approximate — derived from receipt time or only some segments; not evidence of loss"
+                            >
+                              ~approx
+                            </span>
+                          )}
+                        </>
+                      ) : (
+                        <span
+                          className="text-muted-foreground"
+                          title="No TIME_SYNC anchor in the body — the window is unknown, not empty"
+                        >
+                          —
                         </span>
                       )}
-                      {bundle.bundle_seq}
-                    </td>
-                    <td className="py-2 pr-4 tabular-nums">
-                      {bundle.first_record ?? "?"}–{bundle.last_record ?? "?"}
                     </td>
                     <td className="py-2 pr-4 tabular-nums">
                       {formatBytes(bundle.size_bytes)}
                     </td>
                     <td className="py-2 pr-4">
                       {bundle.lossy ? (
-                        // The two causes need different remedies, so they are
-                        // labelled rather than merged into one "missing" count.
-                        <Badge variant="destructive" className="gap-1">
-                          <AlertTriangle className="h-3 w-3" />
-                          {bundle.overflow_delta > 0
-                            ? `${bundle.overflow_delta} overwritten`
-                            : `${bundle.gap_records} missing`}
-                        </Badge>
+                        // Never a count of lost records: that number is not
+                        // obtainable any more, because it needed a counter the
+                        // charger cannot keep across a reboot (ADR 0030). A ring
+                        // wrap says overwriting is happening *now*; a silence is
+                        // measured time, not records. `lossy` is computed
+                        // server-side against the gap threshold, so when there
+                        // are no wraps the silence is definitionally the cause.
+                        <div className="flex flex-wrap gap-1">
+                          {bundle.ring_wrap_events > 0 && (
+                            <Badge variant="destructive" className="gap-1">
+                              <AlertTriangle className="h-3 w-3" />
+                              {bundle.ring_wrap_events} ring wrap
+                              {bundle.ring_wrap_events === 1 ? "" : "s"}
+                            </Badge>
+                          )}
+                          {bundle.ring_wrap_events === 0 &&
+                            bundle.gap_before_seconds !== null && (
+                              <Badge variant="destructive" className="gap-1">
+                                <AlertTriangle className="h-3 w-3" />
+                                {formatDuration(bundle.gap_before_seconds)}{" "}
+                                silence
+                              </Badge>
+                            )}
+                        </div>
                       ) : (
                         <Badge variant="outline">Complete</Badge>
                       )}

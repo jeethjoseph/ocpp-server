@@ -553,27 +553,6 @@ class DiagnosticBundle(Model):
     created_at = fields.DatetimeField(auto_now_add=True, index=True)
     charger = fields.ForeignKeyField("models.Charger", related_name="diagnostic_bundles", index=True)
 
-    # Superseded by the content digest (ADR 0030). Nullable and no longer
-    # written; dropped by a later migration once the UTC window has been
-    # observed on real traffic. Kept for now so historical values survive if
-    # the replacement underperforms.
-    # Superseded by the content digest (ADR 0030). Nullable and no longer
-    # written; dropped by a later migration once the UTC window has been
-    # observed on real traffic. Kept for now so historical values survive if
-    # the replacement underperforms.
-    epoch = fields.IntField(null=True)
-
-    # Firmware-reported header fields (#VLTDIAG/1).
-    bundle_seq = fields.IntField(null=True)
-    boot = fields.IntField(null=True)
-    first_record = fields.IntField(null=True)
-    last_record = fields.IntField(null=True)
-    overflow = fields.IntField(null=True)
-
-    # Derived on ingest by comparing against this charger's previous bundle.
-    overflow_delta = fields.IntField(null=True)
-    gap_records = fields.IntField(null=True)
-
     # When this bundle's records were actually written, reconstructed from the
     # in-band TIME_SYNC anchors (ADR 0030). Null when nothing in the body
     # anchored — a real state, not an error. `time_approximate` marks a window
@@ -590,9 +569,10 @@ class DiagnosticBundle(Model):
     ring_wrap_events = fields.IntField(default=0)
 
     # SHA-256 of the raw body with any legacy `#VLTDIAG/` line stripped — the
-    # bundle's identity (ADR 0030), replacing `(epoch, bundle_seq)`. Nullable
-    # because rows predating the change have no digest; Postgres treats NULLs as
-    # distinct, so those rows do not collide under the unique constraint.
+    # bundle's identity (ADR 0030). Nullable only because rows written before
+    # the digest existed have none; Postgres treats NULLs as distinct, so those
+    # rows do not collide under the unique constraint. Every row written since
+    # has one.
     content_sha256 = fields.CharField(max_length=64, null=True)
 
     s3_key = fields.CharField(max_length=512)
@@ -610,7 +590,6 @@ class DiagnosticBundle(Model):
 
     size_bytes = fields.IntField()
     line_count = fields.IntField(default=0)
-    header_valid = fields.BooleanField(null=True)
 
     class Meta:
         table = "diagnostic_bundle"

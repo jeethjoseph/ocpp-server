@@ -1085,18 +1085,27 @@ export interface DiagnosticBundle {
   id: number;
   charger_id: number;
   charge_point_string_id: string;
-  epoch: number;
-  bundle_seq: number;
-  boot: number | null;
-  first_record: number | null;
-  last_record: number | null;
-  overflow: number | null;
-  overflow_delta: number;
-  gap_records: number;
+  /** Identity of the bundle: SHA-256 of the body (ADR 0030). Null on rows
+   *  written before the digest existed. */
+  content_sha256: string | null;
   size_bytes: number;
   line_count: number;
-  header_valid: boolean;
   received_at_ist: string;
+  /** When the records were *written*, reconstructed from the body's own
+   *  TIME_SYNC anchors. Null when nothing in the body anchored — a real
+   *  state, not an error. */
+  window_start_ist: string | null;
+  window_end_ist: string | null;
+  /** The window fell back to receipt time, or was derived from only some
+   *  segments. Such a window must never be read as evidence of loss. */
+  time_approximate: boolean;
+  /** Silence between the previous bundle's end and this one's start. Derived
+   *  server-side at read time; null when either side is approximate, because
+   *  the arithmetic would be invented rather than measured. */
+  gap_before_seconds: number | null;
+  /** Count of `ring wrapped mid-upload` lines. A RECENCY signal — the buffer
+   *  is destroying undelivered records right now — never a running total. */
+  ring_wrap_events: number;
   lossy: boolean;
 }
 
