@@ -82,3 +82,30 @@ async def next_asset_code(using_db=None) -> str:
         f"SELECT nextval('{ASSET_CODE_SEQUENCE}') AS value"
     )
     return format_asset_code(int(rows[0]["value"]))
+
+
+async def resolve_charger(reference: str):
+    """Resolve a customer-supplied charger reference to a Charger, or None.
+
+    Accepts EITHER an Asset Code or a `charge_point_string_id`, and that is the
+    point: it lets the QR landing page move to `/charge/VOW0001` without
+    breaking a single link that already exists in a browser history, a bookmark,
+    or a sticker printed before the change. Old references keep resolving
+    forever; new ones stop publishing the OCPP identity.
+
+    The Asset Code is tried FIRST and only when the reference actually parses as
+    one for this register. A foreign-series code falls through to the UUID
+    branch and finds nothing, which is correct — it must not resolve to the
+    local unit with the same number.
+    """
+    from models import Charger
+
+    number = parse_asset_code(reference)
+    if number is not None:
+        charger = await Charger.filter(asset_code=format_asset_code(number)).first()
+        if charger is not None:
+            return charger
+
+    # Legacy path: the OCPP identity. Retained indefinitely for links that
+    # predate the Asset Code.
+    return await Charger.filter(charge_point_string_id=reference).first()

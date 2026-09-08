@@ -264,14 +264,18 @@ export default function ChargerDetailPage() {
   const isActionLoading =
     remoteStartMutation.isPending || remoteStopMutation.isPending;
 
-  const qrUrl = `${process.env.NEXT_PUBLIC_APP_URL || "https://www.powerlync.com"}/charge/${charger?.charge_point_string_id}`;
+  // The landing page is addressed by Asset Code, not the OCPP identity — that
+  // UUID is the Basic Auth username for the diagnostics upload endpoint, and a
+  // QR sticker is the last place it should be printed. The route still accepts
+  // a charge_point_string_id, so anything generated before this keeps working.
+  const qrUrl = `${process.env.NEXT_PUBLIC_APP_URL || "https://www.powerlync.com"}/charge/${charger?.asset_code}`;
 
   const handleDownloadQr = () => {
     const canvas = document.getElementById("qr-canvas") as HTMLCanvasElement | null;
     if (!canvas) return;
     const url = canvas.toDataURL("image/png");
     const link = document.createElement("a");
-    link.download = `qr-${charger?.charge_point_string_id || "charger"}.png`;
+    link.download = `qr-${charger?.asset_code || "charger"}.png`;
     link.href = url;
     link.click();
   };

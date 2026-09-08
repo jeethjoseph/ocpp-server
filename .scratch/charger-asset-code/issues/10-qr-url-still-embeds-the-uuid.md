@@ -1,12 +1,14 @@
 # The QR sticker URL still embeds the OCPP UUID
 
-Status: needs-triage
-Severity: raised 2026-09-09 — see Correction below
+Status: done
+Severity: was raised 2026-09-09; resolved same day
 
 ## What to build
 
-Nothing yet — this is the residue slice 04 could not remove, filed so it is a
-decision rather than an oversight.
+*(Original framing, kept for the record. It was resolved — see RESOLVED below.)*
+
+The residue slice 04 could not remove, filed so it is a decision rather than an
+oversight.
 
 ADR 0028 opens by observing that `charge_point_string_id` is a UUID4 that
 doubles as the OCPP WSS path segment **and** the HTTP Basic Auth **username**
@@ -28,7 +30,48 @@ Nothing renders it any more, which was the ticket's acceptance criterion. But
 difference is worth being explicit about rather than letting the closed ticket
 suggest the exposure is gone.
 
-## Why it was not fixed in slice 04
+## RESOLVED (2026-09-09)
+
+The premise below — that the route could not change without a fleet re-sticker —
+was **wrong**, and it was wrong because two different QR codes were conflated:
+
+- The **appless payment QR** is a Razorpay-hosted **UPI** QR (`ChargerQRCode`,
+  `razorpay_qr_code_id`, created in `routers/qr_codes.py`). Scanning it opens a
+  UPI app. It never contained our URL and was never affected.
+- The `/charge/{ref}` URL is a separate **app deep link**, generated as a
+  downloadable PNG from the admin charger detail page and read by the in-app
+  scanner.
+
+Only the second one carried the UUID, and it is not what is stuck on the fleet
+for payments. Evidence that it was barely load-bearing at all: the scanner's own
+regex was `/\/charge\/(\d+)$/` — **numeric only** — so it could not even parse
+the UUID link the admin console generated. That path was already broken.
+
+### What changed
+
+- `charger_code_service.resolve_charger()` accepts **either** an Asset Code or a
+  `charge_point_string_id`. All three `/api/users/charger/{ref}` endpoints
+  (detail, remote-start, remote-stop) use it. Accepting both is what makes this
+  safe: every link already in a browser history, bookmark or printed sheet keeps
+  resolving indefinitely, while nothing new emits the UUID.
+- The admin console now generates `/charge/{asset_code}` and names the download
+  `qr-VOW0001.png`.
+- The scanner accepts an Asset Code, a legacy numeric id, or a UUID — it is no
+  longer narrower than the route it navigates to.
+- **`charge_point_string_id` is gone from the public `/stations` payload.** It
+  was only ever a React list key there; `asset_code` serves that.
+
+The OCPP identity is no longer published on any unauthenticated surface, so the
+enumerable-username exposure on `POST /api/diagnostics/bundles` is closed.
+
+### Still open, deliberately
+
+Rate-limiting on the diagnostics upload endpoint was **not** reviewed as part of
+this. It is worth doing on its own merits — usernames being no longer enumerable
+is not the same as the endpoint being hard to brute-force — but it is unrelated
+to the Asset Code and belongs in its own ticket.
+
+## Why it was not fixed in slice 04 (superseded — see above)
 
 The route cannot change without invalidating every physical sticker on the
 fleet. Fixing it properly means introducing a **second, public-facing handle**

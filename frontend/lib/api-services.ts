@@ -111,9 +111,10 @@ export const chargerService = {
 
   getById: (id: number) => api.get<ChargerDetail>(`/api/admin/chargers/${id}`),
 
-  // User-facing endpoint that accepts string IDs (charge_point_string_id)
-  getByStringId: (chargePointId: string) =>
-    api.get<ChargerDetail>(`/api/users/charger/${chargePointId}`),
+  // User-facing lookup. Accepts an Asset Code (VOW0001) or, for links that
+  // predate it, a charge_point_string_id. See ADR 0028.
+  getByStringId: (chargerRef: string) =>
+    api.get<ChargerDetail>(`/api/users/charger/${chargerRef}`),
 
   create: (data: ChargerCreate) =>
     api.post<ApiResponse<{ charger: Charger; ocpp_url: string }>>(
@@ -231,7 +232,13 @@ export const transactionService = {
 
 // Public stations service for user-facing pages
 export interface PublicStationChargerInfo {
-  charge_point_string_id: string;
+  /**
+   * The Asset Code (VOW0001). The OCPP identity is deliberately NOT in this
+   * payload — it is the Basic Auth username for the diagnostics upload
+   * endpoint, so an unauthenticated response must not enumerate it. See
+   * ADR 0028.
+   */
+  asset_code: string;
   name: string;
   latest_status: string;
   connectors: Array<{

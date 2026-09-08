@@ -6,6 +6,7 @@ from decimal import Decimal
 from auth_middleware import require_admin, require_user_or_admin, require_user
 from core.config import wallet_charging_enabled
 from core.roles import INTERNAL_ROLES
+from services import charger_code_service
 from models import User, Transaction, WalletTransaction, Wallet, UserRoleEnum, TransactionStatusEnum, ChargerPurposeEnum
 from schemas import BaseModel
 import logging
@@ -721,7 +722,12 @@ async def get_charger_by_string_id(
 
     try:
         # Look up charger by charge_point_string_id
-        charger = await Charger.filter(charge_point_string_id=charge_point_id).prefetch_related('station__franchisee', 'connectors').first()
+        # Accepts an Asset Code OR a charge_point_string_id, so the QR landing
+        # page can be addressed by the code while every link printed or
+        # bookmarked before the change keeps resolving. ADR 0028.
+        charger = await charger_code_service.resolve_charger(charge_point_id)
+        if charger is not None:
+            await charger.fetch_related('station__franchisee', 'connectors')
 
         if not charger:
             raise HTTPException(status_code=404, detail="Charger not found")
@@ -836,7 +842,7 @@ async def remote_start_by_string_id(
 
     try:
         # Look up charger by charge_point_string_id
-        charger = await Charger.filter(charge_point_string_id=charge_point_id).first()
+        charger = await charger_code_service.resolve_charger(charge_point_id)
 
         if not charger:
             raise HTTPException(status_code=404, detail="Charger not found")
@@ -926,7 +932,7 @@ async def remote_stop_by_string_id(
 
     try:
         # Look up charger by charge_point_string_id
-        charger = await Charger.filter(charge_point_string_id=charge_point_id).first()
+        charger = await charger_code_service.resolve_charger(charge_point_id)
 
         if not charger:
             raise HTTPException(status_code=404, detail="Charger not found")

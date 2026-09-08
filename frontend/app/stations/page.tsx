@@ -234,7 +234,7 @@ export default function StationsPage() {
                       {selectedStation.chargers.map((charger) => {
                         const isAvailable = charger.latest_status === 'AVAILABLE';
                         return (
-                          <div key={charger.charge_point_string_id} className="p-2 bg-gray-50 rounded">
+                          <div key={charger.asset_code} className="p-2 bg-gray-50 rounded">
                             <div className="flex items-center justify-between">
                               <div className="flex items-center space-x-2 min-w-0">
                                 <div className={`w-2 h-2 rounded-full flex-shrink-0 ${
