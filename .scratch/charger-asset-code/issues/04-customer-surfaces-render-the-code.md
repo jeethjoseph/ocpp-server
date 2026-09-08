@@ -1,6 +1,6 @@
 # Customer surfaces render the Asset Code
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 

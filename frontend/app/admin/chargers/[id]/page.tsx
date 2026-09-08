@@ -319,8 +319,24 @@ export default function ChargerDetailPage() {
                 <QrCode className="h-5 w-5" />
               </Button>
             </div>
-            <p className="text-muted-foreground">
-              ID: {charger.charge_point_string_id}
+            <div className="flex items-center gap-2 flex-wrap">
+              <p className="text-muted-foreground">
+                <span className="font-medium">Asset Code:</span>{" "}
+                <span className="font-mono">{charger.asset_code}</span>
+              </p>
+              {charger.purpose === "TEST" && (
+                <span
+                  title="Bench unit — hidden from customers and never billed"
+                  className="px-1.5 py-0.5 text-[10px] font-semibold rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300">
+                  TEST
+                </span>
+              )}
+            </div>
+            {/* OCPP identity stays visible on admin surfaces: ops needs it for
+                log correlation and firmware deploys. It is scrubbed from
+                customer surfaces only. ADR 0028. */}
+            <p className="text-muted-foreground text-sm">
+              OCPP ID: <span className="font-mono">{charger.charge_point_string_id}</span>
             </p>
             {station && (
               <div className="flex items-center gap-2 mt-2">

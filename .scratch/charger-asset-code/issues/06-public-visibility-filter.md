@@ -1,6 +1,6 @@
 # Bench units stop appearing on public surfaces
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 

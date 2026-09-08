@@ -1,6 +1,6 @@
 # Backfill every charger from the explicit map, then flip to NOT NULL
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 

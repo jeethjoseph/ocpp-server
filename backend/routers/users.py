@@ -5,7 +5,8 @@ from decimal import Decimal
 
 from auth_middleware import require_admin, require_user_or_admin, require_user
 from core.config import wallet_charging_enabled
-from models import User, Transaction, WalletTransaction, Wallet, UserRoleEnum, TransactionStatusEnum
+from core.roles import INTERNAL_ROLES
+from models import User, Transaction, WalletTransaction, Wallet, UserRoleEnum, TransactionStatusEnum, ChargerPurposeEnum
 from schemas import BaseModel
 import logging
 
@@ -839,6 +840,14 @@ async def remote_start_by_string_id(
 
         if not charger:
             raise HTTPException(status_code=404, detail="Charger not found")
+
+        # Refuse a bench unit BEFORE any money moves. StartTransaction blocks
+        # it too, but by then a QR customer has already paid and would need a
+        # refund for a session that was never going to start. ADR 0028.
+        if charger.purpose == ChargerPurposeEnum.TEST and current_user.role not in INTERNAL_ROLES:
+            raise HTTPException(
+                status_code=403, detail="This charger is not available for public use"
+            )
 
         # Use the user's RFID card ID as idTag for OCPP identification
         if not current_user.rfid_card_id:

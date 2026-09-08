@@ -695,6 +695,25 @@ The `charger` row carries **two state-shaped columns by design**, captured in **
 
 The two are independent — a `Faulted` charger can be admin-set `Operative`; a `Charging` charger that admin clicks `Inoperative` stays `Charging` (per OCPP `Scheduled` semantics) but flips `availability=Inoperative` immediately. The toggle was previously broken because it read `latest_status` as a proxy for both concerns; this stopped working any time a charger Accepted ChangeAvailability without sending a follow-up StatusNotification. See ADR 0008 for the full rationale and considered alternatives.
 
+**A third, also orthogonal (2026-09-09, ADR 0028):**
+
+- `purpose` (`ChargerPurposeEnum`, `PUBLIC` | `TEST`, default `PUBLIC`): what the unit is **for**. `TEST` is bench/pre-handover hardware — hidden from `/stations`, excluded from `total_chargers`, refused to non-`INTERNAL_ROLES` on RemoteStart and StartTransaction, never billed, never invoiced.
+
+Do not conflate `purpose` with `availability`. Marking a bench unit `Inoperative` would say "temporarily withdrawn" about hardware that was never fleet hardware at all. The `PUBLIC` default is load-bearing: every gate reading it **fails open**, so a row missed by any backfill keeps billing and stays visible.
+
+`purpose = TEST` sessions are never billed or invoiced **without any code in the billing path mentioning it**. Only `INTERNAL_ROLES` can start on a `TEST` unit, and internal-role sessions already skip wallet deduction and GST invoicing per ADR 0004. The suppression is a *consequence*, not a second check — pinned by tests in `test_charger_purpose_gates.py` because it is invisible in `invoice_service.py`.
+
+### Charger identity — Asset Code (2026-09-09, ADR 0028)
+
+`charger.asset_code` (`VARCHAR(12)`, `UNIQUE NOT NULL`) is the **customer-facing** identifier: `VOW0001` in production, `VOWS0001` in staging and development. It replaced `charge_point_string_id` on every customer surface, because that UUID is the OCPP WSS path segment **and** the Basic Auth username — printing it on a GST invoice published half a credential pair.
+
+- **Series** comes from `CHARGER_CODE_SERIES` in `backend/policy.py`, keyed on `ENVIRONMENT`. An unrecognised value resolves to `VOWS`, **never** `VOW`. Migration 58 builds both DB CHECKs from that same source, so the constraint and Python validation cannot drift.
+- **Allocation is a Postgres sequence** (`charger_asset_code_seq`, migration 60) read by a `pre_save` hook on `Charger`, so no creation path can produce a codeless charger. Not `MAX + 1`: that is a read-modify-write and races. Gaps are expected and never reclaimed.
+- **Lookup parses the integer**, so `VOW0001`, `VOW00001` and `vow1` all resolve. A **foreign series resolves to nothing** — never coerced — because both registers mint codes a real person reads off a real unit.
+- **Rendering and parsing live in `services/charger_code_service.py`.** No surface hand-formats.
+- Admin/franchisee surfaces still show `charge_point_string_id`; ops needs it for log correlation and firmware deploys.
+- **Known residue:** the QR sticker URL is still `/charge/{charge_point_string_id}`, encoded in already-printed stickers, so the UUID remains publicly reachable though nothing renders it. See `.scratch/charger-asset-code/issues/10-qr-url-still-embeds-the-uuid.md` — effectively a prerequisite of ADR 0020.
+
 ---
 
 ## Database Schema Quick Reference
@@ -712,7 +731,7 @@ wallet_transaction (id, wallet_id, amount, type, payment_metadata) -- `amount` i
 
 -- Charging Infrastructure
 charging_station (id, name, latitude, longitude, address)
-charger (id, charge_point_string_id, station_id, vendor, model, latest_status, last_heart_beat_time)
+charger (id, charge_point_string_id, asset_code, purpose, station_id, vendor, model, latest_status, availability, last_heart_beat_time)
 connector (id, charger_id, connector_id, connector_type, max_power_kw) -- connector_type: Type2, CCS, CHAdeMO, Socket
 tariff (id, charger_id, rate_per_kwh, tariff_per_kwh_all_in, gst_percent, hsn_sac_code, is_global) -- ADR 0003
 -- `tariff_per_kwh_all_in` DECIMAL(10,4) — operator-typed, customer-displayed all-inclusive rate (incl. GST + synthetic 2% gateway fee). Authoritative for display. Added 2026-05-18 via migration 36; backfilled from `rate_per_kwh × (1 + gst_percent/100)` so customer-facing prices were preserved.
@@ -1045,7 +1064,7 @@ GET /api/public/stations/map - Charger map data with real-time availability (rat
   Note: `price_per_kwh` is the min tax-EXCLUSIVE rate across the station's chargers (kept for compat). All user-facing UI renders the incl-tax range — when min==max the UI shows a single value, otherwise "₹min–₹max/kWh (incl. GST)". Map endpoint deliberately omits per-charger detail for privacy.
 
 GET /api/public/stations - Authenticated station list (full per-charger detail)
-  Response data items include `chargers[]: { charge_point_string_id, name, latest_status, connectors, tariff_per_kwh, tariff_per_kwh_incl_tax, tariff_gst_percent }` plus the station-level `min/max_price_per_kwh_incl_tax`. The /stations detail modal renders per-charger tariff rows from this; the list card uses the station range.
+  Response data items include `chargers[]: { charge_point_string_id (routing only), asset_code, name, latest_status, connectors, tariff_per_kwh, tariff_per_kwh_incl_tax, tariff_gst_percent }` plus the station-level `min/max_price_per_kwh_incl_tax`. The /stations detail modal renders per-charger tariff rows from this; the list card uses the station range.
 
 GET /api/firmware/latest - Get latest firmware for non-OCPP charge points
   Response: { "version", "filename", "download_url", "checksum", "file_size" }

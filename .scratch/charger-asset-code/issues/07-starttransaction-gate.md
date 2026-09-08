@@ -1,6 +1,6 @@
 # A bench unit refuses to charge a customer
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 

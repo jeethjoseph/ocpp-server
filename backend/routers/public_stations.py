@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 from datetime import datetime
 from enum import Enum
 
-from models import ChargingStation, Charger, Connector, Tariff, ChargerStatusEnum, User
+from models import ChargingStation, Charger, Connector, Tariff, ChargerStatusEnum, User, ChargerPurposeEnum
 from tortoise.functions import Count, Sum
 from tortoise.query_utils import Prefetch
 from auth_middleware import require_user
@@ -119,7 +119,21 @@ async def _fetch_stations_with_availability(
 
     qs = station_filter if station_filter is not None else ChargingStation.all()
     stations = await qs.prefetch_related(
-        Prefetch('chargers', queryset=Charger.all().prefetch_related('connectors', 'tariffs'))
+        # SERVICEABILITY filter: bench units are not part of the customer-facing
+        # fleet, so they are neither listed nor counted toward a station's
+        # capacity. Five production units were inflating total_chargers here.
+        #
+        # Deliberately NOT folded into `_filter_real_chargers` below, which is a
+        # LIVENESS predicate (connected + recent heartbeat). The two are
+        # orthogonal: a bench unit that is online and heartbeating is perfectly
+        # live and still must not be advertised, while a fleet unit that is
+        # offline is not live and must still be counted. Two questions, two
+        # filters. See ADR 0028.
+        Prefetch(
+            'chargers',
+            queryset=Charger.exclude(purpose=ChargerPurposeEnum.TEST)
+            .prefetch_related('connectors', 'tariffs'),
+        )
     ).select_related('franchisee')
 
     connected_charger_ids = set(await redis_manager.get_all_connected_chargers())

@@ -1,6 +1,6 @@
 # Allocate an Asset Code when a charger is created
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 

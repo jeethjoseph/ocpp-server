@@ -18,7 +18,8 @@ from crud import (
     update_charger_heartbeat,
     log_audit_event,
 )
-from models import OCPPLog, Transaction, TransactionStatusEnum, MeterValue
+from models import OCPPLog, Transaction, TransactionStatusEnum, MeterValue, ChargerPurposeEnum
+from core.roles import INTERNAL_ROLES
 from services.wallet_service import WalletService
 from services.wallet_session_service import WalletSessionService
 from core.supplier_identity import SupplierIdentityError, validate_supplier_identity
@@ -886,6 +887,24 @@ class ChargePoint(OcppChargePoint):
             
             if not user.is_active:
                 logger.error(f"OCPP StartTransaction: User {mask_email(user.email)} is deactivated")
+                return call_result.StartTransaction(
+                    transaction_id=0,
+                    id_tag_info={"status": "Blocked"}
+                )
+
+            # SERVICEABILITY gate (ADR 0028). A bench unit serves nobody but the
+            # people testing it: never billed, never invoiced, never advertised.
+            #
+            # This is the one gate in the Asset Code effort that fails CLOSED —
+            # a fleet charger wrongly marked TEST stops accepting customers
+            # entirely, which is a revenue outage on that unit. Everything else
+            # in ADR 0028 defaults PUBLIC and fails open. That asymmetry is why
+            # the TEST set is verified per environment before this ships.
+            if charger.purpose == ChargerPurposeEnum.TEST and user.role not in INTERNAL_ROLES:
+                logger.warning(
+                    f"OCPP StartTransaction: charger {charger.asset_code} is a TEST unit; "
+                    f"rejecting non-internal user {mask_email(user.email)}"
+                )
                 return call_result.StartTransaction(
                     transaction_id=0,
                     id_tag_info={"status": "Blocked"}

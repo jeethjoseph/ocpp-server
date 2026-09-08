@@ -1,6 +1,6 @@
 # Asset Code column, Charger Purpose enum, and the environment series
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 

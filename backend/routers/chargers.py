@@ -9,7 +9,8 @@ import logging
 
 from core.config import wallet_charging_enabled
 from core.roles import INTERNAL_ROLES
-from models import Charger, ChargingStation, Connector, ConnectorTypeEnum, Transaction, OCPPLog, User, ChargerError, Tariff
+from models import Charger, ChargingStation, Connector, ConnectorTypeEnum, Transaction, OCPPLog, User, ChargerError, Tariff, ChargerPurposeEnum
+from tortoise.expressions import Q
 from tortoise.exceptions import IntegrityError
 from tortoise.transactions import in_transaction
 from auth_middleware import require_admin, require_user_or_admin
@@ -305,6 +306,36 @@ async def get_latest_errors_for_chargers(charger_ids: List[int]) -> Dict[int, Ch
 
     return error_dict
 
+def _charger_search_filter(search: str) -> Q:
+    """Match a charger by name, OCPP identity, or Asset Code.
+
+    The Asset Code arm resolves by PARSING THE INTEGER rather than matching the
+    string, so a customer quoting "VOW1" and an admin pasting "VOW0001" land on
+    the same unit. That is what makes ADR 0028's minimum-width rule safe: a
+    code typed at one padding resolves at any other, so the register can widen
+    past VOW9999 without re-padding anything.
+
+    A FOREIGN SERIES RESOLVES TO NOTHING, never to the local unit with the same
+    number. Both registers mint codes a real person reads off a real unit, so
+    coercing a staging code into a production lookup would hand support the
+    wrong charger — a wrong-answer bug, which is worse than a no-answer one.
+    Because `parse_asset_code` returns None for a foreign series, the exact-code
+    arm simply contributes no match.
+    """
+    clauses = Q(name__icontains=search) | Q(charge_point_string_id__icontains=search)
+
+    number = charger_code_service.parse_asset_code(search)
+    if number is not None:
+        clauses = clauses | Q(
+            asset_code=charger_code_service.format_asset_code(number)
+        )
+    else:
+        # Not a resolvable code — still allow substring matching so a partial
+        # paste ("VOWS00") narrows the list rather than returning nothing.
+        clauses = clauses | Q(asset_code__icontains=search)
+    return clauses
+
+
 @router.get("", response_model=ChargerListResponse)
 async def list_chargers(
     page: int = Query(1, ge=1),
@@ -325,7 +356,7 @@ async def list_chargers(
     if station_id:
         query = query.filter(station_id=station_id)
     if search:
-        query = query.filter(name__icontains=search)
+        query = query.filter(_charger_search_filter(search))
     
     # Get total count
     total = await query.count()
@@ -712,6 +743,11 @@ async def remote_start_charging(charger_id: int, connector_id: int = 1, user: Us
     # Multi-connector support (user selection of connector) is out of scope for v1.
 
     charger = await Charger.filter(id=charger_id).first()
+    if charger and charger.purpose == ChargerPurposeEnum.TEST and user.role not in INTERNAL_ROLES:
+        # Refuse BEFORE any money moves. StartTransaction blocks a TEST unit
+        # too, but by then a QR customer has already paid and would need a
+        # refund for a session that was never going to start. ADR 0028.
+        raise HTTPException(status_code=403, detail="This charger is not available for public use")
     if not charger:
         raise HTTPException(status_code=404, detail="Charger not found")
     

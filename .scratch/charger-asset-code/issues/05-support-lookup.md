@@ -1,6 +1,6 @@
 # Support can resolve a customer-quoted Asset Code
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 
