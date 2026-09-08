@@ -21,6 +21,9 @@ import {
  */
 export default function DiagnosticBundles({ chargerId }: { chargerId: number }) {
   const [bundles, setBundles] = useState<DiagnosticBundle[]>([]);
+  // Null once there is nothing older left to fetch.
+  const [cursor, setCursor] = useState<number | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [loading, setLoading] = useState(true);
   const [provisioning, setProvisioning] = useState(false);
   const [revealedKey, setRevealedKey] = useState<string | null>(null);
@@ -29,8 +32,11 @@ export default function DiagnosticBundles({ chargerId }: { chargerId: number }) 
     let cancelled = false;
     diagnosticBundleService
       .list(chargerId)
-      .then((data) => {
-        if (!cancelled) setBundles(data);
+      .then((page) => {
+        if (!cancelled) {
+          setBundles(page.items);
+          setCursor(page.next_cursor);
+        }
       })
       .catch(() => {
         if (!cancelled) toast.error("Could not load diagnostic bundles");
@@ -42,6 +48,22 @@ export default function DiagnosticBundles({ chargerId }: { chargerId: number }) 
       cancelled = true;
     };
   }, [chargerId]);
+
+  const handleLoadOlder = async () => {
+    if (cursor === null) return;
+    setLoadingMore(true);
+    try {
+      const page = await diagnosticBundleService.list(chargerId, 50, cursor);
+      // Append: the archive reads oldest-downwards, and dropping the rows
+      // already on screen would lose the reader's place mid-investigation.
+      setBundles((prev) => [...prev, ...page.items]);
+      setCursor(page.next_cursor);
+    } catch {
+      toast.error("Could not load older bundles");
+    } finally {
+      setLoadingMore(false);
+    }
+  };
 
   const handleDownload = async (bundle: DiagnosticBundle) => {
     try {
@@ -237,6 +259,18 @@ export default function DiagnosticBundles({ chargerId }: { chargerId: number }) 
                 ))}
               </tbody>
             </table>
+            {cursor !== null && (
+              <div className="pt-3 text-center">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleLoadOlder}
+                  disabled={loadingMore}
+                >
+                  {loadingMore ? "Loading…" : "Load older"}
+                </Button>
+              </div>
+            )}
           </div>
         )}
       </CardContent>

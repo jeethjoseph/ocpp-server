@@ -332,6 +332,12 @@ class BundleSummary(BaseModel):
     lossy: bool
 
 
+class BundlePage(BaseModel):
+    items: List[BundleSummary]
+    # Feed back as `before` to fetch the next, older page. Null on the last page.
+    next_cursor: Optional[int]
+
+
 def _gap_threshold_seconds() -> int:
     """Silence longer than this is treated as a candidate loss window.
 
@@ -359,6 +365,21 @@ def _gap_before(bundle, previous) -> Optional[int]:
     return int(gap) if gap > 0 else 0
 
 
+def _pair_with_predecessor(bundles, limit):
+    """Pair each row on the page with the bundle that precedes it in time.
+
+    `bundles` is `limit + 1` rows, newest first. A row's predecessor is the next
+    one along — the *older* one — so a row's predecessor is either on the same
+    page or is exactly that extra row, and never on the previous page. That is
+    what makes the silence gap identical paginated or not.
+    """
+    page = bundles[:limit]
+    return [
+        (b, bundles[i + 1] if i + 1 < len(bundles) else None)
+        for i, b in enumerate(page)
+    ]
+
+
 def _to_summary(bundle, previous=None) -> BundleSummary:
     from utils import to_ist
 
@@ -382,29 +403,57 @@ def _to_summary(bundle, previous=None) -> BundleSummary:
     )
 
 
-@admin_router.get("/chargers/{charger_id}/bundles", response_model=List[BundleSummary])
+@admin_router.get("/chargers/{charger_id}/bundles", response_model=BundlePage)
 async def list_charger_bundles(
     charger_id: int,
     limit: int = Query(50, ge=1, le=200),
+    before: Optional[int] = Query(
+        None,
+        description="Bundle id from a previous page's next_cursor; returns bundles older than it.",
+    ),
     admin_user: User = Depends(require_admin()),
 ):
-    """Recent Diagnostic Bundles for one charger, newest first."""
+    """Diagnostic Bundles for one charger, newest first, one page at a time."""
     from models import DiagnosticBundle
+    from tortoise.expressions import Q
+
+    qs = DiagnosticBundle.filter(charger_id=charger_id)
+
+    if before is not None:
+        anchor = await DiagnosticBundle.get_or_none(id=before, charger_id=charger_id)
+        if anchor is None:
+            raise HTTPException(status_code=404, detail="Unknown pagination cursor")
+        # Keyset, not offset. A charger produces ~1000 bundles a day, so during
+        # any real investigation new rows arrive mid-browse; an OFFSET would
+        # shift every later page under the reader and silently repeat or skip
+        # rows. Comparing against the cursor row's own (created_at, id) is
+        # stable regardless of what arrives. The id breaks ties, which matter
+        # here because retries land in the same second.
+        qs = qs.filter(
+            Q(created_at__lt=anchor.created_at)
+            | Q(created_at=anchor.created_at, id__lt=anchor.id)
+        )
 
     # One extra row so the oldest bundle in the page still has a predecessor to
     # measure its gap against; without it the last row would always read as
     # having no silence before it.
+    #
+    # This is also what keeps the gap correct across a page boundary. A row's
+    # predecessor is the bundle *older* than it, so it is either on the same
+    # page or is precisely this extra row — never on the previous page. Paging
+    # therefore cannot change any row's gap: the first row of page 2 is measured
+    # against the same bundle it would have been on an unpaginated list.
     bundles = (
-        await DiagnosticBundle.filter(charger_id=charger_id)
-        .select_related("charger")
-        .order_by("-created_at")
+        await qs.select_related("charger")
+        .order_by("-created_at", "-id")
         .limit(limit + 1)
     )
-    page = bundles[:limit]
-    return [
-        _to_summary(b, bundles[i + 1] if i + 1 < len(bundles) else None)
-        for i, b in enumerate(page)
-    ]
+    paired = _pair_with_predecessor(bundles, limit)
+    items = [_to_summary(b, prev) for b, prev in paired]
+    return BundlePage(
+        items=items,
+        next_cursor=paired[-1][0].id if paired and len(bundles) > limit else None,
+    )
 
 
 @admin_router.get("/bundles/{bundle_id}/download")

@@ -1109,6 +1109,15 @@ export interface DiagnosticBundle {
   lossy: boolean;
 }
 
+/** One page of bundles. `next_cursor` is fed back as `before` to walk older;
+ *  null means this is the last page. Cursor-based rather than offset because a
+ *  charger emits ~1000 bundles a day, so rows arrive mid-browse and an offset
+ *  would silently repeat or skip them. */
+export interface DiagnosticBundlePage {
+  items: DiagnosticBundle[];
+  next_cursor: number | null;
+}
+
 export interface ChargerAuthKey {
   charge_point_string_id: string;
   auth_key: string;
@@ -1117,10 +1126,12 @@ export interface ChargerAuthKey {
 }
 
 export const diagnosticBundleService = {
-  /** Recent bundles for one charger, newest first. */
-  list: (chargerId: number, limit = 50) =>
-    api.get<DiagnosticBundle[]>(
-      `/api/admin/diagnostics/chargers/${chargerId}/bundles?limit=${limit}`
+  /** One page of bundles for a charger, newest first. Pass the previous page's
+   *  `next_cursor` as `before` to reach older ones. */
+  list: (chargerId: number, limit = 50, before?: number | null) =>
+    api.get<DiagnosticBundlePage>(
+      `/api/admin/diagnostics/chargers/${chargerId}/bundles?limit=${limit}` +
+        (before != null ? `&before=${before}` : "")
     ),
 
   /** Short-lived presigned S3 URL for the raw bundle. */

@@ -215,3 +215,60 @@ def test_ring_wrap_alone_marks_a_bundle_lossy():
 # docstring on the cross-loop flake). The endpoint test
 # `test_s3_failure_is_not_reported_as_success` pins the observable that matters
 # — a failed archive must not mark the row delivered.
+
+
+# --------------------------------------------------------------------------
+# Pagination boundary (issue 12)
+# --------------------------------------------------------------------------
+
+
+def _row(i: int):
+    """A bundle 10 minutes older than the one before it, newest at i=0."""
+    return SimpleNamespace(
+        id=100 - i,
+        first_utc=_T - timedelta(minutes=10 * i),
+        last_utc=_T - timedelta(minutes=10 * i) + timedelta(minutes=1),
+        time_approximate=False,
+        ring_wrap_events=0,
+    )
+
+
+def test_paging_does_not_change_any_bundles_predecessor():
+    """The gap on the first row of page 2 must equal its unpaginated gap.
+
+    This is the bug a naive offset scheme reintroduces at every page boundary.
+    Fetching limit+1 is what prevents it: a row's predecessor is the *older*
+    bundle, so it is either on the same page or is that extra row.
+    """
+    rows = [_row(i) for i in range(7)]          # newest first
+    limit = 3
+
+    # Keyed by id: SimpleNamespace defines __eq__ and so is unhashable.
+    unpaginated = {
+        b.id: prev for b, prev in _diag._pair_with_predecessor(rows, len(rows))
+    }
+
+    page1 = _diag._pair_with_predecessor(rows[:limit + 1], limit)
+    # The cursor is the last row of page 1; page 2 starts strictly older.
+    cursor_id = page1[-1][0].id
+    start = next(i for i, r in enumerate(rows) if r.id == cursor_id) + 1
+    page2 = _diag._pair_with_predecessor(rows[start:start + limit + 1], limit)
+
+    for bundle, predecessor in page1 + page2:
+        expected = unpaginated[bundle.id]
+        assert predecessor is expected, (
+            f"bundle id={bundle.id} paired with the wrong predecessor when paginated"
+        )
+
+    # And concretely: the first row of page 2 reports a real gap, not a blank.
+    first_of_page2, prev = page2[0]
+    assert prev is not None
+    assert _diag._gap_before(first_of_page2, prev) == 9 * 60
+
+
+def test_the_last_row_of_the_final_page_has_no_predecessor():
+    """Not a bug — there genuinely is nothing older to measure against."""
+    rows = [_row(i) for i in range(3)]
+    paired = _diag._pair_with_predecessor(rows, 3)
+    assert paired[-1][1] is None
+    assert _diag._gap_before(paired[-1][0], None) is None
