@@ -22,6 +22,7 @@ from models import (
     TransactionStatusEnum, User, ChargerStatusEnum,
 )
 from main import connected_charge_points
+from core.connection_manager import CommandOutcome
 from services.charger_type_service import (
     is_socket_charger,
     is_socket_charger_cached,
@@ -327,7 +328,7 @@ class TestSocketRemoteStart:
         with patch('main.send_ocpp_request', new_callable=AsyncMock) as mock_send, \
              patch('routers.chargers.is_charger_connected', new_callable=AsyncMock) as mock_connected:
             mock_connected.return_value = True
-            mock_send.return_value = (True, {"status": "Accepted"})
+            mock_send.return_value = CommandOutcome(True, MagicMock(status="Accepted"))
 
             response = await client_admin.post(f"/api/admin/chargers/{charger.id}/remote-start")
             assert response.status_code == 200
@@ -352,7 +353,7 @@ class TestSocketRemoteStart:
         with patch('main.send_ocpp_request', new_callable=AsyncMock) as mock_send, \
              patch('routers.chargers.is_charger_connected', new_callable=AsyncMock) as mock_connected:
             mock_connected.return_value = True
-            mock_send.return_value = (True, {"status": "Accepted"})
+            mock_send.return_value = CommandOutcome(True, MagicMock(status="Accepted"))
 
             response = await client_admin.post(f"/api/admin/chargers/{test_charger.id}/remote-start")
             assert response.status_code == 200

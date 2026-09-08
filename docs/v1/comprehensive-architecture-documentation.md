@@ -2449,6 +2449,33 @@ async def on_data_transfer(self, vendor_id: str, message_id: str = None, data: s
 
 ### Remote Commands (Central System → Charge Point)
 
+**Command outcome contract (ADR-less; see CONTEXT.md → Remote commands)**:
+`connection_manager.send_ocpp_request` returns a **`CommandOutcome`**, never a
+`(success, response)` pair. OCPP tells you two separate things and the old boolean
+collapsed them: whether the charger *replied*, and whether it *agreed*. Six call sites
+read "it replied" as "it worked" and reported a refused command as success — a refused
+`Reset` even wrote a `charger.reset` audit event for a reboot that never happened.
+
+Callers ask for the verdict:
+
+| Property | Meaning |
+|---|---|
+| `is_accepted` | The charger committed to act. Absorbs OCPP `Scheduled` (ChangeAvailability, ADR 0008) and treats a status-less `.conf` — `UpdateFirmware` — as acceptance, since there is nothing to refuse with |
+| `is_refused` | Answered and declined. HTTP **409** at the API edge: the system worked and the answer was no |
+| `is_unanswered` | No reply in the 30 s window. HTTP **504** — an upstream condition, and excluded from Sentry's failed-request reporting unlike a 500 |
+| `status` | Raw OCPP status for callers that surface it verbatim; `None` when unanswered or absent |
+
+`CommandOutcome` is a frozen dataclass and **deliberately does not unpack** — it was a
+NamedTuple only while call sites migrated one command at a time. Unpacking now raises
+`TypeError`, so the conflation cannot be reintroduced by accident.
+
+At-least-once dispatchers (wallet budget cap, QR auto-stop, zero-energy watchdog) read the
+verdict for **logging only** and do not branch on it: energy is monotonic, so a refused or
+lost stop self-heals on the next MeterValues tick and duplicate RemoteStops are idempotent
+at the charger. Before this, a refusal there logged as "sent" — the exact line someone greps
+when a session will not stop.
+
+
 #### 1. RemoteStartTransaction
 ```python
 # Implementation: backend/main.py:480-484

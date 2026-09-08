@@ -11,7 +11,8 @@ import logging
 import os
 import weakref
 from datetime import timedelta
-from typing import Any, Dict, NamedTuple, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
@@ -77,17 +78,20 @@ def _ocpp_message_type(parsed) -> str:
 _ACCEPTING_STATUSES = frozenset({"accepted", "scheduled"})
 
 
-class CommandOutcome(NamedTuple):
+@dataclass(frozen=True)
+class CommandOutcome:
     """What a **remote command** produced. See CONTEXT.md → Remote commands.
 
     `answered` means the charger *replied*. It does **not** mean the charger
     agreed — that conflation is why six call sites reported a refused command as
     success. Ask `is_accepted` / `is_refused` / `is_unanswered` instead.
 
-    Still unpacks as the historical `(success, response)` pair on purpose, so
-    every existing call site keeps working and behaving identically while callers
-    migrate one command at a time. Issue 04 removes the tuple shape, and with it
-    the boolean.
+    **Deliberately not a NamedTuple.** It was one during the migration so the
+    historical ``success, response = ...`` kept working while call sites moved
+    over one command at a time. Every caller now reads the verdict, so the tuple
+    shape is gone: unpacking this raises, which is the point. A plain boolean is
+    what made "the charger answered" and "the charger agreed" look alike, and
+    nothing should be able to reintroduce it by accident.
     """
 
     answered: bool

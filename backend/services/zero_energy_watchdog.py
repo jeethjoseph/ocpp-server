@@ -150,16 +150,28 @@ async def _send_zero_energy_stop(transaction, transaction_id: int):
     from core.connection_manager import connection_manager
 
     try:
-        success, result = await connection_manager.send_ocpp_request(
+        outcome = await connection_manager.send_ocpp_request(
             transaction.charger.charge_point_string_id,
             "RemoteStopTransaction",
             {"transaction_id": transaction_id},
         )
-        if success:
-            logger.info(f"Zero-energy auto-stop sent for txn {transaction_id}")
+        # The verdict does not change control flow here, deliberately.
+        # This is flag-less, at-least-once dispatch: energy is monotonic, so
+        # a refused or lost stop self-heals on the next MeterValues tick,
+        # and duplicate RemoteStops are idempotent at the charger. What the
+        # verdict does change is the log — a refusal used to read as "sent",
+        # which is exactly the line someone greps when a session would not
+        # stop.
+        if outcome.is_accepted:
+            logger.info(f"Zero-energy auto-stop accepted for txn {transaction_id}")
+        elif outcome.is_refused:
+            logger.warning(
+                f"Charger refused zero-energy stop for txn {transaction_id} "
+                f"(status={outcome.status}); retrying on the next tick"
+            )
         else:
             logger.error(
-                f"Failed to send zero-energy stop for txn {transaction_id}: {result}"
+                f"Zero-energy stop unanswered for txn {transaction_id}: {outcome.response}"
             )
     except Exception as e:
         logger.error(

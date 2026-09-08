@@ -358,13 +358,25 @@ async def _dispatch_remote_stop(charger, transaction_id: int) -> None:
     if not await redis_manager.is_charger_connected(charger.charge_point_string_id):
         return
     from main import send_ocpp_request
-    success, response = await send_ocpp_request(
+    outcome = await send_ocpp_request(
         charger.charge_point_string_id,
         "RemoteStopTransaction",
         {"transactionId": transaction_id},
     )
-    if not success:
-        logger.warning(f"Failed to send OCPP stop command for transaction {transaction_id}: {response}")
+    if outcome.is_unanswered:
+        logger.warning(
+            f"Could not deliver OCPP stop for transaction {transaction_id}: {outcome.response}"
+        )
+    elif outcome.is_refused:
+        # Worth its own line. The transaction is already marked STOPPED
+        # server-side by the caller, so a refusal here means the records and the
+        # hardware disagree: the charger may still be delivering energy against
+        # a session we consider closed.
+        logger.warning(
+            f"Charger refused the OCPP stop for transaction {transaction_id} "
+            f"(status={outcome.status}) — transaction is marked STOPPED "
+            f"server-side but the charger may still be energised"
+        )
 
 
 async def _mark_force_stopped(transaction, reason: str, admin_user: User) -> None:

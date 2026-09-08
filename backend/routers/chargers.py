@@ -902,7 +902,7 @@ async def change_charger_availability(
     from main import send_ocpp_request
 
     # Send ChangeAvailability command
-    success, response = await send_ocpp_request(
+    outcome = await send_ocpp_request(
         charger.charge_point_string_id,
         "ChangeAvailability",
         {
@@ -911,9 +911,14 @@ async def change_charger_availability(
         }
     )
 
-    if success:
-        # Get the OCPP response status (Accepted/Scheduled/Rejected)
-        ocpp_status = getattr(response, 'status', str(response))
+    if outcome.answered:
+        # Behaviour here is deliberately unchanged (ADR 0008): `Scheduled` is an
+        # acceptance — the charger will apply it when the current transaction
+        # ends — and only `Accepted`/`Scheduled` persist admin intent. The
+        # explicit tuple is kept rather than `outcome.is_accepted` so this stays
+        # visibly tied to ADR 0008 rather than to a shared status set that could
+        # later drift.
+        ocpp_status = outcome.status or str(outcome.response)
 
         # Persist admin intent when the charger acknowledged the command.
         # See ADR 0008 for why availability is separate from latest_status.
@@ -950,7 +955,13 @@ async def change_charger_availability(
             "previous_status": current_status,
         }
     else:
-        raise HTTPException(status_code=500, detail=f"Failed to change availability: {response}")
+        # Unanswered, not refused — a refusal takes the branch above and is
+        # recorded with its OCPP status. 504 rather than 500: an offline or slow
+        # charger is an upstream condition, not a server fault.
+        raise HTTPException(
+            status_code=504,
+            detail=f"Charger did not respond to the availability command: {outcome.response}",
+        )
 
 @router.post("/{charger_id}/reset", response_model=dict)
 async def reset_charger(
@@ -992,30 +1003,51 @@ async def reset_charger(
     from main import send_ocpp_request
 
     # Send Reset command
-    success, response = await send_ocpp_request(
+    outcome = await send_ocpp_request(
         charger.charge_point_string_id,
         "Reset",
         {"type": type}
     )
 
-    if success:
-        await log_audit_event(
-            action="charger.reset",
-            entity_type="charger",
-            entity_id=charger.charge_point_string_id,
-            actor_type="admin",
-            actor=admin_user,
-            changes={"reset_type": type},
+    # A charger that answers "Rejected" has not rebooted. Reading the reply
+    # itself as success wrote a `charger.reset` audit event for a reboot that
+    # never happened — a durable false record, worse than the misleading
+    # message, because someone reads it back months later and reasons from it.
+    if outcome.is_refused:
+        logger.warning(
+            f"Charger {charger.charge_point_string_id} refused {type} reset "
+            f"(status={outcome.status})"
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Charger declined the {type} reset. It may be mid-transaction "
+                "or otherwise unable to reboot right now."
+            ),
         )
 
-        return {
-            "success": True,
-            "message": f"{type} reset command sent successfully",
-            "reset_type": type,
-            "charger_id": charger_id
-        }
-    else:
-        raise HTTPException(status_code=500, detail=f"Failed to send reset command: {response}")
+    if outcome.is_unanswered:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Charger did not respond to the reset command: {outcome.response}",
+        )
+
+    # Refusal and silence both raised above, so this is an acceptance.
+    await log_audit_event(
+        action="charger.reset",
+        entity_type="charger",
+        entity_id=charger.charge_point_string_id,
+        actor_type="admin",
+        actor=admin_user,
+        changes={"reset_type": type, "ocpp_response": outcome.status},
+    )
+
+    return {
+        "success": True,
+        "message": f"{type} reset accepted by the charger",
+        "reset_type": type,
+        "charger_id": charger_id
+    }
 
 @router.get("/{charger_id}/logs", response_model=LogsListResponse)
 async def get_charger_logs(

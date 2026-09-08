@@ -563,25 +563,30 @@ class QRPaymentService:
             for attempt in range(1, QRPaymentService.MAX_START_RETRIES + 1):
                 logger.info(f"Sending RemoteStartTransaction to {charger.charge_point_string_id} (attempt {attempt}/{QRPaymentService.MAX_START_RETRIES})")
 
-                success, result = await connection_manager.send_ocpp_request(
+                outcome = await connection_manager.send_ocpp_request(
                     charger.charge_point_string_id,
                     "RemoteStartTransaction",
                     {"id_tag": id_tag, "connector_id": 1}
                 )
+                result = outcome.response
 
-                if success:
-                    status_value = str(getattr(result, 'status', '')).lower()
-                    if status_value == "accepted":
-                        logger.info(f"RemoteStartTransaction accepted for charger {charger.id}")
-                        return  # Success — done
-                    else:
-                        # Charger explicitly rejected — no point retrying
-                        logger.warning(f"RemoteStartTransaction rejected: {result}")
-                        break
+                # This site already drew the distinction by hand, which is why
+                # it behaved correctly; it now reads it from the outcome instead
+                # of re-deriving it from the payload.
+                if outcome.is_accepted:
+                    logger.info(f"RemoteStartTransaction accepted for charger {charger.id}")
+                    return  # Success — done
+                if outcome.is_refused:
+                    # Answered and declined. Retrying cannot change a verdict,
+                    # so stop and fall through to the refund.
+                    logger.warning(
+                        f"RemoteStartTransaction refused (status={outcome.status}): {result}"
+                    )
+                    break
 
-                # Communication failure — retry if attempts remain
+                # Unanswered — retry if attempts remain
                 if attempt < QRPaymentService.MAX_START_RETRIES:
-                    logger.warning(f"RemoteStart attempt {attempt} failed: {result}, retrying in {QRPaymentService.START_RETRY_DELAY}s")
+                    logger.warning(f"RemoteStart attempt {attempt} unanswered: {result}, retrying in {QRPaymentService.START_RETRY_DELAY}s")
                     await asyncio.sleep(QRPaymentService.START_RETRY_DELAY)
 
                     # Check if transaction already started despite the timeout
@@ -873,15 +878,29 @@ class QRPaymentService:
     async def _send_remote_stop(transaction, transaction_id: int):
         """Send RemoteStopTransaction as a background task (avoids MeterValues deadlock)."""
         try:
-            success, result = await connection_manager.send_ocpp_request(
+            outcome = await connection_manager.send_ocpp_request(
                 transaction.charger.charge_point_string_id,
                 "RemoteStopTransaction",
                 {"transaction_id": transaction_id}
             )
-            if success:
-                logger.info(f"Auto-stop sent for QR session txn {transaction_id}")
+            # The verdict does not change control flow here, deliberately.
+            # This is flag-less, at-least-once dispatch: energy is monotonic, so
+            # a refused or lost stop self-heals on the next MeterValues tick,
+            # and duplicate RemoteStops are idempotent at the charger. What the
+            # verdict does change is the log — a refusal used to read as "sent",
+            # which is exactly the line someone greps when a session would not
+            # stop.
+            if outcome.is_accepted:
+                logger.info(f"Auto-stop accepted for QR session txn {transaction_id}")
+            elif outcome.is_refused:
+                logger.warning(
+                    f"Charger refused QR auto-stop for txn {transaction_id} "
+                    f"(status={outcome.status}); retrying on the next tick"
+                )
             else:
-                logger.error(f"Failed to auto-stop QR session txn {transaction_id}: {result}")
+                logger.error(
+                    f"QR auto-stop unanswered for txn {transaction_id}: {outcome.response}"
+                )
         except Exception as e:
             logger.error(f"Error sending auto-stop for QR session txn {transaction_id}: {e}")
 

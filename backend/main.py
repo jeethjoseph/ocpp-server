@@ -1741,16 +1741,23 @@ async def get_connected_charge_points(admin_user=Depends(require_admin())):
 @app.post("/api/charge-points/{charge_point_id}/request")
 async def send_command_to_charge_point(charge_point_id: str, command: OCPPCommand, admin_user=Depends(require_admin())):
     """Send OCPP command to a specific charge point"""
-    success, result = await connection_manager.send_ocpp_request(charge_point_id, command.action, command.payload)
-    
-    if success:
-        return OCPPResponse(
-            success=True,
-            message=f"Command {command.action} sent successfully",
-            data=result.dict() if hasattr(result, 'dict') else str(result)
+    outcome = await connection_manager.send_ocpp_request(charge_point_id, command.action, command.payload)
+
+    # Generic passthrough, so it reports the charger's verdict rather than
+    # deciding what a refusal means for an arbitrary command.
+    if outcome.is_unanswered:
+        raise HTTPException(status_code=504, detail=str(outcome.response))
+    if outcome.is_refused:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Charger refused {command.action} (status: {outcome.status})",
         )
-    else:
-        raise HTTPException(status_code=400, detail=result)
+    result = outcome.response
+    return OCPPResponse(
+        success=True,
+        message=f"Command {command.action} accepted by the charger",
+        data=result.dict() if hasattr(result, 'dict') else str(result)
+    )
 
 @app.get("/api/logs", response_model=List[MessageLogResponse])
 async def get_message_logs(limit: int = Query(100, ge=1, le=10000), admin_user=Depends(require_admin())):

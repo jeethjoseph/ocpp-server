@@ -84,23 +84,38 @@ class TestUnanswered:
         assert timeout.is_unanswered and not refused.is_unanswered
 
 
-class TestBackwardCompatibility:
-    """Issue 01 is the expand half: every existing call site must behave
-    identically until issues 02-04 migrate them."""
+class TestTheTupleShapeIsGone:
+    """Issue 04 is the contract half. `TestBackwardCompatibility` lived here and
+    is deliberately deleted, not ported — its three tests asserted that
+    `success, response = outcome` kept working, which was true only while call
+    sites were migrating one command at a time.
 
-    def test_unpacks_as_the_historical_pair(self):
+    Where each intent went:
+
+    * `test_unpacks_as_the_historical_pair` — inverted below. Unpacking is now
+      an error, and that is the guarantee worth holding.
+    * `test_answered_is_true_even_when_refused` — the *distinction* it protected
+      is covered by `TestRefusal`; what it actually asserted (a refusal reads as
+      the historical `True`) is the exact conflation issue 04 exists to remove.
+    * `test_answered_is_false_when_undelivered` — survives as
+      `.answered is False` / `.is_unanswered`, covered above.
+    """
+
+    def test_unpacking_an_outcome_raises(self):
+        """The boolean pair is what made "answered" and "agreed" look alike.
+        Failing loudly beats any caller quietly reintroducing it."""
+        outcome = _answered(call_result.RemoteStartTransaction(status="Rejected"))
+        with pytest.raises(TypeError):
+            _success, _response = outcome  # noqa: F841
+
+    def test_the_fields_are_still_reachable_by_name(self):
         conf = call_result.RemoteStartTransaction(status="Accepted")
-        success, response = CommandOutcome(True, conf)
-        assert success is True
-        assert response is conf
+        outcome = CommandOutcome(True, conf)
+        assert outcome.answered is True
+        assert outcome.response is conf
 
-    def test_answered_is_true_even_when_refused(self):
-        """The historical boolean meant "the charger replied". A refusal must
-        keep unpacking as True so existing callers do not change behaviour."""
-        success, _ = _answered(call_result.RemoteStartTransaction(status="Rejected"))
-        assert success is True
-
-    def test_answered_is_false_when_undelivered(self):
-        success, msg = CommandOutcome(False, "not connected")
-        assert success is False
-        assert msg == "not connected"
+    def test_an_undelivered_command_is_unanswered_not_refused(self):
+        outcome = CommandOutcome(False, "not connected")
+        assert outcome.answered is False
+        assert outcome.is_unanswered and not outcome.is_refused
+        assert outcome.response == "not connected"

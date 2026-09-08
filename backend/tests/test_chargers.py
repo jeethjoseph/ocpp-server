@@ -9,6 +9,7 @@ import random
 from decimal import Decimal
 
 from main import connected_charge_points
+from core.connection_manager import CommandOutcome
 from models import Charger, Connector, Transaction, OCPPLog, Tariff, User, VehicleProfile, ChargerStatusEnum
 
 @pytest.mark.unit
@@ -351,7 +352,7 @@ class TestChargerEndpoints:
         """On OCPP Accepted, Charger.availability is set to Operative."""
         from models import ChargerAvailabilityEnum, AuditLog
         mock_connected.return_value = True
-        mock_send_ocpp.return_value = (True, MagicMock(status="Accepted"))
+        mock_send_ocpp.return_value = CommandOutcome(True, MagicMock(status="Accepted"))
 
         # Set a starting value different from the target so we can prove the write happened.
         await Charger.filter(id=test_charger.id).update(
@@ -384,7 +385,7 @@ class TestChargerEndpoints:
         """On OCPP Accepted, Charger.availability is set to Inoperative."""
         from models import ChargerAvailabilityEnum
         mock_connected.return_value = True
-        mock_send_ocpp.return_value = (True, MagicMock(status="Accepted"))
+        mock_send_ocpp.return_value = CommandOutcome(True, MagicMock(status="Accepted"))
 
         # Fixture default is OPERATIVE — flipping to INOPERATIVE.
         resp = await client_admin.post(
@@ -405,7 +406,7 @@ class TestChargerEndpoints:
         """OCPP Scheduled response also counts as admin intent captured."""
         from models import ChargerAvailabilityEnum
         mock_connected.return_value = True
-        mock_send_ocpp.return_value = (True, MagicMock(status="Scheduled"))
+        mock_send_ocpp.return_value = CommandOutcome(True, MagicMock(status="Scheduled"))
 
         resp = await client_admin.post(
             f"/api/admin/chargers/{test_charger.id}/change-availability"
@@ -425,7 +426,7 @@ class TestChargerEndpoints:
         """OCPP Rejected response must NOT update Charger.availability."""
         from models import ChargerAvailabilityEnum, AuditLog
         mock_connected.return_value = True
-        mock_send_ocpp.return_value = (True, MagicMock(status="Rejected"))
+        mock_send_ocpp.return_value = CommandOutcome(True, MagicMock(status="Rejected"))
 
         # Fixture default is OPERATIVE; should stay OPERATIVE after Rejected.
         resp = await client_admin.post(

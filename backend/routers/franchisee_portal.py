@@ -316,14 +316,28 @@ async def reset_charger(charger_id: int, auth=Depends(require_franchisee())):
     charger = await _verify_charger_ownership(charger_id, franchisee.id)
 
     from main import send_ocpp_request
-    success, response = await send_ocpp_request(
+    outcome = await send_ocpp_request(
         charger.charge_point_string_id,
         "Reset",
         {"type": "Soft"},
     )
-    if success:
-        return {"success": True, "message": "Soft reset sent"}
-    raise HTTPException(status_code=500, detail=f"Reset failed: {response}")
+    # Same trap as the admin path: a charger that answers "Rejected" has not
+    # rebooted, and telling the franchisee it has sends them away believing a
+    # unit was power-cycled when it was not.
+    if outcome.is_refused:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Charger declined the soft reset. It may be mid-transaction "
+                "or otherwise unable to restart right now."
+            ),
+        )
+    if outcome.is_unanswered:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Charger did not respond to the reset command: {outcome.response}",
+        )
+    return {"success": True, "message": "Soft reset accepted by the charger"}
 
 
 @router.post("/chargers/{charger_id}/change-availability")
@@ -348,7 +362,7 @@ async def change_availability(
     charger = await _verify_charger_ownership(charger_id, franchisee.id)
 
     from main import send_ocpp_request
-    success, response = await send_ocpp_request(
+    outcome = await send_ocpp_request(
         charger.charge_point_string_id,
         "ChangeAvailability",
         {
@@ -356,8 +370,10 @@ async def change_availability(
             "type": "Operative" if available else "Inoperative",
         },
     )
-    if success:
-        ocpp_status = getattr(response, "status", str(response))
+    if outcome.answered:
+        # Unchanged by design (ADR 0008): `Scheduled` is an acceptance, and only
+        # Accepted/Scheduled persist the operator's intent.
+        ocpp_status = outcome.status or str(outcome.response)
 
         # Persist admin intent when the charger acknowledged the command.
         # See ADR 0008 for why availability is separate from latest_status.
@@ -384,7 +400,12 @@ async def change_availability(
         )
 
         return {"success": True, "message": "Availability changed"}
-    raise HTTPException(status_code=500, detail=f"Failed: {response}")
+    # Unanswered — a refusal takes the branch above with its OCPP status
+    # recorded. 504, not 500: an offline charger is an upstream condition.
+    raise HTTPException(
+        status_code=504,
+        detail=f"Charger did not respond to the availability command: {outcome.response}",
+    )
 
 
 # ─── Transactions ────────────────────────────────────────────────────
