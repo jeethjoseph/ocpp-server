@@ -115,7 +115,10 @@ async def get_active_session(
         for t in active_transactions:
             sessions.append({
                 "id": t.id,
-                "charger_name": t.charger.name or f"Charger {t.charger.id}",
+                # The Asset Code, not `name` — which is nullable and non-unique,
+                # so the old fallback could render "Charger 3" for four different
+                # units. ADR 0028.
+                "charger_name": t.charger.asset_code,
                 "station_name": t.charger.station.name if t.charger.station else "Unknown Station",
                 # Asset Code, not the OCPP UUID. ADR 0028.
                 "charger_id": t.charger.asset_code,
@@ -909,7 +912,9 @@ async def remote_start_by_string_id(
 
         return {
             "message": "Remote start accepted by charger",
-            "charger_id": charger.charge_point_string_id,
+            # Asset Code: this is a customer-facing endpoint and the OCPP
+            # identity is the Basic Auth username. ADR 0028.
+            "charger_id": charger.asset_code,
             "response": outcome.response
         }
 
@@ -994,7 +999,8 @@ async def remote_stop_by_string_id(
 
         return {
             "message": "Remote stop accepted by charger",
-            "charger_id": charger.charge_point_string_id,
+            # Asset Code — customer-facing. ADR 0028.
+            "charger_id": charger.asset_code,
             "transaction_id": transaction.id,
             "response": outcome.response
         }

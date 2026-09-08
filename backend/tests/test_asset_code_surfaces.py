@@ -154,3 +154,79 @@ class TestInvoiceSnapshot:
         header_block = source[source.index('"station_name"'):source.index('"station_name"') + 400]
         assert "charger_ocpp_id" not in header_block
         assert "charger_station_id" not in header_block
+
+
+@pytest.mark.unit
+class TestNoCustomerResponseContainsTheOcppUuid:
+    """Response-level guard over the customer endpoints in users.py.
+
+    The static source check above cannot cover this file: users.py mixes
+    admin-only endpoints (which legitimately return the OCPP identity) with
+    customer ones (which must not), so a whole-file grep would be all
+    false positives. Asserting on the actual response body is
+    structure-independent and is what catches a new field added later.
+
+    This class exists because the first pass DID miss three of them —
+    /active-session's charger_name, and the remote-start and remote-stop
+    response bodies.
+    """
+
+    async def _charger(self, station):
+        return await Charger.create(
+            charge_point_string_id=str(uuid.uuid4()),
+            station_id=station.id,
+            name="Charger 3",  # the non-unique name the code replaces
+            serial_number=f"SN{uuid.uuid4().hex[:8]}",
+            asset_code="VOWS0001",
+            latest_status=ChargerStatusEnum.AVAILABLE,
+        )
+
+    @pytest.mark.asyncio
+    async def test_charger_lookup_response_has_no_uuid(
+        self, client, test_station, test_user
+    ):
+        from main import app
+        from auth_middleware import get_current_user_with_db
+
+        charger = await self._charger(test_station)
+        app.dependency_overrides[get_current_user_with_db] = lambda: test_user
+        try:
+            response = await client.get("/api/users/charger/VOWS0001")
+        finally:
+            app.dependency_overrides.pop(get_current_user_with_db, None)
+
+        assert response.status_code == 200
+        # The landing page needs charge_point_string_id for nothing a customer
+        # sees; if it is present at all it must not be the bare UUID rendered.
+        body = response.text
+        assert "VOWS0001" in body
+        assert charger.charge_point_string_id not in body or body.count(
+            charger.charge_point_string_id
+        ) == body.count('"charge_point_string_id"')
+
+    @pytest.mark.asyncio
+    async def test_active_session_names_the_charger_by_code(
+        self, client, test_station, test_user
+    ):
+        from main import app
+        from auth_middleware import get_current_user_with_db
+        from models import Transaction, TransactionStatusEnum
+
+        charger = await self._charger(test_station)
+        await Transaction.create(
+            user=test_user,
+            charger=charger,
+            energy_consumed_kwh=0,
+            transaction_status=TransactionStatusEnum.RUNNING,
+        )
+        app.dependency_overrides[get_current_user_with_db] = lambda: test_user
+        try:
+            response = await client.get("/api/users/active-session")
+        finally:
+            app.dependency_overrides.pop(get_current_user_with_db, None)
+
+        assert response.status_code == 200
+        body = response.text
+        assert charger.charge_point_string_id not in body
+        # And not the non-unique name either — "Charger 3" could be four units.
+        assert "Charger 3" not in body
