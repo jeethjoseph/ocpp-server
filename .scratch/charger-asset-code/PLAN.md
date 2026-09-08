@@ -111,6 +111,12 @@ If verification comes back dirty on any row, fall back to starting production at
 
 Tracer-bullet order. Each is independently deployable and independently revertible.
 
+**Cut as tickets in `issues/`** — slice NN is `issues/NN-*.md`, and those files are the
+working copy. This section stays as the rationale; the tickets carry the acceptance
+criteria. Two additions the slice list did not have: `issues/09` covers the staging
+re-stencil described under **Physical work** below, and `issues/08` is filed
+`needs-triage` rather than ready, because it is deferred behind entry conditions.
+
 ### 00 — Confirm the eight production stencils  *(human, asynchronous; gates 04 only)*
 Confirm that the label on each of production's eight fleet units matches
 `Charger.name`, listed in `asset-code-assignments.csv`. Four sites: IDofThings
