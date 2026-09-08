@@ -712,7 +712,7 @@ Do not conflate `purpose` with `availability`. Marking a bench unit `Inoperative
 - **Lookup parses the integer**, so `VOW0001`, `VOW00001` and `vow1` all resolve. A **foreign series resolves to nothing** — never coerced — because both registers mint codes a real person reads off a real unit.
 - **Rendering and parsing live in `services/charger_code_service.py`.** No surface hand-formats.
 - Admin/franchisee surfaces still show `charge_point_string_id`; ops needs it for log correlation and firmware deploys.
-- **Known residue:** the QR sticker URL is still `/charge/{charge_point_string_id}`, encoded in already-printed stickers, so the UUID remains publicly reachable though nothing renders it. See `.scratch/charger-asset-code/issues/10-qr-url-still-embeds-the-uuid.md` — effectively a prerequisite of ADR 0020.
+- **Known residue:** the QR sticker URL is still `/charge/{charge_point_string_id}`, encoded in already-printed stickers, so the UUID stays publicly reachable though nothing renders it. That UUID is the Basic Auth **username** for the LIVE `POST /api/diagnostics/bundles` endpoint (ADR 0029) — `charger_auth_service.authenticate_charger` requires `username == charge_point_string_id` — so this is not a latent ADR 0020 concern but an enumerable username on a production auth surface. The hashed 20-byte key is the only thing behind it. See `.scratch/charger-asset-code/issues/10-qr-url-still-embeds-the-uuid.md`.
 
 ---
 

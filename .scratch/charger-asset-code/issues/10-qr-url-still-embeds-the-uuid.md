@@ -1,6 +1,7 @@
 # The QR sticker URL still embeds the OCPP UUID
 
 Status: needs-triage
+Severity: raised 2026-09-09 — see Correction below
 
 ## What to build
 
@@ -36,13 +37,36 @@ schemes during a transition, and re-stickering the fleet. That is a larger piece
 of work than the whole of slices 01-07 combined, and it is not what ADR 0028 was
 scoped to decide.
 
+## Correction (2026-09-09) — this is NOT merely an ADR 0020 prerequisite
+
+An earlier draft of this ticket argued the exposure was latent, on the grounds
+that ADR 0020 is still PROPOSED and the WSS handshake is unauthenticated, so the
+username half guarded nothing yet. **That was wrong.**
+
+`POST /api/diagnostics/bundles` is live — mounted at `main.py:1701`, shipped as
+ADR 0029 on this branch — and authenticates with
+`charger_auth_service.authenticate_charger`, whose contract is explicit:
+
+> The username MUST equal the charger's `charge_point_string_id`, matching the
+> rule ADR 0020 sets for the WSS handshake, so one credential works unchanged
+> across both transports.
+
+So the UUID printed on every QR sticker is the username half of a credential
+pair that is **in production today**, on an authenticated write endpoint.
+
+This is not an open door: the password half is a 20-byte key stored only as a
+SHA-256 hash, and a charger with no `auth_key_hash` is rejected outright, so a
+known username alone yields nothing. But the framing changes — this is a live
+authentication surface whose usernames are enumerable from the public
+`/stations` payload and physically printed on the hardware, not a tidy-up to do
+before ADR 0020.
+
 ## What to decide
 
-1. Does the residual exposure actually matter, given ADR 0020 is still PROPOSED
-   and the WebSocket handshake is **not yet authenticated**? Today the username
-   half is not guarding anything. It will matter the moment ADR 0020 ships — so
-   the honest framing is that this is a **prerequisite of ADR 0020**, not an
-   independent bug.
+1. Given the above: does an enumerable username on a live auth endpoint warrant
+   acting now, or is the hashed-key half sufficient mitigation to defer? Note
+   that whatever is decided, ADR 0020 shipping widens the blast radius from one
+   upload endpoint to the OCPP transport itself.
 2. If it matters: is the public handle a new random token, or the Asset Code
    itself? The Asset Code is already public by design and already unique per
    register, so `/charge/VOW0001` is the obvious candidate and needs no new
@@ -53,7 +77,8 @@ scoped to decide.
 
 ## Acceptance criteria
 
-- [ ] A decision recorded on whether this blocks [[adr-0020-charger-websocket-basic-auth]]. If it does, ADR 0020 gains an explicit dependency on this ticket.
+- [ ] A decision recorded on whether the live diagnostics-upload exposure warrants acting now, and separately whether this blocks [[adr-0020-charger-websocket-basic-auth]]. If it blocks, ADR 0020 gains an explicit dependency on this ticket.
+- [ ] Rate-limiting / lockout on `POST /api/diagnostics/bundles` reviewed in light of enumerable usernames, independently of whether the route changes.
 - [ ] If proceeding: the landing page resolves by a handle that is **not** the Basic Auth username, and `/charge/{uuid}` keeps working until the fleet is re-stickered.
 - [ ] `charge_point_string_id` disappears from the public `/stations` payload only once nothing needs it for routing.
 
