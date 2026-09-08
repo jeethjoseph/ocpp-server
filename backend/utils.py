@@ -4,6 +4,7 @@ Utility functions for OCPP server.
 Add logging, ID generation, and other helpers here.
 """
 import asyncio
+import contextvars
 import datetime
 import logging
 import uuid
@@ -51,8 +52,33 @@ def generate_uuid():
 
 
 def safe_create_task(coro, *, name: str = None) -> asyncio.Task:
-    """Wrap asyncio.create_task with exception logging for fire-and-forget tasks."""
-    task = asyncio.create_task(coro, name=name)
+    """Fire-and-forget task with exception logging and a detached DB context.
+
+    **The context is deliberately empty.** `asyncio.create_task` normally hands
+    the child a copy of the caller's contextvars, and Tortoise keeps the current
+    DB connection in one of those. A task spawned inside a transaction therefore
+    inherits that transaction's pinned `TransactionWrapper` — and because it runs
+    *later*, the parent has usually committed and returned the connection to the
+    pool by then. The child then issues its query on a connection another
+    coroutine already owns:
+
+        asyncpg.InterfaceError: cannot perform operation: another operation is
+        in progress
+
+    which surfaced as ~80 silently-dropped audit rows in a single dev session.
+    Silent, because the only trace is this function's own error log — the caller
+    cannot await a fire-and-forget task to find out it failed.
+
+    An empty context makes Tortoise resolve a fresh connection from the pool,
+    which is the correct semantic anyway: work that cannot be awaited must not
+    be enrolled in a transaction whose outcome it cannot observe. Note this also
+    detaches Sentry/New Relic scope, so these tasks are reported as their own
+    unit of work rather than as part of the request that spawned them. That is a
+    deliberate trade — losing breadcrumb correlation is cheaper than losing the
+    write. Exception reporting is unaffected: the done-callback below runs in the
+    caller's context.
+    """
+    task = asyncio.create_task(coro, name=name, context=contextvars.Context())
 
     def _done_cb(t: asyncio.Task):
         if t.cancelled():
