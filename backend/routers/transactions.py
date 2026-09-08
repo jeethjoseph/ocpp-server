@@ -67,8 +67,17 @@ class UserBasicInfo(BaseModel):
         from_attributes = True
 
 class ChargerBasicInfo(BaseModel):
+    """Charger identity on the ADMIN transaction detail.
+
+    Carries both identifiers deliberately: `asset_code` is what a customer
+    quotes to support, `charge_point_string_id` is the OCPP identity ops needs
+    for log correlation and firmware deploys. The customer-facing sibling of
+    this endpoint (`/api/users/transaction/{id}`) returns only the code.
+    """
+
     id: int
     name: str
+    asset_code: str
     charge_point_string_id: str
     
     class Config:

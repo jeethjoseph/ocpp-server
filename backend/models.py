@@ -1144,7 +1144,27 @@ class GSTInvoice(Model):
     station_name = fields.CharField(max_length=255, null=True)
     station_location = fields.CharField(max_length=500, null=True)
     place_of_supply_state_code = fields.CharField(max_length=5, null=True)
+    # What was PRINTED on this invoice as the charger identifier: an Asset Code
+    # for invoices issued after the ADR 0028 cutover, a legacy
+    # charge_point_string_id UUID before it. The two eras are separable by
+    # ^VOWS?\d{4,}$.
+    #
+    # Keeps its name despite the Asset Code avoid-list, deliberately: it is a
+    # column header in the GST filings CSV export (routers/invoices.py) that
+    # feeds an accountant's spreadsheet, and renaming it would silently break
+    # saved import mappings on a compliance surface.
     charger_id_str = fields.CharField(max_length=255, null=True)
+
+    # Two internal siblings, NEVER printed and never exported to the GST
+    # filings CSV. Prefer either of these, or the `transaction` FK, when
+    # joining an invoice back to hardware: an Asset Code does name a specific
+    # unit, but an admin can correct a charger's code and this snapshot cannot
+    # be corrected.
+    #
+    # `charger_ocpp_id` is what preserves the audit link to the physical unit
+    # across the cutover, when charger_id_str stopped holding the UUID.
+    charger_station_id = fields.IntField(null=True)
+    charger_ocpp_id = fields.CharField(max_length=255, null=True)
     connector_type = fields.CharField(max_length=50, null=True)
 
     # Charging details

@@ -590,7 +590,15 @@ class InvoiceService:
             station_name=station.name,
             station_location=f"{station.address or ''}, {station.state or ''}".strip(", "),
             place_of_supply_state_code=station.state_code,
-            charger_id_str=charger.charge_point_string_id,
+            # The Asset Code is what a customer can read off the unit and quote
+            # to support. The charge_point_string_id UUID it replaces is the
+            # OCPP WSS path segment AND the Basic Auth username, so printing it
+            # on a PDF that lands in a stranger's inbox published half a
+            # credential pair. It is retained below as charger_ocpp_id, which
+            # is never printed. See ADR 0028.
+            charger_id_str=charger.asset_code,
+            charger_station_id=charger.station_id,
+            charger_ocpp_id=charger.charge_point_string_id,
             connector_type=connector_type,
             energy_consumed_kwh=billable_kwh,
             tariff_rate_incl_tax=tariff_rate_incl,

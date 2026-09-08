@@ -56,7 +56,16 @@ class ChargerConnectorInfo(BaseModel):
     max_power_kw: Optional[float]
 
 class StationChargerInfo(BaseModel):
+    # RETAINED FOR ROUTING ONLY, not for display. The QR landing page lives at
+    # /charge/{charge_point_string_id} and that URL is encoded in the QR codes
+    # already printed on the fleet, so the field cannot be dropped without
+    # invalidating every physical sticker. No customer surface RENDERS it —
+    # they render `asset_code`. Closing the remaining exposure needs a separate
+    # public-facing handle plus a fleet re-sticker; see ADR 0028.
     charge_point_string_id: str
+    # The Asset Code — what a customer reads off the unit and quotes to
+    # support. This is the identifier to display.
+    asset_code: str
     name: str
     latest_status: str
     connectors: List[ChargerConnectorInfo]
@@ -257,6 +266,7 @@ def _build_charger_info(real_chargers, global_tariff) -> List[StationChargerInfo
             tariff_excl = tariff_gst_incl = tariff_gst = None
         result.append(StationChargerInfo(
             charge_point_string_id=charger.charge_point_string_id,
+            asset_code=charger.asset_code,
             name=charger.name or f"Charger {charger.id}",
             latest_status=charger.latest_status.value,
             connectors=connectors,

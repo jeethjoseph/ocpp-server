@@ -39,7 +39,16 @@ export interface StationListResponse {
 
 export interface Charger {
   id: number;
+  /**
+   * OCPP identity: the WSS path segment and Basic Auth username. Internal —
+   * admin and franchisee surfaces only, never rendered to a customer.
+   * Customers see `asset_code`. See ADR 0028.
+   */
   charge_point_string_id: string;
+  /** The Asset Code (VOW0001 / VOWS0001) — the customer-facing identifier. */
+  asset_code: string;
+  /** Serviceability: "PUBLIC" | "TEST". */
+  purpose: string;
   external_charger_id?: string;
   station_id: number;
   name: string;
@@ -265,7 +274,14 @@ export interface TransactionDetail {
   charger: {
     id: number;
     name: string;
-    charge_point_string_id: string;
+    /** The Asset Code — returned by both the admin and customer endpoints. */
+    asset_code: string;
+    /**
+     * OCPP identity. Present on the ADMIN endpoint only
+     * (`/api/admin/transactions/{id}`); the customer endpoint
+     * (`/api/users/transaction/{id}`) deliberately omits it. See ADR 0028.
+     */
+    charge_point_string_id?: string;
   };
   meter_values: MeterValue[];
   wallet_transactions: Array<{

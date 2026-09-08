@@ -115,7 +115,8 @@ async def get_active_session(
                 "id": t.id,
                 "charger_name": t.charger.name or f"Charger {t.charger.id}",
                 "station_name": t.charger.station.name if t.charger.station else "Unknown Station",
-                "charger_id": t.charger.charge_point_string_id,
+                # Asset Code, not the OCPP UUID. ADR 0028.
+                "charger_id": t.charger.asset_code,
                 "status": t.transaction_status.value,
                 "start_time": t.start_time.isoformat() if t.start_time else None,
                 "energy_consumed_kwh": t.energy_consumed_kwh,
@@ -168,8 +169,12 @@ async def get_my_sessions(
                 "id": ct.id,
                 "type": "charging",
                 "station_name": ct.charger.station.name if ct.charger.station else "Unknown Station",
-                "charger_name": ct.charger.name or f"Charger {ct.charger.id}",
-                "charger_id": ct.charger.charge_point_string_id,
+                # The Asset Code replaces both halves of what was here: a
+                # `name` that is nullable and non-unique (so "Charger 3" could
+                # name four different units) and the charge_point_string_id
+                # UUID, which is the OCPP auth username. ADR 0028.
+                "charger_name": ct.charger.asset_code,
+                "charger_id": ct.charger.asset_code,
                 "energy_consumed_kwh": ct.energy_consumed_kwh,
                 "start_time": ct.start_time.isoformat() if ct.start_time else None,
                 "end_time": ct.end_time.isoformat() if ct.end_time else None,
@@ -603,7 +608,9 @@ async def get_user_transaction_details(
             "charger": {
                 "id": charger.id,
                 "name": charger.name,
-                "charge_point_string_id": charger.charge_point_string_id
+                # Asset Code is what the customer sees; the OCPP UUID is
+                # deliberately not returned on a customer surface. ADR 0028.
+                "asset_code": charger.asset_code
             },
             "meter_values": [
                 {
@@ -752,7 +759,10 @@ async def get_charger_by_string_id(
         return {
             "charger": {
                 "id": charger.id,
+                # Retained for routing (the QR sticker URL embeds it), but
+                # the page renders `asset_code`. ADR 0028.
                 "charge_point_string_id": charger.charge_point_string_id,
+                "asset_code": charger.asset_code,
                 "station_id": charger.station_id,
                 "name": charger.name,
                 "model": charger.model,

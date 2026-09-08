@@ -523,9 +523,9 @@ export default function UserChargePage() {
           <CardContent className="space-y-4">
             <div className="space-y-3">
               <div className="flex justify-between items-center">
-                <span className="font-medium text-card-foreground">ID:</span>
+                <span className="font-medium text-card-foreground">Charger:</span>
                 <span className="text-sm font-mono text-muted-foreground bg-muted px-2 py-1 rounded">
-                  {charger.charge_point_string_id}
+                  {charger.asset_code}
                 </span>
               </div>
               

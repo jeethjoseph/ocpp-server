@@ -159,7 +159,9 @@ def _build_entry(qr_payment: QRPayment, txn: Optional[Transaction], sub_state: s
         "transaction_id": txn.id if txn else None,
         "amount_paid": str(qr_payment.amount_paid),
         "started_at": qr_payment.created_at.isoformat(),
-        "charger_name": charger.name if charger else None,
+        # Asset Code, not `name`: customer-facing surfaces show the
+        # identifier a customer can read off the unit. ADR 0028.
+        "charger_name": charger.asset_code if charger else None,
         "station_name": station.name if station else None,
         "franchisee_name": franchisee.business_name if franchisee else None,
         "sub_state": sub_state,
