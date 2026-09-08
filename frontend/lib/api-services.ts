@@ -1144,6 +1144,18 @@ export const diagnosticBundleService = {
    * Generate or rotate the charger's auth key.
    * The plaintext is returned ONCE and is never retrievable again.
    */
+  /** Mint a charger's FIRST key. 409s if one already exists — rotating is a
+   *  separate, explicitly named call. */
   provisionAuthKey: (chargerId: number) =>
     api.post<ChargerAuthKey>(`/api/admin/chargers/${chargerId}/auth-key`, {}),
+
+  /** Replace an existing key. Destructive and irreversible: there is no grace
+   *  overlap, so the charger fails auth until the new key is loaded onto it by
+   *  charger-side tooling — and the fleet is behind carrier NAT, so that means
+   *  visiting the unit. The caller echoes the charger's name to proceed. */
+  rotateAuthKey: (chargerId: number, confirmChargerName: string) =>
+    api.post<ChargerAuthKey>(
+      `/api/admin/chargers/${chargerId}/auth-key/rotate`,
+      { confirm_charger_name: confirmChargerName }
+    ),
 };

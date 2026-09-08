@@ -53,6 +53,10 @@ export interface Charger {
   availability: "Operative" | "Inoperative";
   last_heart_beat_time?: string;
   connection_status: boolean;
+  // Whether a Charger Auth Key has been provisioned — never the hash. Drives
+  // whether the diagnostics panel offers "Generate" or the destructive
+  // "Rotate", so the label cannot claim to mint a key while replacing one.
+  has_auth_key: boolean;
   created_at: string;
   updated_at: string;
   tariff_per_kwh?: number;

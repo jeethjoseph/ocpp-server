@@ -1038,7 +1038,13 @@ export default function ChargerDetailPage() {
 
         {/* Diagnostic Bundles — delivery status + raw archive (ADR 0029).
             Trace content is searched in New Relic, not here. */}
-        {charger && <DiagnosticBundles chargerId={charger.id} />}
+        {charger && (
+          <DiagnosticBundles
+            chargerId={charger.id}
+            chargerName={charger.name}
+            hasAuthKey={charger.has_auth_key}
+          />
+        )}
 
         {/* Audit Log Section */}
         {charger && (

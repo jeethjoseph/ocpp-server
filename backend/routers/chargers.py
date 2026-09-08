@@ -93,6 +93,11 @@ class ChargerResponse(BaseModel):
     availability: str
     last_heart_beat_time: Optional[datetime]
     connection_status: bool
+    # Whether a Charger Auth Key has been provisioned. A boolean, never the hash
+    # — it exists so the UI can tell "Generate" from "Rotate" *before* the
+    # destructive call, which is the signal whose absence made an accidental
+    # rotation possible at all.
+    has_auth_key: bool
     created_at: datetime
     updated_at: datetime
     tariff_per_kwh: Optional[float] = None  # back-derived; internal billing math
@@ -236,6 +241,7 @@ def charger_to_response(
             else str(charger.availability)
         ),
         last_heart_beat_time=charger.last_heart_beat_time,
+        has_auth_key=bool(charger.auth_key_hash),
         created_at=charger.created_at,
         updated_at=charger.updated_at,
         connection_status=connection_status,
@@ -1327,28 +1333,22 @@ class AuthKeyResponse(BaseModel):
     warning: str
 
 
-@router.post("/{charger_id}/auth-key", response_model=AuthKeyResponse)
-async def provision_charger_auth_key(
-    charger_id: int,
-    admin_user: User = Depends(require_admin()),
-):
-    """Generate or rotate a charger's **Charger Auth Key**, revealing it once.
+class RotateAuthKeyRequest(BaseModel):
+    # The charger's own name, echoed back by the caller. A bare `confirm: true`
+    # would be satisfied by muscle memory or a copy-pasted curl; echoing an
+    # identifier you had to look up is the cheapest thing that demonstrates you
+    # know *which* unit you are about to cut off.
+    confirm_charger_name: str
 
-    The plaintext is returned in this response and never again — only its
-    SHA-256 is stored. A lost key is rotated, not recovered.
 
-    Rotation has **no grace overlap**: the old hash is replaced immediately, so
-    the charger fails authentication until the new key is loaded onto it.
-    Delivery onto the unit is charger-side tooling's job, not the server's.
+def _rotation_confirmation_value(charger) -> str:
+    """What the caller must echo to rotate. Falls back to the string id so an
+    unnamed charger cannot skip the check entirely."""
+    return (charger.name or "").strip() or charger.charge_point_string_id
 
-    Currently gates **Diagnostic Bundle upload** only. The OCPP WebSocket
-    handshake does not consult this key yet (ADR 0020 remains PROPOSED).
-    """
-    charger = await Charger.get_or_none(id=charger_id)
-    if not charger:
-        raise HTTPException(status_code=404, detail="Charger not found")
 
-    rotated = bool(charger.auth_key_hash)
+async def _mint_and_store_key(charger, admin_user, *, rotated: bool) -> AuthKeyResponse:
+    """Shared tail of provisioning and rotation: mint, store the hash, audit."""
     plaintext = charger_auth_service.generate_auth_key()
     charger.auth_key_hash = charger_auth_service.hash_auth_key(plaintext)
     await charger.save(update_fields=["auth_key_hash", "updated_at"])
@@ -1384,3 +1384,76 @@ async def provision_charger_auth_key(
         rotated=rotated,
         warning="Copy this key now — it is shown once and cannot be retrieved again.",
     )
+
+
+@router.post("/{charger_id}/auth-key", response_model=AuthKeyResponse)
+async def provision_charger_auth_key(
+    charger_id: int,
+    admin_user: User = Depends(require_admin()),
+):
+    """Mint a charger's **first** Charger Auth Key, revealing it once.
+
+    Deliberately incapable of destroying an existing key: a charger that already
+    has one is refused with 409 and must go through the explicit rotate
+    endpoint. Provisioning and rotation used to be the same call, with which one
+    you got decided by server state the caller could not see — so an admin with
+    no way of knowing a key existed could destroy a working credential in one
+    click, and only learn which operation had happened from the response.
+
+    The plaintext is returned here and never again; only its SHA-256 is stored.
+    """
+    charger = await Charger.get_or_none(id=charger_id)
+    if not charger:
+        raise HTTPException(status_code=404, detail="Charger not found")
+
+    if charger.auth_key_hash:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This charger already has an auth key. Rotating it will cut the "
+                "charger off until the new key is loaded onto the unit — use the "
+                "rotate endpoint to do that deliberately."
+            ),
+        )
+
+    return await _mint_and_store_key(charger, admin_user, rotated=False)
+
+
+@router.post("/{charger_id}/auth-key/rotate", response_model=AuthKeyResponse)
+async def rotate_charger_auth_key(
+    charger_id: int,
+    body: RotateAuthKeyRequest,
+    admin_user: User = Depends(require_admin()),
+):
+    """Replace a charger's **Charger Auth Key**, revealing the new one once.
+
+    Destructive and irreversible. Rotation has **no grace overlap**: the old
+    hash is replaced immediately, so the charger fails authentication from that
+    instant until the new key is loaded onto it by charger-side tooling. The
+    fleet sits behind carrier NAT with no inbound path, so recovery from an
+    unintended rotation means physically visiting the unit.
+
+    The caller must echo the charger's own name to proceed. That converts a slip
+    into a deliberate act; it cannot stop a confident mistake, which would need
+    two-person approval and is disproportionate while this key gates Diagnostic
+    Bundle upload only (ADR 0020 remains PROPOSED, so the OCPP WebSocket
+    handshake does not consult it yet).
+    """
+    charger = await Charger.get_or_none(id=charger_id)
+    if not charger:
+        raise HTTPException(status_code=404, detail="Charger not found")
+
+    if not charger.auth_key_hash:
+        raise HTTPException(
+            status_code=409,
+            detail="This charger has no auth key to rotate — provision one instead.",
+        )
+
+    expected = _rotation_confirmation_value(charger)
+    if body.confirm_charger_name.strip().casefold() != expected.casefold():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Confirmation does not match. Type '{expected}' to rotate this charger's key.",
+        )
+
+    return await _mint_and_store_key(charger, admin_user, rotated=True)

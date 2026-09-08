@@ -683,3 +683,122 @@ class TestChargerEndpoints:
         assert await Tariff.filter(charger_id=charger_id).count() == 1
 
 # Run with: pytest tests/test_chargers.py -v
+
+@pytest.mark.unit
+class TestChargerAuthKeyRotationGuard:
+    """Provisioning and rotation are separate operations on purpose.
+
+    They used to be one endpoint whose behaviour depended on server state the
+    caller could not see, so an admin with no way of knowing a key existed could
+    destroy a working credential in one click. Rotation has no grace overlap and
+    the fleet is behind carrier NAT, so recovery means visiting the unit.
+    """
+
+    @pytest.mark.asyncio
+    async def test_first_provision_succeeds_and_reveals_the_key(
+        self, client_admin: AsyncClient, test_charger
+    ):
+        resp = await client_admin.post(f"/api/admin/chargers/{test_charger.id}/auth-key")
+        assert resp.status_code == status.HTTP_200_OK
+        body = resp.json()
+        assert body["rotated"] is False
+        assert body["auth_key"]
+
+        await test_charger.refresh_from_db()
+        assert test_charger.auth_key_hash
+
+    @pytest.mark.asyncio
+    async def test_provisioning_twice_is_refused_and_leaves_the_key_intact(
+        self, client_admin: AsyncClient, test_charger
+    ):
+        """The whole point: the safe endpoint can never destroy a key."""
+        await client_admin.post(f"/api/admin/chargers/{test_charger.id}/auth-key")
+        await test_charger.refresh_from_db()
+        original = test_charger.auth_key_hash
+
+        resp = await client_admin.post(f"/api/admin/chargers/{test_charger.id}/auth-key")
+        assert resp.status_code == status.HTTP_409_CONFLICT
+
+        await test_charger.refresh_from_db()
+        assert test_charger.auth_key_hash == original, "a refused provision must not rotate"
+
+    @pytest.mark.asyncio
+    async def test_rotation_requires_the_charger_name_and_a_mismatch_changes_nothing(
+        self, client_admin: AsyncClient, test_charger
+    ):
+        await client_admin.post(f"/api/admin/chargers/{test_charger.id}/auth-key")
+        await test_charger.refresh_from_db()
+        original = test_charger.auth_key_hash
+
+        resp = await client_admin.post(
+            f"/api/admin/chargers/{test_charger.id}/auth-key/rotate",
+            json={"confirm_charger_name": "definitely-not-this-charger"},
+        )
+        assert resp.status_code == status.HTTP_400_BAD_REQUEST
+
+        await test_charger.refresh_from_db()
+        assert test_charger.auth_key_hash == original, "a failed confirmation must not rotate"
+
+    @pytest.mark.asyncio
+    async def test_rotation_with_the_right_name_replaces_the_key(
+        self, client_admin: AsyncClient, test_charger
+    ):
+        await client_admin.post(f"/api/admin/chargers/{test_charger.id}/auth-key")
+        await test_charger.refresh_from_db()
+        original = test_charger.auth_key_hash
+
+        resp = await client_admin.post(
+            f"/api/admin/chargers/{test_charger.id}/auth-key/rotate",
+            json={"confirm_charger_name": test_charger.name},
+        )
+        assert resp.status_code == status.HTTP_200_OK
+        assert resp.json()["rotated"] is True
+
+        await test_charger.refresh_from_db()
+        assert test_charger.auth_key_hash != original
+
+    @pytest.mark.asyncio
+    async def test_confirmation_tolerates_case_and_surrounding_whitespace(
+        self, client_admin: AsyncClient, test_charger
+    ):
+        """Guard against slips, not against typing. Requiring exact case would
+        push operators to copy-paste, which defeats the point of the echo."""
+        await client_admin.post(f"/api/admin/chargers/{test_charger.id}/auth-key")
+
+        resp = await client_admin.post(
+            f"/api/admin/chargers/{test_charger.id}/auth-key/rotate",
+            json={"confirm_charger_name": f"  {test_charger.name.upper()}  "},
+        )
+        assert resp.status_code == status.HTTP_200_OK
+
+    @pytest.mark.asyncio
+    async def test_rotating_an_unprovisioned_charger_is_refused(
+        self, client_admin: AsyncClient, test_charger
+    ):
+        """Not silently a provision — that would leak the two operations back
+        into one and undo the split."""
+        resp = await client_admin.post(
+            f"/api/admin/chargers/{test_charger.id}/auth-key/rotate",
+            json={"confirm_charger_name": test_charger.name},
+        )
+        assert resp.status_code == status.HTTP_409_CONFLICT
+
+        await test_charger.refresh_from_db()
+        assert test_charger.auth_key_hash is None
+
+    @pytest.mark.asyncio
+    async def test_charger_response_reports_key_presence_without_the_hash(
+        self, client_admin: AsyncClient, test_charger
+    ):
+        """The signal whose absence made the accident possible."""
+        before = await client_admin.get(f"/api/admin/chargers/{test_charger.id}")
+        assert before.json()["charger"]["has_auth_key"] is False
+
+        await client_admin.post(f"/api/admin/chargers/{test_charger.id}/auth-key")
+
+        after = await client_admin.get(f"/api/admin/chargers/{test_charger.id}")
+        charger_body = after.json()["charger"]
+        assert charger_body["has_auth_key"] is True
+        # The presence flag is the whole exposure; the hash never leaves the server.
+        assert "auth_key_hash" not in charger_body
+        assert "auth_key" not in charger_body

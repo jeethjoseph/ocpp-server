@@ -4,6 +4,15 @@ import { useEffect, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Download, KeyRound, AlertTriangle, FileText } from "lucide-react";
 import { toast } from "sonner";
 import {
@@ -19,7 +28,20 @@ import {
  * — did every bundle arrive, and did the charger lose anything — and hands back
  * the raw archive for anything older than New Relic's 30-day window.
  */
-export default function DiagnosticBundles({ chargerId }: { chargerId: number }) {
+export default function DiagnosticBundles({
+  chargerId,
+  chargerName,
+  hasAuthKey,
+}: {
+  chargerId: number;
+  chargerName: string;
+  hasAuthKey: boolean;
+}) {
+  // Mirrored locally so the button flips from Generate to Rotate straight after
+  // provisioning, without waiting for the parent to refetch the charger.
+  const [keyExists, setKeyExists] = useState(hasAuthKey);
+  const [rotateOpen, setRotateOpen] = useState(false);
+  const [rotateConfirm, setRotateConfirm] = useState("");
   const [bundles, setBundles] = useState<DiagnosticBundle[]>([]);
   // Null once there is nothing older left to fetch.
   const [cursor, setCursor] = useState<number | null>(null);
@@ -65,6 +87,16 @@ export default function DiagnosticBundles({ chargerId }: { chargerId: number }) 
     }
   };
 
+  // A revealed key exists nowhere else — the server kept only its SHA-256, and
+  // rotation has no grace overlap. Losing it here means the charger stays
+  // unauthenticated until someone rotates again, so a reload must not be silent.
+  useEffect(() => {
+    if (!revealedKey) return;
+    const warn = (e: BeforeUnloadEvent) => e.preventDefault();
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [revealedKey]);
+
   const handleDownload = async (bundle: DiagnosticBundle) => {
     try {
       const { url } = await diagnosticBundleService.downloadUrl(bundle.id);
@@ -79,11 +111,30 @@ export default function DiagnosticBundles({ chargerId }: { chargerId: number }) 
     try {
       const result = await diagnosticBundleService.provisionAuthKey(chargerId);
       setRevealedKey(result.auth_key);
-      toast.success(
-        result.rotated ? "Auth key rotated" : "Auth key generated"
-      );
+      setKeyExists(true);
+      toast.success("Auth key generated");
     } catch {
+      // A 409 here means the charger already had a key — the endpoint refuses
+      // to destroy it, so nothing has changed.
       toast.error("Could not generate auth key");
+    } finally {
+      setProvisioning(false);
+    }
+  };
+
+  const handleRotate = async () => {
+    setProvisioning(true);
+    try {
+      const result = await diagnosticBundleService.rotateAuthKey(
+        chargerId,
+        rotateConfirm
+      );
+      setRevealedKey(result.auth_key);
+      setRotateOpen(false);
+      setRotateConfirm("");
+      toast.success("Auth key rotated — the charger is unauthenticated until reflashed");
+    } catch {
+      toast.error("Could not rotate auth key — the existing key is unchanged");
     } finally {
       setProvisioning(false);
     }
@@ -124,13 +175,17 @@ export default function DiagnosticBundles({ chargerId }: { chargerId: number }) 
           Diagnostic Bundles
         </CardTitle>
         <Button
-          variant="outline"
+          variant={keyExists ? "destructive" : "outline"}
           size="sm"
-          onClick={handleProvision}
+          onClick={() => (keyExists ? setRotateOpen(true) : handleProvision())}
           disabled={provisioning}
         >
           <KeyRound className="mr-2 h-4 w-4" />
-          {provisioning ? "Generating…" : "Generate auth key"}
+          {provisioning
+            ? "Working…"
+            : keyExists
+              ? "Rotate auth key"
+              : "Generate auth key"}
         </Button>
       </CardHeader>
 
@@ -143,17 +198,27 @@ export default function DiagnosticBundles({ chargerId }: { chargerId: number }) 
             <code className="block break-all rounded bg-white p-2 font-mono text-sm dark:bg-black">
               {revealedKey}
             </code>
-            <Button
-              variant="ghost"
-              size="sm"
-              className="mt-2"
-              onClick={() => {
-                navigator.clipboard.writeText(revealedKey);
-                toast.success("Copied");
-              }}
-            >
-              Copy
-            </Button>
+            <div className="mt-2 flex gap-2">
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  navigator.clipboard.writeText(revealedKey);
+                  toast.success("Copied");
+                }}
+              >
+                Copy
+              </Button>
+              {/* The only way to dismiss the panel. Clicking elsewhere must not
+                  discard a secret that exists nowhere else. */}
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setRevealedKey(null)}
+              >
+                I have saved this key
+              </Button>
+            </div>
           </div>
         )}
 
@@ -274,6 +339,65 @@ export default function DiagnosticBundles({ chargerId }: { chargerId: number }) 
           </div>
         )}
       </CardContent>
+
+      <Dialog
+        open={rotateOpen}
+        onOpenChange={(o) => {
+          setRotateOpen(o);
+          if (!o) setRotateConfirm("");
+        }}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Rotate auth key for {chargerName}?</DialogTitle>
+            <DialogDescription asChild>
+              <div className="space-y-2 text-sm">
+                <p>
+                  This replaces the key immediately. There is no overlap period —
+                  the charger will fail authentication from the moment you
+                  confirm, until the new key is loaded onto the unit.
+                </p>
+                <p>
+                  The new key is shown <strong>once</strong> and cannot be
+                  retrieved afterwards.
+                </p>
+              </div>
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-2">
+            <label htmlFor="rotate-confirm" className="text-sm font-medium">
+              Type <code className="font-mono">{chargerName}</code> to confirm
+            </label>
+            <Input
+              id="rotate-confirm"
+              value={rotateConfirm}
+              onChange={(e) => setRotateConfirm(e.target.value)}
+              placeholder={chargerName}
+              autoComplete="off"
+            />
+          </div>
+
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setRotateOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={handleRotate}
+              // Matched leniently here and server-side: the guard exists to stop
+              // a slip, and demanding exact case would push people to paste.
+              disabled={
+                provisioning ||
+                rotateConfirm.trim().toLowerCase() !==
+                  chargerName.trim().toLowerCase()
+              }
+            >
+              {provisioning ? "Rotating…" : "Rotate key"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Card>
   );
 }
