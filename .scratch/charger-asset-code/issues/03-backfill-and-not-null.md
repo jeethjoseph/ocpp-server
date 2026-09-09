@@ -35,7 +35,11 @@ test unit — which is why the CSV was reviewed by a human before it got here. A
 wrongly marked `TEST` stops billing and vanishes from public surfaces once slices 06 and
 07 ship.
 
-Four guards, each **raising rather than skipping quietly**:
+Four guards. **Guard 1 raises; guard 2 deliberately does not** (revised 2026-09-09 —
+the entrypoint runs `aerich upgrade` under `set -e`, so a raising migration stops the
+backend booting and takes the fleet offline; a charger onboarded between the worksheet
+and deploy day is routine, and allocating a fresh code is the correct answer for it since
+it carries no painted stencil):
 
 1. Every UUID in the map exists in the target register.
 2. Every row with `asset_code IS NULL` is covered by the map — this is what catches a

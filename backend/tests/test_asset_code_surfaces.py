@@ -5,9 +5,12 @@ Auth username, so printing it on a GST invoice PDF that lands in a stranger's
 inbox published half a credential pair. These tests are the regression guard on
 that, plus on the rule that an already-issued invoice is never rewritten.
 """
+import importlib.util
 import re
 import uuid
 from decimal import Decimal
+
+from tortoise import connections
 
 import pytest
 
@@ -253,3 +256,100 @@ class TestNoCustomerResponseContainsTheOcppUuid:
         assert charger.charge_point_string_id not in body
         # And not the non-unique name either — "Charger 3" could be four units.
         assert "Charger 3" not in body
+
+
+@pytest.mark.unit
+class TestIssuedInvoicesAreNeverRewritten:
+    """Migration 61's backfill, exercised rather than grepped.
+
+    This is the single most compliance-sensitive statement in the effort: a GST
+    invoice with a generated PDF is a frozen tax document and must stay
+    byte-identical. It was previously covered only by asserting the migration's
+    SOURCE contained a WHERE clause — which proves the text exists, not that it
+    works. A typo in the join, or the two UPDATEs in the wrong order, would pass
+    that check and silently rewrite issued invoices.
+    """
+
+    MIGRATION_61 = "/app/migrations/models/61_20260908224718_gst_invoice_charger_snapshot.py"
+
+    def _load(self):
+        spec = importlib.util.spec_from_file_location("gst_snapshot", self.MIGRATION_61)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    async def _seed(self, station, user, *, issued: bool):
+        """An invoice whose charger_id_str holds a pre-cutover UUID."""
+        charger = await Charger.create(
+            charge_point_string_id=str(uuid.uuid4()),
+            station_id=station.id,
+            name="unit",
+            serial_number=f"SN{uuid.uuid4().hex[:8]}",
+            asset_code=f"VOWS{uuid.uuid4().int % 9000 + 1000:04d}",
+            latest_status=ChargerStatusEnum.AVAILABLE,
+        )
+        txn = await Transaction.create(
+            user=user, charger=charger, energy_consumed_kwh=1.0,
+            energy_charge=Decimal("10.00"), gst_amount=Decimal("1.80"),
+            total_billed=Decimal("11.80"),
+            transaction_status=TransactionStatusEnum.COMPLETED,
+        )
+        invoice = await GSTInvoice.create(
+            invoice_number=f"VL/F0001/Q/2627/{uuid.uuid4().int % 90000 + 10000}",
+            series="Q", financial_year="2627", transaction=txn, user=user,
+            supplier_name="VoltLync", supplier_gstin="32ABCDE1234F1Z5",
+            supplier_state_code="32", station_name="S",
+            place_of_supply_state_code="32",
+            # The pre-cutover state: the UUID is what was printed.
+            charger_id_str=charger.charge_point_string_id,
+            energy_consumed_kwh=1.0, tariff_rate_incl_tax=Decimal("118.00"),
+            hsn_sac_code="996749", gst_rate_percent=Decimal("18.00"),
+            energy_taxable_value=Decimal("10.00"), gateway_charges=Decimal("0"),
+            total_taxable_value=Decimal("10.00"), is_inter_state=False,
+            cgst_rate=Decimal("9.00"), cgst_amount=Decimal("0.90"),
+            sgst_rate=Decimal("9.00"), sgst_amount=Decimal("0.90"),
+            total_tax=Decimal("1.80"), total_amount=Decimal("11.80"),
+            payment_method="WALLET",
+            pdf_url="https://s3/invoice.pdf" if issued else None,
+        )
+        return charger, invoice
+
+    async def _run_backfill(self):
+        # Only the two UPDATEs; the ALTERs already ran via the real migration.
+        module = self._load()
+        sql = await module.upgrade(None)
+        updates = sql.split("ALTER TABLE \"gst_invoice\" ADD \"charger_ocpp_id\" VARCHAR(255);")[1]
+        await connections.get("default").execute_script(updates)
+
+    @pytest.mark.asyncio
+    async def test_an_issued_invoice_keeps_the_uuid_it_printed(
+        self, client, test_station, test_user
+    ):
+        charger, invoice = await self._seed(test_station, test_user, issued=True)
+        await self._run_backfill()
+        await invoice.refresh_from_db()
+        # Byte-identical: still the UUID that appears on the generated PDF.
+        assert invoice.charger_id_str == charger.charge_point_string_id
+        assert invoice.charger_id_str != charger.asset_code
+
+    @pytest.mark.asyncio
+    async def test_an_unissued_invoice_gains_the_asset_code(
+        self, client, test_station, test_user
+    ):
+        charger, invoice = await self._seed(test_station, test_user, issued=False)
+        await self._run_backfill()
+        await invoice.refresh_from_db()
+        assert invoice.charger_id_str == charger.asset_code
+
+    @pytest.mark.asyncio
+    async def test_internal_columns_are_backfilled_for_issued_invoices_too(
+        self, client, test_station, test_user
+    ):
+        # They are never printed and never exported, so populating them alters
+        # no document — and it gives compliance one uniform join across the
+        # cutover instead of a regex on charger_id_str.
+        charger, invoice = await self._seed(test_station, test_user, issued=True)
+        await self._run_backfill()
+        await invoice.refresh_from_db()
+        assert invoice.charger_ocpp_id == charger.charge_point_string_id
+        assert invoice.charger_station_id == charger.station_id

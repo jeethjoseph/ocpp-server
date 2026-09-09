@@ -169,15 +169,44 @@ class TestMappedBackfill:
             }))
 
     @pytest.mark.asyncio
-    async def test_guard_2_raises_when_a_charger_is_not_covered(self, client, pre_migration_schema, test_station):
-        # The realistic failure: a charger created between CSV generation and
-        # deploy. Without this guard it would reach the NOT NULL flip and fail
-        # with a constraint error naming no rows.
+    async def test_a_charger_created_since_the_csv_is_allocated_not_fatal(
+        self, client, pre_migration_schema, test_station
+    ):
+        # THE production-safety property. The entrypoint runs `aerich upgrade`
+        # under `set -e` on every boot, so a raising migration does not print an
+        # error — it stops the backend booting and takes the fleet offline. A
+        # charger onboarded between the worksheet and deploy day is routine, so
+        # it must be allocated, not fatal.
         mapped = str(uuid.uuid4())
+        latecomer = str(uuid.uuid4())
         await _charger(test_station, mapped)
-        await _charger(test_station, str(uuid.uuid4()), name="created after the CSV")
-        with pytest.raises(Exception, match="not covered by the map"):
-            await _run(migration._mapped_upgrade({mapped: ("VOWS0001", "PUBLIC")}))
+        await _charger(test_station, latecomer, name="created after the CSV")
+
+        await _run(migration._mapped_upgrade({mapped: ("VOWS0001", "PUBLIC")}))
+
+        assert (await Charger.get(charge_point_string_id=mapped)).asset_code == "VOWS0001"
+        # Allocated past the highest mapped code, not colliding with it.
+        allocated = (await Charger.get(charge_point_string_id=latecomer)).asset_code
+        assert allocated == "VOWS0002"
+
+    @pytest.mark.asyncio
+    async def test_an_unmapped_charger_stays_public(
+        self, client, pre_migration_schema, test_station
+    ):
+        # Fail-open: a row the worksheet never classified keeps billing and
+        # stays visible rather than silently going dark.
+        bench = str(uuid.uuid4())
+        latecomer = str(uuid.uuid4())
+        await _charger(test_station, bench)
+        await _charger(test_station, latecomer)
+
+        # The map classifies the known bench unit; the latecomer is absent.
+        await _run(migration._mapped_upgrade({bench: ("VOWS0001", "TEST")}))
+
+        assert (await Charger.get(charge_point_string_id=bench)).purpose == ChargerPurposeEnum.TEST
+        row = await Charger.get(charge_point_string_id=latecomer)
+        assert row.purpose == ChargerPurposeEnum.PUBLIC
+        assert row.asset_code == "VOWS0002"
 
     @pytest.mark.asyncio
     async def test_guard_3_re_running_is_a_no_op(self, client, pre_migration_schema, test_station):

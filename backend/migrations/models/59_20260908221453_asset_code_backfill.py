@@ -69,7 +69,7 @@ def _sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _mapped_upgrade(mapping: dict) -> str:
+def _mapped_upgrade(mapping: dict, series: str | None = None) -> str:
     """Backfill from the explicit map, guarding every assumption.
 
     Four guards, each RAISING rather than skipping quietly. A migration that
@@ -77,6 +77,10 @@ def _mapped_upgrade(mapping: dict) -> str:
     NOT NULL would surface the shortfall as a confusing constraint violation
     with no clue which rows were missed.
     """
+    if series is None:
+        from policy import charger_code_series
+
+        series = charger_code_series(os.getenv("ENVIRONMENT", "development"))
     values = ",\n            ".join(
         f"({_sql_literal(uuid_)}, {_sql_literal(code)}, {_sql_literal(purpose)})"
         for uuid_, (code, purpose) in mapping.items()
@@ -103,9 +107,27 @@ def _mapped_upgrade(mapping: dict) -> str:
             END IF;
         END $$;
 
-        -- Guard 2: every row still needing a code is covered by the map. This
-        -- is what catches a charger created between CSV generation and deploy
-        -- — the one failure mode a reviewed map cannot see coming.
+        -- Guard 2: report rows the map does not cover, then ALLOCATE for them
+        -- rather than aborting.
+        --
+        -- This deliberately does NOT raise, and the reasoning matters. The
+        -- entrypoint runs `aerich upgrade` under `set -e` on every boot, so a
+        -- raising migration does not print an error — it stops the backend from
+        -- starting and takes the whole fleet offline until someone edits a map
+        -- and redeploys. The only realistic trigger is a charger created between
+        -- CSV generation and deploy, which is a routine event, not a
+        -- catastrophe.
+        --
+        -- Allocating is also the CORRECT answer for such a row, not merely the
+        -- safe one. The map exists to preserve stencils already painted on the
+        -- fleet; a charger onboarded last week has no stencil, so a fresh
+        -- sequential code is exactly what slice 02 would have given it. Its
+        -- `purpose` stays at the PUBLIC default — fail-open, same as every other
+        -- gate in ADR 0028.
+        --
+        -- The wrong-environment case, which IS catastrophic, is still caught by
+        -- guard 1 above: a map built for the other register names UUIDs that do
+        -- not exist here.
         DO $$
         DECLARE uncovered TEXT;
         BEGIN
@@ -114,7 +136,7 @@ def _mapped_upgrade(mapping: dict) -> str:
             LEFT JOIN "_asset_code_map" m ON c."charge_point_string_id" = m."ocpp_id"
             WHERE c."asset_code" IS NULL AND m."ocpp_id" IS NULL;
             IF uncovered IS NOT NULL THEN
-                RAISE EXCEPTION 'Asset Code backfill: chargers not covered by the map: %', uncovered;
+                RAISE NOTICE 'Asset Code backfill: allocating fresh codes for chargers absent from the map (created since the worksheet): %', uncovered;
             END IF;
         END $$;
 
@@ -126,6 +148,26 @@ def _mapped_upgrade(mapping: dict) -> str:
                "purpose" = m."purpose"
           FROM "_asset_code_map" m
          WHERE c."charge_point_string_id" = m."ocpp_id"
+           AND c."asset_code" IS NULL;
+
+        -- Allocate for anything the map did not cover, continuing the register
+        -- past its highest existing code. The `base` subquery is evaluated once,
+        -- before the UPDATE, so it sees the pre-update maximum.
+        UPDATE "charger" c
+           SET "asset_code" = '{series}' || lpad((base."maxnum" + seq."rn")::TEXT, 4, '0')
+          FROM (
+                SELECT "id", row_number() OVER (ORDER BY "id") AS "rn"
+                  FROM "charger"
+                 WHERE "asset_code" IS NULL
+               ) seq,
+               (
+                SELECT COALESCE(
+                         MAX(CAST(substring("asset_code" FROM '[0-9]+$') AS BIGINT)), 0
+                       ) AS "maxnum"
+                  FROM "charger"
+                 WHERE "asset_code" IS NOT NULL
+               ) base
+         WHERE c."id" = seq."id"
            AND c."asset_code" IS NULL;
 
         -- Guard 4: post-condition. Nothing may reach the NOT NULL flip without
@@ -165,12 +207,12 @@ def _sequential_upgrade(series: str) -> str:
 
 async def upgrade(db: BaseDBAsyncClient) -> str:
     environment = (os.getenv("ENVIRONMENT", "development") or "").strip().lower()
+    from policy import charger_code_series
+
     mapping = ASSET_CODE_BACKFILL.get(environment)
     if mapping is None:
-        from policy import charger_code_series
-
         return _sequential_upgrade(charger_code_series(environment))
-    return _mapped_upgrade(mapping)
+    return _mapped_upgrade(mapping, charger_code_series(environment))
 
 
 async def downgrade(db: BaseDBAsyncClient) -> str:
