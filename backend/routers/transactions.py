@@ -67,8 +67,17 @@ class UserBasicInfo(BaseModel):
         from_attributes = True
 
 class ChargerBasicInfo(BaseModel):
+    """Charger identity on the ADMIN transaction detail.
+
+    Carries both identifiers deliberately: `asset_code` is what a customer
+    quotes to support, `charge_point_string_id` is the OCPP identity ops needs
+    for log correlation and firmware deploys. The customer-facing sibling of
+    this endpoint (`/api/users/transaction/{id}`) returns only the code.
+    """
+
     id: int
     name: str
+    asset_code: str
     charge_point_string_id: str
     
     class Config:
@@ -358,13 +367,25 @@ async def _dispatch_remote_stop(charger, transaction_id: int) -> None:
     if not await redis_manager.is_charger_connected(charger.charge_point_string_id):
         return
     from main import send_ocpp_request
-    success, response = await send_ocpp_request(
+    outcome = await send_ocpp_request(
         charger.charge_point_string_id,
         "RemoteStopTransaction",
         {"transactionId": transaction_id},
     )
-    if not success:
-        logger.warning(f"Failed to send OCPP stop command for transaction {transaction_id}: {response}")
+    if outcome.is_unanswered:
+        logger.warning(
+            f"Could not deliver OCPP stop for transaction {transaction_id}: {outcome.response}"
+        )
+    elif outcome.is_refused:
+        # Worth its own line. The transaction is already marked STOPPED
+        # server-side by the caller, so a refusal here means the records and the
+        # hardware disagree: the charger may still be delivering energy against
+        # a session we consider closed.
+        logger.warning(
+            f"Charger refused the OCPP stop for transaction {transaction_id} "
+            f"(status={outcome.status}) — transaction is marked STOPPED "
+            f"server-side but the charger may still be energised"
+        )
 
 
 async def _mark_force_stopped(transaction, reason: str, admin_user: User) -> None:
@@ -398,11 +419,10 @@ async def _recalc_energy_if_missing(transaction) -> None:
     it from the last MeterValue before billing."""
     if transaction.energy_consumed_kwh and transaction.energy_consumed_kwh > 0:
         return
-    latest_meter_value = await MeterValue.filter(
-        transaction_id=transaction.id
-    ).order_by("-created_at").first()
-    if latest_meter_value:
-        transaction.end_meter_kwh = latest_meter_value.reading_kwh
+    from services.meter_readings import latest_meter_value
+    latest = await latest_meter_value(transaction.id)
+    if latest:
+        transaction.end_meter_kwh = latest.reading_kwh
         transaction.energy_consumed_kwh = transaction.end_meter_kwh - (transaction.start_meter_kwh or 0)
         await transaction.save()
         logger.info(f"Calculated energy for force-stopped transaction {transaction.id}: {transaction.energy_consumed_kwh} kWh")

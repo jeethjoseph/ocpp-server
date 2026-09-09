@@ -16,16 +16,21 @@ export default function ScannerPage() {
   const [showManualInput, setShowManualInput] = useState(false);
   const [lastScannedCode, setLastScannedCode] = useState<string | null>(null);
 
+  // Anything the landing page can resolve: an Asset Code (VOW0001 / VOWS0001),
+  // a legacy numeric id, or a charge_point_string_id UUID from a sticker
+  // printed before ADR 0028. The backend accepts all three, so the scanner
+  // must not be narrower than the route it navigates to — it previously
+  // matched ONLY numeric ids and so could not read the UUID QR the admin
+  // console generated.
+  const CHARGER_REF = /^(?:VOWS?\d{4,}|\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+
   const extractChargerIdFromQR = (qrData: string): string | null => {
-    // Parse URL and extract charger ID from /charge/[id] pattern
+    // Parse URL and extract the charger reference from a /charge/[ref] pattern.
     // Supports any base URL: localhost, production domain, etc.
     try {
       const url = new URL(qrData);
-      
-      // Extract from pathname: /charge/123 (any domain)
-      const pathPattern = /\/charge\/(\d+)$/i;
-      const pathMatch = url.pathname.match(pathPattern);
-      if (pathMatch) {
+      const pathMatch = url.pathname.match(/\/charge\/([^/]+)\/?$/i);
+      if (pathMatch && CHARGER_REF.test(pathMatch[1])) {
         return pathMatch[1];
       }
     } catch {
@@ -36,14 +41,13 @@ export default function ScannerPage() {
   };
 
   const navigateToCharger = (chargerId: string) => {
-    // Validate that chargerId is numeric
-    if (!/^\d+$/.test(chargerId)) {
-      toast.error("Invalid charger ID format. Please enter a numeric ID.");
+    if (!CHARGER_REF.test(chargerId.trim())) {
+      toast.error("Invalid charger code. Enter the code printed on the unit, e.g. VOW0001.");
       return;
     }
 
-    toast.success(`Navigating to charger ${chargerId}`);
-    router.push(`/charge/${chargerId}`);
+    toast.success(`Navigating to charger ${chargerId.trim()}`);
+    router.push(`/charge/${chargerId.trim()}`);
   };
 
   const handleQRScan = (qrData: string) => {

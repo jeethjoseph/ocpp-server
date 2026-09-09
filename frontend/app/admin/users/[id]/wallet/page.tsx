@@ -59,15 +59,17 @@ function WalletTransactionsTable({ userId }: { userId: number }) {
     );
   }
   
-  // Calculate running balance
-  let runningBalance = 0;
-  const transactionsWithBalance = transactions.map(transaction => {
-    runningBalance += transaction.amount;
-    return {
-      ...transaction,
-      running_balance: runningBalance
-    };
-  });
+  // Calculate running balance. Written as an immutable fold rather than a
+  // counter mutated inside .map(): the React Compiler rejects render-phase
+  // mutation of a binding captured from an enclosing scope
+  // (react-hooks/immutability).
+  const transactionsWithBalance = transactions.reduce<
+    Array<(typeof transactions)[number] & { running_balance: number }>
+  >((acc, transaction) => {
+    const running_balance =
+      (acc[acc.length - 1]?.running_balance ?? 0) + transaction.amount;
+    return [...acc, { ...transaction, running_balance }];
+  }, []);
   
   return (
     <div className="space-y-4">

@@ -64,11 +64,11 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 - ✅ **Remote Operations** - Start/stop charging, availability control via OCPP commands
 - ✅ **Financial Integration** - Wallet system with automated billing and retry service
 - ✅ **QR-Based Appless Charging** - Scan-and-pay UPI QR codes at chargers without needing an app or account
-- ✅ **Budget Enforcement** - Real-time budget checking during MeterValues with auto-stop when budget exceeded
+- ✅ **Budget Enforcement** - Real-time budget checking during MeterValues with auto-stop when budget exceeded *(moving to charger-side enforcement as the source of truth — ADR 0031; this server-side check is retained as a redundant failsafe)*
 - ✅ **Automated Refunds** - Unused payment balance automatically refunded to customer via Razorpay
 - ✅ **Transaction Resume** - Transactions survive charger reboots via SUSPENDED state with auto-stop timeout
 - ✅ **Disconnect Handler** - Automatic transaction suspension on charger disconnect with configurable timeout and auto-stop billing
-- ✅ **PostBootState Push** - Server pushes meter values and pending transaction state after every charger reboot
+- ⚠️ **PostBootState Push** - Server pushes meter values and pending transaction state after every charger reboot. **Slated for retirement (ADR 0031)**, together with its pull-shaped twin `GetLastMeterValue`: both exist only because the charger could not remember its own meter. Retirement is gated on firmware rollout — current firmware depends on this push to restore its register after a reboot (`[[project-meterstart-race-on-reboot]]`, txn 1377). `GetLastMeterValue`'s session-resume side effect must move to the MeterValues replay path.
 - ✅ **User Experience Features** - Interactive maps, QR scanning, mobile-responsive design
 - ✅ **Scalable Architecture** - Redis-based connection management for horizontal scaling
 - ✅ **Docker Production Deployment** - Complete Docker Compose stack with nginx, SSL, PostgreSQL, Redis
@@ -96,7 +96,7 @@ This CSMS serves as the **Central System** in OCPP terminology, providing:
 ### Frontend Technologies (`/frontend/`)
 | Component | Technology | Version | Purpose |
 |-----------|------------|---------|---------|
-| **Framework** | Next.js | 15.3.8 | React-based frontend with App Router |
+| **Framework** | Next.js | 16.3.3 | React-based frontend with App Router (Active LTS) |
 | **Language** | TypeScript | 5.x | Type safety and developer experience |
 | **Runtime** | React | 19.0.0 | Latest React with concurrent features |
 | **Styling** | Tailwind CSS | v4 | Utility-first CSS framework |
@@ -440,7 +440,7 @@ total_billed = energy_charge + gst_amount         # Wallet deducts total_billed
 - Automatic retry for BILLING_FAILED transactions
 - **QR Refund Retry**: Retries REFUND_FAILED QR payments via Razorpay
 - **Orphaned QR Cleanup**: Detects and refunds QR payments stuck in PAID status (no transaction linked)
-- **Stale Suspended Cleanup**: Delegates to `disconnect_handler.finalize_stale_suspended_transactions("SUSPENDED_TIMEOUT")` (shared backstop; cutoff = `max(DISCONNECT_SUSPEND_TIMEOUT, SUSPEND_TIMEOUT) + 60`). Runs every cycle, so it also catches SUSPENDED txns whose in-memory timer died without a full restart. **Do not give this its own cutoff** — see the disconnect-handler section for the 2026-06-18 incident where a private 5-min cutoff here killed disconnect-suspended sessions inside their 30-min reconnect window.
+- **Stale Suspended Cleanup**: Delegates to `disconnect_handler.finalize_stale_suspended_transactions("SUSPENDED_TIMEOUT")` (shared backstop; per-row cutoff = each txn's own per-connector-type window + 60, ADR 0027). Runs every cycle, so it also catches SUSPENDED txns whose in-memory timer died without a full restart. **Do not give this its own cutoff** — see the disconnect-handler section for the 2026-06-18 incident where a private 5-min cutoff here killed disconnect-suspended sessions inside their 30-min reconnect window.
 - Comprehensive error logging with per-item error handling (one failure doesn't block others)
 
 **Recent Enhancement**: Zero Charged Transaction Handling
@@ -500,6 +500,37 @@ The frontend's `useChangeAvailability` hook (admin) branches on the OCPP respons
 - `availability` (`ChargerAvailabilityEnum`): what an admin or franchisee has commanded via `ChangeAvailability`. Values: `Operative`, `Inoperative`. Written by `routers/chargers.change_charger_availability` and `routers/franchisee_portal.change_availability` on OCPP `Accepted` and `Scheduled` responses (NOT on `Rejected`). Read by the admin UI toggle.
 
 The split exists because a `Faulted` charger can still be admin-set `Operative` (the admin wants it available; the hardware is broken — orthogonal concerns), and a `Charging` charger that admin clicks `Inoperative` flips `availability=Inoperative` immediately while `latest_status` stays `Charging` until the session ends per OCPP `Scheduled` semantics. Surfaced as a bug on 2026-05-27 against charger `ffeadb01-78bc-4b6e-b5cd-1ff657cbedbc` on staging where the toggle appeared broken because the charger Accepted `ChangeAvailability:Operative` but didn't send a follow-up `StatusNotification` — `latest_status` stayed `Unavailable`, the toggle read it as a proxy for admin intent, and clicks appeared to have no effect. ADR 0008 captures the considered alternatives (optimistic latest_status update, TriggerMessage:StatusNotification, audit-log-derived intent) and why none of them survives a real-world firmware quirk.
+
+**Charger identity and serviceability (2026-09-09, ADR 0028)**: two further columns land on `charger`, and neither is redundant with the two above.
+
+`asset_code` (`VARCHAR(12)`, `UNIQUE NOT NULL`) is the **customer-facing identifier** — `VOW0001` production, `VOWS0001` staging/development. It replaced `charge_point_string_id` on every customer surface. That UUID is simultaneously the OCPP WSS path segment and the HTTP Basic Auth **username** under ADR 0020, so the `CHARGER ID:` line on a GST invoice PDF was publishing half a credential pair to whoever received the mail; `/my-charges` meanwhile showed `Charger.name`, which is nullable and non-unique, so `"Charger 3"` could name four different units.
+
+Mechanism, and where it differs from the ADR text:
+
+- The series map and the format pattern live in the git-tracked `backend/policy.py` beside `FRANCHISEE_CODE_BLOCKS`, guarding the same cross-environment hazard from the other side — staging serves real paying customers, so both registers mint codes a human reads off real hardware. An unrecognised `ENVIRONMENT` resolves to `VOWS`, never `VOW`. Migration 58 builds both `CHECK` constraints from that same pattern, so a format change cannot land in the database and not in Python.
+- **Allocation is a Postgres sequence** (`charger_asset_code_seq`, migration 60), not the application-side `max + 1` the ADR describes. `MAX + 1` is a read-modify-write: two concurrent creates read the same maximum and race, and because a `UNIQUE` violation aborts the entire Postgres transaction, the retry has to wrap the whole create. `nextval` is atomic, so the race and the retry both vanish. The one behavioural difference — a burned number when an insert fails — is already sanctioned by the ADR's rule that gaps are never backfilled.
+- The sequence sits under a **`pre_save` hook** on `Charger` rather than in the create endpoint, so the invariant is structural: no path, present or future, can insert a codeless charger. A bare column `DEFAULT` cannot do this job, because Tortoise 0.25 has no `db_default` and always names every column in its `INSERT`.
+- **Lookup parses the integer, not the string.** `VOW0001`, `VOW00001` and `vow1` resolve identically; a **foreign series resolves to nothing rather than being coerced**, so a staging code typed into production finds no unit instead of the wrong one.
+- Backfill (migration 59) applies an **explicit 22-row map keyed on `charge_point_string_id`**, never `Charger.id` — row ids differ per register and can be reused after a delete. `upgrade()` never reads `Charger.name`; the map is literal data, so what a reviewer reads is exactly what executes. Guard 1 (a map naming chargers absent from this register — i.e. built for the wrong environment) **raises**, because applying it would bind wrong codes to real hardware. Guard 2 (a charger created between the worksheet and deploy day) deliberately **does not**: it logs and allocates a fresh sequential code. The entrypoint runs `aerich upgrade` under `set -e` on every boot, so a raising migration does not print an error — it stops the backend starting and takes the fleet offline. A late-onboarded charger is routine, and allocating is also the *correct* answer for it: the map exists to preserve stencils already painted on hardware, and a unit onboarded last week has none.
+
+`purpose` (`ChargerPurposeEnum`, `PUBLIC` | `TEST`, default `PUBLIC`) carries **serviceability**, deliberately not encoded in the code because purpose is mutable and an identifier must not change when a mutable attribute does. `TEST` units are hidden from `/stations`, excluded from `total_chargers`, and refused to non-`INTERNAL_ROLES` at both RemoteStart and StartTransaction.
+
+`purpose` is written through a **dedicated endpoint** (`PATCH /api/admin/chargers/{id}/purpose`), never through `ChargerUpdate`, which rejects it 422. Same reasoning as `ChangeAvailability` under ADR 0008: it is state with billing consequences, so it does not travel with cosmetic fields, and it emits its own audit action (`charger.purpose_changed`). Promotion `TEST → PUBLIC` is a single field update with no minting step — the Asset Code is allocated at creation and never changes, precisely so a unit can move between contexts without acquiring a new identity.
+
+Two properties worth holding onto:
+
+1. **The `PUBLIC` default makes every gate fail open.** A row missed by any backfill keeps billing and stays visible. The single exception is the StartTransaction gate, which fails **closed** — a fleet unit wrongly marked `TEST` is a revenue outage on that unit — which is why the `TEST` set is verified per environment before that slice deploys.
+2. **Billing and invoice suppression are a consequence, not a check.** Nothing in `invoice_service.py` or the wallet path mentions `purpose`. Only `INTERNAL_ROLES` can start on a `TEST` unit, and internal-role sessions already skip wallet deduction and GST invoicing per ADR 0004. Because that composition is invisible at the call site, it is pinned explicitly by `test_charger_purpose_gates.py`.
+
+A **GST Invoice** now snapshots three charger facts. `charger_id_str` keeps holding exactly what was *printed* — a UUID before the cutover, an Asset Code after, the two eras separable by `^VOWS?\d{4,}$` — and keeps its name despite the Asset Code avoid-list, because it is a column header in the GST filings CSV that feeds an accountant's spreadsheet. `charger_station_id` and `charger_ocpp_id` join it, both internal and never exported; the latter preserves the audit link to the physical unit across the cutover. Migration 61 rewrites `charger_id_str` **only where `pdf_url IS NULL`**, and that gate means something narrower than it looks. PDFs are generated **lazily, on first download** (`serve_invoice_pdf`): the document is rendered from the invoice row, uploaded to S3, and the key stored on `pdf_url`. So a null `pdf_url` does **not** mean "not issued" — an invoice can be fully issued, numbered and GST-declared and still have one, simply because nobody clicked download. It means *no artifact has ever been produced from this row*. Where an artifact exists it is an immutable S3 object a customer has seen, so rewriting the column would make the database disagree with the document; where none exists, nobody has seen the old value and a future render legitimately shows the Asset Code. Measured 2026-09-09: production 445 invoices of which **6** rendered, staging 1193 of which **3** — so nine invoices across both registers permanently print a UUID, and remain downloadable. The two internal columns are backfilled everywhere, precisely because they are never rendered.
+
+**Rollback is safe without a database downgrade.** Migration 60 puts a `DEFAULT` on `asset_code`. A pre-cutover backend image has no `asset_code` field on its model, so its `INSERT` omits the column entirely and Postgres supplies the default — meaning reverting the image after migrating does **not** break charger creation. (Verified by simulating the old INSERT.) That is the DEFAULT's real value; serving raw-SQL seed scripts is the lesser half.
+
+**Charger references accept two forms.** `charger_code_service.resolve_charger()` resolves either an Asset Code or a `charge_point_string_id`, and all three `/api/users/charger/{ref}` endpoints use it. That dual acceptance is what let the QR landing page move from `/charge/{uuid}` to `/charge/{asset_code}` without breaking a single existing link — anything printed or bookmarked beforehand still resolves, while nothing new emits the OCPP identity.
+
+This mattered more than it first appeared. That UUID is the HTTP Basic Auth **username** for `POST /api/diagnostics/bundles`, which is live (ADR 0029): `charger_auth_service.authenticate_charger` requires `username == charge_point_string_id` so one credential spans both transports. Returning it in the unauthenticated `/stations` payload therefore enumerated usernames for a production auth surface. It has been removed from that payload — it was only ever a React list key there.
+
+**Two different QR codes, easily conflated.** The **appless payment QR** is a Razorpay-hosted **UPI** QR (`ChargerQRCode`, created in `routers/qr_codes.py`); scanning it opens a UPI app and it never contained a VoltLync URL. The `/charge/{ref}` link is a separate **app deep link**, generated as a PNG from the admin charger detail page and read by the in-app scanner. Only the second carried the UUID. An early draft of this work assumed the payment stickers encoded that URL and concluded the route was frozen; that was wrong. (Corroborating evidence: the scanner's regex was numeric-only, so it could not parse the UUID link the admin console generated — that path was already broken.)
 
 For "command pending vs applied" indicator semantics, a future UI can join the two fields:
 - `availability=Inoperative AND latest_status=Unavailable` → applied
@@ -744,22 +775,33 @@ await start_data_retention_service(
 #### Disconnect Handler (`backend/services/disconnect_handler.py`)
 **Purpose**: Manages transaction suspension and auto-stop when a charger disconnects unexpectedly (power failure, network loss)
 
+> **⚠️ Pending redesign — ADR 0031 (decided 2026-09-09, not yet built).** Firmware will hold the contactor closed and keep charging through a CSMS outage. That **inverts** the ADR 0022 fleet finding (*8 flat, 3 reboot-resets, 0 advanced* — every deployed unit currently opens the contactor on WS loss) on which this module's whole model rests: force-finalizing on the last pre-disconnect reading is only correct **because** the charger stopped delivering. Once it does not, `SUSPENDED` may mean *actively charging*, and finalize-on-timeout bills and refunds against a reading that is knowingly stale.
+>
+> Changes landing here: the window will measure **silence** (time since we last heard about *that transaction*) rather than session age, so `suspended_at` is replaced as the measured column and a charger reporting advancing energy resets the clock — **no upper bound on session duration**. ADR 0027's `latching` split survives with raised magnitudes (~48h latched; unlatched TBD). Past the window we still finalize on server-available data, and the unreported energy is a **deliberate write-off** (see CONTEXT.md **Blackout delivery**). Read this section together with ADR 0031 before changing anything in it.
+
 **Key Functions**:
 ```python
+async def suspend_window_seconds_for_charge_point(charge_point_id: str) -> int
+async def suspend_window_seconds_for_transaction(transaction) -> int
+    """Per-connector-type window (ADR 0027): 12h for latching connectors
+    (Type2/Type1/CCS/CHAdeMO/GB-T -- cable locked into the car), 45min for
+    unlatched sockets and unknown types. Values in git-tracked policy.py."""
+
 async def suspend_transactions_on_disconnect(charge_point_id: str) -> None
     """Called by ConnectionManager on charger disconnect. Suspends all active
-    transactions (RUNNING, STARTED, PENDING_START, PENDING_STOP) and starts
-    a configurable timeout for each."""
+    transactions (RUNNING, STARTED, PENDING_START, PENDING_STOP) and arms the
+    charger's per-type window for each."""
 
-def stale_suspended_cutoff_seconds() -> int
-    """Longest legitimate suspend window + buffer:
-    max(DISCONNECT_SUSPEND_TIMEOUT, SUSPEND_TIMEOUT) + 60. A backstop sweep must
-    wait this long because a SUSPENDED row doesn't record which window applies."""
+async def stale_suspended_cutoff_seconds_for(transaction) -> int
+    """Per-transaction staleness cutoff: the txn's own suspend window + 60s
+    buffer. Derived, so the backstop always fires after that row's primary
+    timer (ADR 0022 invariant, per-row)."""
 
 async def finalize_stale_suspended_transactions(stop_reason: str) -> int
-    """Shared stale-suspended backstop. Finds SUSPENDED txns older than the
-    cutoff and finalizes each via transaction_finalizer. Used by BOTH the startup
-    sweep and the recurring billing-retry sweep so their cutoff can't drift."""
+    """Shared stale-suspended backstop. Pre-filters SUSPENDED txns at the
+    shortest cutoff, then checks each row against its OWN per-type cutoff and
+    finalizes via transaction_finalizer. Used by BOTH the startup sweep and the
+    recurring billing-retry sweep so their cutoff can't drift."""
 
 async def sweep_stale_suspended_transactions() -> None
     """Safety net called once at server startup. Thin wrapper over
@@ -767,14 +809,14 @@ async def sweep_stale_suspended_transactions() -> None
     covers server restarts where in-memory timeout tasks were lost."""
 ```
 
-> ⚠️ **Stale-suspended cutoff incident (2026-06-18)**: `billing_retry_service` once ran its own stale-suspended cleanup with a private cutoff of `SUSPEND_TIMEOUT_SECONDS` (5 min), ignoring the 30-min `DISCONNECT_SUSPEND_TIMEOUT`. On its 30-min cycle it force-stopped disconnect-suspended sessions ~5–9 min after a transient blip — inside the intended reconnect grace. Confirmed on prod txn 949: suspended 06:08:51Z, swept 06:17:36Z (8m45s), charger reconnected 06:27:27Z (18.5 min, inside the 30-min window) but already finalized+refunded. Fix: both sweeps now share `finalize_stale_suspended_transactions` with the `max(...)+60` cutoff. Regression test: `tests/test_billing_retry_stale_suspended.py`. Lesson: a backstop must always wait the LONGEST primary window, never a shorter one.
+> ⚠️ **Stale-suspended cutoff incident (2026-06-18)**: `billing_retry_service` once ran its own stale-suspended cleanup with a private cutoff of `SUSPEND_TIMEOUT_SECONDS` (5 min), ignoring the 30-min `DISCONNECT_SUSPEND_TIMEOUT`. On its 30-min cycle it force-stopped disconnect-suspended sessions ~5–9 min after a transient blip — inside the intended reconnect grace. Confirmed on prod txn 949: suspended 06:08:51Z, swept 06:17:36Z (8m45s), charger reconnected 06:27:27Z (18.5 min, inside the 30-min window) but already finalized+refunded. Fix: both sweeps now share `finalize_stale_suspended_transactions`; since ADR 0027 the cutoff is per-row (each txn's own per-type window + 60). Regression test: `tests/test_billing_retry_stale_suspended.py`. Lesson: a backstop must always wait at least that row's primary window, never a shorter one.
 
 **Disconnect Flow**:
 1. Heartbeat monitor detects charger silence (120s inactivity)
 2. `ConnectionManager.force_disconnect()` fires registered callbacks
 3. `suspend_transactions_on_disconnect()` sets all active transactions to SUSPENDED, records `suspended_at`
-4. Starts a `DISCONNECT_SUSPEND_TIMEOUT` (default 180s) timer per transaction
-5. **If charger reconnects** (BootNotification): timeout is invalidated via CAS guard (`suspended_at` comparison), and a new resume window starts
+4. Starts the connector type's suspend-window timer per transaction (12h latched / 45min unlatched, ADR 0027)
+5. **If charger reconnects** (BootNotification): timeout is invalidated via CAS guard (`suspended_at` comparison), and a fresh timer with the SAME per-type window starts -- the old 300s post-boot timer is retired (it silently shortened the promised grace; 9 sessions killed fleet-wide at ~300s, and ~41% of prod reconnects arrive via BootNotification)
 6. **If timeout expires**: transaction is auto-stopped with `stop_reason=DISCONNECT_TIMEOUT`, energy is calculated from the last MeterValue, and billing is processed
 
 **Auto-Stop Billing** — delegated to `transaction_finalizer.finalize_stopped_transaction` (see below):
@@ -795,16 +837,19 @@ A naive disconnect cap would falsely terminate legitimate long sessions on flaky
 - Zeroed by `zero_energy_watchdog.check_zero_energy` whenever MeterValues show real energy advancing
 - Popped from the dict on transaction finalization
 
-If the counter reaches `MAX_RESETS_WITHOUT_PROGRESS` (default 3), BootNotification stops resetting `suspended_at` and lets the existing timer fire. This caps the worst-case stuck-time at `3 × DISCONNECT_SUSPEND_TIMEOUT_SECONDS` for genuinely broken sessions while allowing healthy long sessions to flap freely.
+If the counter reaches `MAX_RESETS_WITHOUT_PROGRESS` (default 3), BootNotification stops resetting `suspended_at` and lets the existing timer fire. This caps the worst-case stuck-time at 3 × the connector type's suspend window (36h worst case on latched connectors -- accepted in ADR 0027) for genuinely broken sessions while allowing healthy long sessions to flap freely.
 
 **Configuration**:
-| Variable | Default | Purpose |
+| Value | Where | Purpose |
 |----------|---------|---------|
-| `DISCONNECT_SUSPEND_TIMEOUT_SECONDS` | 180 (**staging & prod: 1800**) | Seconds to wait after disconnect before auto-stopping |
-| `SUSPEND_TIMEOUT_SECONDS` | 300 | Resume window after BootNotification resets the timeout |
-| `MAX_DISCONNECT_RESETS_WITHOUT_PROGRESS` | 3 | Max BootNotification resets allowed without energy progress |
+| `SUSPEND_WINDOW_LATCHED_SECONDS = 43200` | `backend/policy.py` (git-tracked) | Suspend window for latching connectors (Type2/Type1/CCS/CHAdeMO/GB-T) |
+| `SUSPEND_WINDOW_UNLATCHED_SECONDS = 2700` | `backend/policy.py` (git-tracked) | Suspend window for unlatched sockets + unknown types |
+| `STALE_SUSPENDED_BUFFER_SECONDS = 60` | `backend/policy.py` (git-tracked) | Buffer added to a txn's window to form the sweep/guard cutoff |
+| `MAX_DISCONNECT_RESETS_WITHOUT_PROGRESS` | env, default 3 | Max BootNotification resets allowed without energy progress |
 
-> ✅ **Timing invariant (now structural — ADR 0022, 2026-07-06)**: the resume staleness guard's threshold is **derived** from the disconnect window (`stale_suspended_cutoff_seconds()` = `max(DISCONNECT_SUSPEND_TIMEOUT, SUSPEND_TIMEOUT)+60`), so it can never be misordered below `DISCONNECT_SUSPEND_TIMEOUT_SECONDS`. The standalone `MAX_RESUME_GAP_SECONDS` env var was retired. This replaces the fragile 2026-06-09 hotfix (hand-raise 900→2100) — the misconfig that force-finalized chargers reconnecting in the 15–30 min window is now unrepresentable, and no startup `validate_timing_invariants()` is needed for it.
+> The former `DISCONNECT_SUSPEND_TIMEOUT_SECONDS` / `SUSPEND_TIMEOUT_SECONDS` env vars are **retired** (ADR 0027): these are policy values, identical across envs, and every incident in this area (txn 870 inversion, the 180-vs-1800 compose drift) came from env-var invisibility. No env override exists by design.
+
+> ✅ **Timing invariant (structural, per-row — ADR 0022 + ADR 0027)**: the resume staleness guard's threshold is **derived per transaction** (`stale_suspended_cutoff_seconds_for(txn)` = that txn's own per-type window + 60), so it can never be misordered below that transaction's primary timer. The standalone `MAX_RESUME_GAP_SECONDS` env var was retired 2026-07-06 (ADR 0022); the windows went per-connector-type 2026-07-23 (ADR 0027). Effective cutoffs: latched 43260s, unlatched 2760s.
 
 **Integration Points**:
 - `ConnectionManager.register_on_disconnect()` -- wires up the callback
@@ -860,7 +905,7 @@ Returns `(is_stale, gap_seconds)`. The gap is computed against the most recent o
 
 A txn with no signals at all returns `(False, None)` — the helper defers to the caller's existing state checks rather than refusing speculatively.
 
-**Threshold**: `MAX_RESUME_GAP_SECONDS` — code default **900** (15 min); **staging & prod run 2100** (35 min) as of 2026-06-09. It must sit *above* the longest primary finalize timer so the guard never races it, yet small enough to limit overcharging when it does fire. **Invariant: `MAX_RESUME_GAP_SECONDS` MUST exceed `DISCONNECT_SUSPEND_TIMEOUT_SECONDS`.** This broke in prod/staging when the disconnect timeout was widened to 1800 while the gap stayed at the 900 default — chargers reconnecting in the 15–30 min window were force-finalized `STALE_RECONNECT` instead of resuming. Fixed by raising the gap to 2100. The ordering is **not enforced at startup** today; a `validate_timing_invariants()` boot check is the proposed durable safeguard. (Historical note: the original "comfortably above the 360s startup sweep cutoff" rationale assumed the 180s disconnect default — it does not survive a widened disconnect timeout, which is why the invariant must be stated against `DISCONNECT_SUSPEND_TIMEOUT_SECONDS`, not a fixed number.)
+**Threshold**: derived per-transaction — `stale_suspended_cutoff_seconds_for(txn)` = the transaction's own per-connector-type suspend window + 60s (latched 43260s / unlatched 2760s; ADR 0022 + ADR 0027). The guard-fires-after-primary ordering is **structural**: the cutoff is defined as own-window + buffer, so no configuration can invert it. (History: this was once the standalone `MAX_RESUME_GAP_SECONDS` env var, whose 900-vs-1800 inversion force-finalized chargers reconnecting in the 15-30 min window — hotfixed 2026-06-09 by raising to 2100, made unrepresentable by ADR 0022's derivation, and made per-type by ADR 0027.)
 
 **Call sites and behavior on stale**:
 | Call site | Action when stale |
@@ -933,7 +978,7 @@ All runbooks follow the same H2 structure (Symptom / What it means / When it's n
 ## Frontend Components
 
 ### Application Architecture
-**Framework**: Next.js 15.3.4 with App Router and React 19
+**Framework**: Next.js 16.3.3 with App Router and React 19
 **Pattern**: Server-first architecture with client components where needed
 
 ### Directory Structure (`frontend/`)
@@ -1557,7 +1602,7 @@ npx cap open android  # Open in Android Studio
 | **Build Tool** | Next.js | Vite |
 | **Native Features** | None | QR, GPS, Payments, Network |
 | **Deployment** | Vercel | App Stores |
-| **Framework** | Next.js 15 App Router | React 19 + React Router |
+| **Framework** | Next.js 16 App Router | React 19 + React Router |
 | **Bundle Size** | ~2MB (includes admin) | ~500KB (user only) |
 
 ---
@@ -2263,8 +2308,10 @@ async def on_boot_notification(self, charge_point_vendor, charge_point_model, **
 - Validates charger registration in database
 - Sets 30-second heartbeat interval
 - Updates charger firmware_version, vendor, model from BootNotification payload
-- **Transaction Suspend/Resume**: On disconnect, `disconnect_handler.py` suspends active transactions with a 180s timeout (`DISCONNECT_SUSPEND_TIMEOUT_SECONDS`). On BootNotification, already-SUSPENDED transactions get their timeout reset (CAS guard invalidates old timeout), and a new 300s resume window starts (`SUSPEND_TIMEOUT_SECONDS`). Still-active transactions (edge case) are suspended as before. Auto-stop with billing + QR refund on timeout expiry. The per-txn loop body is extracted into `_handle_ongoing_transaction_on_boot()` for testability.
-- **Resume staleness guard**: every BootNotification per-txn handler call (and the MeterValues + GetLastMeterValue resume points) goes through `transaction_finalizer.is_resume_too_stale()` first. If the gap exceeds `MAX_RESUME_GAP_SECONDS` (code default 900s; staging/prod 2100s), the txn is finalized with stop_reason `STALE_RECONNECT` instead of being suspended/resumed. This is defense-in-depth for the case where the disconnect handler silently failed to mark SUSPENDED — see the "Resume Staleness Guard" subsection under Transaction Finalizer above (incl. the `MAX_RESUME_GAP_SECONDS > DISCONNECT_SUSPEND_TIMEOUT_SECONDS` invariant).
+- **Charger-reported timestamps (migration 62, 2026-09-09)**: every OCPP frame that carries a `timestamp` now has it retained beside server receipt time — `MeterValue.measured_at`, `Transaction.reported_start_time`, `Transaction.reported_end_time`. **`created_at` / `start_time` / `end_time` remain server receipt and remain the billing + GST-invoice basis**; the reported values never displace them. Parsing goes through `utils.parse_ocpp_timestamp()`, which enforces a clock-plausibility window (charger RTCs here are unreliable — the same reason ADR 0030 reconstructs Bundle time from `TIME_SYNC` anchors) and returns NULL rather than substituting receipt time. Reads go through `services/meter_readings.py` (`latest_meter_value` / `meter_series`), ordering on `COALESCE(measured_at, created_at)`. **`is_resume_too_stale` is the deliberate exception and still reads `created_at`** — it measures silence, which is a receipt-time question. See ADR 0031 decision 8.
+- **`OPEN_TRANSACTION_STATES` (`models.py`, 2026-09-09)**: the single set of states in which a `Transaction` still **occupies** its charger — `STARTED`, `PENDING_START`, `RUNNING`, `SUSPENDED`. Shared by `main._reconcile_existing_open_transaction` (the StartTransaction reconcile guard) and `QRPaymentService._create_qr_payment_locked` (the QR double-payment guard), which had drifted: the QR guard omitted `SUSPENDED`, so a payment landing on a charger with a suspended transaction saw the charger as free and could open a parallel session on physically busy hardware. `PENDING_STOP` is **deliberately excluded** — superseding a txn mid-normal-stop races the StopTransaction path into a double-finalize (the finalizer's idempotency guard only short-circuits on TERMINAL states), and per ADR 0021 the session-end seam is not "busy". Do not swap in `qr_session_state.ACTIVE_TXN_STATES`, which includes `PENDING_STOP` and would regress both.
+- **Transaction Suspend/Resume**: On disconnect, `disconnect_handler.py` suspends active transactions with the connector type's suspend window (12h latched / 45min unlatched, `backend/policy.py`, ADR 0027). On BootNotification, already-SUSPENDED transactions get their timeout reset (CAS guard invalidates old timeout), and a fresh timer with the SAME per-type window starts (the old 300s post-boot window is retired). Still-active transactions (edge case) are suspended as before. Auto-stop with billing + QR refund on timeout expiry. The per-txn loop body is extracted into `_handle_ongoing_transaction_on_boot()` for testability.
+- **Resume staleness guard**: every BootNotification per-txn handler call (and the MeterValues + GetLastMeterValue resume points) goes through `transaction_finalizer.is_resume_too_stale()` first. If the gap exceeds the transaction's derived cutoff (its own per-connector-type suspend window + 60s — ADR 0022 + ADR 0027), the txn is finalized with stop_reason `STALE_RECONNECT` instead of being suspended/resumed. This is defense-in-depth for the case where the disconnect handler silently failed to mark SUSPENDED — see the "Resume Staleness Guard" subsection under Transaction Finalizer above.
 - Resume fields tracked: `suspended_at`, `resumed_at`, `resume_count`
 - Comprehensive connection logging
 
@@ -2438,6 +2485,33 @@ async def on_data_transfer(self, vendor_id: str, message_id: str = None, data: s
 **Use Case**: Monitoring cellular signal strength for charge points with modem connectivity
 
 ### Remote Commands (Central System → Charge Point)
+
+**Command outcome contract (ADR-less; see CONTEXT.md → Remote commands)**:
+`connection_manager.send_ocpp_request` returns a **`CommandOutcome`**, never a
+`(success, response)` pair. OCPP tells you two separate things and the old boolean
+collapsed them: whether the charger *replied*, and whether it *agreed*. Six call sites
+read "it replied" as "it worked" and reported a refused command as success — a refused
+`Reset` even wrote a `charger.reset` audit event for a reboot that never happened.
+
+Callers ask for the verdict:
+
+| Property | Meaning |
+|---|---|
+| `is_accepted` | The charger committed to act. Absorbs OCPP `Scheduled` (ChangeAvailability, ADR 0008) and treats a status-less `.conf` — `UpdateFirmware` — as acceptance, since there is nothing to refuse with |
+| `is_refused` | Answered and declined. HTTP **409** at the API edge: the system worked and the answer was no |
+| `is_unanswered` | No reply in the 30 s window. HTTP **504** — an upstream condition, and excluded from Sentry's failed-request reporting unlike a 500 |
+| `status` | Raw OCPP status for callers that surface it verbatim; `None` when unanswered or absent |
+
+`CommandOutcome` is a frozen dataclass and **deliberately does not unpack** — it was a
+NamedTuple only while call sites migrated one command at a time. Unpacking now raises
+`TypeError`, so the conflation cannot be reintroduced by accident.
+
+At-least-once dispatchers (wallet budget cap, QR auto-stop, zero-energy watchdog) read the
+verdict for **logging only** and do not branch on it: energy is monotonic, so a refused or
+lost stop self-heals on the next MeterValues tick and duplicate RemoteStops are idempotent
+at the charger. Before this, a refusal there logged as "sent" — the exact line someone greps
+when a session will not stop.
+
 
 #### 1. RemoteStartTransaction
 ```python
@@ -4947,7 +5021,7 @@ const useInfiniteTransactions = () => {
 
 **Current Behavior**:
 - On `BootNotification`, ongoing transactions are marked `SUSPENDED` (not FAILED)
-- A background `_suspend_timeout` task waits `SUSPEND_TIMEOUT_SECONDS` (default 300s)
+- A background `_suspend_timeout` task waits the connector type's suspend window (12h latched / 45min unlatched — ADR 0027; formerly a fixed 300s)
 - If the charger resumes the transaction (sends MeterValues or StartTransaction for same id_tag), the transaction is resumed to RUNNING
 - If the timeout fires while still SUSPENDED: transaction is auto-stopped with energy calculation from last MeterValue, wallet billing, and QR payment billing/refund
 - Handles double-boot race conditions via `suspended_at` timestamp comparison
@@ -5136,9 +5210,8 @@ RAZORPAY_KEY_ID=rzp_live_...
 RAZORPAY_KEY_SECRET=...
 RAZORPAY_PLATFORM_FEE_PERCENT=2.0  # Authoritative synthetic rate for customer-facing math (ADR 0001)
 
-# Transaction Suspend/Resume
-DISCONNECT_SUSPEND_TIMEOUT_SECONDS=180  # Timeout after charger disconnect (before marking STOPPED)
-SUSPEND_TIMEOUT_SECONDS=300              # Timeout after BootNotification (resume window)
+# Transaction Suspend/Resume: per-connector-type windows live in git-tracked
+# backend/policy.py, not env vars (ADR 0027)
 
 # Monitoring
 SENTRY_ENABLED=true
@@ -5161,7 +5234,7 @@ CLEANUP_INTERVAL_HOURS=24
 
 ### Frontend Configuration
 - **Output**: `standalone` mode for Docker production builds
-- **Next.js 15.3.8** with App Router, React 19
+- **Next.js 16.3.3** with App Router, React 19
 - **Environment**: `NEXT_PUBLIC_API_URL`, `NEXT_PUBLIC_APP_URL`, `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`
 
 ### Database Management
@@ -5315,6 +5388,30 @@ CORS_ORIGINS = [
 
 ## Recent Changes & Updates
 
+### Diagnostic Bundle upload — headerless redesign (ADR 0030, 2026-08-27)
+
+**Feature.** Chargers POST their own firmware debug traces to `POST /api/diagnostics/bundles` over HTTPS, authenticated with HTTP Basic using the per-charger **Charger Auth Key** (ADR 0020, first consumer). The body is archived to a dedicated per-environment S3 bucket and fanned out to New Relic over OTLP as individual searchable lines. This is deliberately outside OCPP — no `GetDiagnostics`, no `DataTransfer` (ADR 0029 has the reasoning).
+
+**What this release changed.** ADR 0029 put a header of counters on every bundle (`boot`, `seq`, `first`, `last`, `overflow`) and derived data-loss accounting from it. Every one of those fields needs the charger to persist a counter across a reboot, and the firmware team confirmed the hardware cannot — the EEPROM wear pattern that ADR 0029 §3.2 itself warns about. Eight days of staging data agreed: `boot` skipped values and reset to 1, `seq` stayed constant across four genuinely different bundles, and `overflow` was emitted negative (`4294967295` = `-1` in two's complement) into an `INT` column, returning HTTP 500 on every upload for hours. Because a repeated `seq` reads as a reflash, the server-assigned epoch inflated to 11 in 15 bundles, and both loss functions bail on an epoch change — so **19,165 records the charger explicitly reported destroying were stored as `0`**.
+
+**Architecture after the change.** The header is deleted; the body is the whole contract.
+
+| Concern | Before | After |
+|---|---|---|
+| Identity | `(charger, epoch, bundle_seq)` | `SHA-256` of the raw body, leading `#VLTDIAG/` line stripped |
+| Reboot boundary | header `boot` | in-band `===== BOOT` marker |
+| Time | header `first`/`last` | per-segment `TIME_SYNC boot_ms=… utc=…`, resolved both directions |
+| Loss | `gap_records` + `overflow_delta` | UTC **loss window** + `ring_wrap_events` |
+
+- **`backend/services/diagnostic_markers.py`** (new) owns the marker parsing, extracted from `diagnostic_fanout` — which had been doing it correctly all along, but only on the derived New Relic view while the ingest path trusted the header.
+- **Retroactive anchoring.** `boot_ms` is monotonic within a boot, so one `TIME_SYNC` dates every record in that segment including those written *before* it. This is what lets an outage be reconstructed: log unanchored while the modem is down, sync on reconnect, and the whole preceding segment resolves. Confirmed on a real 196 KB bundle whose resolved window starts 11 s before its own first anchor.
+- **Index-before-archive.** The row is written before the S3 object; `archived_at` is set only after the put returns. Archive-first stranded 195 objects that no row pointed at and the retention sweep could never reclaim. The inverse hazard — a row outliving a missing object — is closed by `find_duplicate` filtering `archived_at__isnull=False`, so an unarchived **reservation** never answers a retry with a false 2xx.
+- **Response trimmed** ~700 B → ~120 B. The charger was writing our JSON response (including a `body_preview` of the bundle it had just sent) back into the ring buffer and re-uploading it.
+
+**Deliberately lost.** The cumulative count of records destroyed before delivery. ADR 0029's sharpest idea was distinguishing "lost in transit" from "buffer overwrote it" because they need opposite remedies; that distinction required a monotonic counter stored separately from the data it describes, and this hardware cannot keep one. A ring-wrap event signals overwriting is happening now, never how much. Gap resolution drops from records to minutes.
+
+**Migrations 53–56.** Superseded columns are nullable and no longer written but **not dropped** — expand/contract, so the historical values survive if the replacement underperforms. Env var `DIAGNOSTIC_GAP_THRESHOLD_SECONDS` (default 300, provisional — sampled from one unit during active traffic) added to all three compose files.
+
 ### Latest Release - March 2026 (Branch: 57-qr-based-appless-transaction)
 
 #### New Features Implemented
@@ -5391,7 +5488,7 @@ CORS_ORIGINS = [
   - Auto-stop processes full wallet billing + QR payment billing/refund
   - ConnectionManager `register_on_disconnect()` callback hook fires on `force_disconnect()`
 - **Migration**: `8_20260305050220_add_transaction_resume_fields.py`
-- **Configuration**: `DISCONNECT_SUSPEND_TIMEOUT_SECONDS` (default 180), `SUSPEND_TIMEOUT_SECONDS` (default 300)
+- **Configuration**: per-connector-type suspend windows in `backend/policy.py` (ADR 0027; the original env vars are retired)
 - **Files Added**:
   - `backend/services/disconnect_handler.py` - Transaction suspension, timeout, auto-stop with billing
   - `backend/simulators/ocpp_simulator_disconnect.py` - Synchronous simulator with 3 test modes (no-reconnect, reconnect, no-transaction)

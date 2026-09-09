@@ -1,6 +1,6 @@
 # Public `price_per_kwh` continuity after the tariff rename
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 
@@ -17,3 +17,11 @@ Keep the public stations/map API contract intact through the tariff rename (ADR 
 ## Blocked by
 
 - 01-rename-tariff-columns-back-calc-base-rate.md
+
+## Comments
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo: `price_per_kwh` still served from `backend/routers/public_station_map.py`
+
+Method and caveats: `.scratch/tracker-reconciliation/REPORT.md`.

@@ -22,6 +22,8 @@ const ACTOR_TYPES = ["", "admin", "system", "ocpp", "webhook", "user"] as const;
 // Keep sorted (charger.* then transaction.*), leading "" = All actions.
 const ACTION_OPTIONS = [
   "",
+  "charger.auth_provisioned",
+  "charger.auth_rotated",
   "charger.availability_changed",
   "charger.connected",
   "charger.connection_rejected",

@@ -217,11 +217,12 @@ class FirmwareUpdateService:
         )
 
         from main import send_ocpp_request
-        success, response = await send_ocpp_request(
+        outcome = await send_ocpp_request(
             charger.charge_point_string_id,
             "UpdateFirmware",
             payload,
         )
+        response = outcome.response
 
         update.attempt_count += 1
         update.last_attempt_at = now
@@ -229,16 +230,20 @@ class FirmwareUpdateService:
         if update.started_at is None:
             update.started_at = now
 
-        if success:
+        # `UpdateFirmware.conf` is an empty payload in OCPP 1.6 — there is no
+        # status field, so there is nothing to refuse with and an answer *is* an
+        # acceptance. `is_accepted` encodes that; reading the missing status as a
+        # refusal would break every firmware update.
+        if outcome.is_accepted:
             logger.info(
-                "📦 ✅ UpdateFirmware sent to %s (attempt %d)",
+                "📦 ✅ UpdateFirmware accepted by %s (attempt %d)",
                 charger.charge_point_string_id, update.attempt_count,
             )
             await update.save()
             await self._mark_ws_drop_expected(charger.charge_point_string_id, now)
         else:
             logger.error(
-                "📦 ❌ UpdateFirmware send failed for %s: %s",
+                "📦 ❌ UpdateFirmware unanswered by %s: %s",
                 charger.charge_point_string_id, response,
             )
             await update.save()

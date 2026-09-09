@@ -1017,6 +1017,103 @@ async def test_concurrent_payment_rejected_when_active_txn(client, qr_charger, q
 
 
 @pytest.mark.asyncio
+async def test_concurrent_payment_rejected_when_suspended_txn(
+    client, qr_charger, qr_code, qr_tariff
+):
+    """A SUSPENDED transaction still OCCUPIES the charger — reject + refund.
+
+    SUSPENDED means the charger went quiet mid-session and we are holding the
+    session open for a reconnect. Firmware that keeps the contactor closed
+    through a CSMS outage makes this the state a genuinely-charging session
+    sits in, so treating the charger as free lets a second payment open a
+    parallel session on hardware that is physically busy. See
+    OPEN_TRANSACTION_STATES in models.py.
+    """
+    import uuid
+    user = await User.create(
+        email=f"susp_{uuid.uuid4().hex[:6]}@voltlync.test",
+        phone_number=f"9{uuid.uuid4().int % 1000000000:09d}",
+        rfid_card_id=f"RFID_{uuid.uuid4().hex[:12]}",
+    )
+    await Transaction.create(
+        charger=qr_charger,
+        user=user,
+        transaction_status=TransactionStatusEnum.SUSPENDED,
+        start_meter_kwh=0,
+    )
+
+    payload = _webhook_payload("pay_SUSP001", "qr_TEST123", 10000)
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment = AsyncMock(return_value={"id": "rfnd_SUSP"})
+    mock_razorpay.find_refund_for_payment = AsyncMock()
+    mock_razorpay.fetch_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock(return_value=None)
+    mock_razorpay.fetch_order = AsyncMock()
+    mock_razorpay.create_transfer = AsyncMock()
+
+    with patch("services.qr_payment_service.razorpay_service", mock_razorpay), \
+         patch("services.qr_payment_service.redis_manager") as mock_redis:
+        mock_redis.is_charger_connected = AsyncMock(return_value=True)
+        result = await QRPaymentService.handle_qr_payment(payload)
+
+    assert result["status"] == "failed"
+    assert result["reason"] == "active_transaction"
+
+    rejected = await QRPayment.filter(razorpay_payment_id="pay_SUSP001").first()
+    assert rejected is not None
+    assert rejected.status == QRPaymentStatusEnum.REFUNDED
+
+
+@pytest.mark.asyncio
+async def test_payment_not_rejected_when_pending_stop_txn(
+    client, qr_charger, qr_code, qr_tariff
+):
+    """PENDING_STOP is the session-end seam, NOT "busy" — the payment proceeds.
+
+    Guards the deliberate exclusion of PENDING_STOP from
+    OPEN_TRANSACTION_STATES: rejecting here would both race the
+    StopTransaction path into a double-finalize and contradict ADR 0021
+    ("everything at or after the session-end seam is not busy, so a later
+    payment falls through to the normal new-session flow").
+    """
+    import uuid
+    user = await User.create(
+        email=f"pstop_{uuid.uuid4().hex[:6]}@voltlync.test",
+        phone_number=f"9{uuid.uuid4().int % 1000000000:09d}",
+        rfid_card_id=f"RFID_{uuid.uuid4().hex[:12]}",
+    )
+    await Transaction.create(
+        charger=qr_charger,
+        user=user,
+        transaction_status=TransactionStatusEnum.PENDING_STOP,
+        start_meter_kwh=0,
+    )
+
+    payload = _webhook_payload("pay_PSTOP001", "qr_TEST123", 10000)
+
+    mock_razorpay = MagicMock()
+    mock_razorpay.refund_payment = AsyncMock()
+    mock_razorpay.fetch_payment_fees = AsyncMock(return_value=None)
+
+    with patch("services.qr_payment_service.razorpay_service", mock_razorpay), \
+         patch("services.qr_payment_service.redis_manager") as mock_redis, \
+         patch.object(
+             QRPaymentService, "_start_charging", new_callable=AsyncMock
+         ) as mock_start:
+        mock_redis.is_charger_connected = AsyncMock(return_value=True)
+        result = await QRPaymentService.handle_qr_payment(payload)
+
+    assert result["status"] == "processed"
+    mock_razorpay.refund_payment.assert_not_called()
+    mock_start.assert_awaited_once()
+
+    accepted = await QRPayment.filter(razorpay_payment_id="pay_PSTOP001").first()
+    assert accepted is not None
+    assert accepted.status == QRPaymentStatusEnum.PAID
+
+
+@pytest.mark.asyncio
 async def test_stale_payment_full_refund_passes_speed_optimum(
     client, qr_charger, qr_code, monkeypatch
 ):

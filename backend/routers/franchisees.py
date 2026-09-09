@@ -23,6 +23,7 @@ from models import (
 from auth_middleware import require_admin
 from crud import log_audit_event
 from services import clerk_invitation_service
+from services.franchisee_code_service import allocate_invoice_code
 
 logger = logging.getLogger("ocpp-server")
 
@@ -82,6 +83,8 @@ class FranchiseeResponse(BaseModel):
     contact_email: str
     contact_phone: str
     address: Optional[str] = None
+    # Stable code embedded in this franchisee's GST Invoice numbers.
+    invoice_code: Optional[str] = None
     pan_number: Optional[str] = None
     gstin: Optional[str] = None
     tan_number: Optional[str] = None
@@ -223,6 +226,7 @@ async def _franchisee_to_response(
         "contact_email": f.contact_email,
         "contact_phone": f.contact_phone,
         "address": f.address,
+        "invoice_code": f.invoice_code,
         "pan_number": f.pan_number,
         "gstin": f.gstin,
         "tan_number": f.tan_number,
@@ -291,6 +295,9 @@ async def create_franchisee(
                 notes=body.notes,
                 onboarded_by=admin,
                 user=user,
+                # Allocated inside the same transaction as the row it belongs
+                # to, so a concurrent create cannot hand out the same code.
+                invoice_code=await allocate_invoice_code(),
             )
     except IntegrityError as e:
         # Tortoise wraps the asyncpg error via `IntegrityError(exc)` without

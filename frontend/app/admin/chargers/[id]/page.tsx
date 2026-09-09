@@ -1,7 +1,7 @@
 "use client";
 
 import { useParams } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -12,6 +12,7 @@ import Link from "next/link";
 import { toast } from "sonner";
 import { isSocketCharger as checkSocketCharger } from "@/lib/utils";
 import ChargerAuditLog from "@/components/ChargerAuditLog";
+import DiagnosticBundles from "@/components/DiagnosticBundles";
 import MeterValuesChart from "@/components/MeterValuesChart";
 import ModemTemperatureCard from "@/components/ModemTemperatureCard";
 import {
@@ -110,12 +111,17 @@ export default function ChargerDetailPage() {
   const { data: transactionData } = useAdminTransaction(transactionIdToShow || 0);
   const transaction = transactionData?.transaction;
 
-  // Track last known transaction ID for persistence
-  useEffect(() => {
+  // Track last known transaction ID for persistence. Derived during render
+  // with the previous-value pattern rather than an effect, so the sticky id is
+  // already correct in the same commit.
+  const [prevTransactionId, setPrevTransactionId] =
+    useState(currentTransactionId);
+  if (prevTransactionId !== currentTransactionId) {
+    setPrevTransactionId(currentTransactionId);
     if (currentTransactionId) {
       setLastTransactionId(currentTransactionId);
     }
-  }, [currentTransactionId]);
+  }
 
   // Meter values query - only enabled if there's a transaction
   const { data: meterValuesData } = useAdminTransactionMeterValues(
@@ -258,14 +264,18 @@ export default function ChargerDetailPage() {
   const isActionLoading =
     remoteStartMutation.isPending || remoteStopMutation.isPending;
 
-  const qrUrl = `${process.env.NEXT_PUBLIC_APP_URL || "https://www.powerlync.com"}/charge/${charger?.charge_point_string_id}`;
+  // The landing page is addressed by Asset Code, not the OCPP identity — that
+  // UUID is the Basic Auth username for the diagnostics upload endpoint, and a
+  // QR sticker is the last place it should be printed. The route still accepts
+  // a charge_point_string_id, so anything generated before this keeps working.
+  const qrUrl = `${process.env.NEXT_PUBLIC_APP_URL || "https://www.powerlync.com"}/charge/${charger?.asset_code}`;
 
   const handleDownloadQr = () => {
     const canvas = document.getElementById("qr-canvas") as HTMLCanvasElement | null;
     if (!canvas) return;
     const url = canvas.toDataURL("image/png");
     const link = document.createElement("a");
-    link.download = `qr-${charger?.charge_point_string_id || "charger"}.png`;
+    link.download = `qr-${charger?.asset_code || "charger"}.png`;
     link.href = url;
     link.click();
   };
@@ -313,8 +323,24 @@ export default function ChargerDetailPage() {
                 <QrCode className="h-5 w-5" />
               </Button>
             </div>
-            <p className="text-muted-foreground">
-              ID: {charger.charge_point_string_id}
+            <div className="flex items-center gap-2 flex-wrap">
+              <p className="text-muted-foreground">
+                <span className="font-medium">Asset Code:</span>{" "}
+                <span className="font-mono">{charger.asset_code}</span>
+              </p>
+              {charger.purpose === "TEST" && (
+                <span
+                  title="Bench unit — hidden from customers and never billed"
+                  className="px-1.5 py-0.5 text-[10px] font-semibold rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300">
+                  TEST
+                </span>
+              )}
+            </div>
+            {/* OCPP identity stays visible on admin surfaces: ops needs it for
+                log correlation and firmware deploys. It is scrubbed from
+                customer surfaces only. ADR 0028. */}
+            <p className="text-muted-foreground text-sm">
+              OCPP ID: <span className="font-mono">{charger.charge_point_string_id}</span>
             </p>
             {station && (
               <div className="flex items-center gap-2 mt-2">
@@ -1028,6 +1054,16 @@ export default function ChargerDetailPage() {
               View OCPP logs →
             </Link>
           </div>
+        )}
+
+        {/* Diagnostic Bundles — delivery status + raw archive (ADR 0029).
+            Trace content is searched in New Relic, not here. */}
+        {charger && (
+          <DiagnosticBundles
+            chargerId={charger.id}
+            chargerName={charger.name}
+            hasAuthKey={charger.has_auth_key}
+          />
         )}
 
         {/* Audit Log Section */}

@@ -1,6 +1,6 @@
 # Transactions Console — funding source + native payment status axis
 
-Status: ready-for-agent
+Status: done
 Type: AFK
 
 ## What to build
@@ -31,3 +31,9 @@ Extend the existing `GET /transactions` endpoint in place (do NOT stand up a par
 ## Comments
 
 - **2026-06-20 — Implemented.** GET /transactions enriched (batched, no N+1) with funding_source + verbatim native payment_status; multi-select funding_source + payment_status filters added. Console columns/filters built. Wallet payment-status resolved to blank (no native enum — design refinement, see CONTEXT.md). 15 backend tests green; FE build green.
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo.
+
+Method, evidence and caveats: `.scratch/tracker-reconciliation/REPORT.md`.

@@ -58,22 +58,110 @@ _Avoid_: "energy consumed" without qualifier when context is ambiguous between l
 **Charger** / **EVSE**:
 A single charging unit identified by its OCPP `charge_point_string_id`. State is tracked via `ChargerStatusEnum` (`AVAILABLE`, `CHARGING`, `FAULTED`, …) and the OCPP heartbeat. The unit of "availability" customers see and the unit our budget cap / RemoteStop dispatch operate on.
 
+`charge_point_string_id` is a **UUID4 generated at onboarding** and is **internal-only** — it is the OCPP WSS path segment *and* the Basic Auth **username** under [[adr-0020-charger-websocket-basic-auth]], so it is never rendered on a customer-facing surface. Customers see the **Asset Code** instead.
+_Avoid_: showing `charge_point_string_id` to customers; calling it "the charger ID" without qualification (that phrase is overloaded across `Charger.id`, `charge_point_string_id`, and `GSTInvoice.charger_id_str`).
+
+**Asset Code**:
+The customer-facing identifier for a **Charger**: an environment series plus a zero-padded integer — `VOW0001` production, `VOWS0001` staging and development. Regex `^VOWS?\d{4,}$`, minimum width four and widening by itself past `VOW9999`, stored `VARCHAR(12)`. Unique across VoltLync **and across environments**: the series comes from `CHARGER_CODE_SERIES` in the git-tracked `backend/policy.py`, keyed on the existing `ENVIRONMENT` var, and an unrecognised value resolves to `VOWS`, never `VOW`, so a misconfigured box cannot mint a production-looking code. The split exists because **staging serves real paying customers** (~11 GST invoices/day as of 2026-08) — the same cross-environment hazard that produced duplicate `VL/F2/` invoice numbers and the `qr_payment_{PK}` refund collision.
+
+It names the **physical unit**, not a position: it follows the hardware through a station re-parent, and a replacement unit brings its own code rather than inheriting the dead one's. **Stored, not derived** (`Charger.asset_code`, `UNIQUE NOT NULL`): it derives from nothing mutable, so the anti-drift rule behind [[adr-0015-ocpi-identity-scheme]] has nothing to bite on. **System-allocated, never typed** — the server assigns `max + 1` at creation and there is no admin-editable field, which makes uniqueness structural rather than a form-validation problem. Bears **no relationship to `Charger.name`**, which stays free-form, nullable and non-unique; the one-time backfill seeds from the `VOW####` stencils already painted on the fleet so existing labels stay valid, and nothing reads `name` afterwards. **Allocation is strictly monotonic** — never reused, gaps never backfilled, so nobody has to reason about whether a hole is safe.
+
+Looked up by **parsing the integer**, not matching the string: `VOW0001`, `VOW00001` and `vow1` all resolve, while a foreign series is rejected rather than coerced. That is what makes the minimum-width rule safe: a code typed at one padding resolves at any other. Rendered as `CHARGER: VOW0001`; the customer-service phrasing is "the charger marked VOW0001". Snapshotted onto a **GST Invoice** at issue (`charger_id_str`). See [[adr-0028-customer-facing-charger-code]].
+_Avoid_: "charger ID" / "charge point ID" (those name the UUID **OCPP identity**), "bay number" or "slot" (the code names a unit, not a position — a **Bay** was considered and rejected), treating it as enterable input on a customer surface.
+
+**Charger Purpose**:
+What a **Charger** is *for*, as `Charger.purpose` — `PUBLIC` (advertised, billable, invoiceable), `PRIVATE` (real hardware and real billing, not advertised) or `TEST` (bench, pre-handover or internal; **Internal-role Sessions** only, never billed, never invoiced). Defaults to `PUBLIC`, which is the load-bearing choice: a row missed in any backfill keeps working rather than blocking customers, so the failure direction is fail-open. Deliberately **one enum, not two booleans** — every test unit is non-public, so `is_test` + `is_public` would admit a bench unit advertised as bookable, and the behaviours do not decompose anyway (`TEST` gates billing, `PRIVATE` gates only visibility).
+
+Deliberately **not** encoded in the **Asset Code**: purpose is mutable — a bench unit can be promoted to fleet — and an identifier must not change when a mutable attribute does. Also distinct from `availability` ([[adr-0008-charger-availability-separate-from-status]]), which is admin-commanded intent on *serviceable* hardware; marking a bench unit `Inoperative` would conflate "temporarily withdrawn" with "not fleet hardware at all".
+_Avoid_: "disabled", "hidden" (both describe one effect of one value); reusing `availability` or `latest_status` to mean any of this.
+
+**Documented exception to the Asset Code avoid-list:** `GSTInvoice.charger_id_str` keeps its name. The column predates the term and is a header in the **GST filings CSV export** (`routers/invoices.py`), which feeds an accountant's spreadsheet — renaming it would silently break saved import mappings on a compliance surface. It holds an **Asset Code** for invoices issued after the cutover and a legacy `charge_point_string_id` UUID before it; the two eras are separable by `^VOWS?\d{4,}$`. It is a snapshot of "the charger identifier printed on this invoice", which stays true across the format change.
+
+Its two siblings are **internal, never printed and never exported** to the GST filings CSV: `charger_station_id` (the station at issue, so a compliance query needs no regex) and `charger_ocpp_id` (the **OCPP identity** UUID, the audit link to the physical unit). Prefer either of those, or the `transaction` FK, when joining an invoice back to hardware — an **Asset Code** does name a specific unit, but an admin can correct it and the snapshot cannot be corrected.
+
 **Connector**:
 A physical plug on a `Charger`, modelled as a `Connector` row. **Working invariant (2026-05-21):** every `Charger` in our fleet has exactly one `Connector` (= one OCPI EVSE). The data model permits N:1 but no current deployment uses it, and no per-connector OCPP state is tracked. Carries `max_power_kw` plus the OCPI-native columns (`ocpi_standard`, `ocpi_format`, `ocpi_power_type`, `max_voltage`, `max_amperage`) that are the **source of truth for the [[ocpi-feed]]** (see [[adr-0016-connector-ocpi-normalization]]).
 
-**Plug type**:
-The customer-facing label for a connector's physical type, rendered from the **display-only** `Connector.connector_type` free-text (Type2, Socket, CCS, …). Customer-facing groupings on the station map and modal are by **plug type**, but the underlying counts are charger-level — see [[ui-station-modal-chargers]] for the rendering rule.
-_Avoid_: treating `connector_type` as authoritative for anything machine-read — it is cosmetic; the OCPI `standard` (`ocpi_standard`) is the source of truth (see [[adr-0016-connector-ocpi-normalization]]). _Avoid_: "connector" as a customer-facing label when you mean "charger of plug type X". Renamed in the public station modal 2026-05-21 to avoid the conflation.
+**Plug type** / **Connector type**:
+`Connector.connector_type` — a `ConnectorTypeEnum` (`Type2`, `Type1`, `Socket`, `CCS`, `CHAdeMO`, `GB/T`, `domestic`; enum-enforced since 2026-07-23, previously free text). It is **load-bearing on two orthogonal physical axes**, declared per-type in `charger_type_service.CONNECTOR_TRAITS` (see [[adr-0027-per-connector-type-suspend-windows]]):
+- `starts_from_available` — no Control Pilot signal ⇒ the charger idles in `Available` and remote start is allowed from `Available` as well as `Preparing` (`Socket`, `domestic`, `Type1`, `Type2`). The shared `startable_statuses` helper is the ONLY start-gate implementation.
+- `latching` — the cable locks into the vehicle inlet ⇒ a disconnected session is held for the LONG suspend window (`Type1`, `Type2`, `CCS`, `CHAdeMO`, `GB/T`); unlatched sockets get the short window. **Type2 is why these are two axes**: socket-like on the start gate, latched on the window.
+Unknown types resolve to the safe side of both axes (Preparing-only, short window). For the [[ocpi-feed]], `ocpi_standard` remains the source of truth (see [[adr-0016-connector-ocpi-normalization]]).
+_Avoid_: "connector" as a customer-facing label when you mean "charger of plug type X". Renamed in the public station modal 2026-05-21 to avoid the conflation.
+
+**Suspend window**:
+How long a mid-session charger disconnect (or reboot) is held `SUSPENDED` before force-finalize. **Per-connector-type, keyed on the `latching` trait: 12h latched / 45min unlatched** — values in the git-tracked `backend/policy.py`, NOT env vars (see [[adr-0027-per-connector-type-suspend-windows]]). The same window applies on BOTH suspension paths: the disconnect timer and the post-boot timer armed by BootNotification (the old 300s post-boot timer is retired — a reboot must never shorten the promised grace window). The stale-suspended sweep and resume-staleness guard derive their cutoffs per-transaction (window + 60s buffer), preserving the [[adr-0022-resume-staleness-threshold-derived]] invariant per-row.
+
+**Decided 2026-09-09, not yet built** (pending [[offline-charging-continuity]]): the window measures **silence, not session age** — the clock is the time since we last heard anything about *that transaction*, so a charger that checks in at hour 20 with advancing energy resets it. There is consequently **no upper bound on a session's duration**, which is correct: advancing energy is proof of life, and killing a session we can see is alive was never the intent. The window governs only the **no-information** case. The `latching` split **survives** — it remains exactly the right discriminator when we know nothing, since a latched cable means the car is probably still attached and an unlatched socket means anyone could have pulled it — but the magnitudes rise (~48h latched). `suspended_at` is the wrong column to measure from once this lands; it records when the suspend began and the reconnect path already rewrites it.
+_Avoid_: reading `SUSPENDED` as "not delivering energy" — see [[offline-charging-continuity]].
+
+**Offline charging continuity**:
+Firmware behaviour, **decided 2026-09-09, not yet shipped** (see [[adr-0031-charger-authoritative-offline-session]]): the charger **holds the contactor closed and keeps delivering** through a CSMS outage, rather than opening it on WebSocket loss. Local safety supervision (earth fault, leakage, over/under voltage, over-current) is never gated on the link and continues to stop the charge through its existing paths; the only thing suppressed is a reset whose sole cause is that the CSMS is unreachable.
+
+It covers only *surviving* an outage mid-session, never *beginning* one during it: OCPP 1.6 permits offline starts (`AllowOfflineTxForUnknownId`, `LocalAuthorizeOffline`) and both are held `false`, because every session needs a funding decision only the CSMS can make.
+
+This **inverts a fleet-wide finding**. The [[adr-0022-resume-staleness-threshold-derived]] verification (2026-07-06) swept every disconnect-finalized session in prod history — 11 sessions, 6 chargers — and found **8 flat, 3 reboot-resets, 0 advanced**: every deployed unit opens the contactor on WS loss. That is why the refund-on-stale-reading leak was recorded as *latent, not active*, explicitly conditional on "a future firmware that keeps the contactor closed on WS loss, which none currently does." This is that firmware, so the leak becomes live and every consumer of `SUSPENDED` has to be re-read on the assumption that the charger may be charging right now.
+
+The precondition that makes it safe is the charger-enforced **Budget cap**: without a local energy limit, holding the contactor through an outage means unbounded free energy; with one, the worst case is bounded by what the customer prepaid. Continuity and the local cap are **one change, not two** — neither ships alone.
+_Avoid_: "offline charging" unqualified (it collides with charging *authorized* offline via the local auth list, which is a different OCPP concern); treating it as a firmware-only change (it moves the CSMS's `SUSPENDED` semantics).
+
+**Blackout delivery**:
+Energy delivered while the charger was unreachable. Under [[offline-charging-continuity]] it is real energy, and it has exactly two fates. **Reconciled** — the charger reconnects inside the **Suspend window** and replays its queued `MeterValues` (OCPP 1.6 requires transaction-related messages be queued and delivered in chronological order), so the CSMS learns the true figures and bills them. **Written off** — the charger stays silent past the window, the session is finalized against **server-available data** (the last pre-disconnect reading), and the unreported energy is never billed and never refunded against. The write-off is a **deliberate, accepted loss**: the alternative is stranding a customer's money indefinitely on hardware that may never return.
+
+A late `StopTransaction` arriving after a write-off **does not reopen the money**. It is recorded to separate reported-only fields for ops and measurement, leaving the billed figures — and the **GST Invoice** already issued against them — untouched, because there is no credit-note mechanism to correct an issued invoice (see [[known-issues]]) and a register that disagrees with its own transactions is worse than a known write-off.
+_Avoid_: "lost energy" (it was delivered, and the customer received it — only the *record* was lost); treating a write-off as a billing bug to be retro-corrected.
+
+**Reported energy** vs **Billed energy**:
+Two figures for the same session that may legitimately disagree, kept apart deliberately. **Billed energy** is what the money was computed from — `energy_consumed_kwh`, the basis of the **GST Invoice**, the refund and the **Settlement Entry**. **Reported energy** is what the charger later said it actually delivered, arriving on a `StopTransaction` that reaches us *after* the session was already finalized and invoiced (see [[blackout-delivery]]).
+
+Reported energy is recorded, never promoted: it does not overwrite the billed figure and does not move money. An issued **GST Invoice** cannot be corrected — there is no credit-note table (dropped in migration 27) and stamping a correction breaks the register invariant — so a register that silently disagreed with its own transactions would be strictly worse than a known, measured gap. Reported energy exists to quantify what the write-off is costing and to alert on charger-side meter failure.
+_Avoid_: "actual energy" for either one (it begs the question); treating a reported/billed gap as a billing bug rather than the accepted outcome of [[offline-charging-continuity]].
+
+**Measured time** vs **Receipt time**:
+Two clocks on the same reading, both kept. **Receipt time** (`MeterValue.created_at`, `Transaction.start_time` / `end_time`) is when the CSMS got the frame; it is the **billing and GST Invoice basis** and it never moves. **Measured time** (`MeterValue.measured_at`, `Transaction.reported_start_time` / `reported_end_time`) is when the charger says the thing happened, taken from the OCPP frame's own `timestamp`.
+
+They agree to within milliseconds on a healthy link and diverge by the length of an outage the moment a charger replays queued frames (see [[offline-charging-continuity]]) — which is exactly when the difference matters. A `StopTransaction` arriving hours late makes `reported_end_time` the only record of when charging actually stopped.
+
+Measured time is **reported, never substituted**: it is stored only when plausible and is NULL otherwise, so readers fall back to receipt time. The plausibility guard (`utils.parse_ocpp_timestamp`) exists because **charger clocks in this fleet are not trustworthy** — the same fact that makes ADR 0030 reconstruct **Diagnostic Bundle** time from in-band `TIME_SYNC` anchors instead of believing the charger. Accepted only within 5 minutes of the future and, for readings, no earlier than the transaction's own start.
+
+Which clock a question wants is decided by the question, not by preference: "what did the meter last read?" is measured time (`services.meter_readings.latest_meter_value`); "how long since we heard anything?" — the **Suspend window**'s silence clock — is receipt time.
+_Avoid_: "timestamp" unqualified anywhere the two can differ; treating `created_at` as when the reading was taken.
+
+**Meter reporting invariant**:
+The charger **never reports a cumulative reading lower than one it has already reported for the same transaction.** Stated about the wire, not the hardware, and deliberately so: an *involuntary* register reset (the meter chip losing power in a site outage) cannot be scheduled away, and a power cut is precisely the event that resets the register *and* drops the link, together. Only a *deliberate* reset — commissioning, meter swap — can be constrained to "no open transaction". So the firmware is required to reconstruct the true cumulative value from its own persisted state before reporting, not to prevent the reset.
+
+The charger **owns the meter**; the CSMS observes and does not correct. A violation is logged as an alertable event and **billed as reported** — the meter is the instrument of record. Observation is not overruling: with `PostBootState` retired there is no recovery fallback and no credit note, so this is the only signal that charger-side meter persistence has failed in the field.
+_Avoid_: "the meter never resets" (it does — 3 of the 11 sessions in the ADR 0022 sweep showed reboot-resets); treating the invariant as a hardware property rather than a firmware obligation.
 
 ### Charger connection security
 
 **Charger Auth Key**:
+**Status (2026-08-18): partially shipped.** The key and its `Charger.auth_key_hash` column are being introduced by [[adr-0029-diagnostic-bundle-authenticated-https-upload]] to authenticate **Diagnostic Bundle** uploads over HTTPS. The OCPP WebSocket handshake described below is still **unauthenticated** — [[adr-0020-charger-websocket-basic-auth]] remains PROPOSED. Read the rest of this entry as the target design for the WSS half.
+
 The per-`Charger` secret that authenticates the OCPP WebSocket connection under **OCPP 1.6 Security Profile 2** (WSS transport + HTTP Basic Auth). A 20-byte random key; the charger presents it as the Basic Auth **password** with the `charge_point_string_id` as the **username** on the WSS upgrade. The server stores only a **SHA-256 hash** (`Charger.auth_key_hash`), never the plaintext — the plaintext is revealed exactly once at provisioning/rotation and loaded onto the unit by charger-side tooling (delivery is out of scope for the server). Lost key ⇒ rotate, never retrieve. SHA-256 (not bcrypt) is deliberate: the key is a high-entropy machine credential checked on every reconnect, so a fast hash is both sufficient and cheaper for flaky-modem reconnect churn. See [[adr-0020-charger-websocket-basic-auth]].
 _Avoid_: "charger password" (implies a low-entropy human secret and the wrong hashing choice); conflating it with **AuthorizationKey** (the OCPP config key the charger-side tool writes locally) — same value, different side.
+
+**Key provisioning** vs **Key rotation**:
+Two distinct operations on a **Charger Auth Key**, deliberately not one. **Provisioning** mints the first key for a charger that has none — safe, reversible in effect, and never destroys anything. **Rotation** replaces an existing key, destroying the only credential the unit in the field still holds; it has no grace overlap, so the charger fails authentication from that instant until the new key is loaded onto it by charger-side tooling. Because the fleet sits behind carrier NAT with no inbound path, an unintended rotation is recovered by physically visiting the unit.
+_Avoid_: "overwrite" and "regenerate" — both flatten the two into one act and hide that only one of them is destructive. _Avoid_: treating a rotation of an unprovisioned charger as a provisioning; there is nothing to rotate.
 
 **Charger auth enforcement**:
 The rule deciding whether a connection is required to present a valid **Charger Auth Key**. **Per-charger**, keyed on `auth_key_hash` presence: null ⇒ *legacy mode* (connection allowed, logged as `charger.connection_insecure` — the migration burn-down signal); non-null ⇒ *enforced* (valid Basic Auth required, **username must equal the path `charge_point_id`**, else close `1008`). Auth is checked **before** the force-disconnect-stale-connection logic so an unauthenticated caller can never kick a live charger offline. Once the insecure count reaches zero fleet-wide, the global `REQUIRE_CHARGER_AUTH` flag closes the window by rejecting even null-hash chargers. See [[adr-0020-charger-websocket-basic-auth]].
 _Avoid_: "big-bang cutover" — enforcement is intentionally per-charger to avoid a flag-day outage across flaky-modem fleet.
+
+### Remote commands
+
+**Remote command**:
+An OCPP RPC this server initiates *towards* a charger over the open WebSocket — `RemoteStartTransaction`, `RemoteStopTransaction`, `Reset`, `ChangeAvailability`, `UpdateFirmware`, `DataTransfer`. Always server→charger. The charger's own calls (BootNotification, MeterValues, StatusNotification, …) are not remote commands; those land on the **OCPP message log**.
+
+**Command outcome**:
+What a **remote command** produced, as three mutually exclusive states: **Accepted** (the charger committed to act), **Refused** (the charger answered and declined), **Unanswered** (no reply inside the 30-second window). A charger that is not connected at all never produces a command outcome — connectivity is a pre-flight check answered before anything is sent.
+`Accepted` deliberately absorbs OCPP's `Scheduled` (`ChangeAvailability` only — "I will act when the current session ends"), because both are commitments to act and the one caller that sees `Scheduled` already treats it identically. The raw wire status stays reachable for callers that surface it verbatim.
+_Avoid_: "command result" — `CallResult` is already the OCPP messageTypeId-3 ack frame. "Success"/"failure" for the pair — a refusal is neither: the system worked correctly and the answer was no.
+
+**Refused** vs **Rejected**:
+Two different actors saying no, deliberately kept apart. **Refused** is the *charger* declining a **remote command**. **Rejected** is *this server* declining something — most visibly the `OCPPWebSocketRejected` **NR custom event** for a connect-time reject. The OCPP wire value for a charger's no is literally `"Rejected"`; it is translated to **Refused** at the transport boundary so the actor is unambiguous everywhere above it.
+_Avoid_: "rejected" for a charger's answer — it inverts the actor relative to the connect-time event of the same name.
 
 ### External interoperability (OCPI)
 
@@ -116,8 +204,12 @@ Razorpay's actual processing charge on a captured **QR Payment**, as reported by
 _Avoid_: synthetic platform fee (retired 2026-07-13 — the fee is the actual webhook figure now), assumed fee, platform fee (was overloaded).
 
 **Budget cap**:
-Redis-cached upper bound on energy a **QR Session** can deliver. Equals `(amount_paid − gateway_fee) / (rate_per_kwh × (1 + gst_pct/100))`, using the **actual Gateway fee** reserved at StartTransaction (₹0 for zero-MDR UPI). Enforced from the MeterValues handler by dispatching `RemoteStopTransaction` when consumption crosses the cap.
-_Avoid_: limit, cap.
+Upper bound on energy a **QR Session** (or, via `WalletSessionService`, a **Wallet Session**) can deliver. Equals `(amount_paid − gateway_fee) / (rate_per_kwh × (1 + gst_pct/100))`, using the **actual Gateway fee** reserved at StartTransaction (₹0 for zero-MDR UPI).
+
+**Enforced at the charger, which is the source of truth.** The cap is pushed to the charger as an absolute Wh value in a vendor `DataTransfer` (`messageId=SessionLimit`) immediately after `StartTransaction.conf`, keyed on **`transactionId`** — never on `idTag`, which is a per-`User` value reused across every session that customer ever has. The charger holds it in EEPROM, enforces it locally on its own metering cadence, and therefore honours it **through a CSMS outage**, which is the whole point: OCPP 1.6 has no native per-transaction energy limit (`SetChargingProfile` limits power over a schedule, not cumulative energy; `MaxEnergyOnInvalidId` is a Charge-Point-wide constant), so `DataTransfer` is the spec-sanctioned extension point.
+
+The server-side check (`check_budget_and_auto_stop`, dispatching `RemoteStopTransaction` from the MeterValues handler) is **retained as a redundant failsafe**, not retired: whichever enforcer gets there first wins, on the same flag-less at-least-once basis the auto-stop dispatch already uses. Two rules make the pair safe: the Wh conversion **rounds down** (rounding up makes over-delivery past what the customer paid structural rather than bounded by RemoteStop latency), and `SessionLimit` carries an **absolute value and is re-sendable** — re-asserted on every reconnect, and re-pushed whenever the budget changes (see [[stacked-qr-payment]], whose top-ups arrive by Razorpay webhook on a path the charger is not on).
+_Avoid_: limit, cap. _Avoid_: treating **SessionLimit** as a distinct concept from the **Budget cap** — it is the same bound, expressed in the units of the place that enforces it; `SessionLimit` names the wire message, not a second budget.
 
 ### Billing artefacts
 
@@ -177,6 +269,22 @@ A charger-emitted OCPP `DataTransfer` with `vendorId=VoltLync`, `messageId=Signa
 **Known ambiguity**: the table name is a misnomer post-temperature. A future rename to `charger_telemetry` (or similar) is on the table but not blocking. Until then, treat `signal_quality` as the canonical home for any modem-emitted telemetry, not strictly signal-quality fields.
 _Avoid_: confusing **Modem telemetry** with the (currently hypothetical) OCPP `Temperature` measurand sent inside `MeterValues.sampledValue`. The latter, if/when it appears, is per-transaction cable/socket/EV temperature and belongs on `meter_value` — see ADR 0009 "Consequences" for the orthogonality argument.
 
+**Diagnostic Bundle**:
+A body of **charger-side firmware debug traces** — boot messages, state-machine transitions, modem/AT failures, relay actuations, vendor fault detail — buffered in the charger's on-board EEPROM and uploaded periodically to the CSMS over **HTTPS POST**, outside the OCPP channel. Deliberately and strictly **non-metering**: no kWh, no meter readings, no tamper or calibration events. That exclusion is what keeps a Bundle disposable observability data rather than legal-metrology data adjacent to a **GST Invoice**.
+
+Newline-delimited UTF-8 records and nothing else. It carried a header of counters (`boot`, `seq`, `first`, `last`, `overflow`) until [[adr-0030-diagnostic-bundle-body-is-the-contract]] deleted it: every field required the charger to persist a counter across a reboot, which the hardware cannot do. **The body is the whole contract.** The CSMS reads three in-band markers from it — `===== BOOT`, `TIME_SYNC boot_ms=… utc=…`, and the ring-wrap line — and derives identity, time and loss from those. It is therefore *not* opaque: it is vendor-defined in content but parsed for delivery meaning, though never for domain meaning. Uploaded to `POST /api/diagnostics/bundles` under HTTP Basic Auth with the **Charger Auth Key**, and stored in S3; see [[adr-0029-diagnostic-bundle-authenticated-https-upload]].
+
+_Avoid_: **Diagnostics** / **GetDiagnostics** as if this were the OCPP mechanism — it deliberately is **not** (see the ADR). _Avoid_: "charger logs" unqualified, which collides with **OCPP message log** (that is CSMS-observed protocol traffic; a Bundle is the charger's own internal trace, which the CSMS otherwise never sees). _Avoid_: treating a Bundle as a source of truth for energy — `MeterValues` / `StopTransaction` are the audited billing path, and a second unaudited copy would be a liability, not an asset. _Avoid_: **bundle sequence** and **epoch** — both are retired; a Bundle is identified by the **content digest** of its records. _Avoid_: describing a Bundle as "opaque", which was true only while the CSMS ignored its contents.
+
+**Loss window**:
+The span between one Diagnostic Bundle's last record and the next one's first, measured in **UTC reconstructed from in-band `TIME_SYNC` anchors**. Silence longer than a configured threshold is the signal that records went missing. Derived at read time, never stored — a delayed bundle can arrive later and fill the hole.
+
+Replaces the record-number gap and overflow delta of [[adr-0029-diagnostic-bundle-authenticated-https-upload]], which needed counters the charger cannot keep. **Resolution is minutes, not records**, and the **cumulative count of records a charger destroyed before delivering them is no longer obtainable at all** — that needed a monotonic counter held separately from the data it describes. A **ring-wrap event** says overwriting is happening now; nothing says how much. Do not present either as a total. See [[adr-0030-diagnostic-bundle-body-is-the-contract]].
+_Avoid_: **gap records** / **overflow delta** — both retired with the header.
+
+**Reservation** (Diagnostic Bundle):
+An index row written **before** its S3 object, carrying a null `archived_at`. It exists so a failed upload cannot strand an object no row points at — the ordering that produced 195 unreclaimable objects on staging in one morning. A reservation is **not a delivery**: it is invisible to the duplicate check, so a charger retrying is told to re-send rather than falsely assured the CSMS holds its records. `archived_at` is set only once the S3 put returns.
+
 ### Admin transactions console
 
 **Transactions Console**:
@@ -228,6 +336,8 @@ _Avoid_: treating the cohort as `User`-keyed (it is not — appless QR customers
 > **Domain expert:** "Both. ₹11.80 is the **Tariff** — the GST-inclusive energy price the operator sets and the customer sees. We back-derive the **Base rate** of ₹10.00 (`11.80 / 1.18`) for the invoice's Energy line, which is taxed separately. Neither number contains the gateway; the **Gateway fee** is its own line, shown only when a fee actually applies."
 
 ## Flagged ambiguities
+
+- "overwrite" was used for replacing a **Charger Auth Key** — resolved: the operation is **Key rotation**, and it is distinct from **Key provisioning**. Only rotation is destructive.
 
 - "platform fee" used to be overloaded for both the real Razorpay deduction and the policy figure — resolved 2026-05-18 by introducing **Actual platform fee** and **Synthetic platform fee** as distinct terms.
 - "incl. tax" tariff was ambiguous after the gateway-fee policy change — resolved 2026-05-18 by retiring `tariff_per_kwh_incl_tax` in favour of **All-in tariff** (`tariff_per_kwh_all_in`), which explicitly includes both GST and the synthetic gateway fee.

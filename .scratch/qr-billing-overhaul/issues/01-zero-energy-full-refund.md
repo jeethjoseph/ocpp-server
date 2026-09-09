@@ -1,6 +1,6 @@
 # Zero-energy session full refund
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 
@@ -24,3 +24,11 @@ See [ADR 0002](../../../docs/adr/0002-zero-energy-full-refund.md) and [CONTEXT.m
 ## Blocked by
 
 None — can start immediately.
+
+## Comments
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo.
+
+Method, evidence and caveats: `.scratch/tracker-reconciliation/REPORT.md`.

@@ -1,4 +1,4 @@
-Status: ready-for-agent
+Status: done
 
 # Widen `FirmwareUpdate.download_url` to fit presigned URLs with STS tokens
 
@@ -37,3 +37,11 @@ Touchpoints:
 ## Blocked by
 
 None — can start immediately.
+
+## Comments
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo: `backend/migrations/models/39_20260520070332_widen_fi*` widens `download_url`
+
+Method and caveats: `.scratch/tracker-reconciliation/REPORT.md`.

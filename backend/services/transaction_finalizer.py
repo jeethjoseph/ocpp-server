@@ -36,13 +36,14 @@ logger = logging.getLogger("ocpp-server")
 # we finalize the txn (STALE_RECONNECT) instead of resuming. This only fires
 # when the primary disconnect/suspend timer chain has failed.
 #
-# The threshold is DERIVED from the disconnect window via
-# disconnect_handler.stale_suspended_cutoff_seconds() (= max(DISCONNECT_SUSPEND_TIMEOUT,
-# SUSPEND_TIMEOUT) + buffer) — the same single source of truth the stale-suspended
-# sweeps use — NOT a separate env var. Deriving it guarantees by construction that
-# the guard fires strictly AFTER the primary disconnect timer, so it can never be
+# The threshold is DERIVED per-transaction via
+# disconnect_handler.stale_suspended_cutoff_seconds_for(txn) (= the txn's own
+# per-connector-type suspend window + buffer) — the same single source of truth
+# the stale-suspended sweep uses — NOT a separate env var. Deriving it
+# guarantees by construction that the guard fires strictly AFTER the primary
+# disconnect timer for that transaction's connector type, so it can never be
 # misconfigured to pre-empt a legitimate in-window reconnect (the txn 870 bug).
-# See ADR 0022.
+# See ADR 0022 (derivation) and ADR 0027 (per-connector-type windows).
 
 
 async def is_resume_too_stale(
@@ -55,13 +56,21 @@ async def is_resume_too_stale(
     activity signal we found, or None if we couldn't find any.
 
     Looks at the most recent of: suspended_at, latest MeterValue.created_at,
-    falling back to start_time. Threshold is the derived stale-suspended cutoff
-    (see module comment) — guaranteed larger than the disconnect timer.
+    falling back to start_time. Threshold is the per-transaction derived
+    stale-suspended cutoff (see module comment) — guaranteed larger than the
+    primary suspend window for this transaction's connector type.
     """
     now = datetime.datetime.now(datetime.timezone.utc)
     candidates = []
     if transaction.suspended_at:
         candidates.append(transaction.suspended_at)
+    # Deliberately created_at, NOT services.meter_readings.latest_meter_value:
+    # this measures SILENCE — how long since we heard anything about this
+    # transaction — which is a receipt-time question. A charger replaying an
+    # hours-old queue on reconnect has just told us it is alive, so the gap
+    # legitimately resets to ~0 even though the readings are old. Ordering by
+    # measured_at here would resurrect a stale gap and refuse a live resume.
+    # See ADR 0031 decisions 3 and 8.
     latest_mv = await MeterValue.filter(
         transaction_id=transaction.id
     ).order_by("-created_at").first()
@@ -73,9 +82,9 @@ async def is_resume_too_stale(
         return False, None
     most_recent = max(candidates)
     gap = (now - most_recent).total_seconds()
-    # Derived, not configured — see module comment / ADR 0022.
-    from services.disconnect_handler import stale_suspended_cutoff_seconds
-    return gap > stale_suspended_cutoff_seconds(), gap
+    # Derived per-transaction, not configured — see module comment / ADR 0022.
+    from services.disconnect_handler import stale_suspended_cutoff_seconds_for
+    return gap > await stale_suspended_cutoff_seconds_for(transaction), gap
 
 
 async def finalize_stopped_transaction(
@@ -178,12 +187,11 @@ async def _calculate_final_energy(transaction: Transaction) -> None:
     end_meter_kwh + energy_consumed_kwh on the transaction object.
     Does NOT save — caller is responsible for that.
     """
-    latest_meter_value = await MeterValue.filter(
-        transaction_id=transaction.id
-    ).order_by("-created_at").first()
+    from services.meter_readings import latest_meter_value
+    latest = await latest_meter_value(transaction.id)
 
-    if latest_meter_value:
-        transaction.end_meter_kwh = latest_meter_value.reading_kwh
+    if latest:
+        transaction.end_meter_kwh = latest.reading_kwh
         transaction.energy_consumed_kwh = (
             transaction.end_meter_kwh - (transaction.start_meter_kwh or 0)
         )

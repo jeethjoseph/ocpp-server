@@ -9,12 +9,15 @@ import logging
 
 from core.config import wallet_charging_enabled
 from core.roles import INTERNAL_ROLES
-from models import Charger, ChargingStation, Connector, Transaction, OCPPLog, User, ChargerError, Tariff
+from models import Charger, ChargingStation, Connector, ConnectorTypeEnum, Transaction, OCPPLog, User, ChargerError, Tariff, ChargerPurposeEnum
+from tortoise.expressions import Q
 from tortoise.exceptions import IntegrityError
 from tortoise.transactions import in_transaction
 from auth_middleware import require_admin, require_user_or_admin
 from crud import log_audit_event
 from services.tariff_utils import back_calc_base_rate
+from services.charger_type_service import canonical_connector_type
+from services import charger_auth_service, charger_code_service
 
 logger = logging.getLogger(__name__)
 
@@ -43,12 +46,11 @@ class ChargerCreate(BaseModel):
     )
 
 
-# Selectable connector types for the admin Edit Charger form. The socket subset
-# (see services.charger_type_service.SOCKET_CONNECTOR_TYPES) is untethered and
-# start-from-Available; the rest are tethered/DC. Kept as canonical display
-# strings; validation is case-insensitive.
-ALLOWED_CONNECTOR_TYPES = ["Type2", "Type1", "Socket", "CCS", "CHAdeMO", "GB/T", "domestic"]
-_ALLOWED_CONNECTOR_TYPES_LC = {t.lower() for t in ALLOWED_CONNECTOR_TYPES}
+# Selectable connector types for the admin Charger forms — derived from the
+# canonical enum. Physical behavior per type (start gate, suspend window) is
+# declared in services.charger_type_service.CONNECTOR_TRAITS. Validation and
+# canonicalization ("type 2" -> "Type2") go through canonical_connector_type.
+ALLOWED_CONNECTOR_TYPES = [m.value for m in ConnectorTypeEnum]
 
 
 class ChargerUpdate(BaseModel):
@@ -90,8 +92,19 @@ class ChargerResponse(BaseModel):
     # Admin-set availability ("Operative" | "Inoperative"). Distinct from
     # latest_status — the UI toggle reads THIS field. See ADR 0008.
     availability: str
+    # The customer-facing Asset Code (ADR 0028). Admin surfaces show it
+    # alongside charge_point_string_id, which stays visible here because ops
+    # needs the OCPP identity for log correlation and firmware deploys.
+    asset_code: Optional[str]
+    # Serviceability: PUBLIC | TEST. Drives the TEST badge in the admin UI.
+    purpose: str
     last_heart_beat_time: Optional[datetime]
     connection_status: bool
+    # Whether a Charger Auth Key has been provisioned. A boolean, never the hash
+    # — it exists so the UI can tell "Generate" from "Rotate" *before* the
+    # destructive call, which is the signal whose absence made an accidental
+    # rotation possible at all.
+    has_auth_key: bool
     created_at: datetime
     updated_at: datetime
     tariff_per_kwh: Optional[float] = None  # back-derived; internal billing math
@@ -234,7 +247,14 @@ def charger_to_response(
             if hasattr(charger.availability, "value")
             else str(charger.availability)
         ),
+        asset_code=charger.asset_code,
+        purpose=(
+            charger.purpose.value
+            if hasattr(charger.purpose, "value")
+            else str(charger.purpose)
+        ),
         last_heart_beat_time=charger.last_heart_beat_time,
+        has_auth_key=bool(charger.auth_key_hash),
         created_at=charger.created_at,
         updated_at=charger.updated_at,
         connection_status=connection_status,
@@ -286,6 +306,36 @@ async def get_latest_errors_for_chargers(charger_ids: List[int]) -> Dict[int, Ch
 
     return error_dict
 
+def _charger_search_filter(search: str) -> Q:
+    """Match a charger by name, OCPP identity, or Asset Code.
+
+    The Asset Code arm resolves by PARSING THE INTEGER rather than matching the
+    string, so a customer quoting "VOW1" and an admin pasting "VOW0001" land on
+    the same unit. That is what makes ADR 0028's minimum-width rule safe: a
+    code typed at one padding resolves at any other, so the register can widen
+    past VOW9999 without re-padding anything.
+
+    A FOREIGN SERIES RESOLVES TO NOTHING, never to the local unit with the same
+    number. Both registers mint codes a real person reads off a real unit, so
+    coercing a staging code into a production lookup would hand support the
+    wrong charger — a wrong-answer bug, which is worse than a no-answer one.
+    Because `parse_asset_code` returns None for a foreign series, the exact-code
+    arm simply contributes no match.
+    """
+    clauses = Q(name__icontains=search) | Q(charge_point_string_id__icontains=search)
+
+    number = charger_code_service.parse_asset_code(search)
+    if number is not None:
+        clauses = clauses | Q(
+            asset_code=charger_code_service.format_asset_code(number)
+        )
+    else:
+        # Not a resolvable code — still allow substring matching so a partial
+        # paste ("VOWS00") narrows the list rather than returning nothing.
+        clauses = clauses | Q(asset_code__icontains=search)
+    return clauses
+
+
 @router.get("", response_model=ChargerListResponse)
 async def list_chargers(
     page: int = Query(1, ge=1),
@@ -306,7 +356,7 @@ async def list_chargers(
     if station_id:
         query = query.filter(station_id=station_id)
     if search:
-        query = query.filter(name__icontains=search)
+        query = query.filter(_charger_search_filter(search))
     
     # Get total count
     total = await query.count()
@@ -358,6 +408,58 @@ async def list_chargers(
         limit=limit
     )
 
+
+
+async def _create_charger_rows(charger_data: "ChargerCreate", canonical_types, charge_point_id: str):
+    """Write the Charger, its Connectors and its Tariff as one unit.
+
+    All three writes must succeed or fail together — a partial failure would
+    leave an orphan charger row with no connectors or no tariff (issue 05 / M6).
+    The audit log deliberately stays OUTSIDE this, so the "operator tried"
+    trail survives a rollback.
+
+    No Asset Code handling here on purpose. The code is allocated by the
+    `allocate_asset_code` pre_save hook from a Postgres sequence, which is
+    concurrency-safe — so there is no collision to retry and no creation path
+    that can forget. See ADR 0028.
+    """
+    async with in_transaction():
+        charger = await Charger.create(
+            charge_point_string_id=charge_point_id,
+            external_charger_id=charger_data.external_charger_id,
+            station_id=charger_data.station_id,
+            name=charger_data.name,
+            model=charger_data.model,
+            vendor=charger_data.vendor,
+            serial_number=charger_data.serial_number,
+            latest_status="Unavailable"
+        )
+
+        for connector_input, canonical_type in zip(charger_data.connectors, canonical_types):
+            await Connector.create(
+                charger_id=charger.id,
+                connector_id=connector_input.connector_id,
+                connector_type=canonical_type,
+                max_power_kw=connector_input.max_power_kw
+            )
+
+        # Create charger-specific tariff if provided. The operator types the
+        # GST-inclusive, gateway-exclusive rate; we back-calc the base rate
+        # server-side and persist both. ADR 0026.
+        if charger_data.rate_gst_included is not None:
+            gst_default = Tariff._meta.fields_map["gst_percent"].default
+            gst = Decimal(str(gst_default))
+            gst_incl = Decimal(str(charger_data.rate_gst_included))
+            rate = back_calc_base_rate(gst_incl, gst)
+            await Tariff.create(
+                charger=charger,
+                rate_per_kwh=rate,
+                rate_gst_included=gst_incl,
+                gst_percent=gst,
+            )
+    return charger
+
+
 @router.post("", response_model=dict, status_code=201)
 async def create_charger(charger_data: ChargerCreate, admin_user: User = Depends(require_admin())):
     """Onboard a new charger"""
@@ -367,49 +469,22 @@ async def create_charger(charger_data: ChargerCreate, admin_user: User = Depends
     if not station:
         raise HTTPException(status_code=404, detail="Station not found")
     
+    # Validate + canonicalize connector types up front ("type 2" -> "Type2")
+    # so an invalid type fails fast before any row is written.
+    canonical_types = []
+    for connector_input in charger_data.connectors:
+        canonical_type = canonical_connector_type(connector_input.connector_type)
+        if canonical_type is None:
+            raise HTTPException(status_code=400, detail="Invalid connector type")
+        canonical_types.append(canonical_type)
+
     # Generate unique charge point ID
     charge_point_id = str(uuid.uuid4())
-    
+
     try:
-        # All three writes (Charger + Connectors + Tariff) must succeed or fail
-        # together — otherwise a partial-failure scenario leaves an orphan
-        # charger row with no connectors or no tariff. Issue 05 / M6.
-        # Audit log stays OUTSIDE the transaction so the "we attempted this"
-        # trail is preserved even on rollback.
-        async with in_transaction():
-            charger = await Charger.create(
-                charge_point_string_id=charge_point_id,
-                external_charger_id=charger_data.external_charger_id,
-                station_id=charger_data.station_id,
-                name=charger_data.name,
-                model=charger_data.model,
-                vendor=charger_data.vendor,
-                serial_number=charger_data.serial_number,
-                latest_status="Unavailable"
-            )
-
-            for connector_input in charger_data.connectors:
-                await Connector.create(
-                    charger_id=charger.id,
-                    connector_id=connector_input.connector_id,
-                    connector_type=connector_input.connector_type,
-                    max_power_kw=connector_input.max_power_kw
-                )
-
-            # Create charger-specific tariff if provided. The operator types
-            # the GST-inclusive, gateway-exclusive rate; we back-calc the base
-            # rate server-side and persist both. ADR 0026.
-            if charger_data.rate_gst_included is not None:
-                gst_default = Tariff._meta.fields_map["gst_percent"].default
-                gst = Decimal(str(gst_default))
-                gst_incl = Decimal(str(charger_data.rate_gst_included))
-                rate = back_calc_base_rate(gst_incl, gst)
-                await Tariff.create(
-                    charger=charger,
-                    rate_per_kwh=rate,
-                    rate_gst_included=gst_incl,
-                    gst_percent=gst,
-                )
+        charger = await _create_charger_rows(
+            charger_data, canonical_types, charge_point_id,
+        )
 
         await log_audit_event(
             action="charger.created",
@@ -579,10 +654,11 @@ async def update_charger(charger_id: int, update_data: ChargerUpdate, admin_user
     # correct. See socket-charger-classification issue 01.
     connector_type = update_dict.pop("connector_type", None)
     if connector_type is not None:
-        if connector_type.strip().lower() not in _ALLOWED_CONNECTOR_TYPES_LC:
+        canonical_type = canonical_connector_type(connector_type)
+        if canonical_type is None:
             raise HTTPException(status_code=400, detail="Invalid connector type")
         await Connector.filter(charger_id=charger_id).update(
-            connector_type=connector_type.strip()
+            connector_type=canonical_type
         )
         # Keep the in-memory socket-classification cache coherent. The hot-path
         # StatusNotification handler reads connector_type from
@@ -594,7 +670,7 @@ async def update_charger(charger_id: int, update_data: ChargerUpdate, admin_user
             charger.charge_point_string_id
         )
         if cached is not None:
-            cached["connector_type"] = connector_type.strip()
+            cached["connector_type"] = canonical_type.value
 
     for field, value in update_dict.items():
         setattr(charger, field, value)
@@ -646,6 +722,61 @@ async def delete_charger(charger_id: int, admin_user: User = Depends(require_adm
 
     return {"message": "Charger removed successfully"}
 
+@router.patch("/{charger_id}/purpose", response_model=dict)
+async def change_charger_purpose(
+    charger_id: int,
+    purpose: str = Query(..., regex="^(PUBLIC|TEST)$"),
+    admin_user: User = Depends(require_admin()),
+):
+    """Change what a charger is FOR: fleet hardware or a bench unit (ADR 0028).
+
+    A dedicated endpoint rather than a field on `ChargerUpdate`, following the
+    `ChangeAvailability` precedent, for two reasons. It is not cosmetic state —
+    flipping to TEST withdraws a unit from `/stations`, stops it billing and
+    stops it invoicing — so it should not ride in on a payload that also
+    carries the model name. And it needs its own audit entry: "who took this
+    charger out of service, and when" is the first question asked when a unit
+    stops earning.
+
+    This is the escape hatch for the one gate in ADR 0028 that fails CLOSED. A
+    fleet unit wrongly marked TEST refuses paying customers, and `purpose` is
+    the only inferred column in the backfill — so the correction has to be a
+    reviewed, audited API call, not a manual UPDATE against production.
+
+    Promotion is deliberately a single field update with no minting step: the
+    Asset Code is allocated at creation and never changes, precisely so a unit
+    can move between contexts without acquiring a new identity.
+    """
+    charger = await Charger.filter(id=charger_id).first()
+    if not charger:
+        raise HTTPException(status_code=404, detail="Charger not found")
+
+    previous = (
+        charger.purpose.value
+        if hasattr(charger.purpose, "value")
+        else str(charger.purpose)
+    )
+    if previous == purpose:
+        return {"message": "No change", "purpose": purpose}
+
+    charger.purpose = ChargerPurposeEnum(purpose)
+    await charger.save(update_fields=["purpose"])
+
+    await log_audit_event(
+        action="charger.purpose_changed",
+        entity_type="charger",
+        entity_id=charger.charge_point_string_id,
+        actor_type="admin",
+        actor=admin_user,
+        changes={"from": previous, "to": purpose, "asset_code": charger.asset_code},
+    )
+    logger.info(
+        "🔖 Charger %s purpose %s -> %s by %s",
+        charger.asset_code, previous, purpose, admin_user.id,
+    )
+    return {"message": "Purpose updated", "purpose": purpose, "previous": previous}
+
+
 @router.post("/{charger_id}/remote-start", response_model=dict)
 async def remote_start_charging(charger_id: int, connector_id: int = 1, user: User = Depends(require_user_or_admin())):
     """Start charging remotely"""
@@ -667,16 +798,21 @@ async def remote_start_charging(charger_id: int, connector_id: int = 1, user: Us
     # Multi-connector support (user selection of connector) is out of scope for v1.
 
     charger = await Charger.filter(id=charger_id).first()
+    if charger and charger.purpose == ChargerPurposeEnum.TEST and user.role not in INTERNAL_ROLES:
+        # Refuse BEFORE any money moves. StartTransaction blocks a TEST unit
+        # too, but by then a QR customer has already paid and would need a
+        # refund for a session that was never going to start. ADR 0028.
+        raise HTTPException(status_code=403, detail="This charger is not available for public use")
     if not charger:
         raise HTTPException(status_code=404, detail="Charger not found")
     
-    # Check if charger status is suitable for remote start
-    # Socket chargers may not transition to Preparing (no CP signal), allow Available
-    from services.charger_type_service import is_socket_charger
-    charger_is_socket = await is_socket_charger(charger.charge_point_string_id)
-    allowed_statuses = {"Preparing", "Available"} if charger_is_socket else {"Preparing"}
+    # Check if charger status is suitable for remote start. Socket chargers may
+    # not transition to Preparing (no CP signal) — the shared startable-statuses
+    # helper widens the gate to Available for them (charger_type_service).
+    from services.charger_type_service import startable_statuses_for_charger
+    allowed_statuses = await startable_statuses_for_charger(charger.charge_point_string_id)
     if charger.latest_status not in allowed_statuses:
-        expected = "Preparing or Available" if charger_is_socket else "Preparing"
+        expected = "Preparing or Available" if len(allowed_statuses) > 1 else "Preparing"
         raise HTTPException(status_code=409, detail=f"Cannot start charging. Charger status is {charger.latest_status}, should be {expected}")
     
     # Check if charger is connected (via Redis - works across all workers)
@@ -699,7 +835,7 @@ async def remote_start_charging(charger_id: int, connector_id: int = 1, user: Us
     from main import send_ocpp_request
     
     # Send RemoteStartTransaction command with authenticated user's clerk ID
-    success, response = await send_ocpp_request(
+    outcome = await send_ocpp_request(
         charger.charge_point_string_id,
         "RemoteStartTransaction",
         {
@@ -707,20 +843,39 @@ async def remote_start_charging(charger_id: int, connector_id: int = 1, user: Us
             "id_tag": actual_id_tag  # Use authenticated user's RFID card ID
         }
     )
-    
-    if success:
-        return {
-            "success": True,
-            "message": "Remote start command sent successfully",
-            "connector_id": connector_id
-        }
-    # A charger that doesn't ACK in time is offline/slow — an upstream
-    # gateway condition, not a server fault. Return 504 (excluded from
-    # Sentry's failed-request reporting; see monitoring_service) instead of
-    # a 500 that would spam error tracking with expected operational noise.
-    if isinstance(response, str) and response.startswith("OCPP timeout"):
-        raise HTTPException(status_code=504, detail="Charger did not respond in time. It may be offline — please try again.")
-    raise HTTPException(status_code=500, detail=f"Failed to send start command: {response}")
+
+    # The charger answered and declined — busy, connector occupied, id_tag not
+    # authorised. Deliberately not a 5xx: the system worked and the answer was
+    # no. Reporting this as success left the operator waiting for a session
+    # that was never going to start.
+    if outcome.is_refused:
+        logger.warning(
+            f"Charger refused start for {charger.charge_point_string_id} "
+            f"connector {connector_id} (status={outcome.status})"
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Charger declined the start command. It may be busy or the "
+                "connector unavailable — please try again."
+            ),
+        )
+
+    # A charger that doesn't ACK in time is offline/slow — an upstream gateway
+    # condition, not a server fault. 504 is excluded from Sentry's
+    # failed-request reporting (see monitoring_service), unlike a 500 which
+    # would spam error tracking with expected operational noise.
+    if outcome.is_unanswered:
+        raise HTTPException(
+            status_code=504,
+            detail="Charger did not respond in time. It may be offline — please try again.",
+        )
+
+    return {
+        "success": True,
+        "message": "Remote start accepted by charger",
+        "connector_id": connector_id
+    }
 
 @router.post("/{charger_id}/remote-stop", response_model=dict)
 async def remote_stop_charging(charger_id: int, reason: Optional[str] = "Requested by operator", user: User = Depends(require_user_or_admin())):
@@ -762,30 +917,51 @@ async def remote_stop_charging(charger_id: int, reason: Optional[str] = "Request
         logger.info(f"🛡️ Admin {user.email} stopping transaction {transaction.id} belonging to user {transaction.user_id}")
     
     # Send RemoteStopTransaction command
-    success, response = await send_ocpp_request(
+    outcome = await send_ocpp_request(
         charger.charge_point_string_id,
         "RemoteStopTransaction",
         {"transaction_id": transaction.id}
     )
-    
-    if success:
-        action_type = "Admin override stop" if is_admin and not is_owner else "Remote stop"
-        return {
-            "success": True,
-            "message": f"{action_type} command sent successfully",
-            "transaction_id": transaction.id,
-            "charger_id": charger_id,
-            "transaction_owner": transaction.user_id,
-            "stopped_by": user.id
-        }
-    else:
-        # Don't modify transaction state - let user know the command failed
-        error_msg = f"Failed to send stop command to charger: {response}"
-        logger.warning(f"Remote stop failed for transaction {transaction.id}: {error_msg}")
-        raise HTTPException(
-            status_code=409, 
-            detail=f"Unable to stop charging session. {error_msg}. Please try again or contact support."
+
+    # A refused stop is the dangerous case: the session is still live and still
+    # billing, so the operator must not be told it ended. Deliberately not a 5xx
+    # — the charger answered and declined, which is the system working.
+    if outcome.is_refused:
+        logger.warning(
+            f"Charger refused stop for transaction {transaction.id} "
+            f"(status={outcome.status})"
         )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Charger declined the stop command. The session is still running. "
+                "Try again, and use force-stop if it keeps refusing."
+            ),
+        )
+
+    if outcome.is_unanswered:
+        # Never delivered, or no reply in time — an upstream condition rather
+        # than a server fault, so 504 rather than a 500 that would spam Sentry.
+        logger.warning(
+            f"Remote stop unanswered for transaction {transaction.id}: {outcome.response}"
+        )
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                "Charger did not respond, so the session may still be running. "
+                "It may be offline — please try again."
+            ),
+        )
+
+    action_type = "Admin override stop" if is_admin and not is_owner else "Remote stop"
+    return {
+        "success": True,
+        "message": f"{action_type} accepted by charger",
+        "transaction_id": transaction.id,
+        "charger_id": charger_id,
+        "transaction_owner": transaction.user_id,
+        "stopped_by": user.id
+    }
 
 @router.post("/{charger_id}/change-availability", response_model=dict)
 async def change_charger_availability(
@@ -851,7 +1027,7 @@ async def change_charger_availability(
     from main import send_ocpp_request
 
     # Send ChangeAvailability command
-    success, response = await send_ocpp_request(
+    outcome = await send_ocpp_request(
         charger.charge_point_string_id,
         "ChangeAvailability",
         {
@@ -860,9 +1036,14 @@ async def change_charger_availability(
         }
     )
 
-    if success:
-        # Get the OCPP response status (Accepted/Scheduled/Rejected)
-        ocpp_status = getattr(response, 'status', str(response))
+    if outcome.answered:
+        # Behaviour here is deliberately unchanged (ADR 0008): `Scheduled` is an
+        # acceptance — the charger will apply it when the current transaction
+        # ends — and only `Accepted`/`Scheduled` persist admin intent. The
+        # explicit tuple is kept rather than `outcome.is_accepted` so this stays
+        # visibly tied to ADR 0008 rather than to a shared status set that could
+        # later drift.
+        ocpp_status = outcome.status or str(outcome.response)
 
         # Persist admin intent when the charger acknowledged the command.
         # See ADR 0008 for why availability is separate from latest_status.
@@ -899,7 +1080,13 @@ async def change_charger_availability(
             "previous_status": current_status,
         }
     else:
-        raise HTTPException(status_code=500, detail=f"Failed to change availability: {response}")
+        # Unanswered, not refused — a refusal takes the branch above and is
+        # recorded with its OCPP status. 504 rather than 500: an offline or slow
+        # charger is an upstream condition, not a server fault.
+        raise HTTPException(
+            status_code=504,
+            detail=f"Charger did not respond to the availability command: {outcome.response}",
+        )
 
 @router.post("/{charger_id}/reset", response_model=dict)
 async def reset_charger(
@@ -941,30 +1128,51 @@ async def reset_charger(
     from main import send_ocpp_request
 
     # Send Reset command
-    success, response = await send_ocpp_request(
+    outcome = await send_ocpp_request(
         charger.charge_point_string_id,
         "Reset",
         {"type": type}
     )
 
-    if success:
-        await log_audit_event(
-            action="charger.reset",
-            entity_type="charger",
-            entity_id=charger.charge_point_string_id,
-            actor_type="admin",
-            actor=admin_user,
-            changes={"reset_type": type},
+    # A charger that answers "Rejected" has not rebooted. Reading the reply
+    # itself as success wrote a `charger.reset` audit event for a reboot that
+    # never happened — a durable false record, worse than the misleading
+    # message, because someone reads it back months later and reasons from it.
+    if outcome.is_refused:
+        logger.warning(
+            f"Charger {charger.charge_point_string_id} refused {type} reset "
+            f"(status={outcome.status})"
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Charger declined the {type} reset. It may be mid-transaction "
+                "or otherwise unable to reboot right now."
+            ),
         )
 
-        return {
-            "success": True,
-            "message": f"{type} reset command sent successfully",
-            "reset_type": type,
-            "charger_id": charger_id
-        }
-    else:
-        raise HTTPException(status_code=500, detail=f"Failed to send reset command: {response}")
+    if outcome.is_unanswered:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Charger did not respond to the reset command: {outcome.response}",
+        )
+
+    # Refusal and silence both raised above, so this is an acceptance.
+    await log_audit_event(
+        action="charger.reset",
+        entity_type="charger",
+        entity_id=charger.charge_point_string_id,
+        actor_type="admin",
+        actor=admin_user,
+        changes={"reset_type": type, "ocpp_response": outcome.status},
+    )
+
+    return {
+        "success": True,
+        "message": f"{type} reset accepted by the charger",
+        "reset_type": type,
+        "charger_id": charger_id
+    }
 
 @router.get("/{charger_id}/logs", response_model=LogsListResponse)
 async def get_charger_logs(
@@ -1234,3 +1442,137 @@ async def get_charger_latest_error(
         return None
 
     return ChargerErrorResponse.model_validate(latest, from_attributes=True)
+
+# ============ Charger Auth Key provisioning (ADR 0020 / ADR 0029) ============
+
+class AuthKeyResponse(BaseModel):
+    charge_point_string_id: str
+    auth_key: str
+    rotated: bool
+    warning: str
+
+
+class RotateAuthKeyRequest(BaseModel):
+    # The charger's own name, echoed back by the caller. A bare `confirm: true`
+    # would be satisfied by muscle memory or a copy-pasted curl; echoing an
+    # identifier you had to look up is the cheapest thing that demonstrates you
+    # know *which* unit you are about to cut off.
+    confirm_charger_name: str
+
+
+def _rotation_confirmation_value(charger) -> str:
+    """What the caller must echo to rotate. Falls back to the string id so an
+    unnamed charger cannot skip the check entirely."""
+    return (charger.name or "").strip() or charger.charge_point_string_id
+
+
+async def _mint_and_store_key(charger, admin_user, *, rotated: bool) -> AuthKeyResponse:
+    """Shared tail of provisioning and rotation: mint, store the hash, audit."""
+    plaintext = charger_auth_service.generate_auth_key()
+    charger.auth_key_hash = charger_auth_service.hash_auth_key(plaintext)
+    await charger.save(update_fields=["auth_key_hash", "updated_at"])
+
+    # Two explicit calls rather than a ternary on `action=`: the audit-registry
+    # drift guard (tests/test_audit_actions.py) scans for the literal that
+    # follows `action=`, so a ternary would hide one action from it.
+    if rotated:
+        await log_audit_event(
+            action="charger.auth_rotated",
+            entity_type="charger",
+            entity_id=charger.charge_point_string_id,
+            actor_type="admin",
+            actor=admin_user,
+        )
+    else:
+        await log_audit_event(
+            action="charger.auth_provisioned",
+            entity_type="charger",
+            entity_id=charger.charge_point_string_id,
+            actor_type="admin",
+            actor=admin_user,
+        )
+    # Deliberately logs the outcome and the charger, never the key.
+    logger.info(
+        "🔑 Charger Auth Key %s for %s by admin %s",
+        "rotated" if rotated else "provisioned", charger.charge_point_string_id, admin_user.id,
+    )
+
+    return AuthKeyResponse(
+        charge_point_string_id=charger.charge_point_string_id,
+        auth_key=plaintext,
+        rotated=rotated,
+        warning="Copy this key now — it is shown once and cannot be retrieved again.",
+    )
+
+
+@router.post("/{charger_id}/auth-key", response_model=AuthKeyResponse)
+async def provision_charger_auth_key(
+    charger_id: int,
+    admin_user: User = Depends(require_admin()),
+):
+    """Mint a charger's **first** Charger Auth Key, revealing it once.
+
+    Deliberately incapable of destroying an existing key: a charger that already
+    has one is refused with 409 and must go through the explicit rotate
+    endpoint. Provisioning and rotation used to be the same call, with which one
+    you got decided by server state the caller could not see — so an admin with
+    no way of knowing a key existed could destroy a working credential in one
+    click, and only learn which operation had happened from the response.
+
+    The plaintext is returned here and never again; only its SHA-256 is stored.
+    """
+    charger = await Charger.get_or_none(id=charger_id)
+    if not charger:
+        raise HTTPException(status_code=404, detail="Charger not found")
+
+    if charger.auth_key_hash:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This charger already has an auth key. Rotating it will cut the "
+                "charger off until the new key is loaded onto the unit — use the "
+                "rotate endpoint to do that deliberately."
+            ),
+        )
+
+    return await _mint_and_store_key(charger, admin_user, rotated=False)
+
+
+@router.post("/{charger_id}/auth-key/rotate", response_model=AuthKeyResponse)
+async def rotate_charger_auth_key(
+    charger_id: int,
+    body: RotateAuthKeyRequest,
+    admin_user: User = Depends(require_admin()),
+):
+    """Replace a charger's **Charger Auth Key**, revealing the new one once.
+
+    Destructive and irreversible. Rotation has **no grace overlap**: the old
+    hash is replaced immediately, so the charger fails authentication from that
+    instant until the new key is loaded onto it by charger-side tooling. The
+    fleet sits behind carrier NAT with no inbound path, so recovery from an
+    unintended rotation means physically visiting the unit.
+
+    The caller must echo the charger's own name to proceed. That converts a slip
+    into a deliberate act; it cannot stop a confident mistake, which would need
+    two-person approval and is disproportionate while this key gates Diagnostic
+    Bundle upload only (ADR 0020 remains PROPOSED, so the OCPP WebSocket
+    handshake does not consult it yet).
+    """
+    charger = await Charger.get_or_none(id=charger_id)
+    if not charger:
+        raise HTTPException(status_code=404, detail="Charger not found")
+
+    if not charger.auth_key_hash:
+        raise HTTPException(
+            status_code=409,
+            detail="This charger has no auth key to rotate — provision one instead.",
+        )
+
+    expected = _rotation_confirmation_value(charger)
+    if body.confirm_charger_name.strip().casefold() != expected.casefold():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Confirmation does not match. Type '{expected}' to rotate this charger's key.",
+        )
+
+    return await _mint_and_store_key(charger, admin_user, rotated=True)

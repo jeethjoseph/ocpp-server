@@ -1,6 +1,6 @@
 # Tariff API back-calc, field rename, and validation
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 
@@ -43,3 +43,11 @@ See [ADR 0003](../../../docs/adr/0003-all-inclusive-tariff-with-operator-absorpt
 ## Blocked by
 
 Issue 03 (the schema migration must land first so the columns exist).
+
+## Comments
+
+**2026-09-01 — reconciled to `done` by tracker audit (bucket B re-check).** The audit
+flagged this as open because an artifact its acceptance criteria names is absent. Hand-
+verification shows the work landed differently: renamed during implementation — the all-in minimum is exposed as `min_price_per_kwh_gst_incl` (`backend/routers/public_stations.py:83,156`), not the proposed `min_price_per_kwh_all_in`.
+
+Method: `.scratch/tracker-reconciliation/REPORT.md`.

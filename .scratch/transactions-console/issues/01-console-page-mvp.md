@@ -1,6 +1,6 @@
 # Transactions Console MVP — fix the dead /admin/transactions link
 
-Status: ready-for-agent
+Status: done
 Type: AFK
 
 ## What to build
@@ -27,3 +27,9 @@ None - can start immediately
 ## Comments
 
 - **2026-06-20 — Implemented.** Page /admin/transactions built; dead landing link now resolves. Wired to existing GET /transactions. Build green (exit 0).
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo.
+
+Method, evidence and caveats: `.scratch/tracker-reconciliation/REPORT.md`.

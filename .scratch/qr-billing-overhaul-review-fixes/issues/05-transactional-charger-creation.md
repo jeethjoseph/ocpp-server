@@ -1,6 +1,6 @@
 # Transactional atomicity on charger + connector + tariff creation
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 
@@ -27,3 +27,11 @@ Apply the same fix to `update_charger` if it does multi-row writes — investiga
 ## Blocked by
 
 Slice 1 (config & helper relocation) — same handler is touched by the relocation; landing them in opposite orders creates merge conflicts.
+
+## Comments
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo.
+
+Method, evidence and caveats: `.scratch/tracker-reconciliation/REPORT.md`.

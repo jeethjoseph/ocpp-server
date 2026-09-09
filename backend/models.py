@@ -3,6 +3,7 @@ import enum
 from datetime import date
 from tortoise.models import Model
 from tortoise import fields
+from tortoise.signals import pre_save
 from tortoise.contrib.pydantic import pydantic_model_creator
 
 # Enums
@@ -31,6 +32,36 @@ class ChargerAvailabilityEnum(str, enum.Enum):
     OPERATIVE = "Operative"
     INOPERATIVE = "Inoperative"
 
+class ChargerPurposeEnum(str, enum.Enum):
+    """What a charger is FOR — serviceability, not state and not identity.
+
+    Deliberately one enum rather than two booleans: every TEST unit is
+    non-public, so is_test + is_public would admit a bench unit advertised as
+    bookable, and the behaviours do not decompose anyway (TEST gates billing,
+    PRIVATE would gate only visibility).
+
+    PRIVATE (real hardware, real billing, not advertised) is in ADR 0028 but has
+    no instance in the fleet, so it is deliberately NOT declared here. Tortoise
+    renders a CharEnumField as a plain VARCHAR with no DB enum type or CHECK
+    (see migration 42 for `availability`), so declaring PRIVATE later needs no
+    data migration. Do not add it speculatively.
+    """
+
+    PUBLIC = "PUBLIC"
+    TEST = "TEST"
+
+class ConnectorTypeEnum(str, enum.Enum):
+    """Canonical connector types. Physical behavior (start gate, suspend
+    window) is declared per-type in services.charger_type_service.CONNECTOR_TRAITS
+    — every member here MUST have a traits row there (test-enforced)."""
+    TYPE2 = "Type2"
+    TYPE1 = "Type1"
+    SOCKET = "Socket"
+    CCS = "CCS"
+    CHADEMO = "CHAdeMO"
+    GBT = "GB/T"
+    DOMESTIC = "domestic"
+
 class TransactionStatusEnum(str, enum.Enum):
     STARTED = "STARTED"
     PENDING_START = "PENDING_START"
@@ -42,6 +73,34 @@ class TransactionStatusEnum(str, enum.Enum):
     CANCELLED = "CANCELLED"
     FAILED = "FAILED"
     BILLING_FAILED = "BILLING_FAILED"
+
+
+# The states in which a Transaction still OCCUPIES its charger — i.e. a second
+# session must not be opened alongside it. Two call sites need exactly this set
+# and must not drift apart: the StartTransaction reconcile guard
+# (`main._reconcile_existing_open_transaction`) and the QR double-payment guard
+# (`QRPaymentService._create_qr_payment_locked`).
+#
+# SUSPENDED is included. It is not a terminal state — it means the charger went
+# quiet mid-session and we are holding the session open for a reconnect. Firmware
+# that keeps the contactor closed through a CSMS outage makes this the state a
+# genuinely-charging session sits in, so treating it as "free" lets a second
+# payment start a parallel session on a charger that is physically busy.
+#
+# PENDING_STOP is deliberately EXCLUDED. A txn mid-normal-stop is already being
+# finalized by the StopTransaction path: superseding it races that path into a
+# double-finalize (the finalizer's idempotency guard only short-circuits on
+# TERMINAL states), and per ADR 0021 the session-end seam is not "busy" — a
+# payment arriving there should fall through to the normal new-session flow
+# rather than be rejected. A genuinely stuck PENDING_STOP is caught by the
+# disconnect / stale-suspended sweeps.
+OPEN_TRANSACTION_STATES = [
+    TransactionStatusEnum.STARTED,
+    TransactionStatusEnum.PENDING_START,
+    TransactionStatusEnum.RUNNING,
+    TransactionStatusEnum.SUSPENDED,
+]
+
 
 class MessageDirectionEnum(str, enum.Enum):
     INBOUND = "IN"
@@ -325,7 +384,62 @@ class Charger(Model):
         ChargerAvailabilityEnum,
         default=ChargerAvailabilityEnum.OPERATIVE,
     )
+
+    # The Asset Code — the customer-facing identifier (ADR 0028). An
+    # environment series plus a zero-padded integer: VOW0001 production,
+    # VOWS0001 staging/development.
+    #
+    # System-allocated at creation, never typed, never reused, gaps never
+    # backfilled. It names the PHYSICAL UNIT, not a position, so it survives a
+    # station re-parent and a replacement unit brings its own rather than
+    # inheriting the dead one's. Bears no relationship to `name`.
+    #
+    # NOT NULL: every charger has a code, bench units included. Nothing about
+    # the code says what a unit is for — that is `purpose`. The rejected
+    # alternative (nullable for TEST, with a two-column CHECK and a
+    # mint-on-promotion path) lost on call-site count: 19 admin/franchisee
+    # surfaces render charger identity against 3 customer-facing ones, and
+    # admin surfaces are exactly where bench units appear, so a nullable code
+    # puts a null-branch everywhere it would actually be hit.
+    #
+    # Do not write to it directly — allocation goes through
+    # services.charger_code_service, and a code is immutable once assigned.
+    asset_code = fields.CharField(max_length=12, unique=True)
+
+    # Serviceability — orthogonal to BOTH `latest_status` (what the charger
+    # reports) and `availability` (what an admin commanded on serviceable
+    # hardware). Marking a bench unit Inoperative would conflate "temporarily
+    # withdrawn" with "not fleet hardware at all". See ADR 0008 and ADR 0028.
+    #
+    # The PUBLIC default is load-bearing: it makes every gate that reads this
+    # column FAIL OPEN, so a row missed by any backfill keeps billing and stays
+    # visible rather than silently going dark.
+    purpose = fields.CharEnumField(
+        ChargerPurposeEnum,
+        # Explicit, and wider than the longest declared member. Tortoise
+        # otherwise sizes the VARCHAR to the longest value it can see (6, for
+        # PUBLIC), which would make declaring ADR 0028's PRIVATE later an
+        # ALTER rather than the free change the ADR claims it is. Seven
+        # characters buys that promise for nothing.
+        max_length=7,
+        default=ChargerPurposeEnum.PUBLIC,
+    )
+
     last_heart_beat_time = fields.DatetimeField(null=True)
+
+    # SHA-256 of the Charger Auth Key — the per-unit machine credential from
+    # ADR 0020. Plaintext is revealed exactly once at provisioning and never
+    # stored; a lost key is rotated, never recovered. SHA-256 rather than
+    # bcrypt is deliberate: a high-entropy 20-byte machine secret checked on
+    # every reconnect wants a fast hash.
+    #
+    # Nullable, and null is load-bearing per environment:
+    #   - Diagnostic Bundle upload (ADR 0029) REJECTS a null-hash charger —
+    #     there is no installed base on that endpoint, so it is enforced from
+    #     day one.
+    #   - The OCPP WebSocket handshake does NOT yet consult this column;
+    #     ADR 0020 remains PROPOSED and chargers still connect unauthenticated.
+    auth_key_hash = fields.CharField(max_length=64, null=True)
 
     # Relationships
     tariffs: fields.ReverseRelation["Tariff"]
@@ -334,11 +448,38 @@ class Charger(Model):
     class Meta:
         table = "charger"
 
+@pre_save(Charger)
+async def allocate_asset_code(sender, instance: Charger, using_db, update_fields):
+    """Give every charger an Asset Code at insert time (ADR 0028).
+
+    Lives here rather than in the create endpoint so the invariant is
+    structural: no creation path — the admin API, a seed script, a future bulk
+    import or OCPI onboarding — can produce a charger without a code. That is
+    the same reasoning that makes the code system-allocated in the first place;
+    an invariant enforced only at one call site is an invariant with a
+    deadline.
+
+    Allocation comes from a Postgres sequence, so concurrent creates cannot
+    collide and there is no retry to get wrong. See migration 60.
+
+    Cheap on the hot path: chargers are saved constantly by the heartbeat and
+    StatusNotification handlers, and every one of those already has a code, so
+    this costs a single attribute check and returns.
+    """
+    if instance.asset_code:
+        return
+    from services.charger_code_service import next_asset_code
+
+    instance.asset_code = await next_asset_code(using_db=using_db)
+
+
 class Connector(Model):
     id = fields.IntField(pk=True)
     charger = fields.ForeignKeyField("models.Charger", related_name="connectors")
     connector_id = fields.IntField()
-    connector_type = fields.CharField(max_length=255)
+    # max_length kept at 255 so the column definition is unchanged from the
+    # free-text era (no data migration needed; live data is already canonical).
+    connector_type = fields.CharEnumField(ConnectorTypeEnum, max_length=255)
     max_power_kw = fields.FloatField(null=True)
     
     class Meta:
@@ -384,6 +525,16 @@ class Transaction(Model):
     energy_consumed_kwh = fields.DecimalField(max_digits=12, decimal_places=3, null=True)
     start_time = fields.DatetimeField(auto_now_add=True)
     end_time = fields.DatetimeField(null=True)
+    # Charger-reported session boundaries, as carried on the StartTransaction /
+    # StopTransaction frames. Distinct from start_time / end_time, which are
+    # SERVER RECEIPT times and remain the basis of billing and the GST Invoice.
+    # Under offline continuity a StopTransaction can arrive hours after the
+    # session actually ended, so reported_end_time is the only record of when
+    # the charge really stopped. NULL when absent or rejected by the clock
+    # plausibility guard in utils.parse_ocpp_timestamp — never silently
+    # substituted with receipt time. See ADR 0031.
+    reported_start_time = fields.DatetimeField(null=True)
+    reported_end_time = fields.DatetimeField(null=True)
     stop_reason = fields.TextField(null=True)
     transaction_status = fields.CharEnumField(TransactionStatusEnum)
     suspended_at = fields.DatetimeField(null=True)
@@ -407,6 +558,24 @@ class MeterValue(Model):
     id = fields.IntField(pk=True)
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)
+    # When the CHARGER says it took this reading, from the OCPP frame's own
+    # `timestamp`. `created_at` is when WE received it — the two diverge by the
+    # length of an outage once queued frames are replayed on reconnect, which
+    # is exactly when the distinction matters. NULL when the frame carried no
+    # timestamp or the clock guard rejected it; readers fall back to created_at
+    # (see services.meter_readings.latest_meter_value). ADR 0031.
+    #
+    # Deliberately NOT indexed. Reads order by COALESCE(measured_at, created_at),
+    # and a btree index on measured_at alone CANNOT serve that expression —
+    # verified on a 20k-row probe with enable_seqscan=off, where the planner
+    # still chose a full scan + top-N heapsort over using it. An index here
+    # would cost write amplification on the highest-write table in the system
+    # (one row per MeterValues frame per charger) and return nothing. Every
+    # reader narrows by transaction_id first, which the FK index already serves,
+    # and none of them sit on a per-frame path. If profiling ever disagrees, the
+    # index that would actually work is the matching expression index:
+    #   (transaction_id, COALESCE(measured_at, created_at) DESC, id DESC)
+    measured_at = fields.DatetimeField(null=True)
     transaction = fields.ForeignKeyField("models.Transaction", related_name="meter_values")
     reading_kwh = fields.DecimalField(max_digits=12, decimal_places=3)
     current = fields.FloatField(null=True)
@@ -499,6 +668,81 @@ class SignalQuality(Model):
 
     class Meta:
         table = "signal_quality"
+
+
+class DiagnosticBundle(Model):
+    """One Diagnostic Bundle upload — the index over the S3 archive (ADR 0029).
+
+    The row exists to answer *"did we receive everything from this charger?"*.
+    The trace content itself lives in S3; this table holds only what is needed
+    to detect loss, which the bundle body cannot tell us on its own.
+
+    Loss is signalled two ways, and they are NOT the pair ADR 0029 described:
+      * a **silence window** — the span between the previous bundle's
+        ``last_utc`` and this one's ``first_utc`` — means records are missing.
+        Derived at read time, never stored, because a delayed bundle can arrive
+        later and fill the hole.
+      * ``ring_wrap_events`` > 0 means the charger's buffer overwrote records
+        before it could deliver them.
+
+    The cumulative "how many records were destroyed in total" figure that
+    ``overflow_delta`` carried is **gone and not approximated**. It required a
+    monotonic counter held separately from the data it describes, and the
+    charger cannot persist one across a reboot. See ADR 0030.
+    """
+    id = fields.IntField(pk=True)
+    created_at = fields.DatetimeField(auto_now_add=True, index=True)
+    charger = fields.ForeignKeyField("models.Charger", related_name="diagnostic_bundles", index=True)
+
+    # When this bundle's records were actually written, reconstructed from the
+    # in-band TIME_SYNC anchors (ADR 0030). Null when nothing in the body
+    # anchored — a real state, not an error. `time_approximate` marks a window
+    # that fell back to receipt time, or one derived from only some segments;
+    # such a window must never be read as evidence of a loss gap.
+    first_utc = fields.DatetimeField(null=True)
+    last_utc = fields.DatetimeField(null=True)
+    time_approximate = fields.BooleanField(default=False)
+
+    # Count of in-band `ring wrapped mid-upload` lines. A RECENCY signal — the
+    # buffer is destroying undelivered records right now — never a running
+    # total. Cumulative overwrite accounting needs a counter in storage separate
+    # from the data it describes, which this hardware cannot keep (ADR 0030).
+    ring_wrap_events = fields.IntField(default=0)
+
+    # SHA-256 of the raw body with any legacy `#VLTDIAG/` line stripped — the
+    # bundle's identity (ADR 0030). Nullable only because rows written before
+    # the digest existed have none; Postgres treats NULLs as distinct, so those
+    # rows do not collide under the unique constraint. Every row written since
+    # has one.
+    content_sha256 = fields.CharField(max_length=64, null=True)
+
+    s3_key = fields.CharField(max_length=512)
+
+    # Set only once the S3 object is confirmed durable (ADR 0030, issue 06).
+    #
+    # The row is written BEFORE the object, so a failed upload can never strand
+    # an object no row points at — the ordering that produced 195 orphans in one
+    # morning. That inverts the risk: a row can now outlive a missing object.
+    # `archived_at` is what keeps that from becoming a durability lie. A row
+    # with it NULL is a *reservation*, not a delivery: it is invisible to the
+    # duplicate check, so a charger retrying is told to re-send rather than
+    # being falsely assured we hold its records.
+    archived_at = fields.DatetimeField(null=True)
+
+    size_bytes = fields.IntField()
+    line_count = fields.IntField(default=0)
+
+    class Meta:
+        table = "diagnostic_bundle"
+        # Idempotency key. A charger that retries after a lost response re-sends
+        # the same bundle; the retry must be a no-op, not a duplicate archive.
+        # Keyed on content rather than sequence: the firmware reuses sequence
+        # numbers across genuinely different bundles, so a sequence key made
+        # every retry look like a reflash (ADR 0030).
+        # Content is the arbiter now; the sequence constraint is dropped because
+        # the firmware reuses sequence numbers across different bundles.
+        unique_together = (("charger", "content_sha256"),)
+
 
 class ChargerError(Model):
     """
@@ -662,6 +906,15 @@ class Franchisee(Model):
     contact_email = fields.CharField(max_length=255, unique=True)
     contact_phone = fields.CharField(max_length=20)
     address = fields.TextField(null=True)
+
+    # Stable, globally-unique identifier embedded in the customer-facing GST
+    # Invoice number (`F0001/Q/26/00001`). Deliberately NOT the primary key:
+    # PKs are per-database autoincrements, and production and staging share one
+    # GSTIN, so PK-derived numbers collided across registers. Allocated once at
+    # onboarding from this environment's block (policy.FRANCHISEE_CODE_BLOCKS)
+    # and never reused. `F0000` is reserved for VoltLync-owned stations.
+    # Nullable only so the Aerich migration can add-then-backfill.
+    invoice_code = fields.CharField(max_length=5, unique=True, null=True)
 
     # Tax/Legal (populated during KYC or by admin)
     pan_number = fields.CharField(max_length=10, unique=True, null=True)
@@ -947,7 +1200,27 @@ class GSTInvoice(Model):
     station_name = fields.CharField(max_length=255, null=True)
     station_location = fields.CharField(max_length=500, null=True)
     place_of_supply_state_code = fields.CharField(max_length=5, null=True)
+    # What was PRINTED on this invoice as the charger identifier: an Asset Code
+    # for invoices issued after the ADR 0028 cutover, a legacy
+    # charge_point_string_id UUID before it. The two eras are separable by
+    # ^VOWS?\d{4,}$.
+    #
+    # Keeps its name despite the Asset Code avoid-list, deliberately: it is a
+    # column header in the GST filings CSV export (routers/invoices.py) that
+    # feeds an accountant's spreadsheet, and renaming it would silently break
+    # saved import mappings on a compliance surface.
     charger_id_str = fields.CharField(max_length=255, null=True)
+
+    # Two internal siblings, NEVER printed and never exported to the GST
+    # filings CSV. Prefer either of these, or the `transaction` FK, when
+    # joining an invoice back to hardware: an Asset Code does name a specific
+    # unit, but an admin can correct a charger's code and this snapshot cannot
+    # be corrected.
+    #
+    # `charger_ocpp_id` is what preserves the audit link to the physical unit
+    # across the cutover, when charger_id_str stopped holding the UUID.
+    charger_station_id = fields.IntField(null=True)
+    charger_ocpp_id = fields.CharField(max_length=255, null=True)
     connector_type = fields.CharField(max_length=50, null=True)
 
     # Charging details

@@ -12,7 +12,7 @@ from tortoise.transactions import in_transaction
 from models import (
     User, Wallet, Charger, Transaction, QRPayment, ChargerQRCode, MeterValue,
     QRPaymentStatusEnum, AuthProviderEnum, ChargerStatusEnum,
-    TransactionStatusEnum, UserRoleEnum
+    TransactionStatusEnum, UserRoleEnum, OPEN_TRANSACTION_STATES
 )
 
 
@@ -419,13 +419,13 @@ class QRPaymentService:
         async with in_transaction():
             locked_charger = await Charger.select_for_update().get(id=charger.id)
 
+            # Shared with the StartTransaction reconcile guard — see
+            # OPEN_TRANSACTION_STATES in models.py for why SUSPENDED is in
+            # (a suspended session may be physically charging) and
+            # PENDING_STOP is out (the session-end seam is not "busy").
             active_txn = await Transaction.filter(
                 charger=locked_charger,
-                transaction_status__in=[
-                    TransactionStatusEnum.RUNNING,
-                    TransactionStatusEnum.STARTED,
-                    TransactionStatusEnum.PENDING_START,
-                ]
+                transaction_status__in=OPEN_TRANSACTION_STATES,
             ).first()
             pending_qr = await QRPayment.filter(
                 charger=locked_charger,
@@ -435,7 +435,8 @@ class QRPaymentService:
 
             if active_txn or pending_qr:
                 reason = (
-                    f"Active transaction {active_txn.id}"
+                    f"Open transaction {active_txn.id} "
+                    f"({active_txn.transaction_status.value})"
                     if active_txn
                     else f"Pending QR payment {pending_qr.id} already waiting"
                 )
@@ -466,12 +467,11 @@ class QRPaymentService:
     ) -> None:
         """Decide what to do with an accepted PAID payment: start now, wait for
         plug-in, or refund if the charger is offline."""
-        # Socket chargers may remain Available (no CP signal for Preparing)
-        from services.charger_type_service import is_socket_charger as _is_socket
+        # Socket chargers may remain Available (no CP signal for Preparing) —
+        # the shared startable-statuses helper widens the gate for them.
+        from services.charger_type_service import startable_statuses_for_charger
         is_connected = await redis_manager.is_charger_connected(charger.charge_point_string_id)
-        start_statuses = {ChargerStatusEnum.PREPARING}
-        if await _is_socket(charger.charge_point_string_id):
-            start_statuses.add(ChargerStatusEnum.AVAILABLE)
+        start_statuses = await startable_statuses_for_charger(charger.charge_point_string_id)
 
         if charger.latest_status in start_statuses and is_connected:
             # Start charging immediately
@@ -564,25 +564,30 @@ class QRPaymentService:
             for attempt in range(1, QRPaymentService.MAX_START_RETRIES + 1):
                 logger.info(f"Sending RemoteStartTransaction to {charger.charge_point_string_id} (attempt {attempt}/{QRPaymentService.MAX_START_RETRIES})")
 
-                success, result = await connection_manager.send_ocpp_request(
+                outcome = await connection_manager.send_ocpp_request(
                     charger.charge_point_string_id,
                     "RemoteStartTransaction",
                     {"id_tag": id_tag, "connector_id": 1}
                 )
+                result = outcome.response
 
-                if success:
-                    status_value = str(getattr(result, 'status', '')).lower()
-                    if status_value == "accepted":
-                        logger.info(f"RemoteStartTransaction accepted for charger {charger.id}")
-                        return  # Success — done
-                    else:
-                        # Charger explicitly rejected — no point retrying
-                        logger.warning(f"RemoteStartTransaction rejected: {result}")
-                        break
+                # This site already drew the distinction by hand, which is why
+                # it behaved correctly; it now reads it from the outcome instead
+                # of re-deriving it from the payload.
+                if outcome.is_accepted:
+                    logger.info(f"RemoteStartTransaction accepted for charger {charger.id}")
+                    return  # Success — done
+                if outcome.is_refused:
+                    # Answered and declined. Retrying cannot change a verdict,
+                    # so stop and fall through to the refund.
+                    logger.warning(
+                        f"RemoteStartTransaction refused (status={outcome.status}): {result}"
+                    )
+                    break
 
-                # Communication failure — retry if attempts remain
+                # Unanswered — retry if attempts remain
                 if attempt < QRPaymentService.MAX_START_RETRIES:
-                    logger.warning(f"RemoteStart attempt {attempt} failed: {result}, retrying in {QRPaymentService.START_RETRY_DELAY}s")
+                    logger.warning(f"RemoteStart attempt {attempt} unanswered: {result}, retrying in {QRPaymentService.START_RETRY_DELAY}s")
                     await asyncio.sleep(QRPaymentService.START_RETRY_DELAY)
 
                     # Check if transaction already started despite the timeout
@@ -610,7 +615,7 @@ class QRPaymentService:
     @staticmethod
     async def handle_payment_without_plug(charger_id: int, qr_payment_id: int):
         """Wait for charger to enter a startable state, then start. Timeout -> refund."""
-        from services.charger_type_service import is_socket_charger as _is_socket
+        from services.charger_type_service import startable_statuses_for_charger
         timeout = QR_PAYMENT_PENDING_TIMEOUT
         poll_interval = 10
         elapsed = 0
@@ -628,10 +633,9 @@ class QRPaymentService:
                 return  # Already handled
 
             # Socket chargers may stay Available (no CP signal for Preparing)
-            start_statuses = {ChargerStatusEnum.PREPARING}
-            if await _is_socket(charger.charge_point_string_id):
-                start_statuses.add(ChargerStatusEnum.AVAILABLE)
-
+            start_statuses = await startable_statuses_for_charger(
+                charger.charge_point_string_id
+            )
             if charger.latest_status in start_statuses:
                 user = await User.filter(id=qr_payment.user_id).first()
                 if user:
@@ -791,9 +795,8 @@ class QRPaymentService:
             return None
 
         if reading_kwh is None:
-            latest = await MeterValue.filter(
-                transaction_id=transaction_id
-            ).order_by("-id").first()
+            from services.meter_readings import latest_meter_value
+            latest = await latest_meter_value(transaction_id)
             reading_dec = Decimal(latest.reading_kwh) if latest else start_meter
         else:
             reading_dec = Decimal(str(reading_kwh))
@@ -875,15 +878,29 @@ class QRPaymentService:
     async def _send_remote_stop(transaction, transaction_id: int):
         """Send RemoteStopTransaction as a background task (avoids MeterValues deadlock)."""
         try:
-            success, result = await connection_manager.send_ocpp_request(
+            outcome = await connection_manager.send_ocpp_request(
                 transaction.charger.charge_point_string_id,
                 "RemoteStopTransaction",
                 {"transaction_id": transaction_id}
             )
-            if success:
-                logger.info(f"Auto-stop sent for QR session txn {transaction_id}")
+            # The verdict does not change control flow here, deliberately.
+            # This is flag-less, at-least-once dispatch: energy is monotonic, so
+            # a refused or lost stop self-heals on the next MeterValues tick,
+            # and duplicate RemoteStops are idempotent at the charger. What the
+            # verdict does change is the log — a refusal used to read as "sent",
+            # which is exactly the line someone greps when a session would not
+            # stop.
+            if outcome.is_accepted:
+                logger.info(f"Auto-stop accepted for QR session txn {transaction_id}")
+            elif outcome.is_refused:
+                logger.warning(
+                    f"Charger refused QR auto-stop for txn {transaction_id} "
+                    f"(status={outcome.status}); retrying on the next tick"
+                )
             else:
-                logger.error(f"Failed to auto-stop QR session txn {transaction_id}: {result}")
+                logger.error(
+                    f"QR auto-stop unanswered for txn {transaction_id}: {outcome.response}"
+                )
         except Exception as e:
             logger.error(f"Error sending auto-stop for QR session txn {transaction_id}: {e}")
 

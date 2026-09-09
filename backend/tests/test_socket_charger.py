@@ -22,6 +22,7 @@ from models import (
     TransactionStatusEnum, User, ChargerStatusEnum,
 )
 from main import connected_charge_points
+from core.connection_manager import CommandOutcome
 from services.charger_type_service import (
     is_socket_charger,
     is_socket_charger_cached,
@@ -52,8 +53,10 @@ class TestChargerTypeService:
         assert await is_socket_charger("socket-charger-1") is True
 
     @pytest.mark.asyncio
-    async def test_is_socket_charger_false_for_type2(self, client, test_charger):
-        assert await is_socket_charger(test_charger.charge_point_string_id) is False
+    async def test_is_socket_charger_true_for_type2(self, client, test_charger):
+        """Type2 is untethered (no CP signal) — socket-like for the start
+        gate since the socket-classification fix. See CONNECTOR_TRAITS."""
+        assert await is_socket_charger(test_charger.charge_point_string_id) is True
 
     @pytest.mark.asyncio
     async def test_is_socket_charger_false_when_not_found(self, client):
@@ -67,7 +70,12 @@ class TestChargerTypeService:
     @pytest.mark.asyncio
     async def test_is_socket_charger_cached_type2(self, client):
         cache = {"cp-2": {"connector_type": "Type2"}}
-        assert await is_socket_charger_cached("cp-2", cache) is False
+        assert await is_socket_charger_cached("cp-2", cache) is True
+
+    @pytest.mark.asyncio
+    async def test_is_socket_charger_cached_ccs_is_tethered(self, client):
+        cache = {"cp-3": {"connector_type": "CCS"}}
+        assert await is_socket_charger_cached("cp-3", cache) is False
 
     @pytest.mark.asyncio
     async def test_is_socket_charger_cached_falls_back_to_db(self, client, test_station):
@@ -320,7 +328,7 @@ class TestSocketRemoteStart:
         with patch('main.send_ocpp_request', new_callable=AsyncMock) as mock_send, \
              patch('routers.chargers.is_charger_connected', new_callable=AsyncMock) as mock_connected:
             mock_connected.return_value = True
-            mock_send.return_value = (True, {"status": "Accepted"})
+            mock_send.return_value = CommandOutcome(True, MagicMock(status="Accepted"))
 
             response = await client_admin.post(f"/api/admin/chargers/{charger.id}/remote-start")
             assert response.status_code == 200
@@ -328,8 +336,9 @@ class TestSocketRemoteStart:
         connected_charge_points.pop("socket-rs-test", None)
 
     @pytest.mark.asyncio
-    async def test_remote_start_type2_from_available_fails(self, client_admin, test_charger, test_user):
-        """Type 2 charger in Available should reject remote start."""
+    async def test_remote_start_type2_from_available_succeeds(self, client_admin, test_charger, test_user):
+        """Type 2 (untethered, no CP signal) in Available accepts remote start
+        since the socket-classification fix — it can never reach Preparing."""
         test_charger.latest_status = "Available"
         await test_charger.save()
 
@@ -341,14 +350,36 @@ class TestSocketRemoteStart:
             "connector_type": "Type2",
         }
 
+        with patch('main.send_ocpp_request', new_callable=AsyncMock) as mock_send, \
+             patch('routers.chargers.is_charger_connected', new_callable=AsyncMock) as mock_connected:
+            mock_connected.return_value = True
+            mock_send.return_value = CommandOutcome(True, MagicMock(status="Accepted"))
+
+            response = await client_admin.post(f"/api/admin/chargers/{test_charger.id}/remote-start")
+            assert response.status_code == 200
+
+        connected_charge_points.pop(test_charger.charge_point_string_id, None)
+
+    @pytest.mark.asyncio
+    async def test_remote_start_ccs_from_available_fails(self, client_admin, test_station, test_user):
+        """A genuinely tethered type (CCS) in Available still rejects remote
+        start — it must reach Preparing first."""
+        charger = await Charger.create(
+            charge_point_string_id="ccs-rs-test",
+            station_id=test_station.id,
+            name="CCS RS Test",
+            latest_status="Available",
+        )
+        await Connector.create(
+            charger_id=charger.id, connector_id=1, connector_type="CCS"
+        )
+
         with patch('routers.chargers.is_charger_connected', new_callable=AsyncMock) as mock_connected:
             mock_connected.return_value = True
 
-            response = await client_admin.post(f"/api/admin/chargers/{test_charger.id}/remote-start")
+            response = await client_admin.post(f"/api/admin/chargers/{charger.id}/remote-start")
             assert response.status_code == 409
             assert "Preparing" in response.json()["detail"]
-
-        connected_charge_points.pop(test_charger.charge_point_string_id, None)
 
 
 # --- Unit Tests: Create charger with Socket ---

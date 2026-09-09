@@ -33,8 +33,20 @@ from models import (
 )
 from core.roles import INTERNAL_ROLES
 from utils import to_ist
+from policy import VOLTLYNC_OWNED_INVOICE_CODE
 from services.wallet_service import WalletService
 from services.monitoring_service import MetricsCollector
+from services.franchisee_code_service import invoice_code_for
+
+# Rule 46(b) CGST: "a consecutive serial number not exceeding sixteen
+# characters ... unique for a financial year". Every invoice issued before
+# 2026-08 was 18-22 characters and breached this; the format is now sized to
+# the limit exactly, so any future field widening must trade against another.
+INVOICE_NUMBER_MAX_LEN = 16
+
+# Stored `series` values map to one rendered character. Two characters would
+# push the number to 17 and breach the limit, which is why "WAL" renders "W".
+INVOICE_SERIES_CHAR = {"QR": "Q", "WAL": "W"}
 
 logger = logging.getLogger("ocpp-server")
 
@@ -206,9 +218,30 @@ class InvoiceService:
         with its own running counter; VoltLync-owned stations (franchisee_id
         IS NULL) share a single sequence per (series, FY).
 
-        Number format:
-          VL/F{franchisee_id}/{SERIES}/{FY_NODASH}/{SEQ:05d}   for franchisee-owned
-          VL/{SERIES}/{FY_NODASH}/{SEQ:05d}                     for VoltLync-owned
+        Number format — exactly 16 characters, the Rule 46(b) ceiling:
+
+            F0001/Q/26/00001
+            │     │ │  └── sequence, 5 digits
+            │     │ └───── financial-year start year, "2026-27" -> "26"
+            │     └─────── series: Q = QR/UPI, W = Wallet
+            └───────────── Franchisee.invoice_code; F0000 = VoltLync-owned
+
+        Replaces `VL/F{franchisee_id}/{SERIES}/{FY}/{SEQ}`, which was 18-22
+        characters (over the limit) and derived from a per-database primary
+        key, so production and staging minted colliding numbers under one
+        GSTIN. The `VL/` prefix is dropped: Rule 46 carries the supplier's
+        name, address and GSTIN as separate invoice fields, so the serial has
+        no branding duty and the four characters are needed elsewhere.
+
+        The counter is NOT reset at the format change. The sequence continues
+        (…/00156 in the old format, then F0001/Q/26/00157), so no number is
+        ever reused for a franchisee within a financial year — a stronger
+        reading of "consecutive serial number... unique for a financial year"
+        than restarting a parallel series at 00001 would give.
+
+        `series` keeps its stored values (QR / WAL): it is a data
+        classification that the admin filter, the summary grouping and the
+        GST filings CSV all read. Only the rendered character changes.
         """
         counter = await GSTInvoiceCounter.filter(
             franchisee_id=franchisee_id,
@@ -229,9 +262,32 @@ class InvoiceService:
             )
             seq = 1
 
-        fy_short = financial_year.replace("-", "")
-        prefix = f"VL/F{franchisee_id}" if franchisee_id else "VL"
-        return f"{prefix}/{series}/{fy_short}/{seq:05d}"
+        if franchisee_id is None:
+            code = VOLTLYNC_OWNED_INVOICE_CODE
+        else:
+            franchisee = await Franchisee.filter(id=franchisee_id).only(
+                "id", "invoice_code"
+            ).first()
+            code = invoice_code_for(franchisee)
+
+        # "2026-27" -> "26". Two digits is enough to satisfy "unique for a
+        # financial year" and buys three characters against the 16-char limit.
+        fy_short = financial_year.split("-")[0][-2:]
+        series_char = INVOICE_SERIES_CHAR.get(series)
+        if series_char is None:
+            raise ValueError(
+                f"no single-character invoice series code for {series!r}; add one "
+                f"to INVOICE_SERIES_CHAR — a longer code would breach the "
+                f"16-character Rule 46(b) limit"
+            )
+
+        number = f"{code}/{series_char}/{fy_short}/{seq:05d}"
+        if len(number) > INVOICE_NUMBER_MAX_LEN:
+            raise ValueError(
+                f"generated invoice number {number!r} is {len(number)} characters; "
+                f"Rule 46(b) allows at most {INVOICE_NUMBER_MAX_LEN}"
+            )
+        return number
 
     @staticmethod
     def determine_gst_split(
@@ -534,7 +590,15 @@ class InvoiceService:
             station_name=station.name,
             station_location=f"{station.address or ''}, {station.state or ''}".strip(", "),
             place_of_supply_state_code=station.state_code,
-            charger_id_str=charger.charge_point_string_id,
+            # The Asset Code is what a customer can read off the unit and quote
+            # to support. The charge_point_string_id UUID it replaces is the
+            # OCPP WSS path segment AND the Basic Auth username, so printing it
+            # on a PDF that lands in a stranger's inbox published half a
+            # credential pair. It is retained below as charger_ocpp_id, which
+            # is never printed. See ADR 0028.
+            charger_id_str=charger.asset_code,
+            charger_station_id=charger.station_id,
+            charger_ocpp_id=charger.charge_point_string_id,
             connector_type=connector_type,
             energy_consumed_kwh=billable_kwh,
             tariff_rate_incl_tax=tariff_rate_incl,

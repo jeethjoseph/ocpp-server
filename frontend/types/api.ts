@@ -39,7 +39,16 @@ export interface StationListResponse {
 
 export interface Charger {
   id: number;
+  /**
+   * OCPP identity: the WSS path segment and Basic Auth username. Internal —
+   * admin and franchisee surfaces only, never rendered to a customer.
+   * Customers see `asset_code`. See ADR 0028.
+   */
   charge_point_string_id: string;
+  /** The Asset Code (VOW0001 / VOWS0001) — the customer-facing identifier. */
+  asset_code: string;
+  /** Serviceability: "PUBLIC" | "TEST". */
+  purpose: string;
   external_charger_id?: string;
   station_id: number;
   name: string;
@@ -53,6 +62,10 @@ export interface Charger {
   availability: "Operative" | "Inoperative";
   last_heart_beat_time?: string;
   connection_status: boolean;
+  // Whether a Charger Auth Key has been provisioned — never the hash. Drives
+  // whether the diagnostics panel offers "Generate" or the destructive
+  // "Rotate", so the label cannot claim to mint a key while replacing one.
+  has_auth_key: boolean;
   created_at: string;
   updated_at: string;
   tariff_per_kwh?: number;
@@ -261,7 +274,14 @@ export interface TransactionDetail {
   charger: {
     id: number;
     name: string;
-    charge_point_string_id: string;
+    /** The Asset Code — returned by both the admin and customer endpoints. */
+    asset_code: string;
+    /**
+     * OCPP identity. Present on the ADMIN endpoint only
+     * (`/api/admin/transactions/{id}`); the customer endpoint
+     * (`/api/users/transaction/{id}`) deliberately omits it. See ADR 0028.
+     */
+    charge_point_string_id?: string;
   };
   meter_values: MeterValue[];
   wallet_transactions: Array<{
@@ -297,7 +317,7 @@ export interface RevenueBreakdown {
   tds_amount?: number | null;
 }
 
-export interface ApiResponse<T = any> {
+export interface ApiResponse<T = unknown> {
   success?: boolean;
   message: string;
   data?: T;
@@ -328,7 +348,7 @@ export interface UserDetail extends UserListItem {
   avatar_url?: string;
   terms_accepted_at?: string;
   preferred_language: string;
-  notification_preferences: Record<string, any>;
+  notification_preferences: Record<string, unknown>;
 }
 
 export interface UserListResponse {
@@ -358,12 +378,19 @@ export interface UserChargingTransaction {
   stop_reason?: string;
 }
 
+/**
+ * Free-form gateway metadata. Values are rendered directly into JSX, so the
+ * value type stays renderable rather than `unknown` — a bare `unknown` here
+ * fails the build at the render sites in admin/users/[id]/wallet.
+ */
+export type JsonMetadata = Record<string, string | number | boolean | null>;
+
 export interface UserWalletTransaction {
   id: number;
   amount: number;
   type: string;
   description?: string;
-  payment_metadata?: Record<string, any>;
+  payment_metadata?: JsonMetadata;
   created_at: string;
 }
 
@@ -667,6 +694,10 @@ export interface Franchisee {
   contact_email: string;
   contact_phone: string;
   address?: string | null;
+  /** Stable code embedded in this franchisee's GST invoice numbers
+   *  (F0001/Q/26/00001). Allocated once at onboarding; null only for rows
+   *  predating the backfill. */
+  invoice_code?: string | null;
   pan_number?: string | null;
   gstin?: string | null;
   tan_number?: string | null;

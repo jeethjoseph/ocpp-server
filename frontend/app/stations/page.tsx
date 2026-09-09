@@ -47,8 +47,14 @@ export default function StationsPage() {
         }
       );
     } else {
-      // Default location if geolocation not supported
-      setUserLocation({ lat: 37.7749, lng: -122.4194 });
+      // Geolocation unsupported: apply the fallback on a later tick so it is
+      // not a synchronous state write in the effect body
+      // (react-hooks/set-state-in-effect).
+      const timer = setTimeout(
+        () => setUserLocation({ lat: 37.7749, lng: -122.4194 }),
+        0
+      );
+      return () => clearTimeout(timer);
     }
   }, []);
 
@@ -228,7 +234,7 @@ export default function StationsPage() {
                       {selectedStation.chargers.map((charger) => {
                         const isAvailable = charger.latest_status === 'AVAILABLE';
                         return (
-                          <div key={charger.charge_point_string_id} className="p-2 bg-gray-50 rounded">
+                          <div key={charger.asset_code} className="p-2 bg-gray-50 rounded">
                             <div className="flex items-center justify-between">
                               <div className="flex items-center space-x-2 min-w-0">
                                 <div className={`w-2 h-2 rounded-full flex-shrink-0 ${

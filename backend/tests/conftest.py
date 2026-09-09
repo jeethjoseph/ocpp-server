@@ -132,6 +132,18 @@ async def client() -> AsyncGenerator[AsyncClient, None]:
         else:
             await Tortoise.generate_schemas()
 
+        # Asset Code allocation reads a Postgres sequence (migration 60), and
+        # `generate_schemas` only builds what models.py declares — Tortoise has
+        # no sequence concept. Create it here so the `allocate_asset_code`
+        # pre_save hook works in tests exactly as it does in a real register.
+        # Reset per test, so codes are predictable rather than depending on how
+        # many chargers earlier tests happened to create.
+        from tortoise import connections as _seq_conn
+        await _seq_conn.get("default").execute_script(
+            "CREATE SEQUENCE IF NOT EXISTS charger_asset_code_seq;"
+            " SELECT setval('charger_asset_code_seq', 1, false);"
+        )
+
         # Clean up database before each test (order matters for FK constraints)
         from models import (
             WalletTransaction, MeterValue,
@@ -253,8 +265,12 @@ async def test_franchisee():
     from decimal import Decimal
     import random
     from models import Franchisee, FranchiseeStatusEnum
+    from services.franchisee_code_service import allocate_invoice_code
     suffix = random.randint(100000000, 999999999)
     return await Franchisee.create(
+        # Allocated exactly as the create endpoint does. Without it,
+        # get_next_invoice_number raises rather than mint a malformed number.
+        invoice_code=await allocate_invoice_code(),
         business_name=f"Test Franchisee {suffix}",
         contact_name="Test Contact",
         contact_email=f"franchisee_{suffix}@voltlync.test",

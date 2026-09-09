@@ -4,6 +4,7 @@ Utility functions for OCPP server.
 Add logging, ID generation, and other helpers here.
 """
 import asyncio
+import contextvars
 import datetime
 import logging
 import uuid
@@ -31,6 +32,62 @@ def to_ist(dt):
         dt = dt.replace(tzinfo=datetime.timezone.utc)
     return dt.astimezone(IST)
 
+# How far ahead of our own clock a charger-reported timestamp may sit before we
+# stop believing it. Small, because a charger running fast is reporting a time
+# that has not happened yet — there is no legitimate reason for that beyond
+# ordinary NTP drift.
+OCPP_CLOCK_SKEW_SECONDS = 300
+
+
+def parse_ocpp_timestamp(value, *, not_before=None, context: str = "") -> "datetime.datetime | None":
+    """Parse a charger-reported OCPP timestamp into a tz-aware UTC datetime.
+
+    Returns ``None`` when the value is missing, unparseable, or implausible —
+    callers fall back to server receipt time (``created_at``), so a bad clock
+    degrades to today's behaviour instead of poisoning the record.
+
+    **Charger clocks in this fleet are not trustworthy.** ADR 0030 exists partly
+    because of it: Diagnostic Bundle timestamps are reconstructed from in-band
+    ``TIME_SYNC`` anchors rather than believed outright. So a reported time is
+    accepted only inside a plausibility window — no further ahead than
+    ``OCPP_CLOCK_SKEW_SECONDS``, and (where the caller knows one) no earlier than
+    ``not_before``, which is normally the transaction's start.
+
+    Naive inputs are assumed UTC, matching the rest of the codebase.
+    """
+    if not value:
+        return None
+
+    if isinstance(value, datetime.datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            logger.warning("Unparseable OCPP timestamp %r%s", value, f" ({context})" if context else "")
+            return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    parsed = parsed.astimezone(datetime.timezone.utc)
+
+    skew = datetime.timedelta(seconds=OCPP_CLOCK_SKEW_SECONDS)
+    if parsed > get_utc_now() + skew:
+        logger.warning("Rejecting future OCPP timestamp %s%s", parsed, f" ({context})" if context else "")
+        return None
+
+    if not_before is not None:
+        floor = not_before if not_before.tzinfo else not_before.replace(tzinfo=datetime.timezone.utc)
+        if parsed < floor - skew:
+            logger.warning(
+                "Rejecting OCPP timestamp %s before floor %s%s",
+                parsed, floor, f" ({context})" if context else "",
+            )
+            return None
+
+    return parsed
+
+
 def csv_safe_cell(value) -> str:
     """Neutralize CSV formula injection (OWASP). A spreadsheet treats a cell
     whose first character is ``= + - @`` (or a leading tab/CR) as a formula, so
@@ -51,8 +108,33 @@ def generate_uuid():
 
 
 def safe_create_task(coro, *, name: str = None) -> asyncio.Task:
-    """Wrap asyncio.create_task with exception logging for fire-and-forget tasks."""
-    task = asyncio.create_task(coro, name=name)
+    """Fire-and-forget task with exception logging and a detached DB context.
+
+    **The context is deliberately empty.** `asyncio.create_task` normally hands
+    the child a copy of the caller's contextvars, and Tortoise keeps the current
+    DB connection in one of those. A task spawned inside a transaction therefore
+    inherits that transaction's pinned `TransactionWrapper` — and because it runs
+    *later*, the parent has usually committed and returned the connection to the
+    pool by then. The child then issues its query on a connection another
+    coroutine already owns:
+
+        asyncpg.InterfaceError: cannot perform operation: another operation is
+        in progress
+
+    which surfaced as ~80 silently-dropped audit rows in a single dev session.
+    Silent, because the only trace is this function's own error log — the caller
+    cannot await a fire-and-forget task to find out it failed.
+
+    An empty context makes Tortoise resolve a fresh connection from the pool,
+    which is the correct semantic anyway: work that cannot be awaited must not
+    be enrolled in a transaction whose outcome it cannot observe. Note this also
+    detaches Sentry/New Relic scope, so these tasks are reported as their own
+    unit of work rather than as part of the request that spawned them. That is a
+    deliberate trade — losing breadcrumb correlation is cheaper than losing the
+    write. Exception reporting is unaffected: the done-callback below runs in the
+    caller's context.
+    """
+    task = asyncio.create_task(coro, name=name, context=contextvars.Context())
 
     def _done_cb(t: asyncio.Task):
         if t.cancelled():

@@ -9,6 +9,7 @@ import random
 from decimal import Decimal
 
 from main import connected_charge_points
+from core.connection_manager import CommandOutcome
 from models import Charger, Connector, Transaction, OCPPLog, Tariff, User, VehicleProfile, ChargerStatusEnum
 
 @pytest.mark.unit
@@ -49,10 +50,11 @@ class TestChargerEndpoints:
         assert "ocpp_url" in data
         assert data["ocpp_url"].endswith(data["charger"]["charge_point_string_id"])
         
-        # Verify connectors were created
+        # Verify connectors were created — input "CCS2" canonicalizes to the
+        # enum value "CCS" on persist (charger_type_service alias table).
         connectors = await Connector.filter(charger_id=data["charger"]["id"]).all()
         assert len(connectors) == 2
-        assert connectors[0].connector_type in ["CCS2", "CHAdeMO"]
+        assert connectors[0].connector_type in ["CCS", "CHAdeMO"]
     
     @pytest.mark.asyncio
     async def test_create_charger_station_not_found(self, client_admin: AsyncClient):
@@ -188,7 +190,14 @@ class TestChargerEndpoints:
             "websocket": MagicMock()
         }
         # Mock OCPP response
-        mock_send_ocpp.return_value = (True, {"status": "Accepted"})
+        # Must be a real CommandOutcome, not a bare tuple — handlers ask it
+        # questions (is_refused / is_unanswered), and a tuple mock would pass
+        # unpacking then blow up on the accessor.
+        from core.connection_manager import CommandOutcome
+        from ocpp.v16 import call_result
+        mock_send_ocpp.return_value = CommandOutcome(
+            True, call_result.RemoteStopTransaction(status="Accepted")
+        )
         response = await client_admin.post(
             f"/api/admin/chargers/{test_charger.id}/remote-stop",
             json={"reason": "Operator request"}
@@ -197,7 +206,7 @@ class TestChargerEndpoints:
         data = response.json()
         assert data["success"] is True
         # Endpoint message text changed when admin override path was added
-        assert "stop command sent" in data["message"].lower()
+        assert "accepted by charger" in data["message"].lower()
         # transaction_id is now an int in the response, not a string
         assert data["transaction_id"] == transaction.id
         # Verify OCPP command was called — payload key changed from
@@ -242,7 +251,10 @@ class TestChargerEndpoints:
         await Charger.filter(id=test_charger.id).update(
             latest_status=ChargerStatusEnum.PREPARING
         )
-        mock_send_ocpp.return_value = (False, "OCPP timeout: RemoteStartTransaction")
+        from core.connection_manager import CommandOutcome
+        mock_send_ocpp.return_value = CommandOutcome(
+            False, "OCPP timeout: RemoteStartTransaction"
+        )
 
         response = await client_admin.post(
             f"/api/admin/chargers/{test_charger.id}/remote-start"
@@ -254,22 +266,33 @@ class TestChargerEndpoints:
     @pytest.mark.asyncio
     @patch("routers.chargers.is_charger_connected")
     @patch("main.send_ocpp_request")
-    async def test_remote_start_other_failure_returns_500(
+    async def test_remote_start_refused_returns_409(
         self, mock_send_ocpp, mock_connected, client_admin: AsyncClient, test_charger
     ):
-        """A non-timeout OCPP failure still surfaces as a 500 server error."""
+        """A charger that answers Rejected gets 409, not 500.
+
+        This test previously asserted 500 while mocking `(False, "Rejected")`,
+        which conflated a delivery failure with a refusal. They are different:
+        a refusal means the charger answered, and per CONTEXT.md -> Remote
+        commands that is an expected outcome, not a server fault.
+        """
         from models import ChargerStatusEnum
+        from core.connection_manager import CommandOutcome
+        from ocpp.v16 import call_result
         mock_connected.return_value = True
         await Charger.filter(id=test_charger.id).update(
             latest_status=ChargerStatusEnum.PREPARING
         )
-        mock_send_ocpp.return_value = (False, "Rejected")
+        mock_send_ocpp.return_value = CommandOutcome(
+            True, call_result.RemoteStartTransaction(status="Rejected")
+        )
 
         response = await client_admin.post(
             f"/api/admin/chargers/{test_charger.id}/remote-start"
         )
 
-        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+        assert response.status_code == status.HTTP_409_CONFLICT
+        assert "declined" in response.json()["detail"].lower()
 
     @pytest.mark.asyncio
     @patch('main.send_ocpp_request')
@@ -282,7 +305,14 @@ class TestChargerEndpoints:
         }
         
         # Mock OCPP response
-        mock_send_ocpp.return_value = (True, {"status": "Accepted"})
+        # Must be a real CommandOutcome, not a bare tuple — handlers ask it
+        # questions (is_refused / is_unanswered), and a tuple mock would pass
+        # unpacking then blow up on the accessor.
+        from core.connection_manager import CommandOutcome
+        from ocpp.v16 import call_result
+        mock_send_ocpp.return_value = CommandOutcome(
+            True, call_result.RemoteStartTransaction(status="Accepted")
+        )
         
         response = await client_admin.post(
             f"/api/admin/chargers/{test_charger.id}/change-availability?type=Inoperative&connector_id=0"
@@ -322,7 +352,7 @@ class TestChargerEndpoints:
         """On OCPP Accepted, Charger.availability is set to Operative."""
         from models import ChargerAvailabilityEnum, AuditLog
         mock_connected.return_value = True
-        mock_send_ocpp.return_value = (True, MagicMock(status="Accepted"))
+        mock_send_ocpp.return_value = CommandOutcome(True, MagicMock(status="Accepted"))
 
         # Set a starting value different from the target so we can prove the write happened.
         await Charger.filter(id=test_charger.id).update(
@@ -355,7 +385,7 @@ class TestChargerEndpoints:
         """On OCPP Accepted, Charger.availability is set to Inoperative."""
         from models import ChargerAvailabilityEnum
         mock_connected.return_value = True
-        mock_send_ocpp.return_value = (True, MagicMock(status="Accepted"))
+        mock_send_ocpp.return_value = CommandOutcome(True, MagicMock(status="Accepted"))
 
         # Fixture default is OPERATIVE — flipping to INOPERATIVE.
         resp = await client_admin.post(
@@ -376,7 +406,7 @@ class TestChargerEndpoints:
         """OCPP Scheduled response also counts as admin intent captured."""
         from models import ChargerAvailabilityEnum
         mock_connected.return_value = True
-        mock_send_ocpp.return_value = (True, MagicMock(status="Scheduled"))
+        mock_send_ocpp.return_value = CommandOutcome(True, MagicMock(status="Scheduled"))
 
         resp = await client_admin.post(
             f"/api/admin/chargers/{test_charger.id}/change-availability"
@@ -396,7 +426,7 @@ class TestChargerEndpoints:
         """OCPP Rejected response must NOT update Charger.availability."""
         from models import ChargerAvailabilityEnum, AuditLog
         mock_connected.return_value = True
-        mock_send_ocpp.return_value = (True, MagicMock(status="Rejected"))
+        mock_send_ocpp.return_value = CommandOutcome(True, MagicMock(status="Rejected"))
 
         # Fixture default is OPERATIVE; should stay OPERATIVE after Rejected.
         resp = await client_admin.post(
@@ -653,3 +683,122 @@ class TestChargerEndpoints:
         assert await Tariff.filter(charger_id=charger_id).count() == 1
 
 # Run with: pytest tests/test_chargers.py -v
+
+@pytest.mark.unit
+class TestChargerAuthKeyRotationGuard:
+    """Provisioning and rotation are separate operations on purpose.
+
+    They used to be one endpoint whose behaviour depended on server state the
+    caller could not see, so an admin with no way of knowing a key existed could
+    destroy a working credential in one click. Rotation has no grace overlap and
+    the fleet is behind carrier NAT, so recovery means visiting the unit.
+    """
+
+    @pytest.mark.asyncio
+    async def test_first_provision_succeeds_and_reveals_the_key(
+        self, client_admin: AsyncClient, test_charger
+    ):
+        resp = await client_admin.post(f"/api/admin/chargers/{test_charger.id}/auth-key")
+        assert resp.status_code == status.HTTP_200_OK
+        body = resp.json()
+        assert body["rotated"] is False
+        assert body["auth_key"]
+
+        await test_charger.refresh_from_db()
+        assert test_charger.auth_key_hash
+
+    @pytest.mark.asyncio
+    async def test_provisioning_twice_is_refused_and_leaves_the_key_intact(
+        self, client_admin: AsyncClient, test_charger
+    ):
+        """The whole point: the safe endpoint can never destroy a key."""
+        await client_admin.post(f"/api/admin/chargers/{test_charger.id}/auth-key")
+        await test_charger.refresh_from_db()
+        original = test_charger.auth_key_hash
+
+        resp = await client_admin.post(f"/api/admin/chargers/{test_charger.id}/auth-key")
+        assert resp.status_code == status.HTTP_409_CONFLICT
+
+        await test_charger.refresh_from_db()
+        assert test_charger.auth_key_hash == original, "a refused provision must not rotate"
+
+    @pytest.mark.asyncio
+    async def test_rotation_requires_the_charger_name_and_a_mismatch_changes_nothing(
+        self, client_admin: AsyncClient, test_charger
+    ):
+        await client_admin.post(f"/api/admin/chargers/{test_charger.id}/auth-key")
+        await test_charger.refresh_from_db()
+        original = test_charger.auth_key_hash
+
+        resp = await client_admin.post(
+            f"/api/admin/chargers/{test_charger.id}/auth-key/rotate",
+            json={"confirm_charger_name": "definitely-not-this-charger"},
+        )
+        assert resp.status_code == status.HTTP_400_BAD_REQUEST
+
+        await test_charger.refresh_from_db()
+        assert test_charger.auth_key_hash == original, "a failed confirmation must not rotate"
+
+    @pytest.mark.asyncio
+    async def test_rotation_with_the_right_name_replaces_the_key(
+        self, client_admin: AsyncClient, test_charger
+    ):
+        await client_admin.post(f"/api/admin/chargers/{test_charger.id}/auth-key")
+        await test_charger.refresh_from_db()
+        original = test_charger.auth_key_hash
+
+        resp = await client_admin.post(
+            f"/api/admin/chargers/{test_charger.id}/auth-key/rotate",
+            json={"confirm_charger_name": test_charger.name},
+        )
+        assert resp.status_code == status.HTTP_200_OK
+        assert resp.json()["rotated"] is True
+
+        await test_charger.refresh_from_db()
+        assert test_charger.auth_key_hash != original
+
+    @pytest.mark.asyncio
+    async def test_confirmation_tolerates_case_and_surrounding_whitespace(
+        self, client_admin: AsyncClient, test_charger
+    ):
+        """Guard against slips, not against typing. Requiring exact case would
+        push operators to copy-paste, which defeats the point of the echo."""
+        await client_admin.post(f"/api/admin/chargers/{test_charger.id}/auth-key")
+
+        resp = await client_admin.post(
+            f"/api/admin/chargers/{test_charger.id}/auth-key/rotate",
+            json={"confirm_charger_name": f"  {test_charger.name.upper()}  "},
+        )
+        assert resp.status_code == status.HTTP_200_OK
+
+    @pytest.mark.asyncio
+    async def test_rotating_an_unprovisioned_charger_is_refused(
+        self, client_admin: AsyncClient, test_charger
+    ):
+        """Not silently a provision — that would leak the two operations back
+        into one and undo the split."""
+        resp = await client_admin.post(
+            f"/api/admin/chargers/{test_charger.id}/auth-key/rotate",
+            json={"confirm_charger_name": test_charger.name},
+        )
+        assert resp.status_code == status.HTTP_409_CONFLICT
+
+        await test_charger.refresh_from_db()
+        assert test_charger.auth_key_hash is None
+
+    @pytest.mark.asyncio
+    async def test_charger_response_reports_key_presence_without_the_hash(
+        self, client_admin: AsyncClient, test_charger
+    ):
+        """The signal whose absence made the accident possible."""
+        before = await client_admin.get(f"/api/admin/chargers/{test_charger.id}")
+        assert before.json()["charger"]["has_auth_key"] is False
+
+        await client_admin.post(f"/api/admin/chargers/{test_charger.id}/auth-key")
+
+        after = await client_admin.get(f"/api/admin/chargers/{test_charger.id}")
+        charger_body = after.json()["charger"]
+        assert charger_body["has_auth_key"] is True
+        # The presence flag is the whole exposure; the hash never leaves the server.
+        assert "auth_key_hash" not in charger_body
+        assert "auth_key" not in charger_body

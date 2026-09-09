@@ -18,12 +18,15 @@ from crud import (
     update_charger_heartbeat,
     log_audit_event,
 )
-from models import OCPPLog, Transaction, TransactionStatusEnum, MeterValue
+from models import OCPPLog, Transaction, TransactionStatusEnum, MeterValue, ChargerPurposeEnum
+from core.roles import INTERNAL_ROLES
 from services.wallet_service import WalletService
 from services.wallet_session_service import WalletSessionService
+from core.supplier_identity import SupplierIdentityError, validate_supplier_identity
 from redis_manager import redis_manager
 from core.connection_manager import connection_manager
-from utils import safe_create_task, mask_id_tag, mask_email
+from utils import safe_create_task, mask_id_tag, mask_email, parse_ocpp_timestamp, get_utc_now
+from services.meter_readings import latest_meter_value
 
 from ocpp.v16 import ChargePoint as OcppChargePoint
 from ocpp.v16 import call, call_result
@@ -32,7 +35,10 @@ import logging
 import json
 
 # Transaction resume constants
-SUSPEND_TIMEOUT_SECONDS = int(os.environ.get("SUSPEND_TIMEOUT_SECONDS", "300"))
+# Post-boot suspend windows are per-connector-type and derived from policy.py
+# via disconnect_handler.suspend_window_seconds_for_charge_point — see ADR 0027.
+# The old SUSPEND_TIMEOUT_SECONDS env var (300s) is retired: a reboot must never
+# shorten the reconnect grace window the disconnect path promised.
 
 # StartTransaction reconcile (ADR 0022 / RCA issue 04): when a new session starts
 # on a charger that still has an open transaction, classify the old one. Last
@@ -55,19 +61,12 @@ async def _reconcile_existing_open_transaction(charge_point_id, charger, meter_s
     Transaction carries no connector_id and the fleet is single-connector — revisit
     if multi-connector chargers are introduced.
     """
-    from models import Transaction, TransactionStatusEnum
+    from models import Transaction, TransactionStatusEnum, OPEN_TRANSACTION_STATES
     from services.transaction_finalizer import is_resume_too_stale
-    # PENDING_STOP is deliberately EXCLUDED: a txn mid-normal-stop is already
-    # being finalized by the StopTransaction path, so superseding it here would
-    # race that path into a double-finalize/double-bill (the finalizer's
-    # idempotency guard only short-circuits on TERMINAL states). A genuinely
-    # stuck PENDING_STOP is caught by the disconnect/stale-suspended sweeps.
-    open_states = [
-        TransactionStatusEnum.STARTED, TransactionStatusEnum.PENDING_START,
-        TransactionStatusEnum.RUNNING, TransactionStatusEnum.SUSPENDED,
-    ]
+    # Shared with the QR double-payment guard — see OPEN_TRANSACTION_STATES in
+    # models.py for why SUSPENDED is in and PENDING_STOP is out.
     existing = await Transaction.filter(
-        charger_id=charger.id, transaction_status__in=open_states,
+        charger_id=charger.id, transaction_status__in=OPEN_TRANSACTION_STATES,
     ).order_by("-start_time").first()
     if not existing:
         return None
@@ -121,6 +120,7 @@ from routers import stations, chargers, transactions, auth, webhooks, users, pub
 # Import monitoring service
 from services.monitoring_service import (
     initialize_monitoring,
+    ignore_current_transaction,
     MetricsCollector,
     OCPPMetrics,
     SentryHelper,
@@ -145,6 +145,18 @@ else:
     for h in root.handlers:
         if not h.formatter:
             h.setFormatter(fmt)
+
+# The python-ocpp library logs every wire frame at INFO ("<id>: receive message
+# [2, ...]"). That exact frame is already persisted in full on the OCPP message
+# log row, which is what the Logs Console reads and what the ~90-day retention
+# window preserves — so forwarding it to New Relic duplicates the payload for
+# every single frame, roughly half of all log ingest.
+#
+# Drop the library to WARNING: protocol errors and warnings still surface, only
+# the routine per-frame chatter stops leaving the process. This targets the
+# library's own "ocpp" logger and does NOT touch this app's "ocpp-server"
+# logger below — a separate top-level logger, not a dotted child of "ocpp".
+logging.getLogger("ocpp").setLevel(logging.WARNING)
 
 # App-specific logger with custom formatter (propagate=False to avoid
 # duplicate output through root's handler)
@@ -343,7 +355,8 @@ class ChargePoint(OcppChargePoint):
         # A BootNotification means the charger rebooted. Handle ongoing transactions:
         # - Already SUSPENDED (from disconnect): reset suspended_at to extend window
         # - Still RUNNING/STARTED/etc (edge case): suspend them
-        # In both cases, start a SUSPEND_TIMEOUT_SECONDS timeout for resume.
+        # In both cases, arm the connector-type suspend window for resume — the
+        # SAME window the disconnect path uses, never a shorter one (ADR 0027).
         try:
             ongoing_transactions = await Transaction.filter(
                 charger__charge_point_string_id=self.id,
@@ -394,12 +407,9 @@ class ChargePoint(OcppChargePoint):
 
     async def _push_post_boot_state(self, transaction=None):
         """Send PostBootState DataTransfer to charger with meter value and optional transaction info."""
-        from models import Transaction, TransactionStatusEnum, MeterValue
         try:
             if transaction:
-                latest_mv = await MeterValue.filter(
-                    transaction_id=transaction.id
-                ).order_by("-created_at").first()
+                latest_mv = await latest_meter_value(transaction.id)
 
                 start_kwh = transaction.start_meter_kwh or 0
                 last_kwh = latest_mv.reading_kwh if latest_mv else start_kwh
@@ -544,10 +554,15 @@ class ChargePoint(OcppChargePoint):
             },
         ))
 
-        # Start resume timeout — will auto-stop if charger doesn't resume
-        safe_create_task(self._suspend_timeout(transaction.id, now, SUSPEND_TIMEOUT_SECONDS))
+        # Start resume timeout — will auto-stop if charger doesn't resume.
+        # Window = the connector type's suspend window (never shorter than the
+        # disconnect window it replaces — the 300s post-boot timer killed 9
+        # sessions fleet-wide; see ADR 0027).
+        from services.disconnect_handler import suspend_window_seconds_for_charge_point
+        post_boot_window = await suspend_window_seconds_for_charge_point(self.id)
+        safe_create_task(self._suspend_timeout(transaction.id, now, post_boot_window))
 
-    async def _suspend_timeout(self, transaction_id: int, original_suspended_at, timeout_seconds: int = 300):
+    async def _suspend_timeout(self, transaction_id: int, original_suspended_at, timeout_seconds: int):
         """Auto-stop a SUSPENDED transaction if the charger doesn't resume it in time."""
         try:
             await asyncio.sleep(timeout_seconds)
@@ -634,9 +649,7 @@ class ChargePoint(OcppChargePoint):
 
         # Calculate energy from latest meter value if not already set
         if transaction.end_meter_kwh is None:
-            latest_mv = await MeterValue.filter(
-                transaction_id=transaction.id
-            ).order_by("-created_at").first()
+            latest_mv = await latest_meter_value(transaction.id)
             if latest_mv:
                 transaction.end_meter_kwh = latest_mv.reading_kwh
                 transaction.energy_consumed_kwh = transaction.end_meter_kwh - (transaction.start_meter_kwh or 0)
@@ -750,13 +763,11 @@ class ChargePoint(OcppChargePoint):
                 charger = await Charger.filter(charge_point_string_id=self.id).first()
                 if charger:
                     if error_code and error_code != "NoError":
-                        # Parse timestamp if provided
-                        error_ts = None
-                        if timestamp:
-                            try:
-                                error_ts = datetime.datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                            except (ValueError, AttributeError) as e:
-                                logger.debug(f"Could not parse StatusNotification timestamp '{timestamp}': {e}")
+                        # Shared parser: same clock-plausibility rules as every
+                        # other charger-reported timestamp (ADR 0031).
+                        error_ts = parse_ocpp_timestamp(
+                            timestamp, context=f"StatusNotification from {self.id}"
+                        )
 
                         # Create error record
                         await ChargerError.create(
@@ -868,6 +879,24 @@ class ChargePoint(OcppChargePoint):
                     id_tag_info={"status": "Blocked"}
                 )
 
+            # SERVICEABILITY gate (ADR 0028). A bench unit serves nobody but the
+            # people testing it: never billed, never invoiced, never advertised.
+            #
+            # This is the one gate in the Asset Code effort that fails CLOSED —
+            # a fleet charger wrongly marked TEST stops accepting customers
+            # entirely, which is a revenue outage on that unit. Everything else
+            # in ADR 0028 defaults PUBLIC and fails open. That asymmetry is why
+            # the TEST set is verified per environment before this ships.
+            if charger.purpose == ChargerPurposeEnum.TEST and user.role not in INTERNAL_ROLES:
+                logger.warning(
+                    f"OCPP StartTransaction: charger {charger.asset_code} is a TEST unit; "
+                    f"rejecting non-internal user {mask_email(user.email)}"
+                )
+                return call_result.StartTransaction(
+                    transaction_id=0,
+                    id_tag_info={"status": "Blocked"}
+                )
+
             # Reconcile any existing open transaction on this charger before
             # starting a new one — finalize a stale orphan, or short-circuit on a
             # retry / genuine concurrent (ADR 0022 / RCA issue 04).
@@ -889,6 +918,22 @@ class ChargePoint(OcppChargePoint):
                 user=user,
                 charger=charger,
                 start_meter_kwh=Decimal(str(meter_start)) / Decimal(1000),  # Convert Wh to kWh
+                # start_time is auto_now_add (server receipt) and stays the
+                # billing basis; this records what the charger claimed. ADR 0031.
+                #
+                # Floored at roughly now, because a session can never START
+                # offline (AllowOfflineTxForUnknownId / LocalAuthorizeOffline
+                # are held false), so a reported start is always within seconds
+                # of receipt. Without a floor, a charger whose RTC came up at
+                # epoch — before NITZ/NTP sync, which is exactly what happens
+                # when power returns and someone plugs in immediately — would
+                # write 1970 here, and any later duration derived from it would
+                # read as ~56 years.
+                reported_start_time=parse_ocpp_timestamp(
+                    timestamp,
+                    not_before=get_utc_now(),
+                    context=f"StartTransaction from {self.id}",
+                ),
                 transaction_status=TransactionStatusEnum.RUNNING  # Changed from STARTED to RUNNING
             )
 
@@ -988,6 +1033,15 @@ class ChargePoint(OcppChargePoint):
             transaction.end_meter_kwh = Decimal(str(meter_stop)) / Decimal(1000)  # Convert Wh to kWh
             transaction.energy_consumed_kwh = transaction.end_meter_kwh - (transaction.start_meter_kwh or Decimal(0))
             transaction.end_time = datetime.datetime.now(datetime.timezone.utc)
+            # When the charger says the session actually ended. Under offline
+            # continuity this can precede end_time (receipt) by hours, and it is
+            # the ONLY record of when charging really stopped. end_time stays the
+            # billing/invoice basis — reported, never substituted. ADR 0031.
+            transaction.reported_end_time = parse_ocpp_timestamp(
+                timestamp,
+                not_before=transaction.start_time,
+                context=f"StopTransaction txn {transaction_id} from {self.id}",
+            )
             transaction.transaction_status = TransactionStatusEnum.COMPLETED
             transaction.stop_reason = kwargs.get('reason', 'Remote')
             
@@ -1226,13 +1280,26 @@ class ChargePoint(OcppChargePoint):
                 if meter_data['reading_kwh'] is not None:
                     try:
                         logger.debug(f"🔋 💾 Creating MeterValue record in database...")
+                        # The frame's own timestamp — when the CHARGER took the
+                        # reading, which is not when we received it once queued
+                        # frames are replayed after an outage. Floored at the
+                        # transaction start so a reset RTC cannot backdate a
+                        # reading out of its own session (ADR 0031).
+                        measured_at = parse_ocpp_timestamp(
+                            timestamp,
+                            not_before=transaction.start_time,
+                            context=f"MeterValues txn {transaction_id} from {self.id}",
+                        )
                         meter_record = await MeterValue.create(
                             transaction=transaction,
+                            measured_at=measured_at,
                             reading_kwh=meter_data['reading_kwh'],
                             current=meter_data['current'],
                             voltage=meter_data['voltage'],
                             power_kw=meter_data['power_kw']
                         )
+                        if timestamp and measured_at is None:
+                            MetricsCollector.increment_counter("Custom/OCPP/UnusableFrameTimestamp")
                         meter_records_created += 1
                         
                         logger.info(f"🔋 ✅ STORED meter value ID={meter_record.id} for transaction {transaction_id}: "
@@ -1506,12 +1573,10 @@ class ChargePoint(OcppChargePoint):
                 )
 
             # Get last meter value (fall back to start_meter_kwh)
-            latest_meter_value = await MeterValue.filter(
-                transaction_id=transaction_id
-            ).order_by("-created_at").first()
+            latest_mv = await latest_meter_value(transaction_id)
 
             start_meter_kwh = transaction.start_meter_kwh or 0
-            last_meter_kwh = latest_meter_value.reading_kwh if latest_meter_value else start_meter_kwh
+            last_meter_kwh = latest_mv.reading_kwh if latest_mv else start_meter_kwh
             energy_consumed_kwh = last_meter_kwh - start_meter_kwh
 
             # Convert to Wh (integers) for charger
@@ -1575,6 +1640,12 @@ async def health_check():
     Health check endpoint for monitoring systems
     Checks database and Redis connectivity
     """
+    # Keep the liveness probe out of APM. It runs every ~15s per environment
+    # and was the largest transaction on the account while carrying no
+    # diagnostic value beyond "the process is up". The checks below still run
+    # for real — this suppresses telemetry, not behaviour.
+    ignore_current_transaction()
+
     import time
     from starlette.responses import Response
     start_time = time.time()
@@ -1648,6 +1719,11 @@ app.include_router(qr_codes.router)
 app.include_router(public_qr_transactions.router)
 app.include_router(public_qr_active_sessions.router)
 
+# Diagnostic Bundle upload (ADR 0029) — authenticated charger-facing endpoint.
+from routers import diagnostics
+app.include_router(diagnostics.router)
+app.include_router(diagnostics.admin_router)
+
 from routers import franchisees, franchisee_portal, invoices, admin_settlements, reports
 app.include_router(franchisees.router)
 app.include_router(franchisee_portal.router)
@@ -1707,16 +1783,23 @@ async def get_connected_charge_points(admin_user=Depends(require_admin())):
 @app.post("/api/charge-points/{charge_point_id}/request")
 async def send_command_to_charge_point(charge_point_id: str, command: OCPPCommand, admin_user=Depends(require_admin())):
     """Send OCPP command to a specific charge point"""
-    success, result = await connection_manager.send_ocpp_request(charge_point_id, command.action, command.payload)
-    
-    if success:
-        return OCPPResponse(
-            success=True,
-            message=f"Command {command.action} sent successfully",
-            data=result.dict() if hasattr(result, 'dict') else str(result)
+    outcome = await connection_manager.send_ocpp_request(charge_point_id, command.action, command.payload)
+
+    # Generic passthrough, so it reports the charger's verdict rather than
+    # deciding what a refusal means for an arbitrary command.
+    if outcome.is_unanswered:
+        raise HTTPException(status_code=504, detail=str(outcome.response))
+    if outcome.is_refused:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Charger refused {command.action} (status: {outcome.status})",
         )
-    else:
-        raise HTTPException(status_code=400, detail=result)
+    result = outcome.response
+    return OCPPResponse(
+        success=True,
+        message=f"Command {command.action} accepted by the charger",
+        data=result.dict() if hasattr(result, 'dict') else str(result)
+    )
 
 @app.get("/api/logs", response_model=List[MessageLogResponse])
 async def get_message_logs(limit: int = Query(100, ge=1, le=10000), admin_user=Depends(require_admin())):
@@ -1760,17 +1843,38 @@ async def startup_event():
     await init_db()
     await redis_manager.connect()
 
-    # Compliance preflight: GST invoices cannot be issued without a supplier
-    # GSTIN (CGST Rule 46). Surface this loudly at boot rather than silently
-    # at per-session issuance time, so a misconfigured deploy doesn't accrue
-    # un-invoiced sessions for hours before anyone notices.
-    if not os.getenv("VOLTLYNC_GSTIN"):
-        logger.error(
-            "STARTUP WARNING: VOLTLYNC_GSTIN is not configured. "
-            "Customer-facing GST invoices will NOT be issued until this is "
-            "set (see backend/services/invoice_service.py:generate_invoice). "
-            "All charging sessions will complete and be billed, but no "
-            "gst_invoice row will be created."
+    # Compliance preflight: refuse to serve with an absent or incoherent
+    # supplier identity. This was a warning until 2026-08 and it is why 1,287
+    # invoices carried another registered person's GSTIN for four months —
+    # a warning nobody reads is indistinguishable from no check at all.
+    # Aborting is the correct failure mode: a boot that fails is a five-minute
+    # config fix, while a boot that succeeds mints defective tax invoices at
+    # roughly eleven a day across both registers.
+    # Enforced where invoices are real, warned where they are not. Staging is
+    # NOT exempt: it shares production's GSTIN and financial year and has
+    # issued the majority of our tax invoices to real customers. Only local
+    # development degrades to a warning — blocking it would push developers to
+    # paste in a plausible-looking GSTIN, which is the defect, not the fix.
+    _identity_env = os.getenv("ENVIRONMENT", "development").strip().lower()
+    try:
+        validate_supplier_identity(
+            gstin=os.getenv("VOLTLYNC_GSTIN"),
+            business_name=os.getenv("VOLTLYNC_BUSINESS_NAME"),
+            state_code=os.getenv("VOLTLYNC_STATE_CODE"),
+            entity_type=os.getenv("VOLTLYNC_ENTITY_TYPE"),
+        )
+        logger.info("✅ Supplier identity validated for GST invoicing")
+    except SupplierIdentityError as e:
+        if _identity_env in ("production", "prod", "staging"):
+            logger.critical(
+                "STARTUP ABORTED: supplier identity is invalid in %s. %s",
+                _identity_env, e,
+            )
+            raise
+        logger.warning(
+            "Supplier identity invalid (%s) — continuing because ENVIRONMENT=%s. "
+            "GST invoices issued here are not valid documents. %s",
+            type(e).__name__, _identity_env, e,
         )
 
     # ADR 0026: the tariff excludes the gateway and the base rate is a simple

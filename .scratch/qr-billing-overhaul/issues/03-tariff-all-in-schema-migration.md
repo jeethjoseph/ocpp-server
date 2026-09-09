@@ -1,6 +1,6 @@
 # `Tariff.tariff_per_kwh_all_in` schema migration and backfill
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 
@@ -45,3 +45,11 @@ See [ADR 0003](../../../docs/adr/0003-all-inclusive-tariff-with-operator-absorpt
 ## Blocked by
 
 None — can start immediately. Issues 04 and 05 depend on this landing.
+
+## Comments
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo.
+
+Method, evidence and caveats: `.scratch/tracker-reconciliation/REPORT.md`.

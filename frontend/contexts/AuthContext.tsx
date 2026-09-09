@@ -45,8 +45,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // Use refs to ensure getToken always accesses current auth state (not stale closure values)
   const clerkAuthRef = useRef(clerkAuth);
 
-  // Update ref on every render to always have current value
-  clerkAuthRef.current = clerkAuth;
+  // Keep the ref current. Written in an effect rather than during render:
+  // the React Compiler disallows render-phase ref mutation (react-hooks/refs).
+  // getToken() is only ever invoked from async query paths, never while
+  // rendering, so reading the post-commit value is correct.
+  useEffect(() => {
+    clerkAuthRef.current = clerkAuth;
+  });
 
   const getToken = async (): Promise<string | null> => {
     // Use ref to get CURRENT auth state (not captured closure value)

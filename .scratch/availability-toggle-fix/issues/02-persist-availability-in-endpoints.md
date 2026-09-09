@@ -1,4 +1,4 @@
-Status: ready-for-agent
+Status: done
 
 # Persist `availability` on Accepted in both change-availability endpoints
 
@@ -168,3 +168,11 @@ docker exec ocpp-backend pytest tests/test_chargers.py -v
 - Franchisee endpoint now writes an audit log entry (it didn't before)
 - Tests cover Accepted, Rejected, Scheduled, and audit-log-shape cases
 - PR merged to `develop`
+
+## Comments
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo: `availability` persisted in `backend/routers/chargers.py` and `backend/routers/franchisee_portal.py`
+
+Method and caveats: `.scratch/tracker-reconciliation/REPORT.md`.
