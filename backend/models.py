@@ -74,6 +74,34 @@ class TransactionStatusEnum(str, enum.Enum):
     FAILED = "FAILED"
     BILLING_FAILED = "BILLING_FAILED"
 
+
+# The states in which a Transaction still OCCUPIES its charger — i.e. a second
+# session must not be opened alongside it. Two call sites need exactly this set
+# and must not drift apart: the StartTransaction reconcile guard
+# (`main._reconcile_existing_open_transaction`) and the QR double-payment guard
+# (`QRPaymentService._create_qr_payment_locked`).
+#
+# SUSPENDED is included. It is not a terminal state — it means the charger went
+# quiet mid-session and we are holding the session open for a reconnect. Firmware
+# that keeps the contactor closed through a CSMS outage makes this the state a
+# genuinely-charging session sits in, so treating it as "free" lets a second
+# payment start a parallel session on a charger that is physically busy.
+#
+# PENDING_STOP is deliberately EXCLUDED. A txn mid-normal-stop is already being
+# finalized by the StopTransaction path: superseding it races that path into a
+# double-finalize (the finalizer's idempotency guard only short-circuits on
+# TERMINAL states), and per ADR 0021 the session-end seam is not "busy" — a
+# payment arriving there should fall through to the normal new-session flow
+# rather than be rejected. A genuinely stuck PENDING_STOP is caught by the
+# disconnect / stale-suspended sweeps.
+OPEN_TRANSACTION_STATES = [
+    TransactionStatusEnum.STARTED,
+    TransactionStatusEnum.PENDING_START,
+    TransactionStatusEnum.RUNNING,
+    TransactionStatusEnum.SUSPENDED,
+]
+
+
 class MessageDirectionEnum(str, enum.Enum):
     INBOUND = "IN"
     OUTBOUND = "OUT"
@@ -497,6 +525,16 @@ class Transaction(Model):
     energy_consumed_kwh = fields.DecimalField(max_digits=12, decimal_places=3, null=True)
     start_time = fields.DatetimeField(auto_now_add=True)
     end_time = fields.DatetimeField(null=True)
+    # Charger-reported session boundaries, as carried on the StartTransaction /
+    # StopTransaction frames. Distinct from start_time / end_time, which are
+    # SERVER RECEIPT times and remain the basis of billing and the GST Invoice.
+    # Under offline continuity a StopTransaction can arrive hours after the
+    # session actually ended, so reported_end_time is the only record of when
+    # the charge really stopped. NULL when absent or rejected by the clock
+    # plausibility guard in utils.parse_ocpp_timestamp — never silently
+    # substituted with receipt time. See ADR 0031.
+    reported_start_time = fields.DatetimeField(null=True)
+    reported_end_time = fields.DatetimeField(null=True)
     stop_reason = fields.TextField(null=True)
     transaction_status = fields.CharEnumField(TransactionStatusEnum)
     suspended_at = fields.DatetimeField(null=True)
@@ -520,6 +558,24 @@ class MeterValue(Model):
     id = fields.IntField(pk=True)
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)
+    # When the CHARGER says it took this reading, from the OCPP frame's own
+    # `timestamp`. `created_at` is when WE received it — the two diverge by the
+    # length of an outage once queued frames are replayed on reconnect, which
+    # is exactly when the distinction matters. NULL when the frame carried no
+    # timestamp or the clock guard rejected it; readers fall back to created_at
+    # (see services.meter_readings.latest_meter_value). ADR 0031.
+    #
+    # Deliberately NOT indexed. Reads order by COALESCE(measured_at, created_at),
+    # and a btree index on measured_at alone CANNOT serve that expression —
+    # verified on a 20k-row probe with enable_seqscan=off, where the planner
+    # still chose a full scan + top-N heapsort over using it. An index here
+    # would cost write amplification on the highest-write table in the system
+    # (one row per MeterValues frame per charger) and return nothing. Every
+    # reader narrows by transaction_id first, which the FK index already serves,
+    # and none of them sit on a per-frame path. If profiling ever disagrees, the
+    # index that would actually work is the matching expression index:
+    #   (transaction_id, COALESCE(measured_at, created_at) DESC, id DESC)
+    measured_at = fields.DatetimeField(null=True)
     transaction = fields.ForeignKeyField("models.Transaction", related_name="meter_values")
     reading_kwh = fields.DecimalField(max_digits=12, decimal_places=3)
     current = fields.FloatField(null=True)

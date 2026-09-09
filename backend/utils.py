@@ -32,6 +32,62 @@ def to_ist(dt):
         dt = dt.replace(tzinfo=datetime.timezone.utc)
     return dt.astimezone(IST)
 
+# How far ahead of our own clock a charger-reported timestamp may sit before we
+# stop believing it. Small, because a charger running fast is reporting a time
+# that has not happened yet — there is no legitimate reason for that beyond
+# ordinary NTP drift.
+OCPP_CLOCK_SKEW_SECONDS = 300
+
+
+def parse_ocpp_timestamp(value, *, not_before=None, context: str = "") -> "datetime.datetime | None":
+    """Parse a charger-reported OCPP timestamp into a tz-aware UTC datetime.
+
+    Returns ``None`` when the value is missing, unparseable, or implausible —
+    callers fall back to server receipt time (``created_at``), so a bad clock
+    degrades to today's behaviour instead of poisoning the record.
+
+    **Charger clocks in this fleet are not trustworthy.** ADR 0030 exists partly
+    because of it: Diagnostic Bundle timestamps are reconstructed from in-band
+    ``TIME_SYNC`` anchors rather than believed outright. So a reported time is
+    accepted only inside a plausibility window — no further ahead than
+    ``OCPP_CLOCK_SKEW_SECONDS``, and (where the caller knows one) no earlier than
+    ``not_before``, which is normally the transaction's start.
+
+    Naive inputs are assumed UTC, matching the rest of the codebase.
+    """
+    if not value:
+        return None
+
+    if isinstance(value, datetime.datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            logger.warning("Unparseable OCPP timestamp %r%s", value, f" ({context})" if context else "")
+            return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    parsed = parsed.astimezone(datetime.timezone.utc)
+
+    skew = datetime.timedelta(seconds=OCPP_CLOCK_SKEW_SECONDS)
+    if parsed > get_utc_now() + skew:
+        logger.warning("Rejecting future OCPP timestamp %s%s", parsed, f" ({context})" if context else "")
+        return None
+
+    if not_before is not None:
+        floor = not_before if not_before.tzinfo else not_before.replace(tzinfo=datetime.timezone.utc)
+        if parsed < floor - skew:
+            logger.warning(
+                "Rejecting OCPP timestamp %s before floor %s%s",
+                parsed, floor, f" ({context})" if context else "",
+            )
+            return None
+
+    return parsed
+
+
 def csv_safe_cell(value) -> str:
     """Neutralize CSV formula injection (OWASP). A spreadsheet treats a cell
     whose first character is ``= + - @`` (or a leading tab/CR) as a formula, so

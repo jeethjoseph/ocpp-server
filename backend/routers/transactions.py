@@ -419,11 +419,10 @@ async def _recalc_energy_if_missing(transaction) -> None:
     it from the last MeterValue before billing."""
     if transaction.energy_consumed_kwh and transaction.energy_consumed_kwh > 0:
         return
-    latest_meter_value = await MeterValue.filter(
-        transaction_id=transaction.id
-    ).order_by("-created_at").first()
-    if latest_meter_value:
-        transaction.end_meter_kwh = latest_meter_value.reading_kwh
+    from services.meter_readings import latest_meter_value
+    latest = await latest_meter_value(transaction.id)
+    if latest:
+        transaction.end_meter_kwh = latest.reading_kwh
         transaction.energy_consumed_kwh = transaction.end_meter_kwh - (transaction.start_meter_kwh or 0)
         await transaction.save()
         logger.info(f"Calculated energy for force-stopped transaction {transaction.id}: {transaction.energy_consumed_kwh} kWh")

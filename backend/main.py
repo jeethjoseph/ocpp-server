@@ -25,7 +25,8 @@ from services.wallet_session_service import WalletSessionService
 from core.supplier_identity import SupplierIdentityError, validate_supplier_identity
 from redis_manager import redis_manager
 from core.connection_manager import connection_manager
-from utils import safe_create_task, mask_id_tag, mask_email
+from utils import safe_create_task, mask_id_tag, mask_email, parse_ocpp_timestamp, get_utc_now
+from services.meter_readings import latest_meter_value
 
 from ocpp.v16 import ChargePoint as OcppChargePoint
 from ocpp.v16 import call, call_result
@@ -60,19 +61,12 @@ async def _reconcile_existing_open_transaction(charge_point_id, charger, meter_s
     Transaction carries no connector_id and the fleet is single-connector — revisit
     if multi-connector chargers are introduced.
     """
-    from models import Transaction, TransactionStatusEnum
+    from models import Transaction, TransactionStatusEnum, OPEN_TRANSACTION_STATES
     from services.transaction_finalizer import is_resume_too_stale
-    # PENDING_STOP is deliberately EXCLUDED: a txn mid-normal-stop is already
-    # being finalized by the StopTransaction path, so superseding it here would
-    # race that path into a double-finalize/double-bill (the finalizer's
-    # idempotency guard only short-circuits on TERMINAL states). A genuinely
-    # stuck PENDING_STOP is caught by the disconnect/stale-suspended sweeps.
-    open_states = [
-        TransactionStatusEnum.STARTED, TransactionStatusEnum.PENDING_START,
-        TransactionStatusEnum.RUNNING, TransactionStatusEnum.SUSPENDED,
-    ]
+    # Shared with the QR double-payment guard — see OPEN_TRANSACTION_STATES in
+    # models.py for why SUSPENDED is in and PENDING_STOP is out.
     existing = await Transaction.filter(
-        charger_id=charger.id, transaction_status__in=open_states,
+        charger_id=charger.id, transaction_status__in=OPEN_TRANSACTION_STATES,
     ).order_by("-start_time").first()
     if not existing:
         return None
@@ -413,12 +407,9 @@ class ChargePoint(OcppChargePoint):
 
     async def _push_post_boot_state(self, transaction=None):
         """Send PostBootState DataTransfer to charger with meter value and optional transaction info."""
-        from models import Transaction, TransactionStatusEnum, MeterValue
         try:
             if transaction:
-                latest_mv = await MeterValue.filter(
-                    transaction_id=transaction.id
-                ).order_by("-created_at").first()
+                latest_mv = await latest_meter_value(transaction.id)
 
                 start_kwh = transaction.start_meter_kwh or 0
                 last_kwh = latest_mv.reading_kwh if latest_mv else start_kwh
@@ -658,9 +649,7 @@ class ChargePoint(OcppChargePoint):
 
         # Calculate energy from latest meter value if not already set
         if transaction.end_meter_kwh is None:
-            latest_mv = await MeterValue.filter(
-                transaction_id=transaction.id
-            ).order_by("-created_at").first()
+            latest_mv = await latest_meter_value(transaction.id)
             if latest_mv:
                 transaction.end_meter_kwh = latest_mv.reading_kwh
                 transaction.energy_consumed_kwh = transaction.end_meter_kwh - (transaction.start_meter_kwh or 0)
@@ -774,13 +763,11 @@ class ChargePoint(OcppChargePoint):
                 charger = await Charger.filter(charge_point_string_id=self.id).first()
                 if charger:
                     if error_code and error_code != "NoError":
-                        # Parse timestamp if provided
-                        error_ts = None
-                        if timestamp:
-                            try:
-                                error_ts = datetime.datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                            except (ValueError, AttributeError) as e:
-                                logger.debug(f"Could not parse StatusNotification timestamp '{timestamp}': {e}")
+                        # Shared parser: same clock-plausibility rules as every
+                        # other charger-reported timestamp (ADR 0031).
+                        error_ts = parse_ocpp_timestamp(
+                            timestamp, context=f"StatusNotification from {self.id}"
+                        )
 
                         # Create error record
                         await ChargerError.create(
@@ -931,6 +918,22 @@ class ChargePoint(OcppChargePoint):
                 user=user,
                 charger=charger,
                 start_meter_kwh=Decimal(str(meter_start)) / Decimal(1000),  # Convert Wh to kWh
+                # start_time is auto_now_add (server receipt) and stays the
+                # billing basis; this records what the charger claimed. ADR 0031.
+                #
+                # Floored at roughly now, because a session can never START
+                # offline (AllowOfflineTxForUnknownId / LocalAuthorizeOffline
+                # are held false), so a reported start is always within seconds
+                # of receipt. Without a floor, a charger whose RTC came up at
+                # epoch — before NITZ/NTP sync, which is exactly what happens
+                # when power returns and someone plugs in immediately — would
+                # write 1970 here, and any later duration derived from it would
+                # read as ~56 years.
+                reported_start_time=parse_ocpp_timestamp(
+                    timestamp,
+                    not_before=get_utc_now(),
+                    context=f"StartTransaction from {self.id}",
+                ),
                 transaction_status=TransactionStatusEnum.RUNNING  # Changed from STARTED to RUNNING
             )
 
@@ -1030,6 +1033,15 @@ class ChargePoint(OcppChargePoint):
             transaction.end_meter_kwh = Decimal(str(meter_stop)) / Decimal(1000)  # Convert Wh to kWh
             transaction.energy_consumed_kwh = transaction.end_meter_kwh - (transaction.start_meter_kwh or Decimal(0))
             transaction.end_time = datetime.datetime.now(datetime.timezone.utc)
+            # When the charger says the session actually ended. Under offline
+            # continuity this can precede end_time (receipt) by hours, and it is
+            # the ONLY record of when charging really stopped. end_time stays the
+            # billing/invoice basis — reported, never substituted. ADR 0031.
+            transaction.reported_end_time = parse_ocpp_timestamp(
+                timestamp,
+                not_before=transaction.start_time,
+                context=f"StopTransaction txn {transaction_id} from {self.id}",
+            )
             transaction.transaction_status = TransactionStatusEnum.COMPLETED
             transaction.stop_reason = kwargs.get('reason', 'Remote')
             
@@ -1268,13 +1280,26 @@ class ChargePoint(OcppChargePoint):
                 if meter_data['reading_kwh'] is not None:
                     try:
                         logger.debug(f"🔋 💾 Creating MeterValue record in database...")
+                        # The frame's own timestamp — when the CHARGER took the
+                        # reading, which is not when we received it once queued
+                        # frames are replayed after an outage. Floored at the
+                        # transaction start so a reset RTC cannot backdate a
+                        # reading out of its own session (ADR 0031).
+                        measured_at = parse_ocpp_timestamp(
+                            timestamp,
+                            not_before=transaction.start_time,
+                            context=f"MeterValues txn {transaction_id} from {self.id}",
+                        )
                         meter_record = await MeterValue.create(
                             transaction=transaction,
+                            measured_at=measured_at,
                             reading_kwh=meter_data['reading_kwh'],
                             current=meter_data['current'],
                             voltage=meter_data['voltage'],
                             power_kw=meter_data['power_kw']
                         )
+                        if timestamp and measured_at is None:
+                            MetricsCollector.increment_counter("Custom/OCPP/UnusableFrameTimestamp")
                         meter_records_created += 1
                         
                         logger.info(f"🔋 ✅ STORED meter value ID={meter_record.id} for transaction {transaction_id}: "
@@ -1548,12 +1573,10 @@ class ChargePoint(OcppChargePoint):
                 )
 
             # Get last meter value (fall back to start_meter_kwh)
-            latest_meter_value = await MeterValue.filter(
-                transaction_id=transaction_id
-            ).order_by("-created_at").first()
+            latest_mv = await latest_meter_value(transaction_id)
 
             start_meter_kwh = transaction.start_meter_kwh or 0
-            last_meter_kwh = latest_meter_value.reading_kwh if latest_meter_value else start_meter_kwh
+            last_meter_kwh = latest_mv.reading_kwh if latest_mv else start_meter_kwh
             energy_consumed_kwh = last_meter_kwh - start_meter_kwh
 
             # Convert to Wh (integers) for charger

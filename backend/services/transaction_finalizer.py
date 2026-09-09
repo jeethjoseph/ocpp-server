@@ -64,6 +64,13 @@ async def is_resume_too_stale(
     candidates = []
     if transaction.suspended_at:
         candidates.append(transaction.suspended_at)
+    # Deliberately created_at, NOT services.meter_readings.latest_meter_value:
+    # this measures SILENCE — how long since we heard anything about this
+    # transaction — which is a receipt-time question. A charger replaying an
+    # hours-old queue on reconnect has just told us it is alive, so the gap
+    # legitimately resets to ~0 even though the readings are old. Ordering by
+    # measured_at here would resurrect a stale gap and refuse a live resume.
+    # See ADR 0031 decisions 3 and 8.
     latest_mv = await MeterValue.filter(
         transaction_id=transaction.id
     ).order_by("-created_at").first()
@@ -180,12 +187,11 @@ async def _calculate_final_energy(transaction: Transaction) -> None:
     end_meter_kwh + energy_consumed_kwh on the transaction object.
     Does NOT save — caller is responsible for that.
     """
-    latest_meter_value = await MeterValue.filter(
-        transaction_id=transaction.id
-    ).order_by("-created_at").first()
+    from services.meter_readings import latest_meter_value
+    latest = await latest_meter_value(transaction.id)
 
-    if latest_meter_value:
-        transaction.end_meter_kwh = latest_meter_value.reading_kwh
+    if latest:
+        transaction.end_meter_kwh = latest.reading_kwh
         transaction.energy_consumed_kwh = (
             transaction.end_meter_kwh - (transaction.start_meter_kwh or 0)
         )

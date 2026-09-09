@@ -12,7 +12,7 @@ from tortoise.transactions import in_transaction
 from models import (
     User, Wallet, Charger, Transaction, QRPayment, ChargerQRCode, MeterValue,
     QRPaymentStatusEnum, AuthProviderEnum, ChargerStatusEnum,
-    TransactionStatusEnum, UserRoleEnum
+    TransactionStatusEnum, UserRoleEnum, OPEN_TRANSACTION_STATES
 )
 
 
@@ -419,13 +419,13 @@ class QRPaymentService:
         async with in_transaction():
             locked_charger = await Charger.select_for_update().get(id=charger.id)
 
+            # Shared with the StartTransaction reconcile guard — see
+            # OPEN_TRANSACTION_STATES in models.py for why SUSPENDED is in
+            # (a suspended session may be physically charging) and
+            # PENDING_STOP is out (the session-end seam is not "busy").
             active_txn = await Transaction.filter(
                 charger=locked_charger,
-                transaction_status__in=[
-                    TransactionStatusEnum.RUNNING,
-                    TransactionStatusEnum.STARTED,
-                    TransactionStatusEnum.PENDING_START,
-                ]
+                transaction_status__in=OPEN_TRANSACTION_STATES,
             ).first()
             pending_qr = await QRPayment.filter(
                 charger=locked_charger,
@@ -435,7 +435,8 @@ class QRPaymentService:
 
             if active_txn or pending_qr:
                 reason = (
-                    f"Active transaction {active_txn.id}"
+                    f"Open transaction {active_txn.id} "
+                    f"({active_txn.transaction_status.value})"
                     if active_txn
                     else f"Pending QR payment {pending_qr.id} already waiting"
                 )
@@ -794,9 +795,8 @@ class QRPaymentService:
             return None
 
         if reading_kwh is None:
-            latest = await MeterValue.filter(
-                transaction_id=transaction_id
-            ).order_by("-id").first()
+            from services.meter_readings import latest_meter_value
+            latest = await latest_meter_value(transaction_id)
             reading_dec = Decimal(latest.reading_kwh) if latest else start_meter
         else:
             reading_dec = Decimal(str(reading_kwh))
