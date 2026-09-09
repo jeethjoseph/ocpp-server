@@ -7,10 +7,25 @@ from tortoise import BaseDBAsyncClient
 # two eras stay separable by ^VOWS?[0-9]{4,}$. Two internal columns join it,
 # never printed and never exported to the GST filings CSV.
 #
-# ISSUED INVOICES ARE NOT REWRITTEN. `charger_id_str` is backfilled only where
-# `pdf_url IS NULL` — i.e. no PDF has been generated, so nothing a customer or
-# an auditor has seen can change. This was ruled out in the 2026-07-31 charter
-# and is not negotiable: a GST invoice is a frozen tax document.
+# RENDERED INVOICES ARE NOT REWRITTEN. `charger_id_str` is backfilled only where
+# `pdf_url IS NULL`.
+#
+# Be precise about what that gate means, because the obvious reading is wrong.
+# PDFs are generated LAZILY, on first download (`routers/invoices.py`
+# serve_invoice_pdf): the document is rendered from this row, uploaded to S3,
+# and the key stored on `pdf_url`. So `pdf_url IS NULL` does NOT mean "not
+# issued" — an invoice can be fully issued, numbered and declared, and still
+# have a null `pdf_url` simply because nobody has clicked download. It means
+# "no artifact has ever been produced from this row".
+#
+# That is exactly the right gate. Where an artifact exists it is an immutable
+# S3 object that a customer has seen, so rewriting the column would make the
+# database disagree with the document. Where none exists, nobody has ever seen
+# the old value, and a future render legitimately shows the Asset Code.
+#
+# Measured 2026-09-09: production 445 invoices of which 6 rendered; staging
+# 1193 of which 3. So nine invoices across both registers keep the UUID they
+# printed, permanently, and the rest gain the Asset Code.
 #
 # The two NEW columns are backfilled for EVERY row, issued or not. They are
 # internal by construction — never rendered on the PDF, never exported — so
