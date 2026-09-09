@@ -2,6 +2,25 @@
 
 Status: done
 
+## Decision locked 2026-09-09 — backfill `charger_id_str` on unrendered invoices
+
+The plan justified `WHERE pdf_url IS NULL` as "no issued PDF changes". Investigation
+showed `pdf_url` does not mean what that assumed: PDFs render **lazily on first
+download**, and two paths let a customer see one without it being set — the
+`_stream_pdf_inline` S3-outage fallback, and any download predating the caching feature
+(shipped 2026-05-22; prod invoices start 2026-04-24, and the six cached objects only
+date from 2026-08-12, suggesting it reached prod later still).
+
+So the guarantee is weaker than the decision was made on: 9 cached invoices is a floor,
+not a ceiling, and the true number a customer has seen is unknowable from this column.
+
+**Decision: keep the backfill (option A).** A customer who re-downloads a pre-caching
+invoice may see the `CHARGER ID:` line change from a UUID to an Asset Code. Everything
+legally material — invoice number, amounts, tax split, dates — is byte-identical, and
+the charger identifier is voluntary descriptive content under no statutory length or
+charset constraint (see the comment above `FRANCHISEE_CODE_BLOCKS` in `policy.py`). The
+changed line makes the document more useful, not less.
+
 ## What to build
 
 Stop showing customers a UUID. This is the slice the whole effort exists for.
