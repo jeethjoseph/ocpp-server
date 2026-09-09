@@ -27,6 +27,7 @@ _CHARGER = [
     "charger.created",
     "charger.deleted",
     "charger.disconnected",
+    "charger.purpose_changed",
     "charger.reset",
     "charger.updated",
 ]

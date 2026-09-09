@@ -47,13 +47,36 @@ class TestNoCustomerSurfaceRendersTheUuid:
         ]
         assert not offenders, f"{path} still reads the OCPP UUID: {offenders}"
 
-    def test_qr_description_has_no_uuid_fallback(self):
-        # This previously read `charger.name or charger.charge_point_string_id`,
-        # putting a raw UUID in the Razorpay payee line whenever `name` was
-        # null. Every charger now has an Asset Code, so there is no fallback.
-        source = open("/app/routers/qr_codes.py").read()
+    # EVERY module that can create a Razorpay QR. The first version of this
+    # test named only qr_codes.py, and franchisee_portal.py — a second,
+    # independent QR-creation path — kept the UUID fallback for another two
+    # commits because nothing looked at it. Enumerate the paths, not the one
+    # you remember.
+    QR_CREATING_MODULES = ["routers/qr_codes.py", "routers/franchisee_portal.py"]
+
+    @pytest.mark.parametrize("path", QR_CREATING_MODULES)
+    def test_no_qr_description_falls_back_to_the_uuid(self, path):
+        # The payee/description line is what a customer reads in their UPI app
+        # at payment. `charger.name or charger.charge_point_string_id` put a raw
+        # UUID there whenever `name` was null. Every charger now has an Asset
+        # Code, so there is nothing to fall back to.
+        source = open(f"/app/{path}").read()
         assert "charger.name or charger.charge_point_string_id" not in source
-        assert "charger_name = charger.asset_code" in source
+        assert "or qr.charger.charge_point_string_id" not in source
+
+    def test_every_qr_creating_module_is_covered_by_this_guard(self):
+        # Fails when a THIRD QR-creation path appears, rather than silently
+        # leaving it unguarded.
+        import subprocess
+
+        hits = subprocess.run(
+            ["grep", "-rl", "razorpay_service.create_qr_code", "/app/routers"],
+            capture_output=True, text=True,
+        ).stdout.split()
+        found = {h.replace("/app/", "") for h in hits}
+        assert found == set(self.QR_CREATING_MODULES), (
+            f"QR-creating modules changed: {found}. Add it to QR_CREATING_MODULES."
+        )
 
     def test_invoice_pdf_prints_the_snapshot_not_the_live_uuid(self):
         source = open("/app/services/invoice_service.py").read()

@@ -29,8 +29,15 @@ in as tidy-up.
 1. Slices 04 and 05 are live in **both** environments through at least one full billing
    cycle, with GST invoices issued carrying an Asset Code.
 2. Support has resolved at least one customer-quoted code end to end.
-3. No code references `Charger.name` outside migrations and ADRs — **19 backend render
-   sites** and **19 frontend files** at last count.
+3. No code references `Charger.name` outside migrations and ADRs. **Re-measured
+   2026-09-09, after slices 04-07: 20 backend sites and 18 frontend files.** The
+   count did NOT fall the way the plan assumed — slices 04-07 scrubbed `name`
+   from *customer* surfaces, but admin and franchisee surfaces still render it
+   everywhere, and that is deliberate (ADR 0028 keeps operator labels intact).
+   This condition is therefore much further from holding than "slice 04 stops
+   `name` being load-bearing" implied: it is not load-bearing for **identity**,
+   but it is still the operator's own label on ~20 admin surfaces. Dropping it
+   means deleting that label, not merely removing a redundant field.
 4. Anything `name` legitimately carried has been moved first. `V3C_Test`, `V7C_Test` and
    `Chargemode_1` are **hardware type** and belong in `Charger.model` / `Charger.vendor`,
    which already exist. Capture before dropping. Provenance notes like `Staging_VOW0004`

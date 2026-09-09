@@ -638,11 +638,11 @@ async def _serialize_franchisee_qr(
     qr: ChargerQRCode, franchisee: Franchisee
 ) -> dict:
     business = franchisee.business_name
-    charger_name = qr.charger.name or qr.charger.charge_point_string_id if qr.charger else ""
+    charger_name = qr.charger.asset_code if qr.charger else ""
     return {
         "id": qr.id,
         "charger_id": qr.charger_id,
-        "charger_name": qr.charger.name if qr.charger else None,
+        "charger_name": charger_name or None,
         "razorpay_qr_code_id": qr.razorpay_qr_code_id,
         "image_url": qr.image_url,
         "short_url": qr.short_url,
@@ -680,7 +680,12 @@ async def _create_franchisee_qr(
     disbursed via a Route transfer after the session settles.
     """
     business_name = franchisee.business_name
-    charger_name = charger.name or charger.charge_point_string_id
+    # The Asset Code, never the UUID. This is the payee/description line the
+    # customer reads in their UPI app at payment, and the old fallback put a
+    # raw charge_point_string_id there whenever `name` was null — the same
+    # defect fixed in routers/qr_codes.py. Every charger now has a code, so
+    # there is nothing to fall back to. ADR 0028.
+    charger_name = charger.asset_code
 
     result = await razorpay_service.create_qr_code(
         payee_name=build_qr_payee_name(business_name, charger_name),

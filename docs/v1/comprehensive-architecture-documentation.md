@@ -515,6 +515,8 @@ Mechanism, and where it differs from the ADR text:
 
 `purpose` (`ChargerPurposeEnum`, `PUBLIC` | `TEST`, default `PUBLIC`) carries **serviceability**, deliberately not encoded in the code because purpose is mutable and an identifier must not change when a mutable attribute does. `TEST` units are hidden from `/stations`, excluded from `total_chargers`, and refused to non-`INTERNAL_ROLES` at both RemoteStart and StartTransaction.
 
+`purpose` is written through a **dedicated endpoint** (`PATCH /api/admin/chargers/{id}/purpose`), never through `ChargerUpdate`, which rejects it 422. Same reasoning as `ChangeAvailability` under ADR 0008: it is state with billing consequences, so it does not travel with cosmetic fields, and it emits its own audit action (`charger.purpose_changed`). Promotion `TEST → PUBLIC` is a single field update with no minting step — the Asset Code is allocated at creation and never changes, precisely so a unit can move between contexts without acquiring a new identity.
+
 Two properties worth holding onto:
 
 1. **The `PUBLIC` default makes every gate fail open.** A row missed by any backfill keeps billing and stays visible. The single exception is the StartTransaction gate, which fails **closed** — a fleet unit wrongly marked `TEST` is a revenue outage on that unit — which is why the `TEST` set is verified per environment before that slice deploys.

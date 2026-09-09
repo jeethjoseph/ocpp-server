@@ -222,3 +222,106 @@ class TestBillingSuppressionComposes:
             "if charger.purpose == ChargerPurposeEnum.TEST and user.role not in INTERNAL_ROLES:"
             in source
         )
+
+
+@pytest.mark.unit
+class TestPurposeIsAdministrable:
+    """`purpose` must be changeable after the backfill (ADR 0028).
+
+    This class exists because the first pass shipped `purpose` readable
+    everywhere and writable NOWHERE: ChargerCreate/Update are `extra="forbid"`
+    and no endpoint set it, so migration 59 was the only writer. That made a new
+    bench unit impossible to withdraw, promotion impossible to perform, and the
+    correction for a wrongly-TEST fleet unit a manual UPDATE against production
+    — on the one gate in this effort that fails closed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_admin_can_withdraw_a_unit_to_test(
+        self, client_admin: AsyncClient, test_station
+    ):
+        charger = await _charger(test_station, "VOWS0001")
+        response = await client_admin.patch(
+            f"/api/admin/chargers/{charger.id}/purpose?purpose=TEST"
+        )
+        assert response.status_code == status.HTTP_200_OK
+        await charger.refresh_from_db()
+        assert charger.purpose == ChargerPurposeEnum.TEST
+
+    @pytest.mark.asyncio
+    async def test_admin_can_promote_a_bench_unit_to_fleet(
+        self, client_admin: AsyncClient, test_station
+    ):
+        # The escape hatch: a fleet unit wrongly marked TEST by the backfill's
+        # one inferred column refuses paying customers until this call is made.
+        charger = await _charger(test_station, "VOWS0001", purpose=ChargerPurposeEnum.TEST)
+        response = await client_admin.patch(
+            f"/api/admin/chargers/{charger.id}/purpose?purpose=PUBLIC"
+        )
+        assert response.status_code == status.HTTP_200_OK
+        await charger.refresh_from_db()
+        assert charger.purpose == ChargerPurposeEnum.PUBLIC
+
+    @pytest.mark.asyncio
+    async def test_promotion_does_not_change_the_asset_code(
+        self, client_admin: AsyncClient, test_station
+    ):
+        # A unit moving between contexts keeps its identity — that is why
+        # purpose is a separate field rather than encoded in the code.
+        charger = await _charger(test_station, "VOWS0001", purpose=ChargerPurposeEnum.TEST)
+        await client_admin.patch(f"/api/admin/chargers/{charger.id}/purpose?purpose=PUBLIC")
+        await charger.refresh_from_db()
+        assert charger.asset_code == "VOWS0001"
+
+    @pytest.mark.asyncio
+    async def test_the_change_is_audited(self, client_admin: AsyncClient, test_station):
+        # "Who took this charger out of service, and when" is the first
+        # question asked when a unit stops earning.
+        from models import AuditLog
+
+        charger = await _charger(test_station, "VOWS0001")
+        await client_admin.patch(f"/api/admin/chargers/{charger.id}/purpose?purpose=TEST")
+        # Scoped to THIS charger: AuditLog is not in conftest's per-test
+        # cleanup, so rows accumulate across a session and an unscoped .first()
+        # returns an earlier test's entry.
+        entry = await AuditLog.filter(
+            action="charger.purpose_changed",
+            entity_id=charger.charge_point_string_id,
+        ).first()
+        assert entry is not None
+        assert entry.changes["from"] == "PUBLIC"
+        assert entry.changes["to"] == "TEST"
+
+    @pytest.mark.asyncio
+    async def test_an_invalid_purpose_is_rejected(
+        self, client_admin: AsyncClient, test_station
+    ):
+        charger = await _charger(test_station, "VOWS0001")
+        response = await client_admin.patch(
+            f"/api/admin/chargers/{charger.id}/purpose?purpose=PRIVATE"
+        )
+        # PRIVATE is in ADR 0028 but deliberately not declared — adding it is a
+        # decision, not something an API caller can do by typing it.
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+    @pytest.mark.asyncio
+    async def test_a_no_op_change_is_harmless(
+        self, client_admin: AsyncClient, test_station
+    ):
+        charger = await _charger(test_station, "VOWS0001")
+        response = await client_admin.patch(
+            f"/api/admin/chargers/{charger.id}/purpose?purpose=PUBLIC"
+        )
+        assert response.status_code == status.HTTP_200_OK
+
+    @pytest.mark.asyncio
+    async def test_purpose_still_cannot_ride_in_on_the_general_update(
+        self, client_admin: AsyncClient, test_station
+    ):
+        # The dedicated endpoint exists so this stays rejected: purpose has
+        # billing consequences and must not travel with the model name.
+        charger = await _charger(test_station, "VOWS0001")
+        response = await client_admin.put(
+            f"/api/admin/chargers/{charger.id}", json={"purpose": "TEST"}
+        )
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY

@@ -722,6 +722,61 @@ async def delete_charger(charger_id: int, admin_user: User = Depends(require_adm
 
     return {"message": "Charger removed successfully"}
 
+@router.patch("/{charger_id}/purpose", response_model=dict)
+async def change_charger_purpose(
+    charger_id: int,
+    purpose: str = Query(..., regex="^(PUBLIC|TEST)$"),
+    admin_user: User = Depends(require_admin()),
+):
+    """Change what a charger is FOR: fleet hardware or a bench unit (ADR 0028).
+
+    A dedicated endpoint rather than a field on `ChargerUpdate`, following the
+    `ChangeAvailability` precedent, for two reasons. It is not cosmetic state —
+    flipping to TEST withdraws a unit from `/stations`, stops it billing and
+    stops it invoicing — so it should not ride in on a payload that also
+    carries the model name. And it needs its own audit entry: "who took this
+    charger out of service, and when" is the first question asked when a unit
+    stops earning.
+
+    This is the escape hatch for the one gate in ADR 0028 that fails CLOSED. A
+    fleet unit wrongly marked TEST refuses paying customers, and `purpose` is
+    the only inferred column in the backfill — so the correction has to be a
+    reviewed, audited API call, not a manual UPDATE against production.
+
+    Promotion is deliberately a single field update with no minting step: the
+    Asset Code is allocated at creation and never changes, precisely so a unit
+    can move between contexts without acquiring a new identity.
+    """
+    charger = await Charger.filter(id=charger_id).first()
+    if not charger:
+        raise HTTPException(status_code=404, detail="Charger not found")
+
+    previous = (
+        charger.purpose.value
+        if hasattr(charger.purpose, "value")
+        else str(charger.purpose)
+    )
+    if previous == purpose:
+        return {"message": "No change", "purpose": purpose}
+
+    charger.purpose = ChargerPurposeEnum(purpose)
+    await charger.save(update_fields=["purpose"])
+
+    await log_audit_event(
+        action="charger.purpose_changed",
+        entity_type="charger",
+        entity_id=charger.charge_point_string_id,
+        actor_type="admin",
+        actor=admin_user,
+        changes={"from": previous, "to": purpose, "asset_code": charger.asset_code},
+    )
+    logger.info(
+        "🔖 Charger %s purpose %s -> %s by %s",
+        charger.asset_code, previous, purpose, admin_user.id,
+    )
+    return {"message": "Purpose updated", "purpose": purpose, "previous": previous}
+
+
 @router.post("/{charger_id}/remote-start", response_model=dict)
 async def remote_start_charging(charger_id: int, connector_id: int = 1, user: User = Depends(require_user_or_admin())):
     """Start charging remotely"""
