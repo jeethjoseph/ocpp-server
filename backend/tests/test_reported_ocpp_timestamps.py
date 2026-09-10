@@ -74,25 +74,71 @@ async def _txn(charger, user, *, started_hours_ago=0):
 
 
 @pytest.mark.asyncio
-async def test_latest_reading_uses_measured_time_not_receipt(client, test_charger, test_user):
-    """The point of the column: a replayed burst arrives in one instant, so
-    receipt order is meaningless — measured order picks the real latest."""
+async def test_billing_baseline_is_receipt_order_and_series_is_measured_order(
+    client, test_charger, test_user
+):
+    """The two readers answer different questions and order differently.
+
+    ``latest_meter_value`` is the billing baseline and orders by RECEIPT — the
+    last frame we got is the latest, full stop. ``meter_series`` is the
+    delivery curve and orders by MEASURED time, which is what the retained
+    timestamp is for. Insert them so the two orderings disagree, and assert
+    each reader gives its own answer.
+    """
     txn = await _txn(test_charger, test_user)
     base = get_utc_now() - datetime.timedelta(hours=6)
 
-    # Inserted newest-measured FIRST, so receipt order disagrees with truth.
+    # Measured LATER but received FIRST.
     await MeterValue.create(
         transaction=txn, reading_kwh=9, measured_at=base + datetime.timedelta(hours=3),
     )
+    # Measured EARLIER but received LAST.
     await MeterValue.create(
         transaction=txn, reading_kwh=4, measured_at=base + datetime.timedelta(hours=1),
     )
 
+    # Billing baseline: the last thing received, regardless of its stamp.
     latest = await latest_meter_value(txn.id)
-    assert float(latest.reading_kwh) == 9.0
+    assert float(latest.reading_kwh) == 4.0
 
+    # Delivery curve: by when the charger says each reading was taken.
     series = await meter_series(txn.id)
     assert [float(m.reading_kwh) for m in series] == [4.0, 9.0]
+
+
+@pytest.mark.asyncio
+async def test_baseline_survives_a_clock_stepping_backwards(
+    client, test_charger, test_user
+):
+    """Regression pin for the ordering bug found in review.
+
+    The clock guard deliberately admits a charger running up to 300 s fast. A
+    frame stamped +4 min, then an NTP correction, then a later frame stamped
+    +1 min: ordering by measured time put the EARLIER, LOWER reading on top and
+    the finalizer would have billed 1.0 kWh for a 9.0 kWh session. Receipt
+    order is monotonic and cannot do this. Reproduced on the dev DB before the
+    fix (A id=321 1.0 kWh measured +4m; B id=322 9.0 kWh measured +1m; latest
+    returned A).
+    """
+    txn = await _txn(test_charger, test_user)
+    now = get_utc_now()
+
+    # A: clock 4 min fast, inside the guard. Low reading. Received first.
+    await MeterValue.create(
+        transaction=txn, reading_kwh=1.0,
+        measured_at=now + datetime.timedelta(minutes=4),
+    )
+    # B: clock corrected, so stamped EARLIER despite arriving LATER. High reading.
+    await MeterValue.create(
+        transaction=txn, reading_kwh=9.0,
+        measured_at=now + datetime.timedelta(minutes=1),
+    )
+
+    latest = await latest_meter_value(txn.id)
+    assert float(latest.reading_kwh) == 9.0, (
+        "billing baseline went backwards on a clock step — the finalizer would "
+        "under-bill this session"
+    )
 
 
 @pytest.mark.asyncio
