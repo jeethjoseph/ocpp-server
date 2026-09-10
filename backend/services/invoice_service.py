@@ -268,6 +268,20 @@ class InvoiceService:
             franchisee = await Franchisee.filter(id=franchisee_id).only(
                 "id", "invoice_code"
             ).first()
+            # Do NOT fall through to invoice_code_for(None): that helper reads
+            # None as "this invoice has no franchisee" and returns the reserved
+            # VOLTLYNC_OWNED_INVOICE_CODE. The sequence, meanwhile, still comes
+            # from this franchisee's own counter — so a missing row would mint
+            # F0000/<series>/<fy>/<seq> off a franchisee sequence and could
+            # duplicate a genuine VoltLync-owned number under the same GSTIN.
+            # That is precisely the Rule 46(b) breach the invoice_code scheme
+            # exists to close. A failed invoice is recoverable; a duplicated
+            # invoice number is not.
+            if franchisee is None:
+                raise ValueError(
+                    f"franchisee {franchisee_id} referenced by this invoice could not "
+                    f"be loaded; refusing to number it as VoltLync-owned"
+                )
             code = invoice_code_for(franchisee)
 
         # "2026-27" -> "26". Two digits is enough to satisfy "unique for a

@@ -360,3 +360,60 @@ async def test_the_stored_digest_is_taken_before_redaction(client, authed):
     assert "12.34567" not in authed.call_args[0][1].decode()
     # ...but the identity is of what the charger actually sent.
     assert recorded.call_args.kwargs["content_sha256"] == content_digest(dirty)
+
+
+# ---------------------------------------------------------------------------
+# Bounded decompression (review finding 3)
+#
+# The body cap applies to the COMPRESSED bytes. gzip of repetitive log text
+# reaches ~1000:1 (measured), so a 2 MB upload expanded to ~2 GB inside a
+# backend that runs a single uvicorn worker -- reachable by any charger holding
+# a valid key, with one request.
+# ---------------------------------------------------------------------------
+
+def test_decompression_is_bounded_and_returns_413():
+    import gzip as _gzip
+    from fastapi import HTTPException
+    from routers.diagnostics import _decode_body
+
+    bomb = _gzip.compress(b"\0" * (4 * 1024 * 1024))
+    assert len(bomb) < 64 * 1024, "probe should be small compressed"
+
+    with pytest.raises(HTTPException) as exc:
+        _decode_body(bomb, "gzip", limit=1024 * 1024)
+    assert exc.value.status_code == 413
+
+
+def test_honest_gzip_body_still_decompresses():
+    import gzip as _gzip
+    from routers.diagnostics import _decode_body
+
+    body = b"===== BOOT =====\nI (100) app: hello\n" * 50
+    decoded, warnings = _decode_body(_gzip.compress(body), "gzip", limit=1024 * 1024)
+    assert decoded == body
+    assert warnings == []
+
+
+def test_uncompressed_body_is_passed_through_untouched():
+    from routers.diagnostics import _decode_body
+
+    body = b"===== BOOT =====\n"
+    decoded, warnings = _decode_body(body, None, limit=1024 * 1024)
+    assert decoded == body and warnings == []
+
+
+def test_corrupt_gzip_degrades_to_a_warning_not_a_crash():
+    """Unchanged behaviour: a body that does not inflate is archived raw with a
+    warning, because the records may still be readable."""
+    from routers.diagnostics import _decode_body
+
+    decoded, warnings = _decode_body(b"not actually gzip", "gzip", limit=1024 * 1024)
+    assert decoded == b"not actually gzip"
+    assert warnings and "did not decompress" in warnings[0]
+
+
+def test_decompressed_cap_defaults_above_the_wire_cap():
+    """An honest bundle compresses maybe 5-10x; the cap must not reject those."""
+    from routers.diagnostics import _max_bytes, _max_decompressed_bytes
+    assert _max_decompressed_bytes() > _max_bytes()
+

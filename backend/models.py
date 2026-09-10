@@ -62,6 +62,29 @@ class ConnectorTypeEnum(str, enum.Enum):
     GBT = "GB/T"
     DOMESTIC = "domestic"
 
+
+# Name and SQL for the DB-level guard on `connector.connector_type`, in one
+# place so the migration that installs it and the test harness that recreates it
+# cannot drift from the enum above — the same doctrine migration 58 applies to
+# the Asset Code patterns.
+#
+# Tortoise models a CharEnumField as a plain VARCHAR, so without this the enum
+# exists only in Python: migration 49 retyped the column but added no
+# constraint, and `CharEnumFieldInstance.to_python_value` raises ValueError on
+# any value that is not byte-exactly a member. One bad row would therefore break
+# every path that loads a Connector — suspend-window selection on disconnect,
+# remote start, QR start, the admin charger list, the public stations feed.
+CONNECTOR_TYPE_CHECK = "connector_type_canonical"
+
+
+def connector_type_check_sql() -> str:
+    """`ALTER TABLE ... ADD CONSTRAINT` for the canonical-connector-type CHECK."""
+    allowed = ", ".join(f"'{m.value}'" for m in ConnectorTypeEnum)
+    return (
+        f'ALTER TABLE "connector" ADD CONSTRAINT "{CONNECTOR_TYPE_CHECK}" '
+        f'CHECK ("connector_type" IN ({allowed}));'
+    )
+
 class TransactionStatusEnum(str, enum.Enum):
     STARTED = "STARTED"
     PENDING_START = "PENDING_START"

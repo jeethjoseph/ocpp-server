@@ -295,8 +295,9 @@ async def create_franchisee(
                 notes=body.notes,
                 onboarded_by=admin,
                 user=user,
-                # Allocated inside the same transaction as the row it belongs
-                # to, so a concurrent create cannot hand out the same code.
+                # Serialised by a transaction-scoped advisory lock inside
+                # allocate_invoice_code — being in the same transaction is NOT
+                # itself sufficient, since a plain SELECT takes no lock.
                 invoice_code=await allocate_invoice_code(),
             )
     except IntegrityError as e:

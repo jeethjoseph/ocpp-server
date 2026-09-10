@@ -144,6 +144,17 @@ async def client() -> AsyncGenerator[AsyncClient, None]:
             " SELECT setval('charger_asset_code_seq', 1, false);"
         )
 
+        # Same reason as the sequence above: the canonical-connector-type CHECK
+        # (migration 63) is DDL Tortoise cannot express, so `generate_schemas`
+        # never builds it and tests would run without a guard the real registers
+        # have. Built from the same helper the migration uses, so the two cannot
+        # drift.
+        from models import CONNECTOR_TYPE_CHECK, connector_type_check_sql
+        await _seq_conn.get("default").execute_script(
+            f'ALTER TABLE "connector" DROP CONSTRAINT IF EXISTS "{CONNECTOR_TYPE_CHECK}";'
+            + connector_type_check_sql()
+        )
+
         # Clean up database before each test (order matters for FK constraints)
         from models import (
             WalletTransaction, MeterValue,

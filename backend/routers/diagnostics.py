@@ -22,10 +22,10 @@ degrades search, never durability.
 from __future__ import annotations
 
 import asyncio
-import gzip
 import logging
 import os
 import time
+import zlib
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -74,6 +74,25 @@ def _max_bytes() -> int:
     return int(os.getenv("DIAGNOSTIC_BUNDLE_MAX_BYTES", str(2 * 1024 * 1024)))
 
 
+# zlib window size that makes decompressobj read a gzip container (as opposed to
+# a bare deflate stream), and the slice size used to feed and drain it.
+_GZIP_WBITS = 16 + zlib.MAX_WBITS
+_INFLATE_CHUNK = 256 * 1024
+
+
+def _max_decompressed_bytes() -> int:
+    """Cap on the DECOMPRESSED body.
+
+    Separate from the wire cap because they bound different things: the wire cap
+    protects bandwidth, this protects memory. Defaults to 8x the wire cap —
+    generous for honest text (a real bundle compresses maybe 5–10x) while still
+    bounding the ~1000:1 amplification a repetitive payload achieves.
+    """
+    return int(
+        os.getenv("DIAGNOSTIC_BUNDLE_MAX_DECOMPRESSED_BYTES", str(8 * _max_bytes()))
+    )
+
+
 def _rate_limited_in_process(charger_key: str) -> bool:
     """Fallback limiter, used only when Redis is unreachable.
 
@@ -116,14 +135,55 @@ async def _rate_limited(charger_key: str) -> bool:
         return _rate_limited_in_process(charger_key)
 
 
-def _decode_body(raw: bytes, content_encoding: Optional[str]) -> tuple[bytes, list[str]]:
-    """Gunzip if the charger declared gzip. Returns (decoded, warnings)."""
+def _decode_body(raw: bytes, content_encoding: Optional[str], limit: int) -> tuple[bytes, list[str]]:
+    """Gunzip if the charger declared gzip, bounded by ``limit``.
+
+    Decompresses incrementally rather than via ``gzip.decompress``, which has no
+    output bound: the body cap applies to the COMPRESSED bytes, and gzip of
+    repetitive log text reaches roughly 1000:1 — a 2 MB upload expands to ~2 GB,
+    in a backend that runs a single uvicorn worker. Any charger holding a valid
+    key could exhaust it with one request, and an oversized-but-honest bundle of
+    repeating lines could approach it by accident.
+
+    Raises 413 rather than truncating: a partial bundle would be archived under a
+    content digest that no longer describes what the charger sent.
+    """
     if (content_encoding or "").strip().lower() != "gzip":
         return raw, []
+
+    decompressor = zlib.decompressobj(_GZIP_WBITS)
+    chunks: list[bytes] = []
+    total = 0
+    # `max_length` bounds the output of each call and parks the input it could
+    # not process in `unconsumed_tail` — feeding that back is the documented way
+    # to inflate incrementally. (Calling decompress(b"") does NOT drain: the
+    # pending work lives in the tail, not in an internal output buffer.)
+    pending = raw
     try:
-        return gzip.decompress(raw), []
+        while pending:
+            chunk = decompressor.decompress(pending, _INFLATE_CHUNK)
+            total += len(chunk)
+            if total > limit:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Decompressed body exceeds {limit} bytes",
+                )
+            chunks.append(chunk)
+            pending = decompressor.unconsumed_tail
+        tail = decompressor.flush()
+        if tail:
+            total += len(tail)
+            if total > limit:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Decompressed body exceeds {limit} bytes",
+                )
+            chunks.append(tail)
+    except HTTPException:
+        raise
     except Exception as exc:
         return raw, [f"Content-Encoding: gzip declared but body did not decompress ({exc})"]
+    return b"".join(chunks), []
 
 
 async def _read_body(request: Request, limit: int) -> bytes:
@@ -169,7 +229,9 @@ async def receive_bundle(request: Request):
         raise HTTPException(status_code=429, detail="Too many uploads; retry later")
 
     raw = await _read_body(request, _max_bytes())
-    body, warnings = _decode_body(raw, request.headers.get("content-encoding"))
+    body, warnings = _decode_body(
+        raw, request.headers.get("content-encoding"), _max_decompressed_bytes()
+    )
 
     try:
         text = body.decode("utf-8")
@@ -417,7 +479,15 @@ async def list_charger_bundles(
     from models import DiagnosticBundle
     from tortoise.expressions import Q
 
-    qs = DiagnosticBundle.filter(charger_id=charger_id)
+    # `archived_at__isnull=False` restricts this to DELIVERED bundles, matching
+    # `find_duplicate` and `previous_delivered` in diagnostic_bundle_service.
+    # A row with it NULL is a reservation whose S3 write never completed, and
+    # including one here does two visible harms: it renders with a Download
+    # button pointing at a key no object exists at, and — because
+    # `_pair_with_predecessor` runs over this same page — it becomes the
+    # predecessor of the next real bundle and corrupts the silence gap this
+    # feature exists to measure.
+    qs = DiagnosticBundle.filter(charger_id=charger_id, archived_at__isnull=False)
 
     if before is not None:
         anchor = await DiagnosticBundle.get_or_none(id=before, charger_id=charger_id)

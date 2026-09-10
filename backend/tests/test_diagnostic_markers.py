@@ -148,3 +148,55 @@ def test_ring_wrap_events_are_counted():
     ])
     assert dm.count_ring_wraps(body) == 2
     assert dm.count_ring_wraps("nothing here") == 0
+
+
+# ---------------------------------------------------------------------------
+# Malformed clock anchors (review finding 2)
+#
+# The anchor regexes match digits and colons, which is strictly more permissive
+# than strptime. An unparseable-but-well-shaped stamp used to raise out of
+# resolve_window into receive_bundle's unguarded call, returning HTTP 500 --
+# and because the charger never saw a 2xx it re-sent the identical body until
+# its hourly upload budget was gone, forever.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("bad_utc", [
+    "0000-00-00T00:00:00Z",   # RTC never synced -- the realistic case
+    "2026-13-45T99:99:99Z",   # digits in range for the regex, not for a calendar
+    "2026-08-19T12:02:05:99Z",  # [\d:]+ admits the extra group
+])
+def test_malformed_anchor_does_not_raise(bad_utc):
+    assert dm.find_anchor([f"TIME_SYNC boot_ms=17673 utc={bad_utc}"]) is None
+
+
+@pytest.mark.parametrize("bad_utc", ["0000-00-00T00:00:00Z", "2026-13-45T99:99:99Z"])
+def test_bundle_with_malformed_anchor_still_resolves_a_window(bad_utc):
+    """The bundle is archived with an approximate window rather than 500ing."""
+    body = "\n".join([
+        "===== BOOT @278 ms, reset reason 3 =====",
+        f"TIME_SYNC boot_ms=17673 utc={bad_utc}",
+        "I (17700) app: charging started",
+    ])
+    first, last, approximate = dm.resolve_window(body, RECEIVED)
+    assert approximate is True
+    assert first is not None and last is not None
+
+
+def test_good_anchor_after_a_malformed_one_is_still_found():
+    """A charger that syncs mid-segment must not be written off because its
+    first attempt was garbage."""
+    anchor = dm.find_anchor([
+        "TIME_SYNC boot_ms=100 utc=0000-00-00T00:00:00Z",
+        "TIME_SYNC boot_ms=17673 utc=2026-08-19T12:02:05Z",
+    ])
+    assert anchor is not None
+    boot_ms, utc = anchor
+    assert boot_ms == 17673
+    assert utc == datetime(2026, 8, 19, 12, 2, 5, tzinfo=timezone.utc)
+
+
+def test_malformed_loose_form_anchor_does_not_raise():
+    """The pre-C1 free-text anchor takes the same guard."""
+    assert dm.find_anchor([
+        "I (17673) app: Time synced from heartbeat: 0000-00-00T00:00:00Z"
+    ]) is None

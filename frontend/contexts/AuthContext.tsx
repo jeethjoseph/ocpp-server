@@ -1,6 +1,6 @@
 'use client';
 
-import { createContext, useContext, ReactNode, useEffect, useRef } from 'react';
+import { createContext, useContext, ReactNode, useEffect, useLayoutEffect, useRef } from 'react';
 import { useAuth as useClerkAuth, useUser } from '@clerk/nextjs';
 
 interface AuthContextValue {
@@ -45,11 +45,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // Use refs to ensure getToken always accesses current auth state (not stale closure values)
   const clerkAuthRef = useRef(clerkAuth);
 
-  // Keep the ref current. Written in an effect rather than during render:
-  // the React Compiler disallows render-phase ref mutation (react-hooks/refs).
-  // getToken() is only ever invoked from async query paths, never while
-  // rendering, so reading the post-commit value is correct.
-  useEffect(() => {
+  // Keep the ref current. Written in an effect rather than during render,
+  // because the React Compiler disallows render-phase ref mutation
+  // (react-hooks/refs).
+  //
+  // useLayoutEffect, NOT useEffect. React runs passive effects child-first, so
+  // with useEffect this provider's write happened AFTER its children's effects.
+  // isAuthReady is published through context and computed during render, so on
+  // the commit where Clerk finishes loading a child sees isAuthReady === true
+  // and fires its query in that same commit -- reading a ref that still held
+  // the previous render's isLoaded: false. getToken() then returned null and
+  // the request went out with no Authorization header, 401ing the first call
+  // after sign-in. Layout effects run before paint and before passive child
+  // effects, which restores the ordering the render-phase write used to give.
+  useLayoutEffect(() => {
     clerkAuthRef.current = clerkAuth;
   });
 

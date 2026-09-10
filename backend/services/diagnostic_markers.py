@@ -128,19 +128,48 @@ def split_boot_segments(lines: Iterable[str]) -> list[list[str]]:
     return segments
 
 
+def _anchor_utc(raw: str) -> Optional[datetime]:
+    """Parse an anchor's UTC stamp, or None if the charger's clock produced
+    something that is shaped like a timestamp but is not one.
+
+    The anchor regexes match digits and colons, which is strictly more
+    permissive than ``strptime`` — ``utc=0000-00-00T00:00:00Z`` from a charger
+    whose RTC has not synced passes the regex and raises. That exception used to
+    escape ``resolve_window`` into the unguarded call in ``receive_bundle``,
+    returning HTTP 500; the charger then never advanced its delivered marker and
+    re-sent the identical body until its hourly upload budget was spent, forever.
+
+    Degrading to "no anchor" matches how every other parse in this module
+    behaves: an unresolvable bundle is still archived, with an approximate window.
+    """
+    try:
+        return datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        logger.warning("Ignoring unparseable TIME_SYNC anchor %r", raw)
+        return None
+
+
 def find_anchor(segment: Iterable[str]) -> Optional[tuple[int, datetime]]:
-    """Find this segment's (boot_ms, utc) clock anchor, if it has one."""
+    """Find this segment's (boot_ms, utc) clock anchor, if it has one.
+
+    A malformed anchor does not stop the search — a later line in the same
+    segment may carry a good one, and a bundle from a charger that synced
+    mid-segment is exactly the case worth recovering.
+    """
     for line in segment:
         m = _TIME_SYNC_RE.search(line)
         if m:
-            utc = datetime.strptime(m.group(2), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-            return int(m.group(1)), utc
+            utc = _anchor_utc(m.group(2))
+            if utc is not None:
+                return int(m.group(1)), utc
+            continue
         m = _TIME_SYNC_LOOSE_RE.search(line)
         if m:
             parsed = _parse_line(line)
             if parsed and parsed["boot_ms"] is not None:
-                utc = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                return parsed["boot_ms"], utc
+                utc = _anchor_utc(m.group(1))
+                if utc is not None:
+                    return parsed["boot_ms"], utc
     return None
 
 

@@ -37,6 +37,13 @@ def current_block() -> tuple[int, int]:
     return franchisee_code_block(os.getenv("ENVIRONMENT", "development"))
 
 
+# Advisory-lock key for invoice-code allocation. An arbitrary constant, chosen
+# once and never reused for another lock: Postgres advisory locks share one
+# namespace per database, so two features picking the same number would block
+# each other for no reason.
+_INVOICE_CODE_LOCK_KEY = 8_471_205
+
+
 async def allocate_invoice_code() -> str:
     """Next free code in this environment's block.
 
@@ -50,7 +57,18 @@ async def allocate_invoice_code() -> str:
     this exists to prevent.
     """
     low, high = current_block()
-    async with in_transaction():
+    async with in_transaction() as conn:
+        # Serialise allocation across concurrent creates. A plain SELECT takes
+        # no lock, so under READ COMMITTED two callers read the same snapshot of
+        # taken codes, pick the same gap, and one dies on the unique index —
+        # surfacing to the caller as a misleading duplicate-email/PAN error.
+        # Being "inside a transaction" confers nothing here; the lock does.
+        # Transaction-scoped, so it releases on commit or rollback without a
+        # matching unlock, and it is keyed on a constant because allocation is
+        # global to the block, not per-row.
+        await conn.execute_query(
+            "SELECT pg_advisory_xact_lock($1)", [_INVOICE_CODE_LOCK_KEY]
+        )
         taken = set(
             await Franchisee.filter(invoice_code__not_isnull=True)
             .values_list("invoice_code", flat=True)
