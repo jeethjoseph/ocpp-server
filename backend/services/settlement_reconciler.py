@@ -7,39 +7,48 @@ the reason this module exists — three months of events whose handler read a
 field that does not exist, leaving 377 rows one step short of SETTLED.
 
 Each pass fetches every still-PROCESSED transfer older than the age floor with
-``?expand[]=recipient_settlement`` and advances it through the same strict
+its recipient settlement expanded and advances it through the same strict
 predicate the webhook uses (``FranchiseeSettlementService.settle_from_transfer``),
 so the two paths cannot disagree about what "settled" means.
 
-Why an age floor: linked accounts settle on the parent's T+n schedule, and a
-held transfer only settles the business day after the hold lifts. Polling a
-row minutes after ``transfer.processed`` is a wasted call with a predictable
-answer. Observed lag on this account is T+3 (processed 30 May, settled 2 June
-2026), so the floor sits just under it at two days and the sweep runs every six
-hours: a row is examined at most a couple of times before it settles, and a
-dropped webhook is reconciled within a day rather than within four. Volume is
-a few dozen transfers a day across both environments, so the cost is a handful
-of GETs per pass against a 500-row cap. The backfill runs once with no floor.
+Ordering is NEWEST-processed first, deliberately. A row that can never settle
+— its recipient settlement failed, its linked account is deactivated, its
+transfer id 404s — is re-examined every pass and never leaves this pool, so
+oldest-first would let such rows crowd the head of the queue and starve the
+rows that actually settled. Newest-first means the live rows are always
+examined; the permanently-stuck tail is what a tight budget cuts, and that
+tail is exactly what the STUCK_PROCESSED_DAYS alarm exists to surface to a
+human. There is no cursor and there deliberately is no state: a pass that hits
+the budget re-examines from the newest again next time.
+
+Cadence and floor live in ``policy.py`` beside the stuck threshold, because the
+three have an ordering (floor < alarm) that is easy to break one at a time —
+the drift ADR 0027 was written to stop. The backfill runs once with no floor.
 
 Same lifecycle shape as ``stuck_payout_detector`` — start/stop/_loop/_sweep —
-so the two are wired and reasoned about identically. Cadence and floor are
-policy, not deployment wiring, and so are constants here rather than env vars
-(the ADR 0027 rule).
+and the same gate: a no-op unless Route is enabled, so a dev box restored
+from a production dump does not poll api.razorpay.com every six hours.
 """
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from policy import (
+    SETTLEMENT_AGE_FLOOR_DAYS as AGE_FLOOR_DAYS,
+    SETTLEMENT_SWEEP_INTERVAL_SECONDS as SWEEP_INTERVAL_SECONDS,
+    STUCK_PROCESSED_DAYS,
+)
 from utils import safe_create_task
 
 logger = logging.getLogger("ocpp-server")
 
-SWEEP_INTERVAL_SECONDS = 6 * 3600
-AGE_FLOOR_DAYS = 2
-# Bounds the Razorpay calls one pass may make. A pass that hits the cap logs
-# and stops; the next one picks up where it left off, oldest rows first.
-MAX_ROWS_PER_SWEEP = 500
+# Bounds the Razorpay calls one pass may make. Not policy — an operational
+# safety cap against a runaway backlog. At a few dozen transfers a day it is
+# never reached in steady state; a pass that does reach it warns, because the
+# rows it could not examine are the oldest ones and the alarm is what covers
+# those.
+MAX_ROWS_PER_SWEEP = 1000
 
 
 async def reconcile_processed_transfers(
@@ -60,13 +69,13 @@ async def reconcile_processed_transfers(
     if age_floor_days is not None:
         cutoff = datetime.now(timezone.utc) - timedelta(days=age_floor_days)
         query = query.filter(transfer_processed_at__lt=cutoff)
-    entries = await query.order_by("transfer_processed_at").limit(limit).all()
+    entries = await query.order_by("-transfer_processed_at").limit(limit).all()
 
     counts = {"examined": len(entries), "settled": 0, "unsettled": 0, "errors": 0}
     for entry in entries:
         try:
-            transfer = await razorpay_service.fetch_transfer_with_settlement(
-                entry.razorpay_transfer_id
+            transfer = await razorpay_service.fetch_transfer(
+                entry.razorpay_transfer_id, expand_settlement=True
             )
         except Exception as exc:
             counts["errors"] += 1
@@ -84,7 +93,9 @@ async def reconcile_processed_transfers(
         logger.info("Settlement reconcile pass: %s", counts)
     if counts["examined"] >= limit:
         logger.warning(
-            "Settlement reconcile hit the %s-row cap; remaining rows next pass", limit
+            "Settlement reconcile hit the %s-call budget; the oldest rows were "
+            "not examined this pass — if they are stuck, the %s-day alarm covers them",
+            limit, STUCK_PROCESSED_DAYS,
         )
     return counts
 
@@ -134,7 +145,16 @@ _reconciler: Optional[SettlementReconciler] = None
 
 
 async def start_settlement_reconciler():
+    """Start the background sweep. No-op unless Razorpay Route is enabled —
+    the same gate as ``stuck_payout_detector``. Without it a dev or CI box
+    holding TRANSFER_PROCESSED rows (a DB restored from a production dump) would
+    hit the real API every six hours, or log an error per row forever."""
     global _reconciler
+    from services.razorpay_service import razorpay_service
+
+    if not razorpay_service.is_route_enabled():
+        logger.info("Razorpay Route not enabled; skipping settlement_reconciler")
+        return
     if _reconciler is None:
         _reconciler = SettlementReconciler()
     await _reconciler.start()

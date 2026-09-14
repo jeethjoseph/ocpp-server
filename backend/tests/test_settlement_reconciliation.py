@@ -215,7 +215,7 @@ async def test_unsettled_statuses_do_not_advance(
     e = await _entry(test_franchisee, test_charger, test_user,
                      transfer_id=f"trf_{status}", status=SettlementStatusEnum.TRANSFER_PROCESSED)
     assert await FranchiseeSettlementService.settle_from_transfer(
-        _transfer(f"trf_{status}", settlement_status=status), settlement_processed=True
+        _transfer(f"trf_{status}", settlement_status=status)
     ) is False
     assert (await CommissionLedgerEntry.get(id=e.id)).settlement_status == SettlementStatusEnum.TRANSFER_PROCESSED
 
@@ -231,7 +231,7 @@ async def test_sweep_backfills_and_records_the_real_settlement_date(
     e = await _entry(test_franchisee, test_charger, test_user,
                      transfer_id="trf_june", status=SettlementStatusEnum.TRANSFER_PROCESSED,
                      processed_at=june)
-    with patch.object(rp_module.razorpay_service, "fetch_transfer_with_settlement",
+    with patch.object(rp_module.razorpay_service, "fetch_transfer",
                       AsyncMock(return_value=_transfer("trf_june", nested=NESTED_PROCESSED))):
         counts = await reconcile_processed_transfers(age_floor_days=None)
 
@@ -250,8 +250,8 @@ async def test_sweep_respects_the_age_floor(client, test_franchisee, test_charge
                  transfer_id="trf_fresh", status=SettlementStatusEnum.TRANSFER_PROCESSED,
                  processed_at=datetime.now(UTC))
     fetch = AsyncMock()
-    with patch.object(rp_module.razorpay_service, "fetch_transfer_with_settlement", fetch):
-        counts = await reconcile_processed_transfers()  # default 3-day floor
+    with patch.object(rp_module.razorpay_service, "fetch_transfer", fetch):
+        counts = await reconcile_processed_transfers()  # default 2-day floor
     assert counts["examined"] == 0
     fetch.assert_not_awaited()
 
@@ -268,12 +268,12 @@ async def test_sweep_leaves_pending_rows_and_survives_a_fetch_error(
                      transfer_id="trf_boom", status=SettlementStatusEnum.TRANSFER_PROCESSED,
                      processed_at=old)
 
-    async def fetch(transfer_id):
+    async def fetch(transfer_id, **_):
         if transfer_id == "trf_boom":
             raise Exception("HTTP 500")
         return _transfer(transfer_id, settlement_status="pending")
 
-    with patch.object(rp_module.razorpay_service, "fetch_transfer_with_settlement",
+    with patch.object(rp_module.razorpay_service, "fetch_transfer",
                       AsyncMock(side_effect=fetch)):
         counts = await reconcile_processed_transfers()
 
@@ -315,3 +315,114 @@ async def test_deferred_lookup_swallows_its_own_errors(client, monkeypatch):
     with patch.object(svc.FranchiseeSettlementService, "handle_settlement_webhook",
                       AsyncMock(side_effect=Exception("razorpay down"))):
         await svc.settlement_lookup_after_delay("settlement.processed", SETTLEMENT_EVENT)
+
+
+# ------------------------------------------------- review findings, pinned --
+
+@pytest.mark.asyncio
+async def test_transfer_processed_redelivery_does_not_regress_a_settled_row(
+    client, test_franchisee, test_charger, test_user
+):
+    """Finding 1. Razorpay redelivers transfer.processed on any timeout and
+    the router does not dedupe. Once a row is SETTLED, a late redelivery must
+    not walk it back — that reset transfer_processed_at, held it under the
+    sweep floor for two more days, and showed a paid payout as unpaid."""
+    settled_at = datetime(2026, 7, 22, tzinfo=UTC)
+    e = await _entry(test_franchisee, test_charger, test_user,
+                     transfer_id="trf_regress", status=SettlementStatusEnum.SETTLED,
+                     processed_at=datetime(2026, 7, 20, tzinfo=UTC))
+    await CommissionLedgerEntry.filter(id=e.id).update(settled_at=settled_at, transfer_fee=Decimal("0.11"))
+
+    await FranchiseeSettlementService.handle_transfer_webhook(
+        "transfer.processed", _transfer("trf_regress", settlement_status=None, fees=999)
+    )
+
+    e = await CommissionLedgerEntry.get(id=e.id)
+    assert e.settlement_status == SettlementStatusEnum.SETTLED
+    assert e.settled_at == settled_at
+    assert e.transfer_fee == Decimal("0.11")
+    assert e.transfer_processed_at == datetime(2026, 7, 20, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_webhook_path_stamps_the_settlement_date_not_now(
+    client, test_franchisee, test_charger, test_user
+):
+    """Finding 2. The list endpoint returns no nested settlement, but the
+    webhook IS the settlement: its created_at must become settled_at. A
+    redelivery 12 hours late must not freeze the wrong day."""
+    e = await _entry(test_franchisee, test_charger, test_user,
+                     transfer_id="trf_dated", status=SettlementStatusEnum.TRANSFER_PROCESSED)
+    with patch.object(rp_module.razorpay_service, "list_transfers_for_settlement",
+                      AsyncMock(return_value=[_transfer("trf_dated")])):
+        await FranchiseeSettlementService.handle_settlement_webhook("settlement.processed", SETTLEMENT_EVENT)
+
+    e = await CommissionLedgerEntry.get(id=e.id)
+    assert e.settlement_status == SettlementStatusEnum.SETTLED
+    assert e.settled_at == datetime.fromtimestamp(SETTLEMENT_EVENT["created_at"], tz=UTC)
+    assert (datetime.now(UTC) - e.settled_at) > timedelta(hours=1)
+
+
+@pytest.mark.asyncio
+async def test_webhook_path_refuses_a_failed_settlement(
+    client, test_franchisee, test_charger, test_user
+):
+    """The attached settlement carries the event's own status. A
+    settlement.processed whose entity says anything but processed advances
+    nothing — the shared predicate sees one input shape on both paths."""
+    e = await _entry(test_franchisee, test_charger, test_user,
+                     transfer_id="trf_evfailed", status=SettlementStatusEnum.TRANSFER_PROCESSED)
+    with patch.object(rp_module.razorpay_service, "list_transfers_for_settlement",
+                      AsyncMock(return_value=[_transfer("trf_evfailed")])):
+        await FranchiseeSettlementService.handle_settlement_webhook(
+            "settlement.processed", {**SETTLEMENT_EVENT, "status": "failed"}
+        )
+    assert (await CommissionLedgerEntry.get(id=e.id)).settlement_status == SettlementStatusEnum.TRANSFER_PROCESSED
+
+
+@pytest.mark.asyncio
+async def test_reconciler_start_is_gated_on_route(client):
+    """Finding 3. Same gate as stuck_payout_detector: a dev box restored from
+    a production dump must not poll api.razorpay.com every six hours."""
+    from services import settlement_reconciler as rec
+    rec._reconciler = None
+    with patch.object(rp_module.razorpay_service, "is_route_enabled", return_value=False):
+        await rec.start_settlement_reconciler()
+    assert rec._reconciler is None
+
+
+@pytest.mark.asyncio
+async def test_sweep_examines_newest_first_so_stuck_rows_cannot_starve_it(
+    client, test_franchisee, test_charger, test_user
+):
+    """Finding 4. With a budget of 1, the row examined must be the NEWEST
+    eligible one; a permanently-unsettleable old row must not sit at the head
+    of every pass and block it."""
+    old = datetime.now(UTC) - timedelta(days=30)
+    newer = datetime.now(UTC) - timedelta(days=5)
+    await _entry(test_franchisee, test_charger, test_user,
+                 transfer_id="trf_ancient", status=SettlementStatusEnum.TRANSFER_PROCESSED, processed_at=old)
+    fresh = await _entry(test_franchisee, test_charger, test_user,
+                         transfer_id="trf_recent", status=SettlementStatusEnum.TRANSFER_PROCESSED, processed_at=newer)
+    fetched = []
+
+    async def fetch(transfer_id, **_):
+        fetched.append(transfer_id)
+        return _transfer(transfer_id, nested=NESTED_PROCESSED)
+
+    with patch.object(rp_module.razorpay_service, "fetch_transfer", AsyncMock(side_effect=fetch)):
+        counts = await reconcile_processed_transfers(limit=1)
+
+    assert fetched == ["trf_recent"]
+    assert counts["examined"] == 1 and counts["settled"] == 1
+    assert (await CommissionLedgerEntry.get(id=fresh.id)).settlement_status == SettlementStatusEnum.SETTLED
+
+
+def test_settlement_tuning_is_ordered():
+    """Finding 10. The alarm must sit strictly past the sweep floor, or every
+    healthy row inside the floor pages the operator. Asserted at import in
+    policy.py; pinned here so the assertion cannot be quietly removed."""
+    from policy import SETTLEMENT_AGE_FLOOR_DAYS, STUCK_PROCESSED_DAYS
+    from services.settlement_reconciler import AGE_FLOOR_DAYS
+    from services.stuck_payout_detector import STUCK_PROCESSED_DAYS as detector_days
+    assert AGE_FLOOR_DAYS == SETTLEMENT_AGE_FLOOR_DAYS < STUCK_PROCESSED_DAYS == detector_days

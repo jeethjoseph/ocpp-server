@@ -771,12 +771,16 @@ async def handle_settlement_event(event_type: str, event_data: dict):
             name=f"settlement-lookup-{settlement_data.get('id')}",
         )
 
+        # "queued", not "processed": the lookup has not run yet. Its outcome
+        # is logged (and a failure reaches Sentry at ERROR) from the task
+        # itself; this row records only that the event was received and
+        # scheduled, which is all that is true at this point.
         await log_webhook_event(
             source=WebhookSourceEnum.RAZORPAY,
             event_type=event_type,
             event_id=settlement_data.get("id"),
             payload=event_data,
-            status="processed",
+            status="queued",
         )
     except Exception as e:
         logger.error("Error handling %s webhook: %s", event_type, e, exc_info=True)

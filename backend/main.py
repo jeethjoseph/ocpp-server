@@ -1935,8 +1935,9 @@ async def startup_event():
     from services.stuck_payout_detector import start_stuck_payout_detector
     await start_stuck_payout_detector()
 
-    # Start the settlement reconciler: daily poll of TRANSFER_PROCESSED rows
-    # against Razorpay, the backstop for the settlement.processed webhook.
+    # Start the settlement reconciler: six-hourly poll of TRANSFER_PROCESSED
+    # rows against Razorpay, the backstop for the settlement.processed webhook.
+    # No-op unless Route is enabled (mirrors the stuck-payout detector).
     from services.settlement_reconciler import start_settlement_reconciler
     await start_settlement_reconciler()
 

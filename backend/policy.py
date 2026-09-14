@@ -163,3 +163,41 @@ def charger_code_series(environment: str) -> str:
     return CHARGER_CODE_SERIES.get(
         (environment or "").strip().lower(), CHARGER_CODE_SERIES["staging"]
     )
+
+
+# --- Route settlement reconciliation: how a Settlement Entry reaches SETTLED ---
+#
+# Razorpay's settlement.processed webhook names a settlement but never lists
+# the transfers it paid; the link runs transfer -> settlement, so the CSMS
+# looks up GET /v1/transfers?recipient_settlement_id= on the webhook and polls
+# each TRANSFER_PROCESSED row on a sweep. These four numbers tune that
+# lifecycle and are kept side by side because they have an ORDERING that is
+# easy to break by editing one in isolation — the MAX_RESUME_GAP vs
+# DISCONNECT_SUSPEND drift ADR 0027 was written to stop.
+#
+# Observed settlement lag on this account is T+3 (processed 30 May, settled
+# 2 June 2026, confirmed by live API probe). The sweep floor sits just under
+# it; the stuck alarm sits well past it.
+
+# The settlement.processed lookup runs this long after the webhook is acked.
+# Insurance against read-after-write lag on Razorpay's index at the instant
+# the event fires, not a courtesy.
+SETTLEMENT_LOOKUP_DELAY_SECONDS = 60
+
+# The reconciliation sweep's cadence, and how old a TRANSFER_PROCESSED row must
+# be before it is worth a Razorpay call. Volume is a few dozen transfers a day
+# across both environments, so the cost is a handful of GETs per pass.
+SETTLEMENT_SWEEP_INTERVAL_SECONDS = 6 * 3600
+SETTLEMENT_AGE_FLOOR_DAYS = 2
+
+# A TRANSFER_PROCESSED row older than this is stuck (stuck_payout_detector).
+# Before this clause existed the state had no watchdog: 377 rows sat in it for
+# three months with no alert about them. The reconciler is the fix; the alarm
+# is what says the fix is still running.
+STUCK_PROCESSED_DAYS = 7
+
+# The alarm must fire strictly AFTER the sweep has had a real chance to settle
+# the row, or every healthy row inside the poll floor pages the operator.
+assert SETTLEMENT_AGE_FLOOR_DAYS < STUCK_PROCESSED_DAYS, (
+    "STUCK_PROCESSED_DAYS must exceed SETTLEMENT_AGE_FLOOR_DAYS"
+)

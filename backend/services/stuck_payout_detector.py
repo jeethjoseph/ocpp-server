@@ -9,6 +9,10 @@ Stuck criteria (mirrors ``routers/admin_settlements.py:_stuck_filter``):
 - ``FAILED`` or ``ON_HOLD`` with ``retry_count >= MAX_TRANSFER_RETRIES``
 - ``PENDING`` older than ``STUCK_PAYOUT_THRESHOLD_HOURS``
 - ``TRANSFER_INITIATED`` older than ``STUCK_PAYOUT_THRESHOLD_HOURS``
+- ``TRANSFER_PROCESSED`` older than ``policy.STUCK_PROCESSED_DAYS`` (a
+  fixed day-scale threshold, not the hour-scale one above: settlement
+  legitimately lags processing by the linked account's T+n schedule, so a
+  two-day-old PROCESSED row is normal and must not read as stuck)
   (Razorpay webhook never landed)
 
 Alerts are aggregated per franchisee — one Sentry message per
@@ -28,14 +32,13 @@ from utils import safe_create_task
 logger = logging.getLogger(__name__)
 
 
-# A TRANSFER_PROCESSED row older than this is stuck. Wider than the hourly
-# threshold the other states use because settlement legitimately lags
-# processing by the linked account's T+n schedule (observed T+3 here) and the
-# reconciler polls on a two-day floor; seven days is well past both. Before this
-# clause existed the state had no watchdog at all — 377 rows sat in it for three
-# months without one alert about them. The reconciler is the fix; this is the
-# alarm that the fix is still running.
-STUCK_PROCESSED_DAYS = 7
+# A TRANSFER_PROCESSED row older than STUCK_PROCESSED_DAYS is stuck. It is a
+# separate, wider threshold than older_than_hours because settlement
+# legitimately lags processing by the linked account's T+n schedule (observed
+# T+3) and the reconciler polls on a two-day floor. The value lives in
+# policy.py beside that floor so the ordering (floor < alarm) is asserted in
+# one place; it is bound here so tests can import it from this module.
+from policy import STUCK_PROCESSED_DAYS  # noqa: E402
 
 
 def build_stuck_filter(
@@ -205,6 +208,10 @@ class StuckPayoutDetector:
                 "statuses": sorted(statuses),
                 "entry_ids": sorted(entry_ids)[:50],
                 "threshold_hours": self.threshold_hours,
+                # TRANSFER_PROCESSED rows are selected by this day-scale
+                # threshold, not threshold_hours; name it so the responder
+                # reaches for the right knob.
+                "processed_threshold_days": STUCK_PROCESSED_DAYS,
             },
         )
         logger.warning(
