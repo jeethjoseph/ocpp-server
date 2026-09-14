@@ -272,3 +272,44 @@ async def test_loop_survives_sweep_exception(
 
     # The loop swallowed the exception (didn't propagate) so the test reaches here.
     assert call_count["n"] >= 1
+
+
+async def test_filter_catches_processed_never_settled(
+    client, test_franchisee, test_charger, test_user
+):
+    """TRANSFER_PROCESSED older than STUCK_PROCESSED_DAYS is stuck.
+
+    This state had no clause at all before 2026-09-14, which is how 377 rows
+    sat in it for three months with no alert about them: the settlement
+    webhook handler was reading a field Razorpay never sends, and nothing
+    watched the state rows were left in. The reconciler is the fix; this
+    clause is the alarm that the fix is still running. The threshold is wider
+    than the hourly one because settlement legitimately lags processing by
+    the linked account's T+n schedule (observed T+3)."""
+    from services.stuck_payout_detector import STUCK_PROCESSED_DAYS
+
+    stuck = await _make_ledger(
+        test_franchisee, test_charger, test_user,
+        settlement_status=SettlementStatusEnum.TRANSFER_PROCESSED,
+        transfer_processed_at=datetime.now(timezone.utc) - timedelta(days=STUCK_PROCESSED_DAYS + 1),
+    )
+    recent = await _make_ledger(
+        test_franchisee, test_charger, test_user,
+        settlement_status=SettlementStatusEnum.TRANSFER_PROCESSED,
+        transfer_processed_at=datetime.now(timezone.utc) - timedelta(days=STUCK_PROCESSED_DAYS - 1),
+    )
+    # Settled rows are never stuck, however old.
+    settled = await _make_ledger(
+        test_franchisee, test_charger, test_user,
+        settlement_status=SettlementStatusEnum.SETTLED,
+        transfer_processed_at=datetime.now(timezone.utc) - timedelta(days=60),
+    )
+
+    matched_ids = {
+        e.id for e in await CommissionLedgerEntry.filter(
+            build_stuck_filter(older_than_hours=24, max_transfer_retries=3)
+        ).all()
+    }
+    assert stuck.id in matched_ids
+    assert recent.id not in matched_ids
+    assert settled.id not in matched_ids

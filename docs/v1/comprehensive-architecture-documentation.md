@@ -2848,6 +2848,28 @@ Implementation notes:
      `build_stuck_filter` Tortoise predicate is shared with the admin
      list endpoint `GET /api/admin/settlements/stuck` — single source
      of truth for "what's stuck."
+   - **Settlement reconciler** (`services/settlement_reconciler.py`,
+     2026-09-14). Six-hourly poll of `TRANSFER_PROCESSED` rows older than
+     `AGE_FLOOR_DAYS = 2` (observed settlement lag is T+3) via
+     `razorpay_service.fetch_transfer_with_settlement()`
+     (`?expand[]=recipient_settlement`), advancing each through the
+     single shared predicate
+     `FranchiseeSettlementService.settle_from_transfer()` — the same
+     one the `settlement.processed` webhook path uses. **Why it
+     exists:** `settlement.processed` carries only the settlement's
+     own `{id, amount, status, fees, tax, utr, created_at}` and never
+     lists the transfers it paid; the link runs transfer → settlement.
+     The old handler read a nonexistent `transfers` array, so from
+     June to September 2026 no row ever reached `SETTLED` (377 rows,
+     ₹18,130). The webhook now does the documented lookup
+     (`GET /v1/transfers?recipient_settlement_id=`; **an empty result
+     is a platform-own settlement and a quiet no-op**), and the
+     reconciler is the backstop for dropped events. Backfill =
+     `reconcile_processed_transfers(age_floor_days=None)`. Same
+     start/stop/_loop shape as the detector; wired beside it in
+     `main.py`. Fee capture (`transfer_fee_rupees`, `fees + tax`
+     paise) moved to `transfer.processed`, where the Transfer entity
+     already carries it.
      For entries the retry sweep cannot resolve on its own, admins
      have two terminal-resolution endpoints, both behind
      `require_admin()` and both audit-logged:

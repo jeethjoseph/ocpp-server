@@ -759,9 +759,16 @@ async def handle_settlement_event(event_type: str, event_data: dict):
             logger.warning("No settlement entity in %s webhook", event_type)
             return
 
-        from services.franchisee_settlement_service import FranchiseeSettlementService
-        await FranchiseeSettlementService.handle_settlement_webhook(
-            event_type, settlement_data
+        # Ack first, look up later. The handler calls Razorpay's API to learn
+        # which transfers this settlement paid; doing that inline kept Razorpay
+        # waiting on our 200 and turned any slow patch on their side into a
+        # redelivery loop. The record is logged as received; the lookup is a
+        # background task with its own delay and its own error handling.
+        from services.franchisee_settlement_service import settlement_lookup_after_delay
+        from utils import safe_create_task
+        safe_create_task(
+            settlement_lookup_after_delay(event_type, settlement_data),
+            name=f"settlement-lookup-{settlement_data.get('id')}",
         )
 
         await log_webhook_event(

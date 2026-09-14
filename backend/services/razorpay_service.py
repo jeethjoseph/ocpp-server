@@ -1289,6 +1289,84 @@ class RazorpayService:
             logger.error("Failed to fetch transfer %s: %s", transfer_id, e)
             raise
 
+    async def fetch_transfer_with_settlement(self, transfer_id: str) -> Dict:
+        """Fetch a transfer with its linked-account settlement expanded.
+
+        ``?expand[]=recipient_settlement`` is the documented way to learn that
+        a Route transfer has settled to the linked account: the response gains a
+        nested ``recipient_settlement`` object ({id, status, utr, fees, tax,
+        created_at}), null while unsettled. Without the expand the transfer
+        carries only ``settlement_status`` and ``recipient_settlement_id`` —
+        enough to see *that* it settled, not whether that settlement then
+        failed, which is why the reconciliation sweep uses this variant.
+        """
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    f"https://api.razorpay.com/v1/transfers/{transfer_id}",
+                    params={"expand[]": "recipient_settlement"},
+                    auth=(self.api_key, self.api_secret),
+                )
+            if resp.is_error:
+                raise Exception(self._error_description(resp))
+            return resp.json()
+        except httpx.HTTPError as e:
+            logger.error("Failed to fetch transfer %s with settlement: %s", transfer_id, e)
+            raise
+
+    async def list_transfers_for_settlement(self, settlement_id: str) -> list:
+        """Every Route transfer covered by one linked-account settlement.
+
+        ``GET /v1/transfers?recipient_settlement_id=`` — Razorpay defines that
+        parameter as "a unique identifier of a settlement obtained from the
+        settlement.processed webhook payload", which makes this the documented
+        second half of that webhook: the event carries only the settlement's
+        own id/amount/fees/utr, and this call answers which transfers it paid.
+
+        Returns an empty list — not an error — for a settlement that covered no
+        transfers. The platform receives its OWN bank settlements under the same
+        event name, and those legitimately map to nothing.
+        """
+        if not self.is_configured():
+            raise Exception("Razorpay not configured")
+        items: list = []
+        skip = 0
+        page = 100
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                while True:
+                    resp = await client.get(
+                        "https://api.razorpay.com/v1/transfers",
+                        params={
+                            "recipient_settlement_id": settlement_id,
+                            "count": page,
+                            "skip": skip,
+                        },
+                        auth=(self.api_key, self.api_secret),
+                    )
+                    if resp.is_error:
+                        raise Exception(self._error_description(resp))
+                    batch = resp.json().get("items") or []
+                    items.extend(batch)
+                    if len(batch) < page:
+                        return items
+                    skip += page
+        except httpx.HTTPError as e:
+            logger.error(
+                "Failed to list transfers for settlement %s: %s", settlement_id, e
+            )
+            raise
+
+    @staticmethod
+    def _error_description(resp) -> str:
+        try:
+            description = resp.json().get("error", {}).get("description") or ""
+        except Exception:
+            description = ""
+        return description or f"HTTP {resp.status_code}"
+
     async def reverse_transfer(
         self, transfer_id: str, amount_paise: Optional[int] = None
     ) -> Dict:

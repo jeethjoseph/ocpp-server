@@ -28,8 +28,19 @@ from utils import safe_create_task
 logger = logging.getLogger(__name__)
 
 
+# A TRANSFER_PROCESSED row older than this is stuck. Wider than the hourly
+# threshold the other states use because settlement legitimately lags
+# processing by the linked account's T+n schedule (observed T+3 here) and the
+# reconciler polls on a two-day floor; seven days is well past both. Before this
+# clause existed the state had no watchdog at all — 377 rows sat in it for three
+# months without one alert about them. The reconciler is the fix; this is the
+# alarm that the fix is still running.
+STUCK_PROCESSED_DAYS = 7
+
+
 def build_stuck_filter(
-    older_than_hours: int, max_transfer_retries: int
+    older_than_hours: int, max_transfer_retries: int,
+    processed_older_than_days: int = STUCK_PROCESSED_DAYS,
 ) -> Q:
     """Tortoise filter for commission_ledger_entry rows that look stuck.
 
@@ -41,12 +52,21 @@ def build_stuck_filter(
       (terminal-but-not-acknowledged), or
     - ``PENDING`` older than ``older_than_hours``, or
     - ``TRANSFER_INITIATED`` older than ``older_than_hours``
-      (Razorpay webhook never landed).
+      (Razorpay webhook never landed), or
+    - ``TRANSFER_PROCESSED`` older than ``processed_older_than_days``
+      (transfer accepted but never reconciled as settled — the reconciler
+      has stopped, or Razorpay never settled it).
     """
     from models import SettlementStatusEnum
 
     cutoff = datetime.now(timezone.utc) - timedelta(hours=older_than_hours)
+    processed_cutoff = datetime.now(timezone.utc) - timedelta(days=processed_older_than_days)
     return (
+        Q(
+            settlement_status=SettlementStatusEnum.TRANSFER_PROCESSED,
+            transfer_processed_at__lt=processed_cutoff,
+        )
+        | (
         Q(
             settlement_status__in=[
                 SettlementStatusEnum.FAILED,
@@ -61,6 +81,7 @@ def build_stuck_filter(
         | Q(
             settlement_status=SettlementStatusEnum.TRANSFER_INITIATED,
             transfer_initiated_at__lt=cutoff,
+        )
         )
     )
 

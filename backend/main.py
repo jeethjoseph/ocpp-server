@@ -1935,6 +1935,11 @@ async def startup_event():
     from services.stuck_payout_detector import start_stuck_payout_detector
     await start_stuck_payout_detector()
 
+    # Start the settlement reconciler: daily poll of TRANSFER_PROCESSED rows
+    # against Razorpay, the backstop for the settlement.processed webhook.
+    from services.settlement_reconciler import start_settlement_reconciler
+    await start_settlement_reconciler()
+
     logger.info("Database initialized with Tortoise ORM")
     logger.info("Redis connection established")
     logger.info("Periodic cleanup task started")
@@ -1999,6 +2004,9 @@ async def shutdown_event():
     # Stop stuck-payout detector
     from services.stuck_payout_detector import stop_stuck_payout_detector
     await stop_stuck_payout_detector()
+
+    from services.settlement_reconciler import stop_settlement_reconciler
+    await stop_settlement_reconciler()
 
     await close_db()
     await redis_manager.disconnect()
