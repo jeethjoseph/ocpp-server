@@ -27,9 +27,14 @@ the placeholder contact also short-circuited the phone-first user lookup
 and merged distinct payers into one UPI_GUEST user. Undoing that touches
 session ownership and is a separate, explicitly-approved step.
 
-Usage:
+Usage (dev):
     docker exec ocpp-backend python scripts/backfill_razorpay_placeholder_identity.py           # dry-run
     docker exec ocpp-backend python scripts/backfill_razorpay_placeholder_identity.py --apply   # commit
+
+Usage (staging / prod): `docker exec` runs as root there, but the deps are a
+`pip install --user` under /home/app, so point Python at them explicitly:
+    docker exec -e PYTHONPATH=/home/app/.local/lib/python3.11/site-packages \
+        ocpp-backend-prod python scripts/backfill_razorpay_placeholder_identity.py [--apply]
 """
 
 import argparse
