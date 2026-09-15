@@ -396,3 +396,65 @@ async def test_active_franchisee_allowed(
     await test_franchisee.save()
     resp = await client_franchisee.get("/api/franchisee/dashboard")
     assert resp.status_code == 200
+
+
+# --- remote stop honours the charger's verdict --------------------------------
+# A refused stop leaves the session live and billing; reporting it as sent is
+# the worst instance of the answered-vs-accepted conflation. See CONTEXT.md ->
+# Remote commands.
+
+@pytest.mark.asyncio
+@patch("main.send_ocpp_request")
+async def test_franchisee_refused_stop_is_409_not_success(
+    mock_send, client_franchisee, franchisee_a_charger, test_user
+):
+    from core.connection_manager import CommandOutcome
+    from ocpp.v16 import call_result
+    from models import Transaction, VehicleProfile
+
+    vehicle = await VehicleProfile.create(user=test_user)
+    await Transaction.create(
+        user_id=test_user.id,
+        charger_id=franchisee_a_charger.id,
+        vehicle_id=vehicle.id,
+        transaction_status="RUNNING",
+    )
+    mock_send.return_value = CommandOutcome(
+        True, call_result.RemoteStopTransaction(status="Rejected")
+    )
+
+    resp = await client_franchisee.post(
+        f"/api/franchisee/chargers/{franchisee_a_charger.id}/remote-stop"
+    )
+
+    assert resp.status_code == 409
+    detail = resp.json()["detail"].lower()
+    assert "declined" in detail
+    assert "still running" in detail
+
+
+@pytest.mark.asyncio
+@patch("main.send_ocpp_request")
+async def test_franchisee_unanswered_stop_is_504_not_500(
+    mock_send, client_franchisee, franchisee_a_charger, test_user
+):
+    """Was a 500, which reported an offline charger as a server fault and sent
+    expected operational noise to Sentry."""
+    from core.connection_manager import CommandOutcome
+    from models import Transaction, VehicleProfile
+
+    vehicle = await VehicleProfile.create(user=test_user)
+    await Transaction.create(
+        user_id=test_user.id,
+        charger_id=franchisee_a_charger.id,
+        vehicle_id=vehicle.id,
+        transaction_status="RUNNING",
+    )
+    mock_send.return_value = CommandOutcome(False, "OCPP timeout: RemoteStopTransaction")
+
+    resp = await client_franchisee.post(
+        f"/api/franchisee/chargers/{franchisee_a_charger.id}/remote-stop"
+    )
+
+    assert resp.status_code == 504
+    assert "did not respond" in resp.json()["detail"].lower()

@@ -5,7 +5,9 @@ from decimal import Decimal
 
 from auth_middleware import require_admin, require_user_or_admin, require_user
 from core.config import wallet_charging_enabled
-from models import User, Transaction, WalletTransaction, Wallet, UserRoleEnum, TransactionStatusEnum
+from core.roles import INTERNAL_ROLES
+from services import charger_code_service
+from models import User, Transaction, WalletTransaction, Wallet, UserRoleEnum, TransactionStatusEnum, ChargerPurposeEnum
 from schemas import BaseModel
 import logging
 
@@ -88,7 +90,12 @@ async def get_active_session(
     """Get current user's active charging session(s), if any.
 
     Lightweight endpoint for HomeScreen polling. Returns only active
-    sessions (RUNNING, STARTED, PENDING_START) with minimal fields.
+    sessions (RUNNING, STARTED, PENDING_START, SUSPENDED) with minimal fields.
+
+    SUSPENDED is deliberately included: a session held through a charger
+    disconnect (up to 12h on latching connectors, ADR 0027) is still the
+    customer's live, paid session — hiding it while the public QR endpoint
+    shows it as PAUSED contradicts the customer's reality.
 
     Note: This route must appear before dynamic '/{user_id}' routes to avoid
     path-matching conflicts that could incorrectly enforce ADMIN access.
@@ -100,6 +107,7 @@ async def get_active_session(
                 TransactionStatusEnum.RUNNING.value,
                 TransactionStatusEnum.STARTED.value,
                 TransactionStatusEnum.PENDING_START.value,
+                TransactionStatusEnum.SUSPENDED.value,
             ]
         ).prefetch_related('charger__station').order_by('-created_at')
 
@@ -107,9 +115,13 @@ async def get_active_session(
         for t in active_transactions:
             sessions.append({
                 "id": t.id,
-                "charger_name": t.charger.name or f"Charger {t.charger.id}",
+                # The Asset Code, not `name` — which is nullable and non-unique,
+                # so the old fallback could render "Charger 3" for four different
+                # units. ADR 0028.
+                "charger_name": t.charger.asset_code,
                 "station_name": t.charger.station.name if t.charger.station else "Unknown Station",
-                "charger_id": t.charger.charge_point_string_id,
+                # Asset Code, not the OCPP UUID. ADR 0028.
+                "charger_id": t.charger.asset_code,
                 "status": t.transaction_status.value,
                 "start_time": t.start_time.isoformat() if t.start_time else None,
                 "energy_consumed_kwh": t.energy_consumed_kwh,
@@ -162,8 +174,12 @@ async def get_my_sessions(
                 "id": ct.id,
                 "type": "charging",
                 "station_name": ct.charger.station.name if ct.charger.station else "Unknown Station",
-                "charger_name": ct.charger.name or f"Charger {ct.charger.id}",
-                "charger_id": ct.charger.charge_point_string_id,
+                # The Asset Code replaces both halves of what was here: a
+                # `name` that is nullable and non-unique (so "Charger 3" could
+                # name four different units) and the charge_point_string_id
+                # UUID, which is the OCPP auth username. ADR 0028.
+                "charger_name": ct.charger.asset_code,
+                "charger_id": ct.charger.asset_code,
                 "energy_consumed_kwh": ct.energy_consumed_kwh,
                 "start_time": ct.start_time.isoformat() if ct.start_time else None,
                 "end_time": ct.end_time.isoformat() if ct.end_time else None,
@@ -597,7 +613,9 @@ async def get_user_transaction_details(
             "charger": {
                 "id": charger.id,
                 "name": charger.name,
-                "charge_point_string_id": charger.charge_point_string_id
+                # Asset Code is what the customer sees; the OCPP UUID is
+                # deliberately not returned on a customer surface. ADR 0028.
+                "asset_code": charger.asset_code
             },
             "meter_values": [
                 {
@@ -707,7 +725,12 @@ async def get_charger_by_string_id(
 
     try:
         # Look up charger by charge_point_string_id
-        charger = await Charger.filter(charge_point_string_id=charge_point_id).prefetch_related('station__franchisee', 'connectors').first()
+        # Accepts an Asset Code OR a charge_point_string_id, so the QR landing
+        # page can be addressed by the code while every link printed or
+        # bookmarked before the change keeps resolving. ADR 0028.
+        charger = await charger_code_service.resolve_charger(charge_point_id)
+        if charger is not None:
+            await charger.fetch_related('station__franchisee', 'connectors')
 
         if not charger:
             raise HTTPException(status_code=404, detail="Charger not found")
@@ -746,7 +769,10 @@ async def get_charger_by_string_id(
         return {
             "charger": {
                 "id": charger.id,
+                # Retained for routing (the QR sticker URL embeds it), but
+                # the page renders `asset_code`. ADR 0028.
                 "charge_point_string_id": charger.charge_point_string_id,
+                "asset_code": charger.asset_code,
                 "station_id": charger.station_id,
                 "name": charger.name,
                 "model": charger.model,
@@ -819,10 +845,18 @@ async def remote_start_by_string_id(
 
     try:
         # Look up charger by charge_point_string_id
-        charger = await Charger.filter(charge_point_string_id=charge_point_id).first()
+        charger = await charger_code_service.resolve_charger(charge_point_id)
 
         if not charger:
             raise HTTPException(status_code=404, detail="Charger not found")
+
+        # Refuse a bench unit BEFORE any money moves. StartTransaction blocks
+        # it too, but by then a QR customer has already paid and would need a
+        # refund for a session that was never going to start. ADR 0028.
+        if charger.purpose == ChargerPurposeEnum.TEST and current_user.role not in INTERNAL_ROLES:
+            raise HTTPException(
+                status_code=403, detail="This charger is not available for public use"
+            )
 
         # Use the user's RFID card ID as idTag for OCPP identification
         if not current_user.rfid_card_id:
@@ -844,7 +878,7 @@ async def remote_start_by_string_id(
 
         # Send OCPP RemoteStartTransaction command
         from main import send_ocpp_request
-        success, response = await send_ocpp_request(
+        outcome = await send_ocpp_request(
             charger.charge_point_string_id,
             "RemoteStartTransaction",
             {
@@ -853,13 +887,35 @@ async def remote_start_by_string_id(
             }
         )
 
-        if not success:
-            raise HTTPException(status_code=500, detail=f"Remote start failed: {response}")
+        # The charger answered and declined. Not a 5xx — the system worked and
+        # the answer was no.
+        if outcome.is_refused:
+            logger.warning(
+                f"Charger refused start for {charger.charge_point_string_id} "
+                f"(status={outcome.status})"
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Charger declined the start command. It may be busy or the "
+                    "connector unavailable — please try again."
+                ),
+            )
+
+        # Was a 500, which reported an offline charger as a server fault and
+        # disagreed with the admin endpoint's 504 for the identical condition.
+        if outcome.is_unanswered:
+            raise HTTPException(
+                status_code=504,
+                detail="Charger did not respond in time. It may be offline — please try again.",
+            )
 
         return {
-            "message": "Remote start command sent successfully",
-            "charger_id": charger.charge_point_string_id,
-            "response": response
+            "message": "Remote start accepted by charger",
+            # Asset Code: this is a customer-facing endpoint and the OCPP
+            # identity is the Basic Auth username. ADR 0028.
+            "charger_id": charger.asset_code,
+            "response": outcome.response
         }
 
     except HTTPException:
@@ -881,7 +937,7 @@ async def remote_stop_by_string_id(
 
     try:
         # Look up charger by charge_point_string_id
-        charger = await Charger.filter(charge_point_string_id=charge_point_id).first()
+        charger = await charger_code_service.resolve_charger(charge_point_id)
 
         if not charger:
             raise HTTPException(status_code=404, detail="Charger not found")
@@ -907,21 +963,46 @@ async def remote_stop_by_string_id(
         # Send OCPP RemoteStopTransaction command
         from main import send_ocpp_request
         logger.info(f"User {current_user.email} requesting remote stop for charger {charger.charge_point_string_id}, transaction {transaction.id}")
-        success, response = await send_ocpp_request(
+        outcome = await send_ocpp_request(
             charger.charge_point_string_id,
             "RemoteStopTransaction",
             {"transaction_id": transaction.id}
         )
 
-        if not success:
-            logger.error(f"Remote stop failed for {charger.charge_point_string_id}: {response}")
-            raise HTTPException(status_code=409, detail=f"{response}")
+        # The charger answered and declined. The session is still live and still
+        # billing, so this must not read as success. Not a 5xx — a refusal is the
+        # system working correctly and the answer being no.
+        if outcome.is_refused:
+            logger.warning(
+                f"Charger refused stop for {charger.charge_point_string_id} "
+                f"transaction {transaction.id} (status={outcome.status})"
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Charger declined the stop command. Your session is still "
+                    "running — please try again."
+                ),
+            )
+
+        if outcome.is_unanswered:
+            logger.warning(
+                f"Remote stop unanswered for {charger.charge_point_string_id}: {outcome.response}"
+            )
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    "Charger did not respond, so your session may still be "
+                    "running. Please try again."
+                ),
+            )
 
         return {
-            "message": "Remote stop command sent successfully",
-            "charger_id": charger.charge_point_string_id,
+            "message": "Remote stop accepted by charger",
+            # Asset Code — customer-facing. ADR 0028.
+            "charger_id": charger.asset_code,
             "transaction_id": transaction.id,
-            "response": response
+            "response": outcome.response
         }
 
     except HTTPException:

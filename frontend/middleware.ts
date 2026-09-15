@@ -1,6 +1,6 @@
 import { clerkMiddleware, createRouteMatcher } from '@clerk/nextjs/server'
 import { clerkClient } from '@clerk/nextjs/server'
-import { NextResponse } from 'next/server'
+import { NextResponse, type NextRequest } from 'next/server'
 
 const isProtectedRoute = createRouteMatcher([
   '/',
@@ -39,7 +39,7 @@ async function assignDefaultRole(userId: string) {
   }
 }
 
-function handleRoleBasedRouting(req: any, role: string) {
+function handleRoleBasedRouting(req: NextRequest, role: string) {
   const { pathname } = req.nextUrl;
 
   // Admin routes - only admins can access

@@ -1,6 +1,6 @@
 # Live energy consumed during active session
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 
@@ -31,3 +31,11 @@ As part of this work, add a "Live energy consumed" entry to `CONTEXT.md` clarify
 ## Blocked by
 
 None — can start immediately.
+
+## Comments
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo: `frontend/app/admin/chargers/[id]/page.tsx:136` reads `live_energy_kwh`, rendered at :773
+
+Method and caveats: `.scratch/tracker-reconciliation/REPORT.md`.

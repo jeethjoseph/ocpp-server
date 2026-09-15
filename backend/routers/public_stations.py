@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 from datetime import datetime
 from enum import Enum
 
-from models import ChargingStation, Charger, Connector, Tariff, ChargerStatusEnum, User
+from models import ChargingStation, Charger, Connector, Tariff, ChargerStatusEnum, User, ChargerPurposeEnum
 from tortoise.functions import Count, Sum
 from tortoise.query_utils import Prefetch
 from auth_middleware import require_user
@@ -56,7 +56,12 @@ class ChargerConnectorInfo(BaseModel):
     max_power_kw: Optional[float]
 
 class StationChargerInfo(BaseModel):
-    charge_point_string_id: str
+    # The OCPP identity is deliberately ABSENT. It is the HTTP Basic Auth
+    # username for the live diagnostics-upload endpoint, so publishing it in an
+    # unauthenticated payload enumerated usernames for anyone who asked. The
+    # landing page now resolves an Asset Code, so nothing customer-facing needs
+    # the UUID any more. See ADR 0028.
+    asset_code: str
     name: str
     latest_status: str
     connectors: List[ChargerConnectorInfo]
@@ -110,7 +115,21 @@ async def _fetch_stations_with_availability(
 
     qs = station_filter if station_filter is not None else ChargingStation.all()
     stations = await qs.prefetch_related(
-        Prefetch('chargers', queryset=Charger.all().prefetch_related('connectors', 'tariffs'))
+        # SERVICEABILITY filter: bench units are not part of the customer-facing
+        # fleet, so they are neither listed nor counted toward a station's
+        # capacity. Five production units were inflating total_chargers here.
+        #
+        # Deliberately NOT folded into `_filter_real_chargers` below, which is a
+        # LIVENESS predicate (connected + recent heartbeat). The two are
+        # orthogonal: a bench unit that is online and heartbeating is perfectly
+        # live and still must not be advertised, while a fleet unit that is
+        # offline is not live and must still be counted. Two questions, two
+        # filters. See ADR 0028.
+        Prefetch(
+            'chargers',
+            queryset=Charger.exclude(purpose=ChargerPurposeEnum.TEST)
+            .prefetch_related('connectors', 'tariffs'),
+        )
     ).select_related('franchisee')
 
     connected_charger_ids = set(await redis_manager.get_all_connected_chargers())
@@ -256,7 +275,7 @@ def _build_charger_info(real_chargers, global_tariff) -> List[StationChargerInfo
         else:
             tariff_excl = tariff_gst_incl = tariff_gst = None
         result.append(StationChargerInfo(
-            charge_point_string_id=charger.charge_point_string_id,
+            asset_code=charger.asset_code,
             name=charger.name or f"Charger {charger.id}",
             latest_status=charger.latest_status.value,
             connectors=connectors,

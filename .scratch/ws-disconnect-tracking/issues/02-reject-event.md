@@ -1,4 +1,4 @@
-Status: ready-for-agent
+Status: done
 
 # OCPPWebSocketRejected event for connect-time rejects
 
@@ -43,3 +43,11 @@ Emit before the `websocket.close(...)` call so the event is recorded even if the
 ## Blocked by
 
 None — can be implemented in parallel with Issue 01. (Both touch `monitoring_service.py` so expect a merge conflict on that file if both PRs are open at the same time; resolution is mechanical.)
+
+## Comments
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo: `backend/routers/ocpp_ws.py:51,76` call `record_websocket_rejected` (wired; no rejects have occurred yet)
+
+Method and caveats: `.scratch/tracker-reconciliation/REPORT.md`.

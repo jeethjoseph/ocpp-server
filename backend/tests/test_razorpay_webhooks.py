@@ -127,17 +127,29 @@ async def test_settlement_webhook_idempotent_on_replay(
     test_commission_ledger_entry.transfer_fee = Decimal("0.50")
     await test_commission_ledger_entry.save()
 
-    # Razorpay replays with a different fee/tax. Replay must NOT win.
+    # The real payload shape: the settlement's own fields only. It never
+    # carried a `transfers` array — the earlier fixture here encoded the bug
+    # this handler had for three months. The transfers come from the
+    # documented lookup, which the replay returns with a DIFFERENT fee.
+    # Replay must NOT win.
+    from unittest.mock import AsyncMock, patch
     replay_payload = {
-        "id": "setl_replay_001",
-        "transfers": [
-            {"id": "trf_settled_001", "fees": 999, "tax": 0},
-        ],
+        "id": "setl_replay_001", "entity": "settlement", "amount": 1880,
+        "status": "processed", "fees": 0, "tax": 0,
+        "utr": "AXISCN1463261184", "created_at": 1789025679,
     }
-    await FranchiseeSettlementService.handle_settlement_webhook(
-        event_type="settlement.processed",
-        settlement_data=replay_payload,
-    )
+    replayed_lookup = AsyncMock(return_value=[
+        {"id": "trf_settled_001", "settlement_status": "settled",
+         "recipient_settlement_id": "setl_replay_001", "fees": 999, "tax": 0},
+    ])
+    with patch(
+        "services.razorpay_service.razorpay_service.list_transfers_for_settlement",
+        replayed_lookup,
+    ):
+        await FranchiseeSettlementService.handle_settlement_webhook(
+            event_type="settlement.processed",
+            settlement_data=replay_payload,
+        )
 
     refreshed = await CommissionLedgerEntry.get(id=test_commission_ledger_entry.id)
     assert refreshed.settlement_status == SettlementStatusEnum.SETTLED
@@ -159,14 +171,26 @@ async def test_settlement_webhook_first_time_applies(
     test_commission_ledger_entry.transfer_fee = Decimal("0.00")
     await test_commission_ledger_entry.save()
 
+    # Real eight-key payload; the transfer and its fee come from the lookup.
+    from unittest.mock import AsyncMock, patch
     payload = {
-        "id": "setl_first_002",
-        "transfers": [{"id": "trf_first_002", "fees": 47, "tax": 8}],
+        "id": "setl_first_002", "entity": "settlement", "amount": 1880,
+        "status": "processed", "fees": 0, "tax": 0,
+        "utr": "AXISCN1463261184", "created_at": 1789025679,
     }
-    await FranchiseeSettlementService.handle_settlement_webhook(
-        event_type="settlement.processed",
-        settlement_data=payload,
-    )
+    lookup = AsyncMock(return_value=[
+        {"id": "trf_first_002", "settlement_status": "settled",
+         "recipient_settlement_id": "setl_first_002", "fees": 47, "tax": 8},
+    ])
+    with patch(
+        "services.razorpay_service.razorpay_service.list_transfers_for_settlement",
+        lookup,
+    ):
+        await FranchiseeSettlementService.handle_settlement_webhook(
+            event_type="settlement.processed",
+            settlement_data=payload,
+        )
+    lookup.assert_awaited_once_with("setl_first_002")
 
     refreshed = await CommissionLedgerEntry.get(id=test_commission_ledger_entry.id)
     assert refreshed.settlement_status == SettlementStatusEnum.SETTLED

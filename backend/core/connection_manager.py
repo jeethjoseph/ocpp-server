@@ -11,7 +11,8 @@ import logging
 import os
 import weakref
 from datetime import timedelta
-from typing import Dict, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
@@ -68,6 +69,70 @@ def _ocpp_message_type(parsed) -> str:
     if message_type_id == 4:
         return "CallError"
     return "OCPP"
+
+
+# A charger commits to act with either of these. `Scheduled` is
+# ChangeAvailability-only and means "I will act when the current session ends" —
+# a commitment, not a refusal, and the one caller that sees it already treats the
+# two identically. See CONTEXT.md → Remote commands.
+_ACCEPTING_STATUSES = frozenset({"accepted", "scheduled"})
+
+
+@dataclass(frozen=True)
+class CommandOutcome:
+    """What a **remote command** produced. See CONTEXT.md → Remote commands.
+
+    `answered` means the charger *replied*. It does **not** mean the charger
+    agreed — that conflation is why six call sites reported a refused command as
+    success. Ask `is_accepted` / `is_refused` / `is_unanswered` instead.
+
+    **Deliberately not a NamedTuple.** It was one during the migration so the
+    historical ``success, response = ...`` kept working while call sites moved
+    over one command at a time. Every caller now reads the verdict, so the tuple
+    shape is gone: unpacking this raises, which is the point. A plain boolean is
+    what made "the charger answered" and "the charger agreed" look alike, and
+    nothing should be able to reintroduce it by accident.
+    """
+
+    answered: bool
+    response: Any
+
+    @property
+    def status(self) -> Optional[str]:
+        """Raw OCPP status, for callers that surface it verbatim. None if the
+        charger never answered, or if the payload carries no status at all."""
+        if not self.answered:
+            return None
+        raw = getattr(self.response, "status", None)
+        if raw is None:
+            return None
+        # StrEnum on 3.12, but read .value defensively — the library falls back
+        # to a (str, Enum) shim on older interpreters, where str() is "Class.member".
+        return str(getattr(raw, "value", raw))
+
+    @property
+    def is_accepted(self) -> bool:
+        if not self.answered:
+            return False
+        raw = self.status
+        if raw is None:
+            # Some confs carry no status: OCPP 1.6 `UpdateFirmware.conf` is an
+            # empty payload. There is nothing to refuse with, so an answer is an
+            # acceptance. Reading the absence as a refusal would silently break
+            # firmware updates.
+            return True
+        return raw.strip().lower() in _ACCEPTING_STATUSES
+
+    @property
+    def is_refused(self) -> bool:
+        """The charger answered and declined. Deliberately not "rejected" —
+        that word already means this server refusing a charger's connection."""
+        return self.answered and not self.is_accepted
+
+    @property
+    def is_unanswered(self) -> bool:
+        """No reply within the timeout, or the command was never delivered."""
+        return not self.answered
 
 
 class ConnectionManager:
@@ -324,37 +389,39 @@ class ConnectionManager:
 
     # --- OCPP request dispatch ---
 
-    async def send_ocpp_request(self, charge_point_id: str, action: str, payload: Dict = None):
+    async def send_ocpp_request(
+        self, charge_point_id: str, action: str, payload: Dict = None
+    ) -> CommandOutcome:
         """Send an OCPP request from central system to a connected charge point."""
         is_connected = await redis_manager.is_charger_connected(charge_point_id)
         if not is_connected:
             logger.warning(f"Charge point {charge_point_id} not connected (not in Redis)")
-            return False, f"Charge point {charge_point_id} not connected"
+            return CommandOutcome(False, f"Charge point {charge_point_id} not connected")
 
         connection_data = self.connected_charge_points.get(charge_point_id)
         if not connection_data:
             logger.warning(f"ChargePoint instance for {charge_point_id} not found in memory but found in Redis (stale entry after server restart)")
             logger.warning(f"Connected chargers in memory: {list(self.connected_charge_points.keys())}")
             await redis_manager.remove_connected_charger(charge_point_id)
-            return False, "Charger connection lost. Please wait for charger to reconnect (usually within 60 seconds)"
+            return CommandOutcome(False, "Charger connection lost. Please wait for charger to reconnect (usually within 60 seconds)")
 
         cp = connection_data.get("cp")
         websocket = connection_data.get("websocket")
 
         if not cp or not websocket:
             logger.warning(f"Invalid connection data for {charge_point_id}")
-            return False, f"Invalid connection data for {charge_point_id}"
+            return CommandOutcome(False, f"Invalid connection data for {charge_point_id}")
 
         try:
             if not self.is_ws_connected(websocket):
                 state_name = getattr(websocket.client_state, "name", str(getattr(websocket, "client_state", "unknown")))
                 logger.warning(f"WebSocket not connected for {charge_point_id} (state={state_name})")
                 await self.force_disconnect(charge_point_id, f"WebSocket not connected (state={state_name})")
-                return False, "Connection lost"
+                return CommandOutcome(False, "Connection lost")
         except Exception as e:
             logger.warning(f"WebSocket validation failed for {charge_point_id}: {e}")
             await self.force_disconnect(charge_point_id, f"WebSocket validation failed: {e}")
-            return False, "Connection lost"
+            return CommandOutcome(False, "Connection lost")
 
         try:
             if action == "RemoteStartTransaction":
@@ -371,17 +438,17 @@ class ConnectionManager:
                 req = call.DataTransfer(**(payload or {}))
             else:
                 logger.warning(f"Action {action} not implemented in send_ocpp_request")
-                return False, f"Action {action} not implemented"
+                return CommandOutcome(False, f"Action {action} not implemented")
 
             response = await asyncio.wait_for(cp.call(req), timeout=30)
             logger.info(f"Sent {action} request to {charge_point_id}")
-            return True, response
+            return CommandOutcome(True, response)
         except asyncio.TimeoutError:
             logger.warning(f"OCPP timeout (30s) sending {action} to {charge_point_id}")
-            return False, f"OCPP timeout: {action}"
+            return CommandOutcome(False, f"OCPP timeout: {action}")
         except Exception as e:
             logger.error(f"Error sending request to {charge_point_id}: {e}", exc_info=True)
-            return False, str(e)
+            return CommandOutcome(False, str(e))
 
 
 # ============ WebSocket Adapters ============

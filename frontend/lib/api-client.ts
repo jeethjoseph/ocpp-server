@@ -16,6 +16,28 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * The server's own `detail` message from a FastAPI error, when there is one.
+ *
+ * Endpoints increasingly say something the UI cannot infer from a status code —
+ * "the session is still running" after a charger refuses a stop, for instance.
+ * Hard-coded per-status toast copy would flatly contradict that. Returns null
+ * when there is no usable detail so callers keep their own fallback wording.
+ */
+export function serverDetail(err: unknown): string | null {
+  if (!(err instanceof ApiError)) return null;
+  const body = err.message.match(/\{[\s\S]*\}\s*$/);
+  if (!body) return null;
+  try {
+    const parsed = JSON.parse(body[0]);
+    return typeof parsed?.detail === "string" && parsed.detail.trim()
+      ? parsed.detail
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 async function apiRequest<T>(
   endpoint: string,
   options: RequestInit = {}

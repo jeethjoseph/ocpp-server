@@ -227,17 +227,33 @@ class WalletSessionService:
     async def _send_remote_stop(transaction, transaction_id: int):
         """Send RemoteStopTransaction as a background task (avoids MeterValues deadlock)."""
         try:
-            success, result = await connection_manager.send_ocpp_request(
+            outcome = await connection_manager.send_ocpp_request(
                 transaction.charger.charge_point_string_id,
                 "RemoteStopTransaction",
                 {"transaction_id": transaction_id},
             )
-            if success:
-                logger.info(f"Auto-stop sent for wallet session txn {transaction_id}")
+            # The verdict does not change control flow here, deliberately.
+            # This is flag-less, at-least-once dispatch: energy is monotonic, so
+            # a refused or lost stop self-heals on the next MeterValues tick,
+            # and duplicate RemoteStops are idempotent at the charger. What the
+            # verdict does change is the log — a refusal used to read as "sent",
+            # which is exactly the line someone greps when a session would not
+            # stop.
+            if outcome.is_accepted:
+                logger.info(f"Auto-stop accepted for wallet session txn {transaction_id}")
                 MetricsCollector.increment_counter("Custom/Wallet/SessionAutoStopDispatched")
+            elif outcome.is_refused:
+                # Counted as failed: the budget cap did not take effect, and a
+                # wallet session running past its cap is the case that ends in a
+                # negative derived balance.
+                logger.warning(
+                    f"Charger refused wallet auto-stop for txn {transaction_id} "
+                    f"(status={outcome.status}); retrying on the next tick"
+                )
+                MetricsCollector.increment_counter("Custom/Wallet/SessionAutoStopFailed")
             else:
                 logger.error(
-                    f"Failed to auto-stop wallet session txn {transaction_id}: {result}"
+                    f"Wallet auto-stop unanswered for txn {transaction_id}: {outcome.response}"
                 )
                 MetricsCollector.increment_counter("Custom/Wallet/SessionAutoStopFailed")
         except Exception as e:

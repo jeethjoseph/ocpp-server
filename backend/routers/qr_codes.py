@@ -59,7 +59,11 @@ async def _create_qr_for_charger(charger: Charger) -> dict:
     scoped to the franchisee's linked account."""
     franchisee = await _resolve_qr_franchisee(charger)
     business_name = franchisee.business_name if franchisee else None
-    charger_name = charger.name or charger.charge_point_string_id
+    # The Asset Code, never the UUID. This previously fell back to
+    # charge_point_string_id whenever `name` was null, which put a raw UUID in
+    # the Razorpay payee/description line a customer sees at payment. Every
+    # charger now has a code, so there is nothing to fall back to. ADR 0028.
+    charger_name = charger.asset_code
 
     result = await razorpay_service.create_qr_code(
         payee_name=build_qr_payee_name(business_name, charger_name),

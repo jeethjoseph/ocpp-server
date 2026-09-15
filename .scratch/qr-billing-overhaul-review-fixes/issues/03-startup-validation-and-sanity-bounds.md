@@ -1,6 +1,6 @@
 # Startup validation tests + sanity bounds for RAZORPAY_PLATFORM_FEE_PERCENT
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 
@@ -33,3 +33,11 @@ The 5 / 10 thresholds are best-guesses based on real-world payment-gateway fee r
 ## Blocked by
 
 None — can start immediately. Cleanest implementation depends on Slice 1 (so the validation can live next to the constant), but the work can proceed in either order.
+
+## Comments
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo.
+
+Method, evidence and caveats: `.scratch/tracker-reconciliation/REPORT.md`.

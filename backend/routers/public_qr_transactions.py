@@ -148,7 +148,8 @@ async def get_transactions_by_vpa(
             "razorpay_refund_speed_processed": p.razorpay_refund_speed_processed,
             "refund_processed_at": p.refund_processed_at.isoformat() if p.refund_processed_at else None,
             "refund_failure_reason": p.refund_failure_reason,
-            "charger_name": charger.name if charger else None,
+            # Asset Code, not `name`. ADR 0028.
+            "charger_name": charger.asset_code if charger else None,
             "station_name": station.name if station else None,
             "franchisee_name": franchisee.business_name if franchisee else None,
             "duration_minutes": duration_minutes,

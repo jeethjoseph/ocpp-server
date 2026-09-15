@@ -1,7 +1,7 @@
 "use client";
 
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -64,12 +64,17 @@ export default function UserChargePage() {
   const meterValues = meterValuesData?.meter_values || [];
   const latestMeterValue = meterValues[meterValues.length - 1];
 
-  useEffect(() => {
+  // Derived during render with the previous-value pattern rather than an
+  // effect, so both values are correct in the same commit.
+  const [prevTransactionId, setPrevTransactionId] =
+    useState(currentTransactionId);
+  if (prevTransactionId !== currentTransactionId) {
+    setPrevTransactionId(currentTransactionId);
     if (currentTransactionId) {
       setLastTransactionId(currentTransactionId);
     }
     setHasActiveTransaction(!!currentTransactionId);
-  }, [currentTransactionId]);
+  }
 
   // Clear transaction handler (like admin page)
   const clearTransaction = () => {
@@ -518,9 +523,9 @@ export default function UserChargePage() {
           <CardContent className="space-y-4">
             <div className="space-y-3">
               <div className="flex justify-between items-center">
-                <span className="font-medium text-card-foreground">ID:</span>
+                <span className="font-medium text-card-foreground">Charger:</span>
                 <span className="text-sm font-mono text-muted-foreground bg-muted px-2 py-1 rounded">
-                  {charger.charge_point_string_id}
+                  {charger.asset_code}
                 </span>
               </div>
               

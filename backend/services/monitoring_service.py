@@ -213,6 +213,33 @@ class MetricsCollector:
         MetricsCollector.record_metric(name, value, tags)
 
 
+def ignore_current_transaction() -> None:
+    """Drop the in-flight request from New Relic APM.
+
+    For endpoints whose only information content is "the process is up". The
+    container liveness probe calls the health endpoint every ~15s per
+    environment, and New Relic records each call as a full web transaction —
+    the handler, five framework middleware spans, and the Postgres and Redis
+    round-trips the check genuinely performs. That made it the single largest
+    transaction on the account, ahead of real charging traffic, and the main
+    driver of both tracing and metrics ingest.
+
+    This suppresses the *telemetry* only. The endpoint still runs its real
+    dependency checks and still returns its real status, so container
+    healthchecks and any external monitor are unaffected, and a genuine
+    failure still reaches the logs and Sentry.
+
+    No-op when the agent is disabled, so it is safe to call unconditionally.
+    """
+    if not _newrelic_enabled:
+        return
+    try:
+        import newrelic.agent
+        newrelic.agent.ignore_transaction(flag=True)
+    except Exception as e:  # never let instrumentation break the endpoint
+        logger.debug(f"Failed to ignore transaction: {e}")
+
+
 # ==================== INSTRUMENTATION DECORATORS ====================
 
 def trace_transaction(name: Optional[str] = None, group: str = "Python/OCPP"):

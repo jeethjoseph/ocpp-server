@@ -1,6 +1,6 @@
 # Rename tariff columns + back-calc base rate (foundation)
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 
@@ -23,3 +23,11 @@ The one-time transition effect (existing tariffs' effective customer total ticks
 ## Blocked by
 
 - None - can start immediately
+
+## Comments
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo: all-in tariff columns present via `backend/migrations/models/38_*`
+
+Method and caveats: `.scratch/tracker-reconciliation/REPORT.md`.

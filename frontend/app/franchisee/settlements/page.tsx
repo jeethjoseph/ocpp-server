@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { FranchiseeOnly } from "@/components/RoleWrapper";
 import { usePortalSettlements } from "@/lib/queries/franchisee-portal";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -111,9 +111,14 @@ function SettlementsContent() {
   const limit = 20;
 
   // Any filter change resets to the first page so the view stays coherent.
-  useEffect(() => {
+  // Adjusted while rendering rather than in an effect: React supports setting
+  // state during render to derive from changed inputs, and it lands in the
+  // same commit instead of causing a second one.
+  const [prevRange, setPrevRange] = useState({ fromDate, toDate });
+  if (prevRange.fromDate !== fromDate || prevRange.toDate !== toDate) {
+    setPrevRange({ fromDate, toDate });
     setCurrentPage(1);
-  }, [fromDate, toDate]);
+  }
 
   const { data, isLoading, error } = usePortalSettlements({
     page: currentPage,

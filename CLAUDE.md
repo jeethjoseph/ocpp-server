@@ -10,10 +10,17 @@
 - When you are done with making changes, update these documents - Users/raalshasan/makaratech/idofthings/ocpp-server/docs/v1/llm-context-document.md, /Users/raalshasan/makaratech/idofthings/ocpp-server/docs/v1/comprehensive-architecture-documentation.md
 
 ## Build verification (before declaring done)
-- **Frontend**: after any `frontend/` edit, run `cd frontend && npm run build` locally. `next lint` and `tsc --noEmit` are NOT sufficient — the production build enforces `@typescript-eslint/no-unused-vars`, `react/no-unescaped-entities`, and other rules the scoped lint misses.
+- **Frontend**: after any `frontend/` edit, run **both** `cd frontend && npm run build` **and** `npm run lint` locally.
+  Since the Next.js 16 upgrade (2026-08-28) the build **no longer runs ESLint** and the `next lint` command is gone, so a green
+  build will happily ship unused imports, `react/no-unescaped-entities`, `@typescript-eslint/no-explicit-any` and the rest.
+  `npm run lint` — now plain `eslint .` against the flat config in `eslint.config.mjs` — is the *only* thing enforcing those
+  rules; `tsc --noEmit` never checked them. The bar is **0 errors**; ~7 pre-existing warnings are expected and fine.
+  Do not reintroduce the `FlatCompat` shim in `eslint.config.mjs` — it throws against `eslint-config-next` 16.
 - **Backend**: run `docker exec ocpp-backend pytest` for the affected test files. Known pre-existing flake: 6 tests in `tests/test_integration.py` + `tests/test_post_boot_state.py` ERROR with `column "gst_rate_percent" does not exist` — a sync TestClient × Tortoise cross-loop schema-generation issue, **not** a regression. Verifiable by `git stash` then re-running the same tests. Treat these as the baseline for the full-suite run.
 - **Docker build parity**: when changes touch the build (new imports, new deps, config), run `docker compose build frontend` / `docker compose build backend` locally to catch image-level failures before they hit staging.
-- Never declare a change "done" based only on `tsc` output or partial lint runs — staging/prod rebuilds enforce the full ruleset.
+- Never declare a change "done" based only on `tsc` output or partial lint runs. **The old safety net is gone**: staging/prod
+  rebuilds run `next build`, which since Next 16 does *not* lint — so a lint error no longer fails the deploy loudly, it ships
+  silently. Local `npm run lint` is now the last line of defence, not a convenience.
 
 ## Logs
 

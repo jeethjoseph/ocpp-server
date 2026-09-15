@@ -16,15 +16,34 @@ from models import Transaction, TransactionStatusEnum
 from crud import log_audit_event
 from utils import safe_create_task
 from services.monitoring_service import OCPPMetrics
+from policy import (
+    SUSPEND_WINDOW_LATCHED_SECONDS,
+    SUSPEND_WINDOW_UNLATCHED_SECONDS,
+    STALE_SUSPENDED_BUFFER_SECONDS,
+)
 
 logger = logging.getLogger("ocpp-server")
 
-DISCONNECT_SUSPEND_TIMEOUT = int(
-    os.environ.get("DISCONNECT_SUSPEND_TIMEOUT_SECONDS", "180")
-)
-SUSPEND_TIMEOUT = int(
-    os.environ.get("SUSPEND_TIMEOUT_SECONDS", "300")
-)
+
+async def suspend_window_seconds_for_charge_point(charge_point_id: str) -> int:
+    """Suspend window for a charger, keyed by its connector's latching trait.
+
+    Latching connectors (Type2/CCS/...) hold the cable locked in the car, so
+    the session can safely wait 12h for a reconnect; unlatched sockets get the
+    short window. Values and rationale live in policy.py.
+    """
+    from services.charger_type_service import is_latching_charger
+    if await is_latching_charger(charge_point_id):
+        return SUSPEND_WINDOW_LATCHED_SECONDS
+    return SUSPEND_WINDOW_UNLATCHED_SECONDS
+
+
+async def suspend_window_seconds_for_transaction(transaction: Transaction) -> int:
+    """Suspend window for a SUSPENDED transaction row (via its charger)."""
+    from services.charger_type_service import is_latching_charger_by_charger_id
+    if await is_latching_charger_by_charger_id(transaction.charger_id):
+        return SUSPEND_WINDOW_LATCHED_SECONDS
+    return SUSPEND_WINDOW_UNLATCHED_SECONDS
 
 # Pathological-flap detection: count consecutive disconnects WITHOUT energy
 # progress between them. The counter is zeroed by zero_energy_watchdog when
@@ -55,9 +74,11 @@ async def suspend_transactions_on_disconnect(charge_point_id: str) -> None:
             return
 
         now = datetime.now(timezone.utc)
+        window_seconds = await suspend_window_seconds_for_charge_point(charge_point_id)
         logger.warning(
             f"⏸️ Charger {charge_point_id} disconnected — suspending "
-            f"{len(active_transactions)} active transaction(s)"
+            f"{len(active_transactions)} active transaction(s) "
+            f"(window={window_seconds}s)"
         )
 
         for transaction in active_transactions:
@@ -89,7 +110,7 @@ async def suspend_transactions_on_disconnect(charge_point_id: str) -> None:
 
             safe_create_task(
                 _disconnect_suspend_timeout(
-                    transaction.id, now, DISCONNECT_SUSPEND_TIMEOUT
+                    transaction.id, now, window_seconds
                 )
             )
 
@@ -141,34 +162,47 @@ async def _disconnect_suspend_timeout(
         )
 
 
-def stale_suspended_cutoff_seconds() -> int:
-    """Longest legitimate suspend window + buffer.
+def min_stale_suspended_cutoff_seconds() -> int:
+    """Shortest possible stale cutoff — used only to pre-filter sweep candidates."""
+    return SUSPEND_WINDOW_UNLATCHED_SECONDS + STALE_SUSPENDED_BUFFER_SECONDS
 
-    A SUSPENDED row doesn't record whether it was suspended by a disconnect
-    (DISCONNECT_SUSPEND_TIMEOUT window) or a reboot (SUSPEND_TIMEOUT window), so
-    a backstop sweep must wait the longer of the two before treating a row as
-    orphaned — otherwise it pre-empts the in-flight primary timer and kills live
-    sessions inside their reconnect grace window.
+
+async def stale_suspended_cutoff_seconds_for(transaction: Transaction) -> int:
+    """Per-transaction staleness cutoff: the transaction's own suspend window
+    plus a buffer.
+
+    Derived, never configured independently, so the backstop sweep and the
+    resume-staleness guard fire strictly AFTER the primary timer for that
+    transaction's connector type — the ADR 0022 invariant, preserved per-row
+    now that the primary window is per-connector-type.
     """
-    return max(DISCONNECT_SUSPEND_TIMEOUT, SUSPEND_TIMEOUT) + 60
+    window = await suspend_window_seconds_for_transaction(transaction)
+    return window + STALE_SUSPENDED_BUFFER_SECONDS
 
 
 async def finalize_stale_suspended_transactions(stop_reason: str) -> int:
-    """Find SUSPENDED transactions past the longest legitimate suspend window
+    """Find SUSPENDED transactions past their own suspend window (+ buffer)
     and finalize them via the canonical finalizer.
 
     Single source of truth for the stale-suspended backstop, shared by the
     startup sweep and the recurring billing-retry sweep so their cutoff and
-    finalize path can never drift apart. Returns the number swept.
+    finalize path can never drift apart. Candidates are pre-filtered with the
+    shortest cutoff, then each row is checked against its own per-type cutoff.
+    Returns the number swept.
     """
-    cutoff = datetime.now(timezone.utc) - timedelta(
-        seconds=stale_suspended_cutoff_seconds()
-    )
+    now = datetime.now(timezone.utc)
+    candidate_cutoff = now - timedelta(seconds=min_stale_suspended_cutoff_seconds())
 
-    stale_transactions = await Transaction.filter(
+    candidates = await Transaction.filter(
         transaction_status=TransactionStatusEnum.SUSPENDED,
-        suspended_at__lt=cutoff,
+        suspended_at__lt=candidate_cutoff,
     ).all()
+
+    stale_transactions = []
+    for transaction in candidates:
+        cutoff_seconds = await stale_suspended_cutoff_seconds_for(transaction)
+        if transaction.suspended_at < now - timedelta(seconds=cutoff_seconds):
+            stale_transactions.append(transaction)
 
     if not stale_transactions:
         return 0

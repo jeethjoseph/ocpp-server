@@ -1,6 +1,6 @@
 # Frontend: all-in tariff field swap, "(all-inclusive)" label, admin form preview
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 
@@ -55,3 +55,11 @@ See [ADR 0003](../../../docs/adr/0003-all-inclusive-tariff-with-operator-absorpt
 ## Blocked by
 
 Issue 04 (the API must expose `tariff_per_kwh_all_in`).
+
+## Comments
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo.
+
+Method, evidence and caveats: `.scratch/tracker-reconciliation/REPORT.md`.

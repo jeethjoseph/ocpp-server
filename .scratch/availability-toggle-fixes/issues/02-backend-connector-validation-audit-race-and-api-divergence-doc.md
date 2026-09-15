@@ -1,6 +1,6 @@
 # Backend availability-toggle: connector_id hardening, audit snapshot race, admin/franchisee divergence doc
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 
@@ -44,3 +44,11 @@ Backend endpoints follow the same split. **Decision (from grilling Q3):** keep t
 ## Blocked by
 
 None — can start immediately. Issue 03 depends on this landing so the new tests assert against the new behavior.
+
+## Comments
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo: `connector_id` handling in `backend/routers/chargers.py`
+
+Method and caveats: `.scratch/tracker-reconciliation/REPORT.md`.

@@ -1,0 +1,23 @@
+asset_code,purpose,env,station_id,station,charger_id,current_name,charge_point_string_id,latest_status,note
+VOW0001,PUBLIC,prod,6,IDofThings,25,VOW0001,7536bc02-dff1-469c-bc51-20ca44a462a7,Available,seeded from stencil
+VOW0002,PUBLIC,prod,6,IDofThings,26,VOW0002,d2bd7faa-22ad-495d-9cd3-ada154ee316f,Available,seeded from stencil
+VOW0003,PUBLIC,prod,7,Seleno Stones,28,VOW0003,21fa9af6-4ec8-47ed-8961-b757b3035c7a,Available,seeded from stencil
+VOW0006,PUBLIC,prod,8,SARADHY TOWERS,31,VOW0006,ba1e2d83-d22c-4654-a877-3e82238e12bd,Available,seeded from stencil
+VOW0007,PUBLIC,prod,8,SARADHY TOWERS,32,VOW0007,b226ca5e-d5cf-4404-9f4f-25d228493ee2,Available,seeded from stencil
+VOW0008,PUBLIC,prod,9,SK EV Charging Station,34,VOW0008,f2f6a6a5-69e7-47e1-9611-72df4964e29d,Available,seeded from stencil
+VOW0009,PUBLIC,prod,9,SK EV Charging Station,35,VOW0009,a9bebd86-90e2-4bba-bf3d-64619bf23a9f,Available,seeded from stencil
+VOW0010,PUBLIC,prod,9,SK EV Charging Station,38,VOW0010,14b21333-73d3-4c79-9322-7563efcf591f,Available,seeded from stencil
+VOW0011,TEST,prod,6,IDofThings,27,V3C_Test,a623d346-98b6-45b3-9546-ec024ebf54cc,Available,allocated after seed
+VOW0012,TEST,prod,6,IDofThings,29,V7C_Test,a0ce4b7d-16fd-4929-ba71-576067f99ab0,Available,allocated after seed
+VOW0013,TEST,prod,6,IDofThings,30,Chargemode_1,f0e18fee-8a92-4f54-8558-616b1683ec0a,Unavailable,allocated after seed
+VOW0014,TEST,prod,6,IDofThings,36,Staging_VOW0002,01873711-1b3e-402f-b6f4-c0bec8a04fa4,Unavailable,allocated after seed
+VOW0015,TEST,prod,6,IDofThings,37,Staging_VOW0004,9ad4c552-a901-49fe-8f61-00a6904bb1f2,Unavailable,allocated after seed
+VOWS0001,PUBLIC,staging,1,IDT_Staging,4,VOW0001 ,ffeadb01-78bc-4b6e-b5cd-1ff657cbedbc,Available,seeded from stencil
+VOWS0002,PUBLIC,staging,1,IDT_Staging,5,VOW0002,8964a6e8-cb46-48b0-ae86-cdbc67d5a634,Available,seeded from stencil
+VOWS0004,PUBLIC,staging,1,IDT_Staging,9,VOW0004,23a9345c-29bf-4169-b92f-55f7139568a0,Available,seeded from stencil
+VOWS0005,PUBLIC,staging,1,IDT_Staging,10,VOW0005,6a8394f8-dc2d-4cbb-8336-7d174ae6ccd3,Available,seeded from stencil
+VOWS0006,TEST,staging,1,IDT_Staging,1,V3C_Test,ed2bd339-c8cc-44ef-8e8a-710ab61141a5,Available,allocated after seed
+VOWS0007,TEST,staging,1,IDT_Staging,2,V7C_Test,e69ca119-2a05-4db7-9159-da4950ee4103,Available,allocated after seed
+VOWS0008,TEST,staging,1,IDT_Staging,3,V3C_Test1,8fc4b8a2-3637-498b-b469-d08e36cee38d,Available,allocated after seed
+VOWS0009,TEST,staging,1,IDT_Staging,6,V7C_Test2,f92c399a-82a3-4d70-95b7-397fe584dbe4,Preparing,allocated after seed
+VOWS0010,TEST,staging,1,IDT_Staging,7,Chargemode_1,e5d994b1-4385-4ac9-ad06-5f00fe1955f2,Unavailable,allocated after seed

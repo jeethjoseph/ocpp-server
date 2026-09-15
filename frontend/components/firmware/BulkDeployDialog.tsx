@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useMemo, useState } from "react";
 import {
   Dialog,
   DialogContent,
@@ -49,7 +49,12 @@ export function BulkDeployDialog({ firmware, open, onOpenChange }: BulkDeployDia
   const targetVersion = firmware?.version ?? "";
 
   // Reset to a clean pick step whenever the dialog (re)opens for a firmware.
-  useEffect(() => {
+  // Keyed on open+firmware and adjusted during render so the reset is visible
+  // in the first committed frame rather than one commit late.
+  const openKey = open ? String(firmware?.id ?? "") : null;
+  const [prevOpenKey, setPrevOpenKey] = useState(openKey);
+  if (prevOpenKey !== openKey) {
+    setPrevOpenKey(openKey);
     if (open) {
       setStep("pick");
       setStationFilter("all");
@@ -57,7 +62,7 @@ export function BulkDeployDialog({ firmware, open, onOpenChange }: BulkDeployDia
       setSelected(new Set());
       setResult(null);
     }
-  }, [open, firmware?.id]);
+  }
 
   const stationName = (id: number) => stations.find((s) => s.id === id)?.name ?? `Station #${id}`;
 

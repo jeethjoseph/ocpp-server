@@ -21,3 +21,10 @@ A global switch that ends the migration window by rejecting even null-hash charg
 ## Blocked by
 
 - 02 — Per-charger enforcement + legacy-mode burn-down logging
+
+## Comments
+
+**2026-09-01 — checked by tracker audit; CONFIRMED STILL OPEN.** The audit's first pass
+grouped this with likely-complete work; hand-verification disagreed. `REQUIRE_CHARGER_AUTH` appears nowhere — not in `backend/`, not in any of the three compose files. The global flag this issue exists to add has not been built.
+
+Method: `.scratch/tracker-reconciliation/REPORT.md`.

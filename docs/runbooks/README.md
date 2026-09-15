@@ -28,6 +28,7 @@ Every runbook follows the same H2 structure so engineers learn one shape:
 | [stale-suspended-transactions.md](./stale-suspended-transactions.md) | `OCPPStaleSuspendedSwept` event with `count > 0` at startup | OCPP / Stale Suspended Sweep |
 | [disconnect-stop-spike.md](./disconnect-stop-spike.md) | `count(*) FROM OCPPDisconnectStopped > 5` in 10 minutes | OCPP / Disconnect Stop Spike |
 | [zero-energy-stop-spike.md](./zero-energy-stop-spike.md) | `count(*) FROM OCPPZeroEnergyStopped > 3` in 10 minutes | OCPP / Zero Energy Stop Spike |
+| [log-retention-timeout.md](./log-retention-timeout.md) | `Error cleaning up OCPP logs` in backend logs | none — P4, documented so the log line is not misread |
 
 ## New Relic alert configuration
 

@@ -35,7 +35,10 @@ const STATUS_COLORS: Record<string, string> = {
   ON_HOLD: "bg-orange-100 text-orange-800",
 };
 
-const STATUS_OPTIONS = ["", "PENDING", "TRANSFER_INITIATED", "FAILED", "ON_HOLD"];
+// TRANSFER_PROCESSED is selected by the backend's fixed day-scale threshold
+// (policy.STUCK_PROCESSED_DAYS), not by the hours control above — a two-day-old
+// processed row is normal settlement lag, not stuck.
+const STATUS_OPTIONS = ["", "PENDING", "TRANSFER_INITIATED", "TRANSFER_PROCESSED", "FAILED", "ON_HOLD"];
 
 export default function AdminStuckSettlementsPage() {
   const [page, setPage] = useState(1);

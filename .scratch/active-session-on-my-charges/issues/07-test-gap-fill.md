@@ -1,6 +1,6 @@
 # Test gap fill: cache-miss fallback and rate limit on active-sessions endpoint
 
-Status: ready-for-agent
+Status: done
 
 ## Parent
 
@@ -23,3 +23,11 @@ Close two missing test coverage areas on `/api/public/qr-active-sessions`.
 
 - `.scratch/active-session-on-my-charges/issues/04-endpoint-hardening-error-isolation-metrics.md` (changes the error-handling contract these tests interact with)
 - `.scratch/active-session-on-my-charges/issues/06-api-contract-cleanup.md` (response field rename affects assertions)
+
+## Comments
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo: `backend/tests/` covers the active-sessions cache-miss and rate-limit paths
+
+Method and caveats: `.scratch/tracker-reconciliation/REPORT.md`.

@@ -38,13 +38,15 @@ export default function ChargerCombobox({ value, onChange }: ChargerComboboxProp
   // human label so the button keeps showing the name, not a bare id, after a
   // reload or an unrelated search.
   const [cachedLabel, setCachedLabel] = useState<string | undefined>(undefined);
-  useEffect(() => {
+  const [prevSelection, setPrevSelection] = useState({ value, selected });
+  if (prevSelection.value !== value || prevSelection.selected !== selected) {
+    setPrevSelection({ value, selected });
     if (!value) {
       setCachedLabel(undefined);
     } else if (selected) {
       setCachedLabel(selected.name || selected.charge_point_string_id);
     }
-  }, [value, selected]);
+  }
 
   // Close the dropdown when clicking outside.
   useEffect(() => {

@@ -1,6 +1,6 @@
 # Endpoint hardening: per-session error isolation + metrics
 
-Status: ready-for-agent
+Status: done
 
 ## Parent
 
@@ -28,3 +28,11 @@ Make `/api/public/qr-active-sessions` resilient to per-row failures and observab
 ## Blocked by
 
 None — can start immediately.
+
+## Comments
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo: `backend/routers/public_qr_active_sessions.py`
+
+Method and caveats: `.scratch/tracker-reconciliation/REPORT.md`.

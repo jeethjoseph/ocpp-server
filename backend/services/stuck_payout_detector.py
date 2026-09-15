@@ -9,6 +9,10 @@ Stuck criteria (mirrors ``routers/admin_settlements.py:_stuck_filter``):
 - ``FAILED`` or ``ON_HOLD`` with ``retry_count >= MAX_TRANSFER_RETRIES``
 - ``PENDING`` older than ``STUCK_PAYOUT_THRESHOLD_HOURS``
 - ``TRANSFER_INITIATED`` older than ``STUCK_PAYOUT_THRESHOLD_HOURS``
+- ``TRANSFER_PROCESSED`` older than ``policy.STUCK_PROCESSED_DAYS`` (a
+  fixed day-scale threshold, not the hour-scale one above: settlement
+  legitimately lags processing by the linked account's T+n schedule, so a
+  two-day-old PROCESSED row is normal and must not read as stuck)
   (Razorpay webhook never landed)
 
 Alerts are aggregated per franchisee — one Sentry message per
@@ -28,8 +32,18 @@ from utils import safe_create_task
 logger = logging.getLogger(__name__)
 
 
+# A TRANSFER_PROCESSED row older than STUCK_PROCESSED_DAYS is stuck. It is a
+# separate, wider threshold than older_than_hours because settlement
+# legitimately lags processing by the linked account's T+n schedule (observed
+# T+3) and the reconciler polls on a two-day floor. The value lives in
+# policy.py beside that floor so the ordering (floor < alarm) is asserted in
+# one place; it is bound here so tests can import it from this module.
+from policy import STUCK_PROCESSED_DAYS  # noqa: E402
+
+
 def build_stuck_filter(
-    older_than_hours: int, max_transfer_retries: int
+    older_than_hours: int, max_transfer_retries: int,
+    processed_older_than_days: int = STUCK_PROCESSED_DAYS,
 ) -> Q:
     """Tortoise filter for commission_ledger_entry rows that look stuck.
 
@@ -41,12 +55,21 @@ def build_stuck_filter(
       (terminal-but-not-acknowledged), or
     - ``PENDING`` older than ``older_than_hours``, or
     - ``TRANSFER_INITIATED`` older than ``older_than_hours``
-      (Razorpay webhook never landed).
+      (Razorpay webhook never landed), or
+    - ``TRANSFER_PROCESSED`` older than ``processed_older_than_days``
+      (transfer accepted but never reconciled as settled — the reconciler
+      has stopped, or Razorpay never settled it).
     """
     from models import SettlementStatusEnum
 
     cutoff = datetime.now(timezone.utc) - timedelta(hours=older_than_hours)
+    processed_cutoff = datetime.now(timezone.utc) - timedelta(days=processed_older_than_days)
     return (
+        Q(
+            settlement_status=SettlementStatusEnum.TRANSFER_PROCESSED,
+            transfer_processed_at__lt=processed_cutoff,
+        )
+        | (
         Q(
             settlement_status__in=[
                 SettlementStatusEnum.FAILED,
@@ -61,6 +84,7 @@ def build_stuck_filter(
         | Q(
             settlement_status=SettlementStatusEnum.TRANSFER_INITIATED,
             transfer_initiated_at__lt=cutoff,
+        )
         )
     )
 
@@ -184,6 +208,10 @@ class StuckPayoutDetector:
                 "statuses": sorted(statuses),
                 "entry_ids": sorted(entry_ids)[:50],
                 "threshold_hours": self.threshold_hours,
+                # TRANSFER_PROCESSED rows are selected by this day-scale
+                # threshold, not threshold_hours; name it so the responder
+                # reaches for the right knob.
+                "processed_threshold_days": STUCK_PROCESSED_DAYS,
             },
         )
         logger.warning(

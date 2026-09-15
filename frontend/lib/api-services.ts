@@ -111,9 +111,10 @@ export const chargerService = {
 
   getById: (id: number) => api.get<ChargerDetail>(`/api/admin/chargers/${id}`),
 
-  // User-facing endpoint that accepts string IDs (charge_point_string_id)
-  getByStringId: (chargePointId: string) =>
-    api.get<ChargerDetail>(`/api/users/charger/${chargePointId}`),
+  // User-facing lookup. Accepts an Asset Code (VOW0001) or, for links that
+  // predate it, a charge_point_string_id. See ADR 0028.
+  getByStringId: (chargerRef: string) =>
+    api.get<ChargerDetail>(`/api/users/charger/${chargerRef}`),
 
   create: (data: ChargerCreate) =>
     api.post<ApiResponse<{ charger: Charger; ocpp_url: string }>>(
@@ -231,7 +232,13 @@ export const transactionService = {
 
 // Public stations service for user-facing pages
 export interface PublicStationChargerInfo {
-  charge_point_string_id: string;
+  /**
+   * The Asset Code (VOW0001). The OCPP identity is deliberately NOT in this
+   * payload — it is the Basic Auth username for the diagnostics upload
+   * endpoint, so an unauthenticated response must not enumerate it. See
+   * ADR 0028.
+   */
+  asset_code: string;
   name: string;
   latest_status: string;
   connectors: Array<{
@@ -1072,3 +1079,90 @@ export interface PortalQRCode {
   payee_display_name: string;
   created_at: string;
 }
+
+/**
+ * Diagnostic Bundle Service
+ *
+ * Charger firmware debug traces, uploaded over HTTPS outside the OCPP channel
+ * (ADR 0029). This surface answers *delivery* questions — did every bundle
+ * arrive, did the charger lose anything — and hands back the raw archive.
+ * Trace CONTENT is read in New Relic, not here.
+ */
+export interface DiagnosticBundle {
+  id: number;
+  charger_id: number;
+  charge_point_string_id: string;
+  /** Identity of the bundle: SHA-256 of the body (ADR 0030). Null on rows
+   *  written before the digest existed. */
+  content_sha256: string | null;
+  size_bytes: number;
+  line_count: number;
+  received_at_ist: string;
+  /** When the records were *written*, reconstructed from the body's own
+   *  TIME_SYNC anchors. Null when nothing in the body anchored — a real
+   *  state, not an error. */
+  window_start_ist: string | null;
+  window_end_ist: string | null;
+  /** The window fell back to receipt time, or was derived from only some
+   *  segments. Such a window must never be read as evidence of loss. */
+  time_approximate: boolean;
+  /** Silence between the previous bundle's end and this one's start. Derived
+   *  server-side at read time; null when either side is approximate, because
+   *  the arithmetic would be invented rather than measured. */
+  gap_before_seconds: number | null;
+  /** Count of `ring wrapped mid-upload` lines. A RECENCY signal — the buffer
+   *  is destroying undelivered records right now — never a running total. */
+  ring_wrap_events: number;
+  lossy: boolean;
+}
+
+/** One page of bundles. `next_cursor` is fed back as `before` to walk older;
+ *  null means this is the last page. Cursor-based rather than offset because a
+ *  charger emits ~1000 bundles a day, so rows arrive mid-browse and an offset
+ *  would silently repeat or skip them. */
+export interface DiagnosticBundlePage {
+  items: DiagnosticBundle[];
+  next_cursor: number | null;
+}
+
+export interface ChargerAuthKey {
+  charge_point_string_id: string;
+  auth_key: string;
+  rotated: boolean;
+  warning: string;
+}
+
+export const diagnosticBundleService = {
+  /** One page of bundles for a charger, newest first. Pass the previous page's
+   *  `next_cursor` as `before` to reach older ones. */
+  list: (chargerId: number, limit = 50, before?: number | null) =>
+    api.get<DiagnosticBundlePage>(
+      `/api/admin/diagnostics/chargers/${chargerId}/bundles?limit=${limit}` +
+        (before != null ? `&before=${before}` : "")
+    ),
+
+  /** Short-lived presigned S3 URL for the raw bundle. */
+  downloadUrl: (bundleId: number) =>
+    api.get<{ url: string; expires_in: number; s3_key: string }>(
+      `/api/admin/diagnostics/bundles/${bundleId}/download`
+    ),
+
+  /**
+   * Generate or rotate the charger's auth key.
+   * The plaintext is returned ONCE and is never retrievable again.
+   */
+  /** Mint a charger's FIRST key. 409s if one already exists — rotating is a
+   *  separate, explicitly named call. */
+  provisionAuthKey: (chargerId: number) =>
+    api.post<ChargerAuthKey>(`/api/admin/chargers/${chargerId}/auth-key`, {}),
+
+  /** Replace an existing key. Destructive and irreversible: there is no grace
+   *  overlap, so the charger fails auth until the new key is loaded onto it by
+   *  charger-side tooling — and the fleet is behind carrier NAT, so that means
+   *  visiting the unit. The caller echoes the charger's name to proceed. */
+  rotateAuthKey: (chargerId: number, confirmChargerName: string) =>
+    api.post<ChargerAuthKey>(
+      `/api/admin/chargers/${chargerId}/auth-key/rotate`,
+      { confirm_charger_name: confirmChargerName }
+    ),
+};

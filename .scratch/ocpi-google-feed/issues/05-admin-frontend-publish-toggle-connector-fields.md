@@ -28,3 +28,10 @@ Admin UI for the OCPI publish workflow, on top of the issue-04 backend.
 ## Blocked by
 
 - 04 (publish toggle endpoint + connector OCPI write API)
+
+## Comments
+
+**2026-09-01 — checked by tracker audit; CONFIRMED STILL OPEN.** The audit's first pass
+grouped this with likely-complete work; hand-verification disagreed. No OCPI code exists anywhere in `backend/` or `frontend/` — the whole feature is unstarted, not just this slice.
+
+Method: `.scratch/tracker-reconciliation/REPORT.md`.

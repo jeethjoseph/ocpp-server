@@ -1,6 +1,6 @@
 # Synthetic 2% platform fee for QR billing math
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 
@@ -40,3 +40,11 @@ See [ADR 0001](../../../docs/adr/0001-synthetic-vs-actual-platform-fee.md) and [
 ## Blocked by
 
 None — can start immediately (independent code path from issue 01; both touch `qr_payment_service.py` so coordinate merge order to avoid conflicts).
+
+## Comments
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo.
+
+Method, evidence and caveats: `.scratch/tracker-reconciliation/REPORT.md`.

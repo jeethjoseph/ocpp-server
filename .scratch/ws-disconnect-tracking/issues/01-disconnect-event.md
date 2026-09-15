@@ -1,4 +1,4 @@
-Status: ready-for-agent
+Status: done
 
 # OCPPWebSocketDisconnect event end-to-end
 
@@ -81,3 +81,12 @@ The heartbeat_monitor reason string may need to be stabilised so the prefix matc
 ## Blocked by
 
 None — can start immediately.
+
+## Comments
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after
+the work shipped; the tracker had no close ritual. Verified live: `OCPPWebSocketDisconnect`
+is emitted from `backend/services/monitoring_service.py` and confirmed arriving in New Relic
+(staging 246 / prod 108 over 7 days, faceted by `disconnect_category`).
+
+Method and caveats: `.scratch/tracker-reconciliation/REPORT.md`.

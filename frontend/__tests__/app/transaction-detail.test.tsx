@@ -31,7 +31,7 @@ const qrSession: TransactionDetail = {
     updated_at: "2026-06-01T10:45:00Z",
   },
   user: { id: 7, full_name: "Jane Driver", email: "jane@example.com" },
-  charger: { id: 3, name: "CP-3", charge_point_string_id: "CP3-XYZ" },
+  charger: { id: 3, name: "CP-3", asset_code: "VOWS0003", charge_point_string_id: "CP3-XYZ" },
   meter_values: [],
   wallet_transactions: [],
   funding_source: "QR",

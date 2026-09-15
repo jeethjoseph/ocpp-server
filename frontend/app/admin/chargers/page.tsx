@@ -218,7 +218,7 @@ export default function AdminChargersPage() {
             <CardContent>
               <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
                 <Input
-                  placeholder="Search chargers..."
+                  placeholder="Search by Asset Code, name or OCPP ID..."
                   value={searchTerm}
                   onChange={(e) => setSearchTerm(e.target.value)}
                 />
@@ -257,10 +257,10 @@ export default function AdminChargersPage() {
                       ID
                     </th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap">
-                      Name
+                      Asset Code
                     </th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap">
-                      Charge Point ID
+                      OCPP ID
                     </th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap">
                       Status
@@ -301,7 +301,19 @@ export default function AdminChargersPage() {
                           #{charger.id}
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-card-foreground">
-                          {charger.name}
+                          <div className="flex items-center gap-2">
+                            <span className="font-mono">{charger.asset_code}</span>
+                            {charger.purpose === "TEST" && (
+                              <span
+                                title="Bench unit — hidden from customers and never billed"
+                                className="px-1.5 py-0.5 text-[10px] font-semibold rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300">
+                                TEST
+                              </span>
+                            )}
+                          </div>
+                          {charger.name && (
+                            <div className="text-xs text-muted-foreground">{charger.name}</div>
+                          )}
                         </td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm text-muted-foreground font-mono">
                           {charger.charge_point_string_id}

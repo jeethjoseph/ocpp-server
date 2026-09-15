@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   CartesianGrid,
   Line,
@@ -43,8 +43,16 @@ export default function ModemTemperatureCard({
     [data]
   );
 
-  const isStale =
-    latestAt === null || Date.now() - latestAt > STALE_THRESHOLD_MS;
+  // Reading the clock while rendering is impure (react-hooks/purity). Hold
+  // "now" in state and tick it once a minute — this also keeps the relative
+  // labels live instead of frozen at mount.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 60_000);
+    return () => clearInterval(id);
+  }, []);
+
+  const isStale = latestAt === null || now - latestAt > STALE_THRESHOLD_MS;
 
   return (
     <Card>

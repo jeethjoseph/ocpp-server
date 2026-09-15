@@ -472,6 +472,10 @@ export default function FranchiseeDetailPage() {
               {franchisee.business_type || "Not set"}
             </div>
             <div>
+              <span className="text-muted-foreground">Invoice Code:</span>{" "}
+              <span className="font-mono">{franchisee.invoice_code || "Not allocated"}</span>
+            </div>
+            <div>
               <span className="text-muted-foreground">PAN:</span>{" "}
               {franchisee.pan_number || "Not set"}
             </div>

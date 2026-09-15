@@ -70,3 +70,8 @@ Tests patch `OCPPMetrics.record_refund_speed` directly (not `MetricsCollector.in
 
 ### Build verification
 - `docker exec ocpp-backend pytest tests/test_qr_payment_service.py` → 40 passed.
+
+**2026-09-01 — checked by tracker audit; CONFIRMED STILL OPEN.** The audit's first pass
+grouped this with likely-complete work; hand-verification disagreed. Instant refund itself is implemented (`backend/services/qr_payment_service.py`), but the succeeded-vs-fallback **metric counters** this issue asks for are absent — no `Custom/*Refund*` metric and no counter increment on that path.
+
+Method: `.scratch/tracker-reconciliation/REPORT.md`.

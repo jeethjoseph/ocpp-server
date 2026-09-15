@@ -1,6 +1,6 @@
 # 03 — Reports tab shell + Temperature subreport chart
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 
@@ -24,3 +24,11 @@ The admin **Reports** surface and its first subreport (Temperature), end-to-end 
 ## Blocked by
 
 - 02 — Temperature aggregation endpoint (hourly/daily min-avg-max buckets)
+
+## Comments
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo: `frontend/app/admin/reports/page.tsx` + temperature subreport
+
+Method and caveats: `.scratch/tracker-reconciliation/REPORT.md`.

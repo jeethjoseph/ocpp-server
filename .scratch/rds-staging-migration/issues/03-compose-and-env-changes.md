@@ -1,4 +1,4 @@
-Status: ready-for-agent
+Status: done
 
 # Compose + .env.staging.example + Makefile changes for RDS readiness
 
@@ -137,3 +137,11 @@ Before merging:
 - PR merged to `develop`
 - Staging deploy still works (`make staging-deploy` succeeds — no behavioral change yet because `POSTGRES_HOST` is still `postgres` in `.env.staging`)
 - Behavior is identical to pre-PR until the cutover updates `.env.staging` on the EC2 host
+
+## Comments
+
+**2026-09-01 — reconciled to `done` by tracker audit (bucket B re-check).** The audit
+flagged this as open because an artifact its acceptance criteria names is absent. Hand-
+verification shows the work landed differently: renamed during implementation — `DB_SSL_MODE` is wired through all three compose files and `make staging-rds-shell` exists.
+
+Method: `.scratch/tracker-reconciliation/REPORT.md`.

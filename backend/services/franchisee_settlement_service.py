@@ -31,6 +31,69 @@ from models import (
 logger = logging.getLogger("ocpp-server")
 
 TWO_DP = Decimal("0.01")
+
+
+def transfer_fee_rupees(transfer: dict) -> Optional[Decimal]:
+    """Razorpay's actual Route charge for one transfer, in rupees.
+
+    ``fees`` and ``tax`` are top-level integer paise on the Transfer entity,
+    present from ``transfer.processed`` onward. None when the entity carries
+    no ``fees`` at all, so a caller can leave an existing value untouched.
+    This is VoltLync's own cost, debited from the platform — it is NOT the
+    customer-borne Gateway fee and must never be netted against the
+    franchisee payout.
+    """
+    fees = transfer.get("fees")
+    if fees is None:
+        return None
+    total = Decimal(str(fees)) + Decimal(str(transfer.get("tax") or 0))
+    return (total / Decimal("100")).quantize(TWO_DP, ROUND_HALF_UP)
+
+
+def settled_at_from(recipient_settlement: Optional[dict]) -> datetime:
+    """When the linked-account settlement actually ran.
+
+    Taken from the nested settlement's ``created_at`` when the caller has it,
+    so a backfill of rows that settled in June records June, not the day the
+    sweep finally noticed. Falls back to now when the caller only has the
+    transfer list, which carries no nested settlement.
+    """
+    epoch = (recipient_settlement or {}).get("created_at")
+    if epoch:
+        return datetime.fromtimestamp(int(epoch), tz=timezone.utc)
+    return datetime.now(timezone.utc)
+
+
+# Tuning lives in policy.py beside the sweep floor and the stuck threshold,
+# because the three have an ordering that is easy to break one at a time.
+# Bound into this module's namespace (rather than referenced via policy.X) so
+# the deferred lookup reads it at call time and tests can shrink it.
+from policy import SETTLEMENT_LOOKUP_DELAY_SECONDS  # noqa: E402
+
+
+async def settlement_lookup_after_delay(event_type: str, settlement_data: dict) -> None:
+    """Run the settlement lookup off the webhook's response path.
+
+    The router acks Razorpay first and schedules this. Before that change the
+    lookup ran inline while Razorpay waited on our 200 — and a slow Razorpay
+    API at the moment their webhook fires (the two correlate) exceeded their
+    timeout, triggered a redelivery, and ran again. Idempotent, so nothing
+    corrupted; but a retry storm waiting for a degraded afternoon.
+
+    In-process, so a restart in the window loses it. Deliberately accepted:
+    the reconciliation sweep is the guarantee, this is the fast path.
+    """
+    import asyncio
+    await asyncio.sleep(SETTLEMENT_LOOKUP_DELAY_SECONDS)
+    try:
+        await FranchiseeSettlementService.handle_settlement_webhook(
+            event_type, settlement_data
+        )
+    except Exception as exc:
+        logger.error(
+            "Deferred settlement lookup failed for %s: %s",
+            settlement_data.get("id"), exc, exc_info=True,
+        )
 FOUR_DP = Decimal("0.0001")
 MIN_TRANSFER_AMOUNT = Decimal(
     os.getenv("MINIMUM_TRANSFER_AMOUNT", "1.00")
@@ -473,17 +536,12 @@ class FranchiseeSettlementService:
             # Status + transfer_initiated_at were set by the atomic claim;
             # just record the Razorpay-side artefacts.
             updates = {"razorpay_transfer_id": result.get("id")}
-            # Capture fees from the synchronous POST response when present
-            # (settlement.processed will overwrite later if Razorpay sends
-            # an updated value, but bare-id settlement payloads can leave
-            # this 0.00 forever, so prefer to grab it now).
-            fee_paise = result.get("fees")
-            tax_paise = result.get("tax") or 0
-            if fee_paise is not None:
-                total_paise = Decimal(str(fee_paise)) + Decimal(str(tax_paise))
-                updates["transfer_fee"] = (total_paise / Decimal("100")).quantize(
-                    TWO_DP, ROUND_HALF_UP
-                )
+            # Capture the fee from the synchronous POST response when present.
+            # Same helper as the transfer.processed and settled paths, so the
+            # three writers of transfer_fee cannot round differently.
+            fee = transfer_fee_rupees(result)
+            if fee is not None:
+                updates["transfer_fee"] = fee
             await CommissionLedgerEntry.filter(id=entry.id).update(**updates)
             logger.info(
                 "Transfer initiated: entry=%s transfer=%s",
@@ -504,6 +562,39 @@ class FranchiseeSettlementService:
                 retry_count=entry.retry_count + 1,
             )
             return False
+
+    @staticmethod
+    async def _apply_transfer_processed(entry, transfer_data: dict) -> None:
+        """Advance one row to TRANSFER_PROCESSED and capture its fee.
+
+        Never walks a SETTLED row backwards. Razorpay redelivers on any
+        non-2xx or timeout and the router does not dedupe by event id; now
+        that rows genuinely reach SETTLED, a late transfer.processed would
+        otherwise reset the row to TRANSFER_PROCESSED with a fresh
+        transfer_processed_at (so the sweep floor holds it two more days) and
+        show a paid payout as unpaid. settle_from_transfer has this guard;
+        this sibling path lacked it.
+        """
+        if entry.settlement_status == SettlementStatusEnum.SETTLED:
+            logger.info(
+                "transfer.processed for already-SETTLED %s; ignoring redelivery",
+                entry.razorpay_transfer_id,
+            )
+            return
+        updates = {
+            "settlement_status": SettlementStatusEnum.TRANSFER_PROCESSED,
+            "transfer_processed_at": datetime.now(timezone.utc),
+            "failure_reason": None,
+        }
+        # The per-transfer Route fee lives on the transfer entity and is
+        # already populated here — it never depended on the settlement path.
+        fee = transfer_fee_rupees(transfer_data)
+        if fee is not None:
+            updates["transfer_fee"] = fee
+        await CommissionLedgerEntry.filter(id=entry.id).exclude(
+            settlement_status=SettlementStatusEnum.SETTLED
+        ).update(**updates)
+        logger.info("Transfer processed: %s fee=%s", entry.razorpay_transfer_id, fee)
 
     @staticmethod
     async def handle_transfer_webhook(
@@ -528,12 +619,7 @@ class FranchiseeSettlementService:
             return
 
         if event_type == "transfer.processed":
-            await CommissionLedgerEntry.filter(id=entry.id).update(
-                settlement_status=SettlementStatusEnum.TRANSFER_PROCESSED,
-                transfer_processed_at=datetime.now(timezone.utc),
-                failure_reason=None,
-            )
-            logger.info("Transfer processed: %s", transfer_id)
+            await FranchiseeSettlementService._apply_transfer_processed(entry, transfer_data)
 
         elif event_type == "transfer.failed":
             reason = transfer_data.get("error", {}).get(
@@ -551,66 +637,110 @@ class FranchiseeSettlementService:
     ):
         """Handle settlement.processed for linked-account settlements.
 
-        A single settlement can cover multiple transfers. We advance every
-        ledger entry whose ``razorpay_transfer_id`` is listed in the
-        settlement entity, and capture the per-transfer fee (Razorpay's
-        actual transfer charge) when provided.
+        The webhook is a TRIGGER, not a manifest. Its entity carries only the
+        settlement's own ``id, amount, status, fees, tax, utr, created_at`` —
+        verified against 202 production payloads and against Razorpay's
+        documented sample — and never a list of the transfers it paid. The
+        earlier version of this handler read a ``transfers`` array that does
+        not exist, logged at INFO and returned, and so no ledger entry ever
+        reached SETTLED between June and September 2026 (377 rows, ₹18,130).
+
+        The documented second half is ``GET /v1/transfers?recipient_settlement_id=``,
+        whose parameter Razorpay defines as "obtained from the
+        settlement.processed webhook payload". Link direction is
+        transfer → settlement; we ask the transfers which settlement paid them.
+
+        An empty answer is NOT a failure. The platform receives its own bank
+        settlements under this same event name, and those cover no Route
+        transfers. Silence, at INFO, is the correct response to one of those.
         """
         if event_type != "settlement.processed":
             return
+        settlement_id = settlement_data.get("id")
+        if not settlement_id:
+            logger.warning("settlement.processed without an id; ignoring")
+            return
 
-        transfer_ids = []
-        # Known Razorpay shapes: a list of transfer ids, or a list of
-        # {id, fees, tax} dicts. Handle both defensively.
-        raw_transfers = settlement_data.get("transfers") or []
-        for t in raw_transfers:
-            if isinstance(t, str):
-                transfer_ids.append(t)
-            elif isinstance(t, dict) and t.get("id"):
-                transfer_ids.append(t["id"])
-
-        if not transfer_ids:
+        from services.razorpay_service import razorpay_service
+        transfers = await razorpay_service.list_transfers_for_settlement(settlement_id)
+        if not transfers:
             logger.info(
-                "settlement.processed with no transfers listed: %s",
-                settlement_data.get("id"),
+                "settlement.processed %s covers no Route transfers — "
+                "platform-own settlement, nothing to advance",
+                settlement_id,
             )
             return
 
-        # Build a map transfer_id -> (fees_rupees, tax_rupees) when available
-        fee_by_transfer: Dict[str, Decimal] = {}
-        for t in raw_transfers:
-            if isinstance(t, dict) and t.get("id"):
-                fee_paise = t.get("fees")
-                tax_paise = t.get("tax") or 0
-                if fee_paise is not None:
-                    total = Decimal(str(fee_paise)) + Decimal(str(tax_paise))
-                    fee_by_transfer[t["id"]] = (total / Decimal("100")).quantize(
-                        TWO_DP, ROUND_HALF_UP
-                    )
+        # The list endpoint returns transfers without their nested settlement,
+        # but the webhook IS that settlement — its status and created_at are
+        # in hand. Attach them so the shared predicate sees one input shape on
+        # both paths, and so settled_at records the settlement's real date
+        # rather than the moment we happened to look: a redelivery arriving
+        # 12 hours late would otherwise freeze the wrong day permanently.
+        nested = {
+            "id": settlement_id,
+            "status": settlement_data.get("status"),
+            "created_at": settlement_data.get("created_at"),
+            "utr": settlement_data.get("utr"),
+        }
+        settled = 0
+        for transfer in transfers:
+            if transfer.get("recipient_settlement") is None:
+                transfer["recipient_settlement"] = nested
+            if await FranchiseeSettlementService.settle_from_transfer(transfer):
+                settled += 1
+        logger.info(
+            "settlement.processed %s: %s transfer(s) listed, %s ledger row(s) settled",
+            settlement_id, len(transfers), settled,
+        )
 
-        # Razorpay re-delivers webhooks; the filter excludes already-SETTLED
-        # rows so settled_at / transfer_fee are frozen at first observation.
-        # Without this guard, a replay 5 minutes (or 5 days) later would shift
-        # settled_at forward and could over-write transfer_fee with a stale
-        # value from the replay payload.
-        entries = await CommissionLedgerEntry.filter(
-            razorpay_transfer_id__in=transfer_ids,
-        ).exclude(settlement_status=SettlementStatusEnum.SETTLED).all()
-        now = datetime.now(timezone.utc)
-        for entry in entries:
-            updates = {
-                "settlement_status": SettlementStatusEnum.SETTLED,
-                "settled_at": now,
-                "failure_reason": None,
-            }
-            fee = fee_by_transfer.get(entry.razorpay_transfer_id)
-            if fee is not None:
-                updates["transfer_fee"] = fee
-            await CommissionLedgerEntry.filter(id=entry.id).update(**updates)
+    @staticmethod
+    async def settle_from_transfer(transfer: dict) -> bool:
+        """Advance one ledger row to SETTLED from a Transfer entity, if it is.
+
+        Shared by the webhook path and the reconciliation sweep so the two can
+        never disagree about what "settled" means, and takes ONE input shape:
+        a transfer carrying its nested ``recipient_settlement`` (the sweep
+        fetches it expanded; the webhook path attaches the settlement it is
+        acting on). The predicate is strict on purpose: ``settlement_status ==
+        "settled"`` alone is not enough, because the settlement a transfer
+        joined can itself have ``status: failed``. Money is recorded as landed
+        only when that settlement says ``processed``.
+
+        Returns True only when a row was actually moved. One statement, no
+        SELECT first: ``razorpay_transfer_id`` is unique and the UPDATE's row
+        count is exactly the answer. Idempotent — an already-SETTLED row is
+        excluded so ``settled_at`` and the fee are frozen at first
+        observation, which is what makes Razorpay's redelivery harmless.
+        """
+        transfer_id = transfer.get("id")
+        nested = transfer.get("recipient_settlement")
+        if (
+            not transfer_id
+            or transfer.get("settlement_status") != "settled"
+            or not nested
+            or nested.get("status") != "processed"
+        ):
+            return False
+
+        updates = {
+            "settlement_status": SettlementStatusEnum.SETTLED,
+            "settled_at": settled_at_from(nested),
+            "failure_reason": None,
+        }
+        fee = transfer_fee_rupees(transfer)
+        if fee is not None:
+            updates["transfer_fee"] = fee
+        moved = await CommissionLedgerEntry.filter(
+            razorpay_transfer_id=transfer_id
+        ).exclude(settlement_status=SettlementStatusEnum.SETTLED).update(**updates)
+        if moved:
             logger.info(
-                "Settlement processed: entry=%s transfer=%s fee=%s",
-                entry.id, entry.razorpay_transfer_id, fee or "n/a",
+                "Settled: transfer=%s settlement=%s settled_at=%s fee=%s",
+                transfer_id, nested.get("id") or transfer.get("recipient_settlement_id"),
+                updates["settled_at"].date(), fee if fee is not None else "n/a",
             )
+        return bool(moved)
 
     @staticmethod
     async def retry_failed_transfers(franchisee_id: Optional[int] = None):

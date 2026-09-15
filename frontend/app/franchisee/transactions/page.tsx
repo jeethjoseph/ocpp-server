@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import Link from "next/link";
 import { Receipt, Zap, Banknote, ListChecks } from "lucide-react";
 
@@ -123,9 +123,18 @@ function TransactionsContent() {
   const [status, setStatus] = useState("");
 
   // Any filter change resets to the first page so the view stays coherent.
-  useEffect(() => {
+  // Adjusted while rendering rather than in an effect: React supports setting
+  // state during render to derive from changed inputs, and it lands in the
+  // same commit instead of causing a second one.
+  const [prevFilters, setPrevFilters] = useState({ fromDate, toDate, status });
+  if (
+    prevFilters.fromDate !== fromDate ||
+    prevFilters.toDate !== toDate ||
+    prevFilters.status !== status
+  ) {
+    setPrevFilters({ fromDate, toDate, status });
     setCurrentPage(1);
-  }, [fromDate, toDate, status]);
+  }
 
   const { data, isLoading, error } = usePortalTransactions({
     page: currentPage,

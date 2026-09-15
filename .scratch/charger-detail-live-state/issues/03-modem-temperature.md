@@ -1,6 +1,6 @@
 # Modem temperature ingestion, storage, and chart
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 
@@ -43,3 +43,11 @@ Persist the field and surface it on the admin charger detail page (`/admin/charg
 ## Blocked by
 
 None — can start immediately.
+
+## Comments
+
+**2026-09-01 — reconciled to `done` by tracker audit.** Still marked open long after the
+work shipped; the tracker had no close ritual, so the status was never moved back.
+Verified by locating the artifact this issue specifies in the live repo: `temperature_celsius` ingested in `backend/routers/chargers.py`; `frontend/components/ModemTemperatureCard.tsx`
+
+Method and caveats: `.scratch/tracker-reconciliation/REPORT.md`.
