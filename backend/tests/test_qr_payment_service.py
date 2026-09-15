@@ -20,6 +20,7 @@ from unittest.mock import patch, AsyncMock, MagicMock
 from services.qr_payment_service import (
     QRPaymentService, find_or_create_user_from_payment,
     _ensure_actual_fee_captured,
+    scrub_razorpay_placeholder_email, scrub_razorpay_placeholder_contact,
 )
 from services.razorpay_service import (
     RazorpayAlreadyRefundedError,
@@ -98,7 +99,7 @@ def _webhook_payload(
         "id": payment_id,
         "amount": amount_paise,
         "vpa": vpa,
-        "contact": "+919999999999",
+        "contact": "+919876543210",
         "email": "user@example.com",
         "notes": {"customer_name": "Test User"},
         "created_at": 9999999999,  # Future timestamp — no staleness
@@ -2475,3 +2476,84 @@ async def test_sweep_does_not_race_fresh_refund_claim(client, qr_charger, qr_cod
     sweep_rzp.refund_payment.assert_not_called()
     await qr_payment.refresh_from_db()
     assert qr_payment.status == QRPaymentStatusEnum.REFUND_IN_PROGRESS
+
+
+# ============================================================================
+# Razorpay "unknown payer" placeholders (void@razorpay.com / 919999999999)
+# ============================================================================
+
+def _placeholder_payload(payment_id: str, qr_code_id: str, vpa: str):
+    """A qr_code.credited payload exactly as Razorpay sends it for a payer it
+    cannot attribute (observed on the live account from 2026-09-04): no
+    notes, placeholder email and contact, real VPA."""
+    return {
+        "payment": {"entity": {
+            "id": payment_id, "amount": 10000, "vpa": vpa,
+            "contact": "919999999999", "email": "void@razorpay.com",
+            "notes": [], "created_at": 9999999999,
+        }},
+        "qr_code": {"entity": {"id": qr_code_id}},
+    }
+
+
+def test_scrub_placeholder_email_drops_void_razorpay():
+    assert scrub_razorpay_placeholder_email("void@razorpay.com") is None
+    assert scrub_razorpay_placeholder_email(" Void@Razorpay.com ") is None
+    assert scrub_razorpay_placeholder_email(None) is None
+    assert scrub_razorpay_placeholder_email("") is None
+    assert scrub_razorpay_placeholder_email("real@okicici") == "real@okicici"
+
+
+def test_scrub_placeholder_contact_drops_all_nines_in_every_shape():
+    assert scrub_razorpay_placeholder_contact("919999999999") is None
+    assert scrub_razorpay_placeholder_contact("+919999999999") is None
+    assert scrub_razorpay_placeholder_contact("9999999999") is None
+    assert scrub_razorpay_placeholder_contact(None) is None
+    assert scrub_razorpay_placeholder_contact("+919876543210") == "+919876543210"
+    # A longer real number that merely ends in nines is not the placeholder.
+    assert scrub_razorpay_placeholder_contact("+9111119999999999") == "+9111119999999999"
+
+
+def test_parse_qr_webhook_ignores_placeholder_identity():
+    """The placeholder email must not become the customer name and the
+    placeholder contact must not reach the phone-first user lookup."""
+    parsed = QRPaymentService._parse_qr_webhook(
+        _placeholder_payload("pay_VOID1", "qr_TEST123", "payer@okhdfcbank")
+    )
+    assert parsed.customer_name is None
+    assert parsed.contact is None
+    assert parsed.vpa == "payer@okhdfcbank"
+
+
+def test_parse_qr_webhook_still_honours_real_email_and_notes_name():
+    payload = _webhook_payload("pay_REAL1", "qr_TEST123", 10000)
+    parsed = QRPaymentService._parse_qr_webhook(payload)
+    assert parsed.customer_name == "Test User"
+    assert parsed.contact == "+919876543210"
+    payload["payment"]["entity"]["notes"] = {}
+    parsed = QRPaymentService._parse_qr_webhook(payload)
+    assert parsed.customer_name == "user@example.com"
+
+
+@pytest.mark.asyncio
+async def test_placeholder_contact_does_not_merge_distinct_payers(client, qr_charger, qr_code, qr_tariff):
+    """Two payers sharing Razorpay's placeholder contact but paying from
+    different VPAs must resolve to two UPI_GUEST users, not one."""
+    users = []
+    for payment_id, vpa in (("pay_VOIDA", "first@okaxis"), ("pay_VOIDB", "second@ybl")):
+        with patch.object(QRPaymentService, "_start_charging", new=AsyncMock()), \
+             patch("services.qr_payment_service.redis_manager") as mock_redis:
+            mock_redis.is_charger_connected = AsyncMock(return_value=False)
+            await QRPaymentService.handle_qr_payment(
+                _placeholder_payload(payment_id, "qr_TEST123", vpa)
+            )
+        qp = await QRPayment.filter(razorpay_payment_id=payment_id).first()
+        assert qp is not None
+        assert qp.customer_name is None
+        assert qp.customer_contact is None
+        users.append(qp.user_id)
+
+    assert users[0] != users[1]
+    first = await User.get(id=users[0])
+    assert first.upi_vpa == "first@okaxis"
+    assert first.phone_number is None

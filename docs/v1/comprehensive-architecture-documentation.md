@@ -1751,6 +1751,8 @@ The reconciliation script (`backend/scripts/reconcile_wallet_balance.py`) **is o
 3. **Create UPI_GUEST**: New user with email `upi_{vpa}@guest.powerlync.com`, auth_provider=`UPI_GUEST`
 4. **System guest fallback**: `guest@system.powerlync.com` if no identifiers available
 
+> **Placeholder guard (2026-09-15)**: Razorpay stamps UPI QR payments it cannot attribute with `email=void@razorpay.com` and `contact=919999999999` (observed from 2026-09-04, fleet-wide from 2026-09-09) instead of leaving the fields empty. `_parse_qr_webhook` scrubs both (`scrub_razorpay_placeholder_email` / `scrub_razorpay_placeholder_contact`) so the placeholder never becomes `customer_name` (it was printed as BILLED TO on GST invoices) and never enters the phone-first lookup above (it merged 30 distinct payers into one UPI_GUEST user on staging). Repair script: `backend/scripts/backfill_razorpay_placeholder_identity.py`.
+
 #### Step 5: Charging Trigger
 - **If charger is PREPARING (or AVAILABLE for socket chargers) + connected**: Immediately send `RemoteStartTransaction`
 - **If charger is connected but not in startable state**: Background task polls every 10s for 5 minutes (also accepts Available for socket chargers)
@@ -2167,8 +2169,8 @@ CREATE TABLE qr_payment (
     razorpay_qr_code_id VARCHAR(255) NOT NULL,           -- Denormalized QR code reference
     amount_paid DECIMAL(10,2) NOT NULL,                  -- Customer's payment in ₹
     customer_vpa VARCHAR(255),                           -- UPI VPA (e.g., user@okaxis)
-    customer_name VARCHAR(255),                          -- Payer name from Razorpay
-    customer_contact VARCHAR(255),                       -- Phone number from webhook
+    customer_name VARCHAR(255),                          -- notes.customer_name or real payer email; Razorpay's void@razorpay.com placeholder is scrubbed to NULL
+    customer_contact VARCHAR(255),                       -- Phone number from webhook; Razorpay's 919999999999 placeholder is scrubbed to NULL
     energy_cost DECIMAL(10,2),                           -- Calculated after charging
     gst_amount DECIMAL(10,2),                            -- GST on energy_cost (18% default)
     platform_fee DECIMAL(10,2),                          -- Actual Razorpay fee (from webhook/API, fallback to 2% estimate)

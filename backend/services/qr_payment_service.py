@@ -1,5 +1,6 @@
 """QR Payment Service - Core business logic for appless EV charging via Razorpay UPI QR"""
 import os
+import re
 import asyncio
 import logging
 import uuid
@@ -63,6 +64,37 @@ logger = logging.getLogger(__name__)
 QR_PAYMENT_PENDING_TIMEOUT = int(os.getenv("QR_PAYMENT_PENDING_TIMEOUT", "300"))
 
 SYSTEM_GUEST_EMAIL = "guest@system.powerlync.com"
+
+# Razorpay stamps a payer it cannot identify (UPI QR, no linked customer)
+# with these placeholders instead of leaving the fields empty. Observed on
+# the live account from 2026-09-04, fleet-wide from 2026-09-09. Neither is a
+# real identity: the email must never become a customer name on a GST
+# invoice, and the contact must never drive the phone-first user lookup
+# (it merged 30 distinct payers into one UPI_GUEST user on staging).
+RAZORPAY_PLACEHOLDER_EMAILS = frozenset({"void@razorpay.com"})
+RAZORPAY_PLACEHOLDER_CONTACT_DIGITS = "9999999999"
+
+
+def scrub_razorpay_placeholder_email(email: Optional[str]) -> Optional[str]:
+    """Return ``email`` unless it is a Razorpay "unknown payer" placeholder."""
+    if not email or email.strip().lower() in RAZORPAY_PLACEHOLDER_EMAILS:
+        return None
+    return email
+
+
+def scrub_razorpay_placeholder_contact(contact: Optional[str]) -> Optional[str]:
+    """Return ``contact`` unless it is Razorpay's all-nines placeholder.
+
+    Razorpay sends the number with or without a country prefix
+    (``919999999999`` / ``+919999999999``), so compare on the trailing ten
+    digits after stripping the ``+91`` / ``91`` prefix.
+    """
+    if not contact:
+        return None
+    digits = re.sub(r"\D", "", contact)
+    if digits.endswith(RAZORPAY_PLACEHOLDER_CONTACT_DIGITS) and len(digits) <= 12:
+        return None
+    return contact
 
 # Canonical, non-retryable failure_reason for a refund that hit a Razorpay
 # idempotency conflict (HTTP 409) AND had no existing refund to reconcile to.
@@ -292,7 +324,9 @@ class QRPaymentService:
         notes = payment_entity.get("notes", {})
         if not isinstance(notes, dict):
             notes = {}
-        customer_name = notes.get("customer_name") or payment_entity.get("email")
+        customer_name = notes.get("customer_name") or scrub_razorpay_placeholder_email(
+            payment_entity.get("email")
+        )
         qr_code_id = qr_code_entity.get("id") or payment_entity.get(
             "description", ""
         ).split("|")[-1].strip()
@@ -312,7 +346,7 @@ class QRPaymentService:
             payment_id=payment_entity.get("id"),
             amount_paid=amount_paid,
             vpa=payment_entity.get("vpa"),
-            contact=payment_entity.get("contact"),
+            contact=scrub_razorpay_placeholder_contact(payment_entity.get("contact")),
             customer_name=customer_name,
             qr_code_id=qr_code_id,
             fee_fields=fee_fields,
