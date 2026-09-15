@@ -1,0 +1,22 @@
+2026-08-12T17:17:06.622000+00:00	ocpp-prod-db	db-instance	Amazon RDS is unable to access the KMS encryption key for database instance ocpp-prod-db.  This is likely due to the key being disabled or Amazon RDS being unable to access it.  If this continues the database will be placed into an inaccessible state.  Please refer to the troubleshooting section in the Amazon RDS documentation for further details.
+2026-08-12T17:26:08.803000+00:00	ocpp-staging-db	db-instance	Amazon RDS is unable to access the KMS encryption key for database instance ocpp-staging-db.  This is likely due to the key being disabled or Amazon RDS being unable to access it.  If this continues the database will be placed into an inaccessible state.  Please refer to the troubleshooting section in the Amazon RDS documentation for further details.
+2026-08-12T18:17:06.626000+00:00	ocpp-prod-db	db-instance	Amazon RDS is unable to access the KMS encryption key for database instance ocpp-prod-db.  This is likely due to the key being disabled or Amazon RDS being unable to access it.  If this continues the database will be placed into an inaccessible state.  Please refer to the troubleshooting section in the Amazon RDS documentation for further details.
+2026-08-12T18:26:08.855000+00:00	ocpp-staging-db	db-instance	Amazon RDS is unable to access the KMS encryption key for database instance ocpp-staging-db.  This is likely due to the key being disabled or Amazon RDS being unable to access it.  If this continues the database will be placed into an inaccessible state.  Please refer to the troubleshooting section in the Amazon RDS documentation for further details.
+2026-08-12T19:07:36.646000+00:00	ocpp-prod-db	db-instance	Amazon RDS has been unable to access the KMS encryption key for database instance ocpp-prod-db.  This database will be placed into an inaccessible state.  Please refer to the troubleshooting section in the Amazon RDS documentation for further details.
+2026-08-12T19:11:06.385000+00:00	ocpp-staging-db	db-instance	Backing up DB instance
+2026-08-12T19:11:06.386000+00:00	rds:ocpp-staging-db-2026-08-12-19-11	db-snapshot	Creating automated snapshot
+2026-08-12T19:13:55.956000+00:00	ocpp-prod-db	db-instance	DB instance stopped
+2026-08-12T19:16:08.399000+00:00	rds:ocpp-staging-db-2026-08-12-19-11	db-snapshot	Automated snapshot created
+2026-08-12T19:16:08.693000+00:00	ocpp-staging-db	db-instance	Finished DB Instance backup
+2026-08-12T19:16:08.936000+00:00	ocpp-staging-db	db-instance	Amazon RDS has been unable to access the KMS encryption key for database instance ocpp-staging-db.  This database will be placed into an inaccessible state.  Please refer to the troubleshooting section in the Amazon RDS documentation for further details.
+2026-08-12T19:22:28.463000+00:00	ocpp-staging-db	db-instance	DB instance stopped
+2026-08-13T02:52:13.945000+00:00	ocpp-staging-db	db-instance	Recovery of the DB instance has started. Recovery time will vary with the amount of data to be recovered.
+2026-08-13T02:54:02.898000+00:00	ocpp-staging-db	db-instance	DB instance restarted
+2026-08-13T02:54:17.450000+00:00	ocpp-staging-db	db-instance	Recovery of the DB instance is complete.
+2026-08-13T02:56:04.738000+00:00	ocpp-staging-db	db-instance	DB instance started
+2026-08-13T02:59:04.365000+00:00	ocpp-prod-db	db-instance	Recovery of the DB instance has started. Recovery time will vary with the amount of data to be recovered.
+2026-08-13T03:00:42.846000+00:00	ocpp-prod-db	db-instance	DB instance restarted
+2026-08-13T03:02:44.283000+00:00	ocpp-prod-db	db-instance	Recovery of the DB instance is complete.
+2026-08-13T03:02:52.250000+00:00	ocpp-prod-db	db-instance	DB instance started
+2026-08-13T03:03:56.251000+00:00	ocpp-prod-db	db-instance	Performance Insights has been enabled
+2026-08-13T03:03:56.251000+00:00	ocpp-prod-db	db-instance	Monitoring Interval changed to 0
