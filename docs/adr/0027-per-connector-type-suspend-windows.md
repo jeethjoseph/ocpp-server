@@ -1,5 +1,13 @@
 # Suspend windows are per-connector-type, live in git-tracked policy, and connector_type is an enum
 
+> **Amended 2026-09-16: the unlatched window is 3 h, raised from 45 min at the operations team's request.** Everything else in this ADR stands — the per-type split, the latching discriminator, the 12 h latched value, the git-tracked policy home, and the both-paths rule. Only the unlatched magnitude moves.
+>
+> The trade-off recorded below ("45min captures only ~13% of observed socket reconnects") turned out to understate the cost. A 90-day sweep of every session the window force-finalized, across prod and staging, measuring time until the charger's next inbound OCPP message: **42 unlatched sessions, median outage ~95 min, p90 ~6.2 h — the median was more than double the window.** Most socket sessions were being closed while the charger was still coming back. 3 h captures 30 of 42 (71%); 12 h would capture 39 (93%).
+>
+> The cable-security argument that set 45 min is weaker than it looked, because the window only runs its full length while the charger is **unreachable** — and an unreachable charger cannot start a new session, since every session begins with `RemoteStartTransaction`. Once it reconnects and reports `Available`, the socket grace period (300 s) finalizes the stale session, so a socket does not stay logically occupied for hours. What a longer window genuinely costs is refund latency: a QR customer whose charger never returns now waits up to 3 h for the automatic refund instead of 45 min. That was judged acceptable against ending live sessions at the median.
+>
+> Not a ceiling: [[adr-0031-charger-authoritative-offline-session]] will propose **12 h** unlatched / **48 h** latched once the charger-side budget cap ships and the window measures silence rather than session age. This amendment is the interim step under current semantics, and that later change supersedes it.
+
 A mid-session charger disconnect suspends the transaction and waits for reconnect. That wait is now **keyed to the connector's physical latching**: a latched connector (Type2/Type1/CCS/CHAdeMO/GB-T — the cable locks into the vehicle inlet) holds the session **12 hours**; an unlatched socket (Socket/domestic — a plug anyone can pull) holds **45 minutes**. The same window applies on **both** suspension paths — the disconnect timer and the post-boot timer armed by BootNotification — retiring the 300s post-boot timer that silently shortened the promised grace window. The window values live in the git-tracked `backend/policy.py`, not env vars, and `connector_type` is promoted from free text to an enum.
 
 ## Context
@@ -38,7 +46,7 @@ A DB lookup table for the traits was rejected: whether Type2 latches is physics+
 
 ## Decision
 
-1. **`backend/policy.py`**: `SUSPEND_WINDOW_LATCHED_SECONDS = 43200`, `SUSPEND_WINDOW_UNLATCHED_SECONDS = 2700`, `STALE_SUSPENDED_BUFFER_SECONDS = 60`. Git-tracked, no env override.
+1. **`backend/policy.py`**: `SUSPEND_WINDOW_LATCHED_SECONDS = 43200`, `SUSPEND_WINDOW_UNLATCHED_SECONDS = 2700` *(raised to `10800` — 3 h — on 2026-09-16, see the amendment above)*, `STALE_SUSPENDED_BUFFER_SECONDS = 60`. Git-tracked, no env override.
 2. **`CONNECTOR_TRAITS`** in `charger_type_service.py` — one row per enum member, two booleans; shared `startable_statuses` start-gate helper; `is_latching_connector_type` window predicate.
 3. **Both suspension paths resolve the window per charger**: `disconnect_handler.suspend_window_seconds_for_charge_point` feeds the disconnect timer AND the post-boot timer (`main.py` BootNotification handler). The 300s post-boot timer is retired.
 4. **Derived cutoffs go per-transaction**: sweep + staleness guard use `stale_suspended_cutoff_seconds_for(txn)` = own window + buffer. The sweep pre-filters at the shortest cutoff then checks each row against its own. The ADR 0022 invariant (guard/sweep fire strictly after the primary timer) holds per-row by construction.
@@ -46,7 +54,7 @@ A DB lookup table for the traits was rejected: whether Type2 latches is physics+
 
 ## Accepted trade-offs
 
-- **45min captures only ~13% of observed socket reconnects** (12h captures ~95% of Type2's). Deliberate: cable security outweighs resume convenience on unlatched plugs.
+- **45min captures only ~13% of observed socket reconnects** (12h captures ~95% of Type2's). Deliberate: cable security outweighs resume convenience on unlatched plugs. **Revisited 2026-09-16 — see the amendment at the top: the median socket outage is ~95 min, so this trade-off was closing most socket sessions while the charger was still returning. Unlatched is now 3 h (~71% capture).**
 - **QR money can be held up to 12h** on a suspended Type2 session with no refund until finalize. Mitigated by the active-session visibility fix; the orphaned-QR sweep only touches terminal transactions, unchanged.
 - **Flap-guard ceiling becomes 36h** (3 zero-progress resets × 12h). A hard session-age ceiling is a possible follow-up.
 - **Window resolution reads the charger's first connector** — correct under the 1:1 charger:connector invariant; revisit with multi-connector support (deferred).

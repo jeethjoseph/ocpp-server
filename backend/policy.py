@@ -26,8 +26,30 @@ fallback (180) and the deployed value (1800) that nothing flagged.
 # timer armed by BootNotification. The post-boot window must never be shorter
 # than the window it replaces (the 300s post-boot timer killed 9 sessions
 # fleet-wide; ~41% of prod reconnects arrive via BootNotification).
+#
+# Unlatched raised 45 min -> 3 h on 2026-09-16 at the operations team's request.
+# The original 45 min was set on a cable-security argument, with ADR 0027
+# recording that it "captures only ~13% of observed socket reconnects". A
+# 90-day sweep of every session the window force-finalized (prod + staging,
+# measuring time until the charger's next inbound OCPP message) shows that was
+# an understatement of the cost: the MEDIAN unlatched outage is ~95 min, more
+# than twice the window, so most socket sessions were being closed while the
+# charger was still on its way back. 3 h captures 30 of 42 (71%); 12 h would
+# capture 39 (93%).
+#
+# What a longer window costs, and why it is small: the window only runs its
+# full length while the charger is UNREACHABLE, and an unreachable charger
+# cannot start a new session anyway (every session begins with
+# RemoteStartTransaction). Once it reconnects and reports Available, the socket
+# grace period (main.SOCKET_GRACE_PERIOD_SECONDS, 300 s) finalizes the stale
+# session, so the charger does not stay logically occupied for hours. The real
+# cost is that a QR customer whose charger never returns waits up to 3 h for
+# the automatic refund instead of 45 min.
+#
+# ADR 0031 (offline continuity) will propose 12 h here once the charger-side
+# budget cap ships; this is the interim step, not that decision.
 SUSPEND_WINDOW_LATCHED_SECONDS = 43200    # 12 h — captures ~95% of observed Type2 reconnects
-SUSPEND_WINDOW_UNLATCHED_SECONDS = 2700   # 45 min — deliberate cable-security tradeoff
+SUSPEND_WINDOW_UNLATCHED_SECONDS = 10800  # 3 h — ops request 2026-09-16; captures ~71% (was 45 min / ~13%)
 
 # Buffer added on top of a transaction's suspend window to form the
 # stale-suspended cutoff used by the backstop sweep and the resume-staleness

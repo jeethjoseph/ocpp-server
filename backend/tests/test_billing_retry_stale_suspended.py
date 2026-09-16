@@ -8,7 +8,7 @@ cutoff instead of the longest legitimate window.
 
 Post ADR 0027 the windows are per-connector-type (policy.py): latched
 connectors (Type2 — what the `test_charger` fixture has) get the 12h window,
-unlatched sockets the 45min window. These tests pin the sweep to each row's
+unlatched sockets the short window (3h; values in policy.py). These tests pin the sweep to each row's
 OWN window: inside-window rows survive, past-window rows are swept, and a
 latched row is never swept at the socket cutoff.
 """
@@ -71,7 +71,7 @@ class TestBillingRetryStaleSuspendedCutoff:
         self, client, test_station, test_user
     ):
         """Incident shape (txn 949): a socket txn suspended ~9 min ago must
-        NOT be swept — its window is 45 min."""
+        NOT be swept — its window is 3h."""
         socket_charger = await _make_socket_charger(test_station)
         suspended_at = datetime.now(timezone.utc) - timedelta(seconds=540)  # 9 min
         txn = await Transaction.create(
@@ -86,7 +86,7 @@ class TestBillingRetryStaleSuspendedCutoff:
 
         refreshed = await Transaction.get(id=txn.id)
         assert refreshed.transaction_status == TransactionStatusEnum.SUSPENDED, \
-            "Socket txn inside its 45-min window must not be swept"
+            "Socket txn inside its own window must not be swept"
 
     @pytest.mark.asyncio
     async def test_socket_txn_past_own_window_is_swept(

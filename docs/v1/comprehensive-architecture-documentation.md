@@ -784,7 +784,7 @@ await start_data_retention_service(
 async def suspend_window_seconds_for_charge_point(charge_point_id: str) -> int
 async def suspend_window_seconds_for_transaction(transaction) -> int
     """Per-connector-type window (ADR 0027): 12h for latching connectors
-    (Type2/Type1/CCS/CHAdeMO/GB-T -- cable locked into the car), 45min for
+    (Type2/Type1/CCS/CHAdeMO/GB-T -- cable locked into the car), 3h for
     unlatched sockets and unknown types. Values in git-tracked policy.py."""
 
 async def suspend_transactions_on_disconnect(charge_point_id: str) -> None
@@ -815,7 +815,7 @@ async def sweep_stale_suspended_transactions() -> None
 1. Heartbeat monitor detects charger silence (120s inactivity)
 2. `ConnectionManager.force_disconnect()` fires registered callbacks
 3. `suspend_transactions_on_disconnect()` sets all active transactions to SUSPENDED, records `suspended_at`
-4. Starts the connector type's suspend-window timer per transaction (12h latched / 45min unlatched, ADR 0027)
+4. Starts the connector type's suspend-window timer per transaction (12h latched / 3h unlatched, ADR 0027 as amended 2026-09-16)
 5. **If charger reconnects** (BootNotification): timeout is invalidated via CAS guard (`suspended_at` comparison), and a fresh timer with the SAME per-type window starts -- the old 300s post-boot timer is retired (it silently shortened the promised grace; 9 sessions killed fleet-wide at ~300s, and ~41% of prod reconnects arrive via BootNotification)
 6. **If timeout expires**: transaction is auto-stopped with `stop_reason=DISCONNECT_TIMEOUT`, energy is calculated from the last MeterValue, and billing is processed
 
@@ -843,7 +843,7 @@ If the counter reaches `MAX_RESETS_WITHOUT_PROGRESS` (default 3), BootNotificati
 | Value | Where | Purpose |
 |----------|---------|---------|
 | `SUSPEND_WINDOW_LATCHED_SECONDS = 43200` | `backend/policy.py` (git-tracked) | Suspend window for latching connectors (Type2/Type1/CCS/CHAdeMO/GB-T) |
-| `SUSPEND_WINDOW_UNLATCHED_SECONDS = 2700` | `backend/policy.py` (git-tracked) | Suspend window for unlatched sockets + unknown types |
+| `SUSPEND_WINDOW_UNLATCHED_SECONDS = 10800` (3h) | `backend/policy.py` (git-tracked) | Suspend window for unlatched sockets + unknown types |
 | `STALE_SUSPENDED_BUFFER_SECONDS = 60` | `backend/policy.py` (git-tracked) | Buffer added to a txn's window to form the sweep/guard cutoff |
 | `MAX_DISCONNECT_RESETS_WITHOUT_PROGRESS` | env, default 3 | Max BootNotification resets allowed without energy progress |
 
@@ -2312,7 +2312,7 @@ async def on_boot_notification(self, charge_point_vendor, charge_point_model, **
 - Updates charger firmware_version, vendor, model from BootNotification payload
 - **Charger-reported timestamps (migration 62, 2026-09-09)**: every OCPP frame that carries a `timestamp` now has it retained beside server receipt time — `MeterValue.measured_at`, `Transaction.reported_start_time`, `Transaction.reported_end_time`. **`created_at` / `start_time` / `end_time` remain server receipt and remain the billing + GST-invoice basis**; the reported values never displace them. Parsing goes through `utils.parse_ocpp_timestamp()`, which enforces a clock-plausibility window (charger RTCs here are unreliable — the same reason ADR 0030 reconstructs Bundle time from `TIME_SYNC` anchors) and returns NULL rather than substituting receipt time. Reads go through `services/meter_readings.py` (`latest_meter_value` / `meter_series`), ordering on `COALESCE(measured_at, created_at)`. **`is_resume_too_stale` is the deliberate exception and still reads `created_at`** — it measures silence, which is a receipt-time question. See ADR 0031 decision 8.
 - **`OPEN_TRANSACTION_STATES` (`models.py`, 2026-09-09)**: the single set of states in which a `Transaction` still **occupies** its charger — `STARTED`, `PENDING_START`, `RUNNING`, `SUSPENDED`. Shared by `main._reconcile_existing_open_transaction` (the StartTransaction reconcile guard) and `QRPaymentService._create_qr_payment_locked` (the QR double-payment guard), which had drifted: the QR guard omitted `SUSPENDED`, so a payment landing on a charger with a suspended transaction saw the charger as free and could open a parallel session on physically busy hardware. `PENDING_STOP` is **deliberately excluded** — superseding a txn mid-normal-stop races the StopTransaction path into a double-finalize (the finalizer's idempotency guard only short-circuits on TERMINAL states), and per ADR 0021 the session-end seam is not "busy". Do not swap in `qr_session_state.ACTIVE_TXN_STATES`, which includes `PENDING_STOP` and would regress both.
-- **Transaction Suspend/Resume**: On disconnect, `disconnect_handler.py` suspends active transactions with the connector type's suspend window (12h latched / 45min unlatched, `backend/policy.py`, ADR 0027). On BootNotification, already-SUSPENDED transactions get their timeout reset (CAS guard invalidates old timeout), and a fresh timer with the SAME per-type window starts (the old 300s post-boot window is retired). Still-active transactions (edge case) are suspended as before. Auto-stop with billing + QR refund on timeout expiry. The per-txn loop body is extracted into `_handle_ongoing_transaction_on_boot()` for testability.
+- **Transaction Suspend/Resume**: On disconnect, `disconnect_handler.py` suspends active transactions with the connector type's suspend window (12h latched / 3h unlatched, `backend/policy.py`, ADR 0027 as amended 2026-09-16). On BootNotification, already-SUSPENDED transactions get their timeout reset (CAS guard invalidates old timeout), and a fresh timer with the SAME per-type window starts (the old 300s post-boot window is retired). Still-active transactions (edge case) are suspended as before. Auto-stop with billing + QR refund on timeout expiry. The per-txn loop body is extracted into `_handle_ongoing_transaction_on_boot()` for testability.
 - **Resume staleness guard**: every BootNotification per-txn handler call (and the MeterValues + GetLastMeterValue resume points) goes through `transaction_finalizer.is_resume_too_stale()` first. If the gap exceeds the transaction's derived cutoff (its own per-connector-type suspend window + 60s — ADR 0022 + ADR 0027), the txn is finalized with stop_reason `STALE_RECONNECT` instead of being suspended/resumed. This is defense-in-depth for the case where the disconnect handler silently failed to mark SUSPENDED — see the "Resume Staleness Guard" subsection under Transaction Finalizer above.
 - Resume fields tracked: `suspended_at`, `resumed_at`, `resume_count`
 - Comprehensive connection logging
@@ -5045,7 +5045,7 @@ const useInfiniteTransactions = () => {
 
 **Current Behavior**:
 - On `BootNotification`, ongoing transactions are marked `SUSPENDED` (not FAILED)
-- A background `_suspend_timeout` task waits the connector type's suspend window (12h latched / 45min unlatched — ADR 0027; formerly a fixed 300s)
+- A background `_suspend_timeout` task waits the connector type's suspend window (12h latched / 3h unlatched — ADR 0027; formerly a fixed 300s)
 - If the charger resumes the transaction (sends MeterValues or StartTransaction for same id_tag), the transaction is resumed to RUNNING
 - If the timeout fires while still SUSPENDED: transaction is auto-stopped with energy calculation from last MeterValue, wallet billing, and QR payment billing/refund
 - Handles double-boot race conditions via `suspended_at` timestamp comparison

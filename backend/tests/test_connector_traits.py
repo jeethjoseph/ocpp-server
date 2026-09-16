@@ -4,7 +4,7 @@ Covers:
 1. The CONNECTOR_TRAITS table: enum<->traits bijection, both axes per type,
    unknown-type safe defaults, canonicalization.
 2. startable_statuses — the shared Preparing-vs-Available start gate.
-3. Per-charger suspend-window resolution (latched 12h / unlatched 45min).
+3. Per-charger suspend-window resolution (latched 12h / unlatched 3h).
 4. The post-boot regression (txn 999): BootNotification arms the connector
    type's window, never the old 300s timer.
 5. /api/users/active-session includes SUSPENDED sessions.

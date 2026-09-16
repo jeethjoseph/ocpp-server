@@ -272,7 +272,7 @@ class TestIsResumeTooStale:
         is_stale, _ = await is_resume_too_stale(latched_txn)
         assert is_stale is False
 
-        # Unlatched (Socket): 45min window
+        # Unlatched (Socket): 3h window
         socket_charger = await Charger.create(
             charge_point_string_id=str(uuid.uuid4()),
             station_id=test_station.id,
