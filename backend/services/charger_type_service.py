@@ -45,7 +45,7 @@ CONNECTOR_TRAITS = {
 
 # Unknown types get the safe default on each axis independently: require
 # Preparing to start (never widen the start gate for an unrecognised type)
-# and the short suspend window (never hold a possibly-unlatched cable 12h).
+# and the short suspend window (never hold a possibly-unlatched cable for the long one).
 UNKNOWN_TRAITS = ConnectorTraits(starts_from_available=False, latching=False)
 
 

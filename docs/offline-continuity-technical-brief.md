@@ -125,19 +125,19 @@ Six items, no interdependencies between them, schedulable by availability.
 
 | # | Component | Change |
 |---|---|---|
-| **01** | `on_stop_transaction` | Add the terminal-state guard it currently lacks. Today it unconditionally overwrites `end_meter_kwh`, `energy_consumed_kwh`, `end_time` and status, then re-runs billing. The money paths are individually idempotent so there is no double refund — but the row is rewritten, leaving an issued invoice disagreeing with its own transaction. Charger figures go to new `reported_*` energy columns plus an audit + alertable event. **Hard gate for all firmware work.** |
-| **02** | `disconnect_handler`, `transaction_finalizer` | Switch the suspend clock from `suspended_at` age to time-since-last-contact. Touches the disconnect timer, the post-boot timer, the stale-suspended sweep and the derived staleness cutoff — all must keep the ADR 0022 ordering invariant per row. `is_resume_too_stale` deliberately stays on receipt time. |
-| **04** | `connection_manager`, QR + wallet session services | Emit the `SessionLimit` DataTransfer after `StartTransaction.conf`; re-assert on reconnect; re-push on budget change. Wh conversion rounds **down**. Server-side `check_budget_and_auto_stop` retained as a redundant failsafe. Includes simulator support and the wire spec. |
-| **05** | `on_meter_values` | Compare each reading against the last for that transaction; a backwards reading emits an alertable event and still bills as reported. No clamping — the meter is the instrument of record. |
-| **06** | Charger connect path | Explicitly set and read back `AllowOfflineTxForUnknownId` and `LocalAuthorizeOffline` as `false` via `ChangeConfiguration`/`GetConfiguration`, rather than trusting vendor defaults. A charger reporting otherwise is a provisioning fault and must be visible. |
+| **01** | `on_stop_transaction` | Add the terminal-state guard it currently lacks. Today it unconditionally overwrites `end_meter_kwh`, `energy_consumed_kwh`, `end_time` and status, then re-runs billing. The money paths are individually idempotent so there is no double refund — but the row is rewritten, leaving an issued invoice disagreeing with its own transaction. Charger figures go to new `reported_*` energy columns plus an audit + alertable event. The same guard covers `MeterValues` replayed for a terminal transaction: acknowledged and stored, never billed, never resumed, never budget-checked. **Hard gate for all firmware work.** |
+| **02** ✅ 2026-09-15 | `disconnect_handler`, `transaction_finalizer` | One derived silence clock (`last_heard_at`) shared by the single suspend timer (`hold_until_silent`, self-re-arming), the stale sweep and the staleness guard. Finding: readings already reset the clock via resume-and-re-suspend, so this was structural. Heartbeats / bare reconnects do not extend the window; Boot does, flap-capped. ADR 0022 invariant preserved per row. No column. |
+| **04** ✅ 2026-09-15 | `services/session_limit_service.py`, `main.py`, `routers/ocpp_ws.py` | Emit the `SessionLimit` DataTransfer after `StartTransaction.conf`; re-assert on WebSocket connect (not only Boot) for every open transaction; re-push on budget change. Route the charger's `StopDetail` DataTransfer so a budget-cap stop is distinguishable from a user stop. Wh conversion rounds **down**. Server-side `check_budget_and_auto_stop` retained as a redundant failsafe. Includes simulator support and the wire spec. |
+| **05** ✅ 2026-09-15 | `services/meter_monotonicity.py`, `on_meter_values` | Compare each reading against the last for that transaction; a backwards reading emits an alertable event and still bills as reported. No clamping — the meter is the instrument of record. |
+| ~~**06**~~ descoped 2026-09-15 | — | Offline start is impossible by construction (no local start path, no `Authorize` handler, sessions begin only by `RemoteStartTransaction`). No per-charger configuration from the CSMS. Revisit only if firmware gains a local start path. |
 | **10** | Logs Console + CSV export | Extract the frame timestamp from the stored payload at render — no schema change, no index. `OCPPLog.timestamp` is `auto_now_add`, i.e. receipt time despite the name; a replayed queue currently exports as hundreds of identical timestamps. |
 
 ### Blocked on a decision
 
 | # | Change | Blocked by |
 |---|---|---|
-| **03** | Raise suspend window values in `policy.py` (git-tracked, no env override, per ADR 0027) | unlatched figure undecided |
-| **07** | Firmware requirements spec — agreed, not sent | firmware team sign-off |
+| **03** ✅ 2026-09-15 | `policy.py`: 48h latched / 12h unlatched; no hard ceiling. ADR 0027 amended with the 90-day evidence. | — |
+| **07** | Firmware requirements spec **written 2026-09-15**: `docs/firmware/offline-continuity-required-changes-v1.0.md` + `session-limit-spec.md` | firmware review meeting |
 | **08** | Remove `_push_post_boot_state`, `after_boot_notification`, `_handle_get_last_meter_value`, `_get_charger_last_meter_wh` | whole-fleet firmware rollout |
 | **09** | Customer sub-state in `qr_session_state` + `/api/users/active-session` | product decision |
 
@@ -150,8 +150,9 @@ All additive and nullable, Aerich-generated. Existing columns keep their meaning
 | Migration | Columns | Notes |
 |---|---|---|
 | **62**| `meter_value.measured_at`<br>`transaction.reported_start_time`<br>`transaction.reported_end_time` | Three plain `ADD COLUMN`s — **no index, no deploy lock.** An index on `measured_at` was added then removed: reads order by `COALESCE(measured_at, created_at)` and a btree index on one column cannot serve that expression. Verified on a 20k-row probe with `enable_seqscan=off` — the planner still full-scanned. |
-| **63** planned | `transaction.reported_end_meter_kwh`<br>`transaction.reported_energy_kwh` | Item 01. Holds what a late `StopTransaction` reports without disturbing the billed figures or the issued GST invoice. |
-| **64** planned | last-contact timestamp on `transaction` | Item 02. Replaces `suspended_at` as the measured column for the silence clock. |
+| **64** shipped 2026-09-15 | `transaction.reported_end_meter_kwh`<br>`transaction.reported_energy_kwh` | Item 01. Holds what a late `StopTransaction` (or replayed `MeterValues`) reports without disturbing the billed figures or the issued GST invoice. Two plain `ADD COLUMN`s. (63 was taken by the connector-type check.) |
+| **65** shipped 2026-09-15 | `transaction.stop_detail_reason` | Item 04. The charger's StopDetail reason (e.g. `SessionLimit`), beside the OCPP `stop_reason`. One `ADD COLUMN`. |
+| ~~**64**~~ dropped | ~~last-contact timestamp on `transaction`~~ | Item 02 no longer needs a column: a `transaction` write per `MeterValues` frame is the wrong trade on the highest-frequency path. Silence is derived from `suspended_at`, the latest `MeterValue.created_at` and `start_time`, as `is_resume_too_stale` already does. See issue 02. |
 
 ---
 
@@ -187,7 +188,7 @@ not want to signal that intention.
 | **Hold the contactor on WS loss** | Safety paths unchanged and still stop the charge. Only a reset whose sole cause is CSMS unreachability is suppressed. | Agreed |
 | **Enforce `maxEnergy` locally** | Continuity without a local cap is unbounded free energy. **Ships in the same release as the item above — never separately.** | Agreed |
 | **Key on `transactionId`, not `idTag`** | The HLD keys on `idTag`. `rfid_card_id` is a per-`User` value minted once and reused across every session that customer ever has — it cannot identify a session, and the ambiguity worsens against a limit persisted in EEPROM across reboots. | **Change** |
-| **Use `TransactionMessageAttempts` / `TransactionMessageRetryInterval`** | The HLD hardcodes "3 attempts, then 3 every 30 min". These are standard OCPP 1.6 config keys, settable per charger via `ChangeConfiguration` — same behaviour, remotely tunable, legible to any OCPP tooling. | **Change** |
+| **Name the retry cadence by `TransactionMessageAttempts` / `TransactionMessageRetryInterval`** | The HLD hardcodes "3 attempts, then 3 every 30 min". Keep the values fleet-wide in firmware (the CSMS does not set per-charger configuration, decided 2026-09-15) but expose them under the standard key names so the behaviour is legible to any OCPP tooling. | **Minor** |
 | **Torn-write durability on the stored meter value** | Rotate across live-state slots, checksum each record, take the newest valid on boot. The failure mode is a power cut landing mid-write — the exact event the value exists to outlive. Retiring `PostBootState` makes this the *sole* meter-recovery path. | **Change** |
 | **Never report a reading below one already sent** | The HLD promises the register will not reset within a transaction. It cannot: an involuntary reset is what happens when the meter chip loses power, and a site power cut resets it *and* drops the link together. The achievable invariant is about the wire, not the hardware — reconstruct before reporting. | **Change** |
 
@@ -211,7 +212,7 @@ energy = 0.9 − 11.0 = −10.1 kWh
 
 ## 7. Release gates
 
-1. **Gate 1 — item 01 before any firmware release.** The only hard ordering constraint.
+1. **Gate 1 — item 01 before any firmware release.** ✅ **Satisfied 2026-09-15** (migration 64, `test_late_stop_terminal_guard.py`). The only hard ordering constraint.
    Without it, late-arriving stops rewrite invoiced sessions and the GST register stops
    reconciling against its own transactions. There is no credit-note mechanism to repair
    that after the fact.
@@ -230,7 +231,7 @@ against the charger simulator, and building it produces the wire spec item 07 ne
 
 | Decision | Detail | Owner | Blocks |
 |---|---|---|---|
-| **Unlatched suspend window value** | Latched agreed at ~48 h. The unlatched figure is undecided — ADR 0027's latching split survives because it remains the best available evidence about whether the vehicle is still attached when we know nothing else. Mechanism (item 02) can be built without it. | Engineering + operations | 03 |
+| ~~**Unlatched suspend window value**~~ | **Decided 2026-09-15: 12 h** (latched 48 h). 90-day sweep: 93% of unlatched outages back within 12 h, all within 48 h. No hard session-age ceiling. | — | — |
 | **Firmware sign-off on the four changes** | Two of them — the `transactionId` keying and the retry-key change — alter what our backend sends, so a counter-proposal comes back into our scope. | Firmware team | 07 → 08 |
 | **Fleet rollout confirmation** | A status check, not a coding task: every connected charger must be running firmware that persists its own meter state before the recovery messages are removed. | Operations | 08 |
 | **Customer-facing session state** | `SUSPENDED` currently surfaces as **PAUSED**. Under continuity that describes an actively charging vehicle. The honest difficulty: we do not *know* the charger is delivering, only that it probably is — so the label must not claim more certainty than we have. | Product | 09 |

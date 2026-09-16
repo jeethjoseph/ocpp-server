@@ -4,8 +4,8 @@ Transaction Finalizer Service
 Single source of truth for stopping a transaction that timed out (rather than
 being stopped by a normal StopTransaction OCPP message). Used by:
 
-- ChargePoint._suspend_timeout (BootNotification suspend timeout)
-- disconnect_handler._disconnect_suspend_timeout (charger disconnect timeout)
+- disconnect_handler.hold_until_silent (the one suspend timer, armed by both
+  the disconnect path and the BootNotification path)
 - disconnect_handler.sweep_stale_suspended_transactions (startup safety net)
 
 Responsibilities (in order):
@@ -23,7 +23,7 @@ import datetime
 import logging
 from typing import Optional, Tuple
 
-from models import Transaction, TransactionStatusEnum, MeterValue
+from models import Transaction, TransactionStatusEnum, MeterValue, TERMINAL_TRANSACTION_STATES
 from services.wallet_service import WalletService
 from services.monitoring_service import OCPPMetrics
 from crud import log_audit_event
@@ -52,38 +52,25 @@ async def is_resume_too_stale(
     """
     Decide whether a transaction's last activity is too stale to safely resume.
 
-    Returns (is_stale, gap_seconds). gap_seconds is the age of the most recent
-    activity signal we found, or None if we couldn't find any.
+    Returns (is_stale, gap_seconds). gap_seconds is the silence — the age of
+    the most recent signal about this transaction — or None if there is none.
 
-    Looks at the most recent of: suspended_at, latest MeterValue.created_at,
-    falling back to start_time. Threshold is the per-transaction derived
-    stale-suspended cutoff (see module comment) — guaranteed larger than the
-    primary suspend window for this transaction's connector type.
+    Silence comes from disconnect_handler.silence_seconds, the SAME clock the
+    suspend timers and the stale-suspended sweep use. It is receipt time on
+    purpose: a charger replaying an hours-old queue on reconnect has just told
+    us it is alive, so the gap legitimately resets to ~0 even though the
+    readings are old. Measuring by measured_at would resurrect a stale gap and
+    refuse a live resume. See ADR 0031 decisions 3 and 8.
+
+    Threshold is the per-transaction derived stale-suspended cutoff (see module
+    comment) — guaranteed larger than the primary suspend window for this
+    transaction's connector type.
     """
-    now = datetime.datetime.now(datetime.timezone.utc)
-    candidates = []
-    if transaction.suspended_at:
-        candidates.append(transaction.suspended_at)
-    # Deliberately created_at, NOT services.meter_readings.latest_meter_value:
-    # this measures SILENCE — how long since we heard anything about this
-    # transaction — which is a receipt-time question. A charger replaying an
-    # hours-old queue on reconnect has just told us it is alive, so the gap
-    # legitimately resets to ~0 even though the readings are old. Ordering by
-    # measured_at here would resurrect a stale gap and refuse a live resume.
-    # See ADR 0031 decisions 3 and 8.
-    latest_mv = await MeterValue.filter(
-        transaction_id=transaction.id
-    ).order_by("-created_at").first()
-    if latest_mv:
-        candidates.append(latest_mv.created_at)
-    if not candidates and transaction.start_time:
-        candidates.append(transaction.start_time)
-    if not candidates:
+    from services.disconnect_handler import silence_seconds, stale_suspended_cutoff_seconds_for
+    gap = await silence_seconds(transaction)
+    if gap is None:
         return False, None
-    most_recent = max(candidates)
-    gap = (now - most_recent).total_seconds()
     # Derived per-transaction, not configured — see module comment / ADR 0022.
-    from services.disconnect_handler import stale_suspended_cutoff_seconds_for
     return gap > await stale_suspended_cutoff_seconds_for(transaction), gap
 
 
@@ -98,14 +85,10 @@ async def finalize_stopped_transaction(
     Idempotent: if the transaction is already STOPPED/COMPLETED/BILLING_FAILED,
     this is a no-op.
     """
-    # Idempotency guard — don't double-process
-    terminal_states = {
-        TransactionStatusEnum.STOPPED,
-        TransactionStatusEnum.COMPLETED,
-        TransactionStatusEnum.BILLING_FAILED,
-        TransactionStatusEnum.FAILED,
-    }
-    if transaction.transaction_status in terminal_states:
+    # Idempotency guard — don't double-process. Shared with the StopTransaction
+    # late-stop guard and the MeterValues replay guard (models.py) so the three
+    # cannot disagree about when a transaction's money is frozen.
+    if transaction.transaction_status in TERMINAL_TRANSACTION_STATES:
         logger.info(
             f"finalize_stopped_transaction: txn {transaction.id} already "
             f"in terminal state {transaction.transaction_status}, skipping"

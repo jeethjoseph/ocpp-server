@@ -34,6 +34,8 @@ _CHARGER = [
 _TRANSACTION = [
     "transaction.finalized",
     "transaction.force_stopped",
+    "transaction.late_stop_recorded",
+    "transaction.meter_regression",
     "transaction.resume_blocked",
     "transaction.resumed",
     "transaction.status_changed",

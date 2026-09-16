@@ -26,3 +26,7 @@ There is exactly one `Transaction` (the OCPP session); stacking only extends its
 ## Blocked by
 
 - None - can start immediately
+
+## Added 2026-09-15 (offline continuity, ADR 0031)
+
+After raising `budget_limit_paise` for a CHARGING session, call `services.session_limit_service.push_session_limit(charge_point_id, transaction_id, trigger="budget_change")` so the charger-side cap (`SessionLimit`) is re-pushed with the new absolute value. Without it the charger will stop the session at the OLD budget while the CSMS thinks there is money left. Acceptance criterion: a top-up re-pushes `SessionLimit` with the raised `maxEnergy`.

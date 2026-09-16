@@ -124,6 +124,26 @@ OPEN_TRANSACTION_STATES = [
     TransactionStatusEnum.SUSPENDED,
 ]
 
+# The states in which a Transaction's MONEY IS FROZEN. Once a row is here the
+# billed figures (end_meter_kwh, energy_consumed_kwh, end_time, total_billed)
+# have been refunded / invoiced / settled against, and there is no credit-note
+# mechanism to correct an issued GST Invoice (dropped in migration 27). Three
+# call sites share this set so they cannot drift: the finalizer's idempotency
+# guard, the StopTransaction late-stop guard and the MeterValues replay guard
+# (ADR 0031 decision 5). Anything a charger reports for a terminal transaction
+# is recorded to the reported_* fields and never promoted to the billed ones.
+#
+# CANCELLED is included for completeness — nothing in production code sets it
+# today, but it is semantically terminal and a late frame for one must not
+# reopen it.
+TERMINAL_TRANSACTION_STATES = frozenset({
+    TransactionStatusEnum.STOPPED,
+    TransactionStatusEnum.COMPLETED,
+    TransactionStatusEnum.BILLING_FAILED,
+    TransactionStatusEnum.FAILED,
+    TransactionStatusEnum.CANCELLED,
+})
+
 
 class MessageDirectionEnum(str, enum.Enum):
     INBOUND = "IN"
@@ -558,7 +578,25 @@ class Transaction(Model):
     # substituted with receipt time. See ADR 0031.
     reported_start_time = fields.DatetimeField(null=True)
     reported_end_time = fields.DatetimeField(null=True)
+    # What the CHARGER said it delivered, as carried on StopTransaction
+    # (meterStop) or the last replayed MeterValues frame. Distinct from
+    # end_meter_kwh / energy_consumed_kwh, which are the BILLED figures: the
+    # basis of the refund, the Settlement Entry and the GST Invoice, and frozen
+    # once the transaction is terminal (TERMINAL_TRANSACTION_STATES). On a
+    # normal stop the two pairs agree; after a write-off they diverge by the
+    # energy delivered during the blackout, and the gap is the measured cost of
+    # the write-off policy. Recorded, never promoted — there is no credit note
+    # to correct an issued invoice. See ADR 0031 decision 5 and the
+    # "Reported energy vs Billed energy" entry in CONTEXT.md.
+    reported_end_meter_kwh = fields.DecimalField(max_digits=12, decimal_places=3, null=True)
+    reported_energy_kwh = fields.DecimalField(max_digits=12, decimal_places=3, null=True)
     stop_reason = fields.TextField(null=True)
+    # Why the CHARGER says it stopped, from the vendor StopDetail DataTransfer
+    # that follows a StopTransaction. OCPP 1.6 has no budget-stop reason code,
+    # so a charger that opened the contactor on its local SessionLimit sends
+    # StopTransaction reason=Local and then StopDetail reason=SessionLimit.
+    # Reported-only, beside stop_reason, never overwriting it. ADR 0031.
+    stop_detail_reason = fields.CharField(max_length=50, null=True)
     transaction_status = fields.CharEnumField(TransactionStatusEnum)
     suspended_at = fields.DatetimeField(null=True)
     resumed_at = fields.DatetimeField(null=True)

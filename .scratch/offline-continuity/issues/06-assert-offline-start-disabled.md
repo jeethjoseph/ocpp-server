@@ -1,6 +1,6 @@
 # Assert offline session start stays disabled
 
-Status: ready-for-agent
+Status: wontfix
 
 ## What to build
 
@@ -23,3 +23,13 @@ See ADR 0031 decision 9.
 ## Blocked by
 
 None - can start immediately
+
+## Descoped 2026-09-15 — build only if firmware gains a local start path
+
+Both keys are unreachable in this fleet. They govern what a charger does when an id tag is presented *to the charger* (RFID tap, button) while offline. No charger has such a path: the CSMS does not implement the `Authorize` handler at all, every session begins with a `RemoteStartTransaction` after a funding decision, and an offline charger cannot receive one. Offline start is impossible by construction. Building the assertion would have added the first outbound `ChangeConfiguration`/`GetConfiguration` exchange in the codebase, a migration and a UI row to guard a path that does not exist.
+
+Broader decision recorded the same day: **the CSMS does not set per-charger configuration; charger behaviour is fleet-wide in firmware.**
+
+**Trigger to reopen:** firmware adds any local start path (RFID reader, plug-and-charge, start button). The firmware spec (`docs/firmware/session-limit-spec.md`) requires such a path to ship with both keys `false` and to be announced.
+
+**Plan preserved for that day:** run in `after_boot_notification` after the PostBootState push; `ChangeConfiguration` both keys to `false`, then one `GetConfiguration` for both; record to `Charger.offline_start_allowed` (tri-state: true = fault, false = confirmed, null = unknown/unsupported) + `Charger.offline_start_config` (raw read-back, statuses, checked_at); `unknownKey` / `NotSupported` = unsupported, not a fault; a `true` read-back logs at error, audits `charger.offline_start_enabled`, emits `Custom/OCPP/OfflineStart/Enabled` + NR event; charger detail page shows an "Offline start" row (Disabled / Enabled — provisioning fault / Unknown, IST check time); tests for each outcome.

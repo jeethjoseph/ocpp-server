@@ -124,6 +124,11 @@ async def ocpp_websocket(websocket: WebSocket, charge_point_id: str):
     active_connections = len(connection_manager.connected_charge_points)
     await OCPPMetrics.record_active_connections(active_connections)
 
+    # Re-assert the Budget cap for any open transaction on this charger. A
+    # task, not an await: cp.call() needs the message loop below to route the
+    # charger's reply. Fires on every connect, reboot or not (ADR 0031).
+    safe_create_task(cp.reassert_session_limits(), name=f"session-limit-reassert-{charge_point_id}")
+
     try:
         await cp.start()
     except WebSocketDisconnect as e:

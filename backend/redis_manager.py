@@ -254,6 +254,33 @@ class RedisConnectionManager:
             logger.error(f"Failed to invalidate wallet balance cache for {wallet_id}: {e}")
             return False
 
+    # Meter high-water mark (ADR 0031 decision 7 — monotonicity observation)
+    METER_HIGH_PREFIX = "meter_high:"
+    METER_HIGH_TTL = 7 * 86400  # past the longest suspend window (48h) with margin
+
+    async def set_meter_high_water(self, transaction_id: int, reading_kwh: str) -> bool:
+        """Highest cumulative reading reported so far for a transaction, as a
+        Decimal string. One SET per MeterValues frame; never a DB write."""
+        if not self.redis_client:
+            return False
+        try:
+            key = f"{self.METER_HIGH_PREFIX}{transaction_id}"
+            await self.redis_client.set(key, reading_kwh, ex=self.METER_HIGH_TTL)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set meter high-water for transaction {transaction_id}: {e}")
+            return False
+
+    async def get_meter_high_water(self, transaction_id: int) -> Optional[str]:
+        if not self.redis_client:
+            return None
+        try:
+            data = await self.redis_client.get(f"{self.METER_HIGH_PREFIX}{transaction_id}")
+            return data.decode() if isinstance(data, bytes) else data
+        except Exception as e:
+            logger.error(f"Failed to get meter high-water for transaction {transaction_id}: {e}")
+            return None
+
     # Zero-energy watchdog methods
     ZERO_ENERGY_PREFIX = "zero_energy:"
 

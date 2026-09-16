@@ -8,7 +8,7 @@ is derived per-transaction from the connector type's suspend window (policy.py),
 not a separate env var, so it can never be misordered below the primary timer.
 
 NOTE: the `test_charger` fixture has a Type2 (latching) connector, so its
-derived cutoff is the LATCHED window (12h) + buffer. Staleness fixtures below
+derived cutoff is the LATCHED window + buffer. Staleness fixtures below
 use 13h-old activity where they previously used 1h.
 
 Two layers tested:
@@ -129,7 +129,7 @@ class TestIsResumeTooStale:
     ):
         """Charger has been ticking meter values even after a stale suspended_at —
         not stale, latest activity wins."""
-        old = datetime.now(timezone.utc) - timedelta(hours=13)
+        old = datetime.now(timezone.utc) - timedelta(seconds=SUSPEND_WINDOW_LATCHED_SECONDS + 3600)
         txn = await Transaction.create(
             charger=test_charger,
             user=test_user,
@@ -171,7 +171,7 @@ class TestIsResumeTooStale:
             reading_kwh=5.0,
             measurand="Energy.Active.Import.Register",
         )
-        ancient = datetime.now(timezone.utc) - timedelta(hours=13)
+        ancient = datetime.now(timezone.utc) - timedelta(seconds=SUSPEND_WINDOW_LATCHED_SECONDS + 3600)
         await _set_meter_value_created_at(mv.id, ancient)
 
         is_stale, gap = await is_resume_too_stale(txn)
@@ -325,7 +325,7 @@ class TestBootNotificationStalenessGuard:
         self, client, test_charger, test_user, test_tariff, test_wallet
     ):
         """Plan agent's high-risk regression: a still-RUNNING txn whose last
-        meter value is from 13h ago (past the Type2 latched window) must be
+        meter value is from past the Type2 latched window must be
         finalized, not suspended+resumed."""
         from main import ChargePoint
         txn = await Transaction.create(
@@ -340,7 +340,7 @@ class TestBootNotificationStalenessGuard:
             reading_kwh=5.0,
             measurand="Energy.Active.Import.Register",
         )
-        ancient = datetime.now(timezone.utc) - timedelta(hours=13)
+        ancient = datetime.now(timezone.utc) - timedelta(seconds=SUSPEND_WINDOW_LATCHED_SECONDS + 3600)
         await _set_meter_value_created_at(mv.id, ancient)
         await _set_transaction_start_time(txn.id, ancient)
 
@@ -361,10 +361,10 @@ class TestBootNotificationStalenessGuard:
         self, client, test_charger, test_user, test_tariff, test_wallet
     ):
         """Plan agent's IF-branch catch: a SUSPENDED txn whose suspended_at
-        is from 13h ago (past the Type2 latched window) must be finalized,
+        is from past the Type2 latched window must be finalized,
         not have suspended_at refreshed."""
         from main import ChargePoint
-        old = datetime.now(timezone.utc) - timedelta(hours=13)
+        old = datetime.now(timezone.utc) - timedelta(seconds=SUSPEND_WINDOW_LATCHED_SECONDS + 3600)
         txn = await Transaction.create(
             charger=test_charger,
             user=test_user,

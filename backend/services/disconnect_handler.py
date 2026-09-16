@@ -10,9 +10,9 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Dict
+from typing import Dict, Optional
 
-from models import Transaction, TransactionStatusEnum
+from models import Transaction, TransactionStatusEnum, MeterValue
 from crud import log_audit_event
 from utils import safe_create_task
 from services.monitoring_service import OCPPMetrics
@@ -29,7 +29,7 @@ async def suspend_window_seconds_for_charge_point(charge_point_id: str) -> int:
     """Suspend window for a charger, keyed by its connector's latching trait.
 
     Latching connectors (Type2/CCS/...) hold the cable locked in the car, so
-    the session can safely wait 12h for a reconnect; unlatched sockets get the
+    the session can safely wait the long window for a reconnect; unlatched sockets get the
     short window. Values and rationale live in policy.py.
     """
     from services.charger_type_service import is_latching_charger
@@ -50,7 +50,10 @@ async def suspend_window_seconds_for_transaction(transaction: Transaction) -> in
 # MeterValues show energy advancing, so a healthy long session with intermittent
 # disconnects (cellular flake) never trips. Only sustained no-progress flap
 # (>= MAX_RESETS_WITHOUT_PROGRESS) is treated as pathological — at that point
-# we stop resetting suspended_at and let the existing timer fire.
+# we stop resetting suspended_at and let the existing timer fire. Under the
+# silence clock that reads: past the cap, a reboot no longer counts as "heard
+# from" — only a MeterValues frame does, and a frame with no energy progress
+# is the zero-energy watchdog's problem, not this module's.
 _disconnect_reset_count: Dict[int, int] = {}
 MAX_RESETS_WITHOUT_PROGRESS = int(
     os.environ.get("MAX_DISCONNECT_RESETS_WITHOUT_PROGRESS", "3")
@@ -108,11 +111,7 @@ async def suspend_transactions_on_disconnect(charge_point_id: str) -> None:
                 },
             ))
 
-            safe_create_task(
-                _disconnect_suspend_timeout(
-                    transaction.id, now, window_seconds
-                )
-            )
+            arm_suspend_timer(transaction.id, window_seconds, "DISCONNECT_TIMEOUT")
 
             safe_create_task(
                 OCPPMetrics.record_disconnect_suspended(charge_point_id, transaction.id)
@@ -125,41 +124,105 @@ async def suspend_transactions_on_disconnect(charge_point_id: str) -> None:
         )
 
 
-async def _disconnect_suspend_timeout(
-    transaction_id: int,
-    original_suspended_at: datetime,
-    timeout_seconds: int,
-) -> None:
-    """Auto-stop a SUSPENDED transaction if charger doesn't reconnect."""
+# --- Silence clock (ADR 0031 decision 3) ---------------------------------
+#
+# The suspend window measures SILENCE: time since we last heard anything about
+# THIS transaction, by receipt time. It does not measure session age. Three
+# consumers share the two helpers below so they cannot disagree: the suspend
+# timers (hold_until_silent), the stale-suspended sweep, and the resume
+# staleness guard (transaction_finalizer.is_resume_too_stale).
+#
+# What counts as "heard about the transaction": the suspend itself, a
+# MeterValues frame for it (receipt time — a charger replaying an hours-old
+# queue has just proved it is alive), and as a floor the transaction start.
+# A BootNotification counts by re-stamping suspended_at (capped by the flap
+# guard below). A Heartbeat, StatusNotification or bare WebSocket reconnect
+# does NOT count: the charger has said it is alive, but nothing about the
+# session, and under continuity firmware the queue replay follows immediately.
+#
+# Derived, not stored: a last-contact column would cost a transaction-row
+# write per MeterValues frame, the highest-frequency path in the system.
+
+async def last_heard_at(transaction: Transaction) -> Optional[datetime]:
+    """Receipt time of the most recent signal about this transaction.
+
+    start_time is a FALLBACK only, used when there is neither a suspend nor a
+    reading — it is when the session began, not the last time we heard from
+    it, and letting it compete in the max would make a freshly created row
+    look "heard from just now".
+    """
+    candidates = [transaction.suspended_at] if transaction.suspended_at else []
+    latest_mv = await MeterValue.filter(
+        transaction_id=transaction.id
+    ).order_by("-created_at").first()
+    if latest_mv:
+        candidates.append(latest_mv.created_at)
+    if not candidates and transaction.start_time:
+        candidates.append(transaction.start_time)
+    return max(candidates) if candidates else None
+
+
+async def silence_seconds(transaction: Transaction) -> Optional[float]:
+    """Seconds since we last heard about this transaction; None if never."""
+    heard = await last_heard_at(transaction)
+    if heard is None:
+        return None
+    return (datetime.now(timezone.utc) - heard).total_seconds()
+
+
+# One live timer per transaction. Arming again (a reboot inside the window)
+# replaces the previous one rather than stacking a second.
+_suspend_timers: Dict[int, asyncio.Task] = {}
+
+
+def arm_suspend_timer(transaction_id: int, window_seconds: int, stop_reason: str) -> asyncio.Task:
+    """Start (or replace) the silence timer for a SUSPENDED transaction."""
+    previous = _suspend_timers.get(transaction_id)
+    if previous and not previous.done():
+        previous.cancel()
+    task = safe_create_task(
+        hold_until_silent(transaction_id, window_seconds, stop_reason),
+        name=f"suspend-timer-{transaction_id}",
+    )
+    _suspend_timers[transaction_id] = task
+    return task
+
+
+async def hold_until_silent(transaction_id: int, window_seconds: int, stop_reason: str) -> None:
+    """Finalize a SUSPENDED transaction once it has been silent for its window.
+
+    Sleeps the window, then re-checks: if the charger has been heard from in
+    the meantime the timer re-arms for the remainder instead of finalizing.
+    Exits without action as soon as the transaction is no longer SUSPENDED
+    (resumed, or finalized by another path). Replaces the old compare-and-swap
+    on suspended_at, which could only see reboots, not readings.
+    """
+    remaining: float = window_seconds
     try:
-        await asyncio.sleep(timeout_seconds)
-
-        transaction = await Transaction.filter(id=transaction_id).first()
-        if not transaction:
+        while True:
+            await asyncio.sleep(remaining)
+            transaction = await Transaction.filter(id=transaction_id).first()
+            if not transaction or transaction.transaction_status != TransactionStatusEnum.SUSPENDED:
+                logger.info(f"⏸️ Suspend timer for transaction {transaction_id} — no longer SUSPENDED, exiting")
+                return
+            silence = await silence_seconds(transaction)
+            if silence is not None and silence < window_seconds:
+                remaining = window_seconds - silence
+                logger.info(
+                    f"⏸️ Transaction {transaction_id} heard from {silence:.0f}s ago — "
+                    f"re-arming suspend timer for {remaining:.0f}s"
+                )
+                continue
+            from services.transaction_finalizer import finalize_stopped_transaction
+            await finalize_stopped_transaction(transaction, stop_reason)
             return
-
-        # CAS guard: only act if still SUSPENDED with same suspended_at
-        # If charger reconnected, BootNotification resets suspended_at
-        if (
-            transaction.transaction_status != TransactionStatusEnum.SUSPENDED
-            or transaction.suspended_at != original_suspended_at
-        ):
-            logger.info(
-                f"⏸️ Disconnect timeout for transaction {transaction_id} — "
-                f"status already changed, skipping"
-            )
-            return
-
-        from services.transaction_finalizer import finalize_stopped_transaction
-        await finalize_stopped_transaction(transaction, "DISCONNECT_TIMEOUT")
-
     except asyncio.CancelledError:
         pass
     except Exception as e:
-        logger.error(
-            f"Error in disconnect timeout for transaction "
-            f"{transaction_id}: {e}", exc_info=True
-        )
+        logger.error(f"Error in suspend timer for transaction {transaction_id}: {e}", exc_info=True)
+    finally:
+        if _suspend_timers.get(transaction_id) is asyncio.current_task():
+            _suspend_timers.pop(transaction_id, None)
 
 
 def min_stale_suspended_cutoff_seconds() -> int:
@@ -198,10 +261,13 @@ async def finalize_stale_suspended_transactions(stop_reason: str) -> int:
         suspended_at__lt=candidate_cutoff,
     ).all()
 
+    # suspended_at is only the cheap PRE-FILTER (it is never later than the
+    # silence clock). The decision is made on derived silence per row.
     stale_transactions = []
     for transaction in candidates:
         cutoff_seconds = await stale_suspended_cutoff_seconds_for(transaction)
-        if transaction.suspended_at < now - timedelta(seconds=cutoff_seconds):
+        silence = await silence_seconds(transaction)
+        if silence is not None and silence > cutoff_seconds:
             stale_transactions.append(transaction)
 
     if not stale_transactions:

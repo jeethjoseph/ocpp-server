@@ -26,8 +26,30 @@ fallback (180) and the deployed value (1800) that nothing flagged.
 # timer armed by BootNotification. The post-boot window must never be shorter
 # than the window it replaces (the 300s post-boot timer killed 9 sessions
 # fleet-wide; ~41% of prod reconnects arrive via BootNotification).
-SUSPEND_WINDOW_LATCHED_SECONDS = 43200    # 12 h — captures ~95% of observed Type2 reconnects
-SUSPEND_WINDOW_UNLATCHED_SECONDS = 2700   # 45 min — deliberate cable-security tradeoff
+#
+# The window measures SILENCE, not session age (ADR 0031 decision 3): it only
+# ever applies when we have heard nothing about the transaction. Past it the
+# session is finalized on server-available data and the unreported energy is
+# written off — so the window is "how long we hold a customer's money before
+# writing off", and the cost of a longer window is refund latency on an
+# abandoned session, not cable security. Under continuity firmware a pulled
+# plug means a flat meter: the replay bills nothing and the zero-energy
+# watchdog closes the resumed session within its stall timeout.
+#
+# Magnitudes raised 2026-09-15 (ADR 0027 amendment) on a 90-day sweep of every
+# session the previous windows killed, prod + staging, measuring time until
+# the charger next spoke: latched max 41 h, all back within 48 h; unlatched
+# 93% back within 12 h, all within 48 h. Unlatched stays materially shorter
+# because a bare socket gives no evidence the vehicle is still attached, so
+# the abandoned-session refund should not wait two days.
+#
+# No hard session-age ceiling: advancing energy is proof of life and the money
+# is bounded by the Budget cap. A charger that reboots without ever replaying
+# its queue is capped by the flap guard (MAX_RESETS_WITHOUT_PROGRESS) at
+# roughly four windows, and under continuity firmware that pattern is itself a
+# meter-persistence failure for the monotonicity alerting to surface.
+SUSPEND_WINDOW_LATCHED_SECONDS = 172800   # 48 h — every observed latched outage came back within this
+SUSPEND_WINDOW_UNLATCHED_SECONDS = 43200  # 12 h — 93% of observed unlatched outages; bounds refund wait
 
 # Buffer added on top of a transaction's suspend window to form the
 # stale-suspended cutoff used by the backstop sweep and the resume-staleness

@@ -27,7 +27,7 @@ def no_background_tasks():
     """Patch safe_create_task to swallow background tasks so 180s timeout
     sleeps don't hang the test process. Tests verify state at suspension
     time, not what happens after the timer fires."""
-    def fake_create_task(coro):
+    def fake_create_task(coro, **_kwargs):
         # Close the coroutine immediately to suppress 'coroutine was never
         # awaited' warnings without actually scheduling it
         if hasattr(coro, "close"):
@@ -203,7 +203,7 @@ class TestSweepStaleSuspendedTransactions:
         self, client, test_charger, test_user, test_tariff, test_wallet
     ):
         # test_charger is Type2 (latched, ADR 0027) — use a suspended_at well
-        # past its 12h window + buffer so the sweep fires.
+        # past its latched window + buffer so the sweep fires.
         from policy import SUSPEND_WINDOW_LATCHED_SECONDS, STALE_SUSPENDED_BUFFER_SECONDS
         old_suspended_at = datetime.now(timezone.utc) - timedelta(
             seconds=SUSPEND_WINDOW_LATCHED_SECONDS + STALE_SUSPENDED_BUFFER_SECONDS + 60

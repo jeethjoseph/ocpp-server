@@ -494,6 +494,53 @@ class OCPPChargerSimulator:
 
         return True
 
+    def handle_data_transfer(self, message_id: str, payload: dict) -> bool:
+        """Vendor DataTransfer from the CSMS. SessionLimit (ADR 0031) is the
+        Budget cap in Wh for one transaction; the charger enforces it locally,
+        online or offline. Anything else is answered UnknownMessageId."""
+        if payload.get("messageId") != "SessionLimit":
+            self._send_call_result(message_id, {"status": "UnknownMessageId"})
+            return False
+        try:
+            data = payload.get("data")
+            data = json.loads(data) if isinstance(data, str) else (data or {})
+            txn_id = int(data["transactionId"])
+            max_energy = int(data["maxEnergy"])
+        except (KeyError, TypeError, ValueError):
+            self._send_call_result(message_id, {"status": "Rejected"})
+            return False
+        if txn_id != self.transaction_id:
+            print(f"⚠️ [{self.charge_point_id}] SessionLimit for txn {txn_id} but active txn is {self.transaction_id} — Rejected")
+            self._send_call_result(message_id, {"status": "Rejected"})
+            return False
+        self.session_limit_wh = max_energy
+        print(f"📏 [{self.charge_point_id}] SessionLimit accepted: txn {txn_id} maxEnergy={max_energy} Wh")
+        self._send_call_result(message_id, {"status": "Accepted"})
+        return False
+
+    def _session_energy_wh(self) -> int:
+        if not (hasattr(self, "_transaction_start_time") and hasattr(self, "_initial_energy_wh")):
+            return 0
+        elapsed = time.time() - self._transaction_start_time
+        return int((7400 * elapsed) / 3600)
+
+    def enforce_session_limit(self) -> bool:
+        """Open the contactor locally once session energy reaches the limit:
+        StopTransaction(reason=Local) then StopDetail(reason=SessionLimit),
+        because OCPP 1.6 has no budget-stop reason code."""
+        limit = getattr(self, "session_limit_wh", None)
+        if limit is None or not self.transaction_id or self._session_energy_wh() < limit:
+            return False
+        stopped_txn = self.transaction_id
+        print(f"📏 [{self.charge_point_id}] Session energy reached SessionLimit ({limit} Wh) — stopping locally")
+        self.send_stop_transaction(reason="Local")
+        self._send_message("DataTransfer", {
+            "vendorId": "VOLTLYNC", "messageId": "StopDetail",
+            "data": json.dumps({"transactionId": stopped_txn, "reason": "SessionLimit"}),
+        })
+        self.session_limit_wh = None
+        return True
+
     def _dispatch_server_call(self, message: dict) -> bool:
         """Dispatch a parsed server CALL to the appropriate handler. Returns True if it was a stop/reset."""
         action = message["action"]
@@ -503,6 +550,8 @@ class OCPPChargerSimulator:
             return self.handle_remote_stop_transaction(message["message_id"], message["payload"])
         elif action == "Reset":
             return self.handle_reset(message["message_id"], message["payload"])
+        elif action == "DataTransfer":
+            return self.handle_data_transfer(message["message_id"], message["payload"])
         else:
             print(f"⚠️ [{self.charge_point_id}] Unhandled server CALL: {action}")
             return False
@@ -559,6 +608,7 @@ class OCPPChargerSimulator:
                 await asyncio.sleep(self.meter_value_interval)
                 if self.running and self.transaction_id:
                     self.send_meter_values()
+                    self.enforce_session_limit()
             except asyncio.CancelledError:
                 break
             except Exception as e:

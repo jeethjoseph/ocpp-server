@@ -653,6 +653,77 @@ class OCPPMetrics:
         })
 
     @staticmethod
+    async def record_meter_regression(charger_id: str, transaction_id: int,
+                                      previous_kwh: float, current_kwh: float):
+        """A charger reported a cumulative reading LOWER than one it already
+        reported for the same transaction. Billed as reported (the meter is
+        the instrument of record); this is the only field signal that
+        charger-side meter persistence has failed. Alert on it."""
+        MetricsCollector.increment_counter("Custom/OCPP/Meter/MonotonicityViolation")
+        MetricsCollector.record_event("OCPPMeterMonotonicityViolation", {
+            "charger_id": charger_id,
+            "transaction_id": transaction_id,
+            "previous_kwh": previous_kwh,
+            "current_kwh": current_kwh,
+            "delta_kwh": current_kwh - previous_kwh,
+        })
+
+    @staticmethod
+    async def record_session_limit_push(charger_id: str, transaction_id: int, max_energy_wh: int,
+                                        trigger: str, outcome: str):
+        """A SessionLimit DataTransfer was pushed; outcome is one label from
+        session_limit_service._send. Anything but 'accepted' on a charger
+        running continuity firmware is worth a look."""
+        MetricsCollector.increment_counter(f"Custom/OCPP/SessionLimit/{outcome}")
+        MetricsCollector.record_event("OCPPSessionLimitPushed", {
+            "charger_id": charger_id,
+            "transaction_id": transaction_id,
+            "max_energy_wh": max_energy_wh,
+            "trigger": trigger,
+            "outcome": outcome,
+        })
+
+    @staticmethod
+    async def record_stop_detail(charger_id: str, transaction_id: int, reason: str):
+        """The charger explained a stop (e.g. SessionLimit — the local cap fired)."""
+        MetricsCollector.increment_counter(f"Custom/OCPP/StopDetail/{reason}")
+        MetricsCollector.record_event("OCPPStopDetail", {
+            "charger_id": charger_id,
+            "transaction_id": transaction_id,
+            "reason": reason,
+        })
+
+    @staticmethod
+    async def record_late_stop_recorded(charger_id: str, transaction_id: int, status: str,
+                                        billed_kwh: float, reported_kwh: float, gap_kwh: float):
+        """A StopTransaction arrived for a transaction whose money is frozen.
+
+        The gap is the energy delivered during a blackout that was written off
+        rather than billed — the measured cost of ADR 0031's write-off policy.
+        Alert on this event; its frequency and gap size are the policy's price.
+        """
+        MetricsCollector.increment_counter("Custom/OCPP/LateStop/Recorded")
+        MetricsCollector.record_metric("Custom/OCPP/LateStop/GapKwh", gap_kwh)
+        MetricsCollector.record_event("OCPPLateStopRecorded", {
+            "charger_id": charger_id,
+            "transaction_id": transaction_id,
+            "status": status,
+            "billed_energy_kwh": billed_kwh,
+            "reported_energy_kwh": reported_kwh,
+            "gap_kwh": gap_kwh,
+        })
+
+    @staticmethod
+    async def record_late_meter_values_stored(charger_id: str, transaction_id: int, count: int):
+        """MeterValues replayed for a terminal transaction were stored, not billed."""
+        MetricsCollector.increment_counter("Custom/OCPP/LateMeterValues/Stored", value=count)
+        MetricsCollector.record_event("OCPPLateMeterValuesStored", {
+            "charger_id": charger_id,
+            "transaction_id": transaction_id,
+            "count": count,
+        })
+
+    @staticmethod
     async def record_stale_suspended_swept(count: int):
         """Record startup sweep of orphaned SUSPENDED transactions"""
         MetricsCollector.increment_counter("Custom/OCPP/Suspended/StaleSwept", value=count)

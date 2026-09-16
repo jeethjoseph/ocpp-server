@@ -18,7 +18,7 @@ from crud import (
     update_charger_heartbeat,
     log_audit_event,
 )
-from models import OCPPLog, Transaction, TransactionStatusEnum, MeterValue, ChargerPurposeEnum
+from models import OCPPLog, Transaction, TransactionStatusEnum, MeterValue, ChargerPurposeEnum, TERMINAL_TRANSACTION_STATES
 from core.roles import INTERNAL_ROLES
 from services.wallet_service import WalletService
 from services.wallet_session_service import WalletSessionService
@@ -353,7 +353,8 @@ class ChargePoint(OcppChargePoint):
             logger.error(f"❌ Error updating charger info from BootNotification: {e}", exc_info=True)
 
         # A BootNotification means the charger rebooted. Handle ongoing transactions:
-        # - Already SUSPENDED (from disconnect): reset suspended_at to extend window
+        # - Already SUSPENDED (from disconnect): re-stamp suspended_at — the
+        #   reboot counts as "heard from" on the silence clock (flap-capped)
         # - Still RUNNING/STARTED/etc (edge case): suspend them
         # In both cases, arm the connector-type suspend window for resume — the
         # SAME window the disconnect path uses, never a shorter one (ADR 0027).
@@ -490,7 +491,7 @@ class ChargePoint(OcppChargePoint):
 
         # Staleness guard — applies to both branches below. Catches the case
         # where suspend_transactions_on_disconnect failed to run, OR where its
-        # _disconnect_suspend_timeout task died (process restart) before firing.
+        # hold_until_silent timer task died (process restart) before firing.
         is_stale, gap = await is_resume_too_stale(transaction)
         if is_stale:
             logger.warning(
@@ -560,32 +561,19 @@ class ChargePoint(OcppChargePoint):
         # sessions fleet-wide; see ADR 0027).
         from services.disconnect_handler import suspend_window_seconds_for_charge_point
         post_boot_window = await suspend_window_seconds_for_charge_point(self.id)
-        safe_create_task(self._suspend_timeout(transaction.id, now, post_boot_window))
+        await self._suspend_timeout(transaction.id, post_boot_window)
 
-    async def _suspend_timeout(self, transaction_id: int, original_suspended_at, timeout_seconds: int):
-        """Auto-stop a SUSPENDED transaction if the charger doesn't resume it in time."""
-        try:
-            await asyncio.sleep(timeout_seconds)
+    async def _suspend_timeout(self, transaction_id: int, timeout_seconds: int) -> None:
+        """Arm the silence timer for a SUSPENDED transaction after a reboot.
 
-            transaction = await Transaction.filter(id=transaction_id).first()
-            if not transaction:
-                return
-
-            # Only act if still SUSPENDED with the same suspended_at (handles double-boot race)
-            if (
-                transaction.transaction_status != TransactionStatusEnum.SUSPENDED
-                or transaction.suspended_at != original_suspended_at
-            ):
-                logger.info(f"⏸️ Suspend timeout for transaction {transaction_id} — status already changed, skipping")
-                return
-
-            from services.transaction_finalizer import finalize_stopped_transaction
-            await finalize_stopped_transaction(transaction, "SUSPENDED_TIMEOUT")
-
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.error(f"Error in suspend timeout for transaction {transaction_id}: {e}", exc_info=True)
+        Delegates to the one shared timer in disconnect_handler — the same
+        implementation the disconnect path arms — so a reboot inside the
+        window replaces the running timer rather than racing it. The timer
+        finalizes only once the transaction has been SILENT for the window
+        (ADR 0031 decision 3); a reading or a further reboot re-arms it.
+        """
+        from services.disconnect_handler import arm_suspend_timer
+        arm_suspend_timer(transaction_id, timeout_seconds, "SUSPENDED_TIMEOUT")
 
     async def _start_socket_grace_period(self, transactions):
         """Start a grace period for socket charger reporting Available during active transactions."""
@@ -983,6 +971,11 @@ class ChargePoint(OcppChargePoint):
             await OCPPMetrics.record_transaction_started(self.id, user.id)
             SentryHelper.set_transaction_context(transaction.id, self.id, user.id)
 
+            # Picked up by after_start_transaction once the .conf has gone out.
+            # Stashed here rather than read from conn["active_transaction_id"]
+            # so a rejected start can never push a stale id. ADR 0031.
+            self._pending_session_limit_txn = transaction.id
+
             return call_result.StartTransaction(
                 transaction_id=transaction.id,
                 id_tag_info={"status": "Accepted"}
@@ -994,6 +987,43 @@ class ChargePoint(OcppChargePoint):
                 transaction_id=0,
                 id_tag_info={"status": "Invalid"}
             )
+
+    @after('StartTransaction')
+    async def after_start_transaction(self, **kwargs):
+        """Push the Budget cap to the charger once StartTransaction.conf is out.
+
+        The charger is the source of truth for the cap under offline continuity
+        (ADR 0031 decision 2); the server-side budget check remains the failsafe.
+        """
+        transaction_id = getattr(self, "_pending_session_limit_txn", None)
+        self._pending_session_limit_txn = None
+        if transaction_id is None:
+            return
+        from services.session_limit_service import push_session_limit
+        try:
+            await push_session_limit(self.id, transaction_id, trigger="start")
+        except Exception as e:
+            logger.error(f"📏 after_start_transaction failed for {self.id}: {e}", exc_info=True)
+
+    async def reassert_session_limits(self) -> None:
+        """Re-send the current cap for every open transaction on this charger.
+
+        Scheduled on every WebSocket connect (routers/ocpp_ws.py), not only on
+        BootNotification: under continuity firmware the common reconnect is a
+        plain re-establish with no reboot. SUSPENDED is included — that is the
+        state a still-charging session sits in while we were unreachable.
+        """
+        from models import OPEN_TRANSACTION_STATES
+        from services.session_limit_service import push_session_limit
+        try:
+            open_txns = await Transaction.filter(
+                charger__charge_point_string_id=self.id,
+                transaction_status__in=OPEN_TRANSACTION_STATES,
+            ).all()
+            for txn in open_txns:
+                await push_session_limit(self.id, txn.id, trigger="reconnect")
+        except Exception as e:
+            logger.error(f"📏 reassert_session_limits failed for {self.id}: {e}", exc_info=True)
 
     @on('StopTransaction')
     @trace_transaction(name="OCPP/StopTransaction", group="OCPP/Messages")
@@ -1026,12 +1056,24 @@ class ChargePoint(OcppChargePoint):
             
             logger.info(f"🛑 Transaction {transaction_id} status before stop: {transaction.transaction_status}")
 
+            # Money is frozen once the transaction is terminal. A late stop —
+            # a charger replaying its queue after the CSMS wrote the session
+            # off — records what the charger reported and moves nothing.
+            # ADR 0031 decision 5.
+            if transaction.transaction_status in TERMINAL_TRANSACTION_STATES:
+                await self._record_late_stop(transaction, meter_stop, timestamp)
+                return call_result.StopTransaction(id_tag_info={"status": "Accepted"})
+
             if transaction.transaction_status == TransactionStatusEnum.SUSPENDED:
                 logger.info(f"🛑 Stopping SUSPENDED transaction {transaction_id} — charger chose to end rather than resume")
 
             # Update transaction with end values
             transaction.end_meter_kwh = Decimal(str(meter_stop)) / Decimal(1000)  # Convert Wh to kWh
             transaction.energy_consumed_kwh = transaction.end_meter_kwh - (transaction.start_meter_kwh or Decimal(0))
+            # On a normal stop reported == billed; the pair diverges only after
+            # a write-off. Always populated so "reported != billed" is a query.
+            transaction.reported_end_meter_kwh = transaction.end_meter_kwh
+            transaction.reported_energy_kwh = transaction.energy_consumed_kwh
             transaction.end_time = datetime.datetime.now(datetime.timezone.utc)
             # When the charger says the session actually ended. Under offline
             # continuity this can precede end_time (receipt) by hours, and it is
@@ -1141,6 +1183,77 @@ class ChargePoint(OcppChargePoint):
                 id_tag_info={"status": "Invalid"}
             )
 
+    async def _record_late_stop(self, transaction, meter_stop, timestamp) -> None:
+        """Record a StopTransaction for a transaction whose money is frozen.
+
+        Writes ONLY the reported_* fields. The billed figures, the refund, the
+        Settlement Entry and the GST Invoice already issued against them are
+        left exactly as they are — there is no credit note to correct an
+        invoice, so a register that disagreed with its own transactions would
+        be strictly worse than a known, measured gap. ADR 0031 decision 5.
+        """
+        reported_end = Decimal(str(meter_stop)) / Decimal(1000)
+        reported_energy = reported_end - (transaction.start_meter_kwh or Decimal(0))
+        transaction.reported_end_meter_kwh = reported_end
+        transaction.reported_energy_kwh = reported_energy
+        transaction.reported_end_time = parse_ocpp_timestamp(
+            timestamp,
+            not_before=transaction.start_time,
+            context=f"late StopTransaction txn {transaction.id} from {self.id}",
+        )
+        await transaction.save(update_fields=[
+            "reported_end_meter_kwh", "reported_energy_kwh", "reported_end_time", "updated_at",
+        ])
+        billed = transaction.energy_consumed_kwh or Decimal(0)
+        gap = reported_energy - billed
+        logger.warning(
+            f"🛑 Late StopTransaction for terminal txn {transaction.id} "
+            f"({transaction.transaction_status}) from {self.id}: reported={reported_energy} kWh, "
+            f"billed={billed} kWh, gap={gap} kWh — recorded, money untouched"
+        )
+        await self._emit_late_stop_signals(transaction, billed, reported_energy, gap)
+
+    async def _emit_late_stop_signals(self, transaction, billed, reported, gap) -> None:
+        """Audit row (awaited: it is the source of record) + alertable NR event."""
+        try:
+            await log_audit_event(
+                action="transaction.late_stop_recorded",
+                entity_type="transaction",
+                entity_id=transaction.id,
+                actor_type="ocpp",
+                changes={
+                    "status": str(transaction.transaction_status),
+                    "billed_energy_kwh": float(billed),
+                    "reported_energy_kwh": float(reported),
+                    "gap_kwh": float(gap),
+                    "trigger": "StopTransaction",
+                },
+            )
+        except Exception as audit_err:
+            logger.warning(f"late-stop audit write failed for txn {transaction.id} (non-fatal): {audit_err}")
+        safe_create_task(OCPPMetrics.record_late_stop_recorded(
+            self.id, transaction.id, str(transaction.transaction_status),
+            float(billed), float(reported), float(gap),
+        ))
+
+    async def _record_replayed_reading(self, transaction, reading_kwh, stored: int) -> None:
+        """MeterValues for a terminal transaction: keep the reported figure current.
+
+        Readings are already stored for the delivery curve; this only advances
+        reported_end_meter_kwh so the write-off cost is measurable even when no
+        late StopTransaction follows. Never lowers it — a retried frame after a
+        late stop must not walk the reported figure backwards.
+        """
+        safe_create_task(OCPPMetrics.record_late_meter_values_stored(self.id, transaction.id, stored))
+        if reading_kwh is None:
+            return
+        current = transaction.reported_end_meter_kwh
+        if current is not None and reading_kwh <= current:
+            return
+        transaction.reported_end_meter_kwh = reading_kwh
+        transaction.reported_energy_kwh = reading_kwh - (transaction.start_meter_kwh or Decimal(0))
+        await transaction.save(update_fields=["reported_end_meter_kwh", "reported_energy_kwh", "updated_at"])
+
     @on('MeterValues')
     @trace_transaction(name="OCPP/MeterValues", group="OCPP/Messages")
     async def on_meter_values(self, connector_id, meter_value, transaction_id=None, **kwargs):
@@ -1165,6 +1278,17 @@ class ChargePoint(OcppChargePoint):
                 return call_result.MeterValues()
                 
             logger.debug(f"🔋 ✅ Found transaction {transaction_id} for charger {transaction.charger.charge_point_string_id}")
+
+            # A charger replaying its queue after the CSMS wrote the session
+            # off. The frames are acknowledged (the charger must drain its
+            # queue) and stored for forensics, but the session is never
+            # resumed, budget-checked or billed again. ADR 0031 decision 5.
+            is_terminal = transaction.transaction_status in TERMINAL_TRANSACTION_STATES
+            if is_terminal:
+                logger.warning(
+                    f"🔋 MeterValues for terminal txn {transaction_id} "
+                    f"({transaction.transaction_status}) from {self.id} — storing as reported, not billing"
+                )
 
             # Auto-resume SUSPENDED transactions on MeterValues receipt
             if transaction.transaction_status == TransactionStatusEnum.SUSPENDED:
@@ -1278,6 +1402,14 @@ class ChargePoint(OcppChargePoint):
                 
                 # Only create meter value record if we have at least energy reading
                 if meter_data['reading_kwh'] is not None:
+                    # Observe, never correct: a reading below one already
+                    # reported for this txn is logged + alerted and STILL
+                    # stored and billed as reported. ADR 0031 decision 7.
+                    try:
+                        from services.meter_monotonicity import observe_reading
+                        await observe_reading(transaction, self.id, meter_data['reading_kwh'])
+                    except Exception as mono_err:
+                        logger.warning(f"Meter monotonicity check failed (non-fatal): {mono_err}")
                     try:
                         logger.debug(f"🔋 💾 Creating MeterValue record in database...")
                         # The frame's own timestamp — when the CHARGER took the
@@ -1316,6 +1448,11 @@ class ChargePoint(OcppChargePoint):
                     logger.debug(f"🔋 Meter data was: {meter_data}")
             
             logger.info(f"🔋 📊 Summary: Created {meter_records_created} meter value records for transaction {transaction_id}")
+
+            if is_terminal:
+                last_reading = meter_data.get('reading_kwh') if meter_records_created > 0 else None
+                await self._record_replayed_reading(transaction, last_reading, meter_records_created)
+                return call_result.MeterValues()
 
             # Check QR session budget and auto-stop if needed
             if meter_records_created > 0 and meter_data.get('reading_kwh') is not None:
@@ -1409,6 +1546,8 @@ class ChargePoint(OcppChargePoint):
                 return await self._handle_signal_quality(data)
             elif message_id == "GetLastMeterValue":
                 return await self._handle_get_last_meter_value(data)
+            elif message_id == "StopDetail":
+                return await self._handle_stop_detail(data)
             else:
                 logger.warning(f"📡 Unhandled DataTransfer from {self.id}: vendorId={vendor_id}, messageId={message_id}")
                 return call_result.DataTransfer(status="UnknownMessageId")
@@ -1416,6 +1555,34 @@ class ChargePoint(OcppChargePoint):
         except Exception as e:
             logger.error(f"📡 ❌ Error processing DataTransfer from {self.id}: {e}", exc_info=True)
             return call_result.DataTransfer(status="Rejected")
+
+    async def _handle_stop_detail(self, data: str):
+        """StopDetail: why the charger stopped, when OCPP 1.6 has no reason code.
+
+        Follows a StopTransaction(reason=Local). ``{"transactionId": N,
+        "reason": "SessionLimit"}``. Recorded to Transaction.stop_detail_reason
+        beside the OCPP stop_reason — never overwriting it — and counted, so a
+        local budget-cap stop is distinguishable from a customer pressing stop.
+        Unknown or malformed → Rejected, never raised. ADR 0031 decision 2.
+        """
+        import json
+        try:
+            parsed = json.loads(data) if isinstance(data, str) else (data or {})
+            transaction_id = int(parsed.get("transactionId"))
+            reason = str(parsed.get("reason") or "").strip()[:50]
+        except (TypeError, ValueError, AttributeError, json.JSONDecodeError):
+            logger.warning(f"📡 Malformed StopDetail from {self.id}: {data!r}")
+            return call_result.DataTransfer(status="Rejected")
+        if not reason:
+            logger.warning(f"📡 StopDetail from {self.id} without a reason: {data!r}")
+            return call_result.DataTransfer(status="Rejected")
+        updated = await Transaction.filter(id=transaction_id).update(stop_detail_reason=reason)
+        if not updated:
+            logger.warning(f"📡 StopDetail from {self.id} for unknown txn {transaction_id} (reason={reason})")
+            return call_result.DataTransfer(status="Rejected")
+        logger.info(f"📡 StopDetail from {self.id}: txn {transaction_id} stopped for {reason}")
+        safe_create_task(OCPPMetrics.record_stop_detail(self.id, transaction_id, reason))
+        return call_result.DataTransfer(status="Accepted")
 
     async def _handle_signal_quality(self, data: str):
         """

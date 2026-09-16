@@ -7,8 +7,8 @@ the disconnect reconnect grace window was 30 min and the charger came back at
 cutoff instead of the longest legitimate window.
 
 Post ADR 0027 the windows are per-connector-type (policy.py): latched
-connectors (Type2 — what the `test_charger` fixture has) get the 12h window,
-unlatched sockets the 45min window. These tests pin the sweep to each row's
+connectors (Type2 — what the `test_charger` fixture has) get the long window,
+unlatched sockets the short one (values in policy.py). These tests pin the sweep to each row's
 OWN window: inside-window rows survive, past-window rows are swept, and a
 latched row is never swept at the socket cutoff.
 """
@@ -47,7 +47,7 @@ class TestBillingRetryStaleSuspendedCutoff:
         self, client, test_charger, test_user
     ):
         """The ADR 0027 core case: a Type2 (latched) txn suspended for longer
-        than the SOCKET window must NOT be swept — its own window is 12h.
+        than the SOCKET window must NOT be swept — its own window is the long one.
         Under a single global 45-min cutoff this txn would be force-stopped."""
         suspended_at = datetime.now(timezone.utc) - timedelta(
             seconds=SUSPEND_WINDOW_UNLATCHED_SECONDS + STALE_SUSPENDED_BUFFER_SECONDS + 300
@@ -64,14 +64,14 @@ class TestBillingRetryStaleSuspendedCutoff:
 
         refreshed = await Transaction.get(id=txn.id)
         assert refreshed.transaction_status == TransactionStatusEnum.SUSPENDED, \
-            "Latched txn inside its 12h window must not be swept at the socket cutoff"
+            "Latched txn inside its own window must not be swept at the socket cutoff"
 
     @pytest.mark.asyncio
     async def test_socket_txn_within_own_window_survives(
         self, client, test_station, test_user
     ):
         """Incident shape (txn 949): a socket txn suspended ~9 min ago must
-        NOT be swept — its window is 45 min."""
+        NOT be swept — its window is the short one."""
         socket_charger = await _make_socket_charger(test_station)
         suspended_at = datetime.now(timezone.utc) - timedelta(seconds=540)  # 9 min
         txn = await Transaction.create(
@@ -118,7 +118,7 @@ class TestBillingRetryStaleSuspendedCutoff:
     async def test_latched_txn_past_own_window_is_swept(
         self, client, test_charger, test_user, test_tariff, test_wallet
     ):
-        """Backstop preserved on the latched side too: past 12h + buffer the
+        """Backstop preserved on the latched side too: past its window + buffer the
         Type2 txn is cleaned up."""
         suspended_at = datetime.now(timezone.utc) - timedelta(
             seconds=SUSPEND_WINDOW_LATCHED_SECONDS + STALE_SUSPENDED_BUFFER_SECONDS + 120

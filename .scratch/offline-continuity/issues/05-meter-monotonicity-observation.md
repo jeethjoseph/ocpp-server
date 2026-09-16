@@ -1,6 +1,6 @@
 # Observe meter monotonicity violations
 
-Status: ready-for-agent
+Status: done
 
 ## What to build
 
@@ -14,12 +14,16 @@ See ADR 0031 decision 7.
 
 ## Acceptance criteria
 
-- [ ] A reading below a previously reported reading for the same transaction emits an alertable custom event and an audit entry
-- [ ] The reading is still stored and still bills as reported — no clamping, no rejection, no session interruption
-- [ ] The event carries enough to diagnose: transaction, charger, previous and current readings, and the delta
-- [ ] The check is cheap enough to sit on the MeterValues path without adding a query per frame
-- [ ] A session whose readings only ever advance emits nothing
+- [x] A reading below a previously reported reading for the same transaction emits an alertable custom event and an audit entry
+- [x] The reading is still stored and still bills as reported — no clamping, no rejection, no session interruption
+- [x] The event carries enough to diagnose: transaction, charger, previous and current readings, and the delta
+- [x] The check is cheap enough to sit on the MeterValues path without adding a query per frame
+- [x] A session whose readings only ever advance emits nothing
 
 ## Blocked by
 
 None - can start immediately
+
+## Shipped 2026-09-15
+
+**SHIPPED 2026-09-15.** `services/meter_monotonicity.observe_reading(txn, cp_id, reading)` runs in `on_meter_values` before each energy row is stored, for every transaction status (terminal replays included). It compares against a per-transaction high-water mark in Redis (`meter_high:{txn}`, 7-day TTL, one GET+SET per frame, never a DB query on the frame path); on a cache miss it seeds once from `max(start_meter_kwh, latest stored reading)`, so a first reading below `meterStart` is caught. A backwards reading logs at warning, writes audit `transaction.meter_regression` (charger, previous, current, delta, status) and emits counter `Custom/OCPP/Meter/MonotonicityViolation` + NR event `OCPPMeterMonotonicityViolation` — and is then stored and billed exactly as reported. The mark only ever rises, so after a reset every frame below the old mark reports until the register climbs back past it. 7 tests in `test_meter_monotonicity.py`. Regression suites (audit registry, late-stop, timestamps, watchdog, session limit, resume integration, QR) green.

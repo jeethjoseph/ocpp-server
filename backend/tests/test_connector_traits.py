@@ -4,7 +4,7 @@ Covers:
 1. The CONNECTOR_TRAITS table: enum<->traits bijection, both axes per type,
    unknown-type safe defaults, canonicalization.
 2. startable_statuses — the shared Preparing-vs-Available start gate.
-3. Per-charger suspend-window resolution (latched 12h / unlatched 45min).
+3. Per-charger suspend-window resolution (latched long / unlatched short, values in policy.py).
 4. The post-boot regression (txn 999): BootNotification arms the connector
    type's window, never the old 300s timer.
 5. /api/users/active-session includes SUSPENDED sessions.
@@ -96,7 +96,7 @@ def test_unknown_type_gets_safe_defaults_on_both_axes():
     traits = traits_for("SomeFutureConnector")
     assert traits == UNKNOWN_TRAITS
     assert traits.starts_from_available is False  # never widen the start gate
-    assert traits.latching is False               # never hold 12h on unknown
+    assert traits.latching is False               # never hold the long window on unknown
 
 
 # ============================================================================
@@ -168,7 +168,7 @@ class TestSuspendWindowResolution:
 
 @pytest.fixture
 def swallow_background_tasks():
-    def fake_create_task(coro):
+    def fake_create_task(coro, **_kwargs):
         if hasattr(coro, "close"):
             coro.close()
         return MagicMock()
@@ -192,7 +192,7 @@ class TestPostBootWindow:
         self, client, test_charger, test_user, swallow_background_tasks
     ):
         """txn 999 regression: a reboot must arm the connector type's window
-        (12h for Type2), never the old 300s post-boot timer that killed 9
+        (the latched window for Type2), never the old 300s post-boot timer that killed 9
         sessions fleet-wide."""
         from main import ChargePoint
         recent = datetime.now(timezone.utc) - timedelta(seconds=30)
@@ -208,7 +208,7 @@ class TestPostBootWindow:
         await ChargePoint._handle_ongoing_transaction_on_boot(fake_cp, txn, now)
 
         fake_cp._suspend_timeout.assert_called_once_with(
-            txn.id, now, SUSPEND_WINDOW_LATCHED_SECONDS
+            txn.id, SUSPEND_WINDOW_LATCHED_SECONDS
         )
 
     @pytest.mark.asyncio
@@ -230,7 +230,7 @@ class TestPostBootWindow:
         await ChargePoint._handle_ongoing_transaction_on_boot(fake_cp, txn, now)
 
         fake_cp._suspend_timeout.assert_called_once_with(
-            txn.id, now, SUSPEND_WINDOW_UNLATCHED_SECONDS
+            txn.id, SUSPEND_WINDOW_UNLATCHED_SECONDS
         )
 
 

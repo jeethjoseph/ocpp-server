@@ -30,7 +30,7 @@ def no_qr_calls():
 @pytest.fixture(autouse=True)
 def no_background_tasks():
     """Suppress safe_create_task so the 180s timeout sleep doesn't hang the test."""
-    def fake_create_task(coro):
+    def fake_create_task(coro, **_kwargs):
         if hasattr(coro, "close"):
             coro.close()
         return MagicMock()

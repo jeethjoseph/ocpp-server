@@ -251,7 +251,7 @@ charger.
 
 ## Related
 
-- **Code**: `backend/services/disconnect_handler.py` (`_disconnect_suspend_timeout`)
+- **Code**: `backend/services/disconnect_handler.py` (`hold_until_silent`, armed by `arm_suspend_timer`)
 - **Code**: `backend/services/transaction_finalizer.py` (`finalize_stopped_transaction`)
 - **Metric**: `Custom/OCPP/Disconnect/Stopped`
 - **Event**: `OCPPDisconnectStopped` (fields: `transaction_id`, `charger_id`, `energy_kwh`)
